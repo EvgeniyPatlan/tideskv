@@ -310,6 +310,130 @@ TEST_P(StorageContractTest, LargeBatchCommitsAtomically) {
   EXPECT_EQ(ScanCommitted(storage(), kSub).size(), 10000u);
 }
 
+std::optional<std::string> TxnGet(ReadView& v, ColumnFamily cf, std::string_view k) {
+  auto r = v.Get(cf, k);
+  if (!r.ok()) {
+    EXPECT_TRUE(r.status().IsNotFound()) << r.status().ToString();
+    return std::nullopt;
+  }
+  return *r;
+}
+
+TEST_P(StorageContractTest, TxnReadsAfterDeletePrefix) {
+  PutAll(storage(), kMeta, {{"p1a", "1"}, {"p1b", "2"}, {"p2a", "3"}});
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->DeletePrefix(kMeta, "p1").ok());
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "p1a").has_value());
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "p1b").has_value());
+  EXPECT_EQ(TxnGet(**txn, kMeta, "p2a"), "3");
+  EXPECT_EQ(Scan(**txn, kMeta), (Rows{{"p2a", "3"}}));
+}
+
+TEST_P(StorageContractTest, TxnReadsAfterDeleteRange) {
+  PutAll(storage(), kMeta, kAtoE);
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->DeleteRange(kMeta, "b", "d").ok());
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "b").has_value());
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "c").has_value());
+  EXPECT_EQ(TxnGet(**txn, kMeta, "a"), "1");
+  EXPECT_EQ(TxnGet(**txn, kMeta, "d"), "4");
+  EXPECT_EQ(Scan(**txn, kMeta), (Rows{{"a", "1"}, {"d", "4"}, {"e", "5"}}));
+}
+
+TEST_P(StorageContractTest, BufferedPutThenDeletePrefixIsDeleted) {
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "p1k", "v").ok());
+  ASSERT_TRUE((*txn)->DeletePrefix(kMeta, "p1").ok());
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "p1k").has_value());
+  EXPECT_TRUE(Scan(**txn, kMeta).empty());
+}
+
+TEST_P(StorageContractTest, DeleteThenPutSameKeyReadsNewValue) {
+  MustPut(storage(), kMeta, "k", "old");
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->Delete(kMeta, "k").ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "k", "v").ok());
+  EXPECT_EQ(TxnGet(**txn, kMeta, "k"), "v");
+  EXPECT_EQ(Scan(**txn, kMeta), (Rows{{"k", "v"}}));
+}
+
+TEST_P(StorageContractTest, PutAfterDeletePrefixVisibleInsideTxn) {
+  MustPut(storage(), kMeta, "pa", "old");
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->DeletePrefix(kMeta, "p").ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "px", "new").ok());
+  EXPECT_EQ(TxnGet(**txn, kMeta, "px"), "new");
+  EXPECT_FALSE(TxnGet(**txn, kMeta, "pa").has_value());
+  EXPECT_EQ(Scan(**txn, kMeta), (Rows{{"px", "new"}}));
+}
+
+TEST_P(StorageContractTest, ReadViewObservesLaterCommits) {
+  MustPut(storage(), kMeta, "k", "1");
+  auto view = storage().BeginRead();
+  ASSERT_TRUE(view.ok());
+  EXPECT_EQ(TxnGet(**view, kMeta, "k"), "1");
+  MustPut(storage(), kMeta, "k", "2");
+  EXPECT_EQ(TxnGet(**view, kMeta, "k"), "2");
+}
+
+TEST_P(StorageContractTest, WriteTxnObservesLaterCommits) {
+  MustPut(storage(), kMeta, "k", "1");
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  EXPECT_EQ(TxnGet(**txn, kMeta, "k"), "1");
+  {
+    auto other = storage().BeginWrite();
+    ASSERT_TRUE(other.ok());
+    ASSERT_TRUE((*other)->Put(kMeta, "k", "2").ok());
+    ASSERT_TRUE((*other)->Commit().ok());
+  }
+  EXPECT_EQ(TxnGet(**txn, kMeta, "k"), "2");
+}
+
+TEST_P(StorageContractTest, SavepointRollbackRestoresRangeDeletes) {
+  PutAll(storage(), kMeta, {{"b", "2"}});
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  WriteTxn& t = **txn;
+  ASSERT_TRUE(t.Put(kMeta, "a1", "1").ok());
+  ASSERT_TRUE(t.Savepoint("s1").ok());
+  ASSERT_TRUE(t.DeletePrefix(kMeta, "a").ok());
+  ASSERT_TRUE(t.DeleteRange(kMeta, "b", "c").ok());
+  EXPECT_FALSE(TxnGet(t, kMeta, "a1").has_value());
+  EXPECT_FALSE(TxnGet(t, kMeta, "b").has_value());
+  ASSERT_TRUE(t.RollbackToSavepoint("s1").ok());
+  EXPECT_EQ(TxnGet(t, kMeta, "a1"), "1");
+  EXPECT_EQ(TxnGet(t, kMeta, "b"), "2");
+  ASSERT_TRUE(t.Commit().ok());
+  EXPECT_EQ(ScanCommitted(storage(), kMeta), (Rows{{"a1", "1"}, {"b", "2"}}));
+}
+
+TEST_P(StorageContractTest, IteratorLowerBoundClampsSeeks) {
+  PutAll(storage(), kMeta, kAtoE);
+  auto view = storage().BeginRead();
+  ASSERT_TRUE(view.ok());
+  auto created = (*view)->NewIterator(kMeta, {"b", "d"});
+  ASSERT_TRUE(created.ok());
+  std::unique_ptr<Iterator> it = std::move(created).value();
+  ASSERT_TRUE(it->Seek("a").ok());
+  ASSERT_TRUE(it->Valid());
+  EXPECT_EQ(it->key(), "b");
+  ASSERT_TRUE(it->Prev().ok());
+  EXPECT_FALSE(it->Valid());
+  ASSERT_TRUE(it->SeekForPrev("a").ok());
+  EXPECT_FALSE(it->Valid());
+}
+
+TEST_P(StorageContractTest, IteratorBoundsWithHighBytes) {
+  PutAll(storage(), kMeta, {{"\x7f", "1"}, {"\x80", "2"}, {"\x81", "3"}, {"\xff", "4"}});
+  EXPECT_EQ(ScanCommitted(storage(), kMeta, {"\x80", "\xff"}), (Rows{{"\x80", "2"}, {"\x81", "3"}}));
+}
+
 TEST_P(StorageContractTest, ReopenPreservesCommittedData) {
   if (!harness_->SupportsReopen()) GTEST_SKIP() << "backend is not persistent";
   MustPut(storage(), kMeta, "k", "v");

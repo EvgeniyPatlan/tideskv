@@ -19,6 +19,8 @@ struct IterOptions {
   std::string upper;  // exclusive; empty = to the last key
 };
 
+// A new Iterator is unpositioned (Valid() == false) until a Seek* call.
+// key()/value() require Valid().
 // Reaching the end is not an error: positioning calls return OK and Valid() turns false.
 // key()/value() remain valid until the next positioning call. An Iterator must be
 // destroyed before the ReadView/WriteTxn that created it.
@@ -44,6 +46,12 @@ class ReadView {
   virtual Result<std::unique_ptr<Iterator>> NewIterator(ColumnFamily cf, IterOptions opts = {}) = 0;
 };
 
+// Buffered operations take effect in program order, for reads inside the
+// transaction and at commit.
+// BeginRead views and WriteTxn reads observe commits made after the view/transaction
+// was created (read-committed); BeginSnapshot views never do. An Iterator reflects the
+// data as of its creation or newer - callers must not rely on either.
+// Whether a savepoint still exists after RollbackToSavepoint is unspecified; use unique names.
 // Reads observe this transaction's own buffered writes. Destroying an unfinished
 // transaction rolls it back. After Commit/Rollback every call returns InvalidArgument.
 class WriteTxn : public ReadView {
@@ -61,6 +69,7 @@ class WriteTxn : public ReadView {
   virtual Status Rollback() = 0;
 };
 
+// ReadViews and WriteTxns must be destroyed before the Storage that created them.
 class Storage {
  public:
   virtual ~Storage() = default;
