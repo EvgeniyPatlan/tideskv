@@ -1,8 +1,10 @@
-// tideskv-spike: M0 engine measurements (spec §11: R1 tombstones, R4 backup, R7
-// commit cost). Usage:
-//   tideskv-spike commit     --dir D --threads 8 --seconds 10 --sync
-//   interval|full|none tideskv-spike tombstones --dir D --collections 100000
-//   --fields 20 --deleted-pct 50 tideskv-spike backup     --dir D --gb 1
+// tideskv-spike: M0 engine measurements (spec §11: R1 tombstones, R4 backup, R7 commit cost).
+// clang-format off
+// Usage:
+//   tideskv-spike commit     --dir D --threads 8 --seconds 10 --sync interval|full|none
+//   tideskv-spike tombstones --dir D --collections 100000 --fields 20 --deleted-pct 50
+//   tideskv-spike backup     --dir D --gb 1
+// clang-format on
 #include <algorithm>
 #include <atomic>
 #include <chrono>
