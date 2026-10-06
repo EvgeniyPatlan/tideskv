@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 2 * * *"
 
 jobs:
   build-test:
@@ -43,3 +45,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y clang-format-18
       - run: clang-format-18 --dry-run --Werror $(git ls-files '*.h' '*.cc')
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
+      - run: cmake --preset fuzz && cmake --build --preset fuzz -j --target resp_parser_fuzz
+      - run: mkdir -p corpus && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=1800 -max_len=65536
