@@ -1,0 +1,5 @@
+BasedOnStyle: Google
+ColumnLimit: 110
+IncludeBlocks: Preserve
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
