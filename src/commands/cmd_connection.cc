@@ -55,7 +55,7 @@ void Quit(ExecContext& ctx, const ArgList&) {
 }
 
 void Auth(ExecContext& ctx, const ArgList& argv) {
-  if (argv.size() > 3) return ArityError(ctx, "auth");
+  if (argv.size() > 3) return ctx.reply.Error("ERR syntax error");
   const bool legacy = argv.size() == 2;
   const std::string_view user = legacy ? std::string_view("default") : std::string_view(argv[1]);
   if (auto err = CheckCredentials(ctx.server, user, argv.back(), legacy)) return ctx.reply.Error(*err);
@@ -82,25 +82,34 @@ void WriteHelloReply(ExecContext& ctx) {
   r.ArrayHeader(0);
 }
 
-// Parses "HELLO [protover [AUTH user pass] [SETNAME name]]". Returns an error reply or nullopt.
-std::optional<std::string> ParseHello(ExecContext& ctx, const ArgList& argv, int* proto,
-                                      std::optional<std::string>* name) {
+// Result of parsing HELLO options.
+struct HelloOptions {
+  int proto;
+  std::optional<std::pair<std::string_view, std::string_view>> auth;  // user, pass
+  std::optional<std::string_view> setname;
+};
+
+// Parses "HELLO [protover [AUTH user pass] [SETNAME name]]". Collects options without applying.
+// Returns error reply or nullopt on success (check options field).
+std::optional<std::string> ParseHello(const ArgList& argv, int current_proto, HelloOptions* out) {
+  out->proto = current_proto;
   size_t i = 1;
   if (argv.size() > 1) {
     int64_t v = 0;
     if (!ParseInt64(argv[1], &v)) return "ERR Protocol version is not an integer or out of range";
     if (v != 2 && v != 3) return "NOPROTO unsupported protocol version";
-    *proto = static_cast<int>(v);
+    out->proto = static_cast<int>(v);
     i = 2;
   }
   for (; i < argv.size(); ++i) {
-    if (EqualsIgnoreCase(argv[i], "AUTH") && i + 2 < argv.size()) {
-      if (auto err = CheckCredentials(ctx.server, argv[i + 1], argv[i + 2], false)) return err;
-      ctx.session.authenticated = true;
+    if (EqualsIgnoreCase(argv[i], "AUTH")) {
+      if (i + 2 >= argv.size()) return "ERR Syntax error in HELLO option 'AUTH'";
+      out->auth.emplace(argv[i + 1], argv[i + 2]);
       i += 2;
-    } else if (EqualsIgnoreCase(argv[i], "SETNAME") && i + 1 < argv.size()) {
-      if (!ValidClientName(argv[i + 1])) return std::string(kBadName);
-      *name = argv[++i];
+    } else if (EqualsIgnoreCase(argv[i], "SETNAME")) {
+      if (i + 1 >= argv.size()) return "ERR Syntax error in HELLO option 'SETNAME'";
+      out->setname.emplace(argv[i + 1]);
+      ++i;
     } else {
       return "ERR Syntax error in HELLO option '" + argv[i] + "'";
     }
@@ -109,18 +118,35 @@ std::optional<std::string> ParseHello(ExecContext& ctx, const ArgList& argv, int
 }
 
 void Hello(ExecContext& ctx, const ArgList& argv) {
-  int proto = ctx.session.protocol;
-  std::optional<std::string> name;
-  if (auto err = ParseHello(ctx, argv, &proto, &name)) return ctx.reply.Error(*err);
+  HelloOptions opts;
+  // Step a: Parse everything first, return error if syntax invalid (no session mutation)
+  if (auto err = ParseHello(argv, ctx.session.protocol, &opts)) return ctx.reply.Error(*err);
+
+  // Step b: If AUTH pair was given, validate credentials once (failure = error, session unchanged)
+  if (opts.auth) {
+    if (auto err = CheckCredentials(ctx.server, opts.auth->first, opts.auth->second, false)) {
+      return ctx.reply.Error(*err);
+    }
+    ctx.session.authenticated = true;
+  }
+
+  // Step c: Check if authenticated (after optional auth)
   if (!ctx.session.authenticated) {
     return ctx.reply.Error(
         "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH "
         "<user> <pass> option can be used to authenticate the client and select the RESP protocol version at "
         "the same time");
   }
-  if (name) ctx.session.name = *name;
-  ctx.session.protocol = proto;
-  ctx.reply.SetProtocol(proto);  // HELLO's own reply already uses the new protocol
+
+  // Step d: Validate and apply SETNAME (name validation error doesn't undo authentication)
+  if (opts.setname) {
+    if (!ValidClientName(*opts.setname)) return ctx.reply.Error(kBadName);
+    ctx.session.name = *opts.setname;
+  }
+
+  // Step e: Switch protocol and reply
+  ctx.session.protocol = opts.proto;
+  ctx.reply.SetProtocol(opts.proto);  // HELLO's own reply already uses the new protocol
   WriteHelloReply(ctx);
 }
 

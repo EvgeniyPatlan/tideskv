@@ -47,6 +47,11 @@ TEST(Auth, PasswordFlow) {
             "-WRONGPASS invalid username-password pair or user is disabled.\r\n");
 }
 
+TEST(Auth, SyntaxError) {
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"AUTH", "a", "b", "c"}), "-ERR syntax error\r\n");
+}
+
 TEST(Hello, DefaultsToResp2Map) {
   CommandHarness h;
   const std::string r = h.Run({"HELLO"});
@@ -80,6 +85,29 @@ TEST(Hello, AuthAndSetname) {
   EXPECT_EQ(h.Run({"HELLO", "3", "AUTH", "default", "s3cret", "SETNAME", "conn1"}).rfind("%7\r\n", 0), 0u);
   EXPECT_TRUE(h.session.authenticated);
   EXPECT_EQ(h.session.name, "conn1");
+}
+
+TEST(Hello, SyntaxErrorAfterAuth) {
+  CommandHarness h;
+  h.RequirePassword("s3cret");
+  const std::string r = h.Run({"HELLO", "3", "AUTH", "default", "s3cret", "BOGUS"});
+  EXPECT_EQ(r.rfind("-ERR Syntax error in HELLO option 'BOGUS'", 0), 0u);
+  EXPECT_FALSE(h.session.authenticated);
+}
+
+TEST(Hello, AuthErrorPreservesUnauthenticated) {
+  CommandHarness h;
+  h.RequirePassword("s3cret");
+  const std::string r = h.Run({"HELLO", "3", "AUTH", "default", "s3cret", "AUTH", "default", "wrong"});
+  EXPECT_EQ(r.rfind("-WRONGPASS", 0), 0u);
+  EXPECT_FALSE(h.session.authenticated);
+}
+
+TEST(Hello, InvalidSetnameWithoutAuth) {
+  CommandHarness h;
+  h.RequirePassword("s3cret");
+  const std::string r = h.Run({"HELLO", "3", "SETNAME", "bad name"});
+  EXPECT_EQ(r.rfind("-NOAUTH HELLO must be called", 0), 0u);
 }
 
 TEST(Client, IdNamesAndInfo) {
