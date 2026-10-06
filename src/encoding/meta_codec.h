@@ -32,7 +32,7 @@ struct Metadata {
 
 struct DecodedMetadata {
   Metadata meta;
-  std::string payload;  // STRING value; extracted from the encoded input
+  std::string_view payload;  // STRING value; views into the encoded input
 };
 
 std::string EncodeMetadata(const Metadata& meta, std::string_view string_payload = {});

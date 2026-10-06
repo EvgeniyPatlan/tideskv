@@ -10,7 +10,8 @@ TEST(MetaCodec, StringRoundTripIsBinarySafe) {
   m.type = ValueType::kString;
   m.expire_ms = 1700000000123;
   const std::string payload("v\0\r\nx", 5);
-  auto decoded = DecodeMetadata(EncodeMetadata(m, payload));
+  const std::string enc = EncodeMetadata(m, payload);
+  auto decoded = DecodeMetadata(enc);
   ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
   EXPECT_EQ(decoded->meta.type, ValueType::kString);
   EXPECT_EQ(decoded->meta.expire_ms, 1700000000123);

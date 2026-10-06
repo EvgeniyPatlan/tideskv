@@ -52,15 +52,10 @@ Result<DecodedMetadata> DecodeMetadata(std::string_view in) {
   DecodedMetadata d;
   d.meta.type = static_cast<ValueType>(raw_type);
   d.meta.flags = static_cast<uint8_t>(in[1]);
-
-  // Read expire_ms (8 bytes)
-  uint64_t exp = 0;
-  if (in.size() < 10) return Status::Corruption("metadata too short");
-  exp = coding::DecodeFixed64BE(in.data() + 2);
-  d.meta.expire_ms = static_cast<int64_t>(exp);
+  d.meta.expire_ms = static_cast<int64_t>(coding::DecodeFixed64BE(in.data() + 2));
 
   if (d.meta.type == ValueType::kString) {
-    d.payload = std::string(in.substr(kHeaderSize));
+    d.payload = in.substr(kHeaderSize);
     return d;
   }
   if (in.size() != ExpectedSize(d.meta.type)) return Status::Corruption("bad metadata length");
