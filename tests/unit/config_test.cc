@@ -171,17 +171,16 @@ TEST(Config, RewriteHandlesEmptyAndSpacedValues) {
 TEST(Config, RewritePreservesFilePermissions) {
   test::TempDir dir;
   const std::string path = WriteFile(dir, "port 7000\n");
-  // Set permissions to 0600
-  std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                               std::filesystem::perm_options::replace);
+  // Set permissions to 0600 (owner read/write only)
+  const auto expected = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+  std::filesystem::permissions(path, expected, std::filesystem::perm_options::replace);
   Config c;
   ASSERT_TRUE(c.LoadFile(path).ok());
   ASSERT_TRUE(c.Set("requirepass", "test", true).ok());
   ASSERT_TRUE(c.Rewrite().ok());
-  // Verify permissions are preserved
+  // Verify permissions are preserved exactly (not 0644 or other variations)
   const auto perms = std::filesystem::status(path).permissions();
-  const auto expected = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
-  EXPECT_EQ(perms & expected, expected);
+  EXPECT_EQ(perms & std::filesystem::perms::all, expected);
   // Verify no .tmp file remains
   EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
 }

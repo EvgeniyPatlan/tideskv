@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -43,6 +44,7 @@ class Config {
 
  private:
   mutable std::shared_mutex mu_;
+  mutable std::mutex rewrite_mu_;
   ConfigValues values_;
   std::string file_path_;
 };

@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <sys/stat.h>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -166,7 +167,7 @@ std::string QuoteIfNeeded(const std::string& v) {
   if (!needs_quote) return v;
   std::string quoted;
   quoted.push_back('"');
-  for (uint8_t ch : v) {
+  for (char ch : v) {
     if (ch == '\\') {
       quoted += "\\\\";
     } else if (ch == '"') {
@@ -272,6 +273,7 @@ Config::Pairs Config::Get(std::string_view pattern) const {
 }
 
 Status Config::Rewrite() const {
+  std::lock_guard<std::mutex> rewrite_lock(rewrite_mu_);
   std::string path;
   {
     std::shared_lock lock(mu_);
@@ -327,12 +329,16 @@ Status Config::Rewrite() const {
     ::unlink(tmp.c_str());
     return Status::IOError("cannot rename " + tmp + " to " + path);
   }
-  // Sync directory
-  int dir_fd = ::open(".", O_RDONLY | O_CLOEXEC);
-  if (dir_fd >= 0) {
-    ::fsync(dir_fd);
+  // Sync directory containing the config file
+  std::string dir_path = std::filesystem::path(path).parent_path().string();
+  if (dir_path.empty()) dir_path = ".";
+  int dir_fd = ::open(dir_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir_fd < 0) return Status::IOError("cannot open directory " + dir_path);
+  if (::fsync(dir_fd) != 0) {
     ::close(dir_fd);
+    return Status::IOError("cannot fsync directory " + dir_path);
   }
+  ::close(dir_fd);
   return Status::Ok();
 }
 
