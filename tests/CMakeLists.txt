@@ -1,0 +1,48 @@
+include(GoogleTest)
+
+# Header-only until support/*.cc files appear (Task 18), then a static library.
+file(GLOB SUPPORT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/support/*.cc)
+if(SUPPORT_SOURCES)
+  add_library(test_support STATIC ${SUPPORT_SOURCES})
+  target_include_directories(test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(test_support PUBLIC tideskv_core GTest::gtest)
+else()
+  add_library(test_support INTERFACE)
+  target_include_directories(test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(test_support INTERFACE tideskv_core GTest::gtest)
+endif()
+
+file(GLOB UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cc)
+add_executable(unit_tests ${UNIT_SOURCES})
+target_link_libraries(unit_tests PRIVATE test_support tidesdb GTest::gtest_main rapidcheck rapidcheck_gtest)
+tideskv_defaults(unit_tests)
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)
+
+file(GLOB CONTRACT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/contract/*.cc)
+if(CONTRACT_SOURCES)
+  add_executable(contract_tests ${CONTRACT_SOURCES})
+  target_link_libraries(contract_tests PRIVATE test_support GTest::gtest_main)
+  tideskv_defaults(contract_tests)
+  gtest_discover_tests(contract_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
+if(INTEGRATION_SOURCES AND TARGET tideskv-server)
+  add_executable(integration_tests ${INTEGRATION_SOURCES})
+  target_link_libraries(integration_tests PRIVATE test_support GTest::gtest_main)
+  target_compile_definitions(integration_tests PRIVATE TIDESKV_SERVER_BIN="$<TARGET_FILE:tideskv-server>")
+  add_dependencies(integration_tests tideskv-server)
+  tideskv_defaults(integration_tests)
+  gtest_discover_tests(integration_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 60)
+endif()
+
+if(TIDESKV_FUZZ)
+  add_executable(resp_parser_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/resp_parser_fuzz.cc)
+  target_compile_options(resp_parser_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_options(resp_parser_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_libraries(resp_parser_fuzz PRIVATE tideskv_core)
+endif()
+
+add_test(NAME engine_boundary
+  COMMAND ${PROJECT_SOURCE_DIR}/scripts/check_engine_boundary.sh
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

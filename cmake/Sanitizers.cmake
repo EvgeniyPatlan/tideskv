@@ -1,0 +1,22 @@
+if(TIDESKV_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+  add_link_options(-fsanitize=address,undefined)
+elseif(TIDESKV_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+elseif(NOT TIDESKV_SANITIZE STREQUAL "")
+  message(FATAL_ERROR "TIDESKV_SANITIZE must be empty, 'address' or 'thread'")
+endif()
+
+if(TIDESKV_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "TIDESKV_COVERAGE requires clang")
+  endif()
+  add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+  add_link_options(-fprofile-instr-generate)
+endif()
+
+# Warnings for our own targets only (third-party code is not ours to fix).
+function(tideskv_defaults target)
+  target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type)
+endfunction()

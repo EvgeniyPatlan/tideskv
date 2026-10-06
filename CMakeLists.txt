@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.24)
+project(tideskv VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(TIDESKV_BUILD_TESTS "Build tests" ON)
+option(TIDESKV_BUILD_BENCH "Build the M0 spike/bench tools" OFF)
+option(TIDESKV_FUZZ "Build libFuzzer targets (clang only)" OFF)
+option(TIDESKV_COMPRESSION "Build TidesDB with LZ4+Zstd (needs liblz4-dev libzstd-dev)" ON)
+option(TIDESKV_COVERAGE "Clang source-based coverage" OFF)
+set(TIDESKV_SANITIZE "" CACHE STRING "Sanitizer: empty, address or thread")
+
+include(cmake/Sanitizers.cmake)
+include(cmake/Dependencies.cmake)
+
+add_subdirectory(src)
+if(TIDESKV_BUILD_BENCH)
+  add_subdirectory(bench)
+endif()
+if(TIDESKV_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
