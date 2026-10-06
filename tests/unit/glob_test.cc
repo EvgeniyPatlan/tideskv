@@ -38,6 +38,11 @@ TEST(Glob, EscapesAndReversedRange) {
   EXPECT_TRUE(GlobMatch("[\\]]", "]"));
 }
 
+TEST(Glob, RangeToCloseBracket) {
+  EXPECT_TRUE(GlobMatch("[a-]", "^"));  // range from 'a' (97) to ']' (93), reversed to ']'..'^'
+  EXPECT_FALSE(GlobMatch("[a-]", "-"));  // '-' (45) not in range
+}
+
 TEST(Glob, NoCase) {
   EXPECT_TRUE(GlobMatch("HeLLo*", "hello world", true));
   EXPECT_FALSE(GlobMatch("HeLLo*", "hello world", false));

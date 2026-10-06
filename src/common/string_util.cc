@@ -9,9 +9,26 @@ namespace {
 
 char LowerAscii(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
 
+// Check if integer string is canonical (no leading zeros, except "0" itself; no "-0").
+// After optional '-', first digit must be 1-9 unless entire string is exactly "0".
+bool IsCanonicalInteger(std::string_view s) {
+  if (s.empty()) return false;
+  size_t pos = 0;
+  if (s[0] == '-') {
+    if (s.size() == 1) return false;  // Just "-"
+    ++pos;
+  }
+  if (s[pos] == '0') {
+    // "0" is canonical (and only "0", not "-0" or "00" or "007")
+    // So the entire string must be exactly "0" (no minus, just the single char)
+    return s.size() == 1 && s[0] == '0';
+  }
+  return true;
+}
+
 template <typename T>
 bool ParseInteger(std::string_view s, T* out) {
-  if (s.empty()) return false;
+  if (s.empty() || !IsCanonicalInteger(s)) return false;
   T value{};
   const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
   if (ec != std::errc{} || ptr != s.data() + s.size()) return false;

@@ -29,7 +29,7 @@ ClassResult MatchClass(std::string_view pat, size_t p, char ch, bool nocase) {
     if (pat[i] == '\\' && i + 1 < pat.size()) {
       matched |= Fold(pat[i + 1], nocase) == c;
       i += 2;
-    } else if (i + 2 < pat.size() && pat[i + 1] == '-' && pat[i + 2] != ']') {
+    } else if (i + 2 < pat.size() && pat[i + 1] == '-') {
       unsigned char lo = Fold(pat[i], nocase);
       unsigned char hi = Fold(pat[i + 2], nocase);
       if (lo > hi) std::swap(lo, hi);

@@ -19,7 +19,7 @@ TEST(ParseInt64, AcceptsStrictDecimal) {
 
 TEST(ParseInt64, RejectsGarbage) {
   int64_t v = 0;
-  for (const char* bad : {"", "-", "+1", " 1", "1 ", "1a", "0x10", "9223372036854775808", "1.0"}) {
+  for (const char* bad : {"", "-", "+1", " 1", "1 ", "1a", "0x10", "9223372036854775808", "1.0", "007", "00", "-0"}) {
     EXPECT_FALSE(ParseInt64(bad, &v)) << bad;
   }
 }
@@ -28,6 +28,11 @@ TEST(ParseUint64, RejectsNegative) {
   uint64_t v = 0;
   EXPECT_FALSE(ParseUint64("-1", &v));
   EXPECT_TRUE(ParseUint64("18446744073709551615", &v));
+}
+
+TEST(ParseUint64, RejectsNonCanonical) {
+  uint64_t v = 0;
+  EXPECT_FALSE(ParseUint64("007", &v));
 }
 
 TEST(ParseMemory, RedisUnits) {
