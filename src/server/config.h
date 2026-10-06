@@ -39,7 +39,7 @@ class Config {
   Pairs Get(std::string_view pattern) const;  // case-insensitive glob, sorted by name
   Status Rewrite() const;                     // rewrites the loaded file with current values
   ConfigValues Snapshot() const;
-  const std::string& file_path() const { return file_path_; }
+  std::string file_path() const;
 
  private:
   mutable std::shared_mutex mu_;

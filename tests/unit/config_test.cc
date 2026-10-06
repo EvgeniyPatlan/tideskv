@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <fstream>
 
 #include "support/temp_dir.h"
@@ -124,6 +125,66 @@ TEST(Config, RewritePersistsRuntimeChanges) {
 }
 
 TEST(Config, RewriteWithoutFileFails) { EXPECT_FALSE(Config().Rewrite().ok()); }
+
+TEST(Config, RejectsControlCharactersInStringOptions) {
+  Config c;
+  // Reject newline in requirepass
+  EXPECT_FALSE(c.Set("requirepass", "x\nbind 0.0.0.0", true).ok());
+  // Reject other control chars: tab, newline in dir, DEL in bind, SOH in dir, CRLF in logfile
+  EXPECT_FALSE(c.Set("requirepass", std::string("x\ty"), true).ok());
+  EXPECT_FALSE(c.Set("requirepass", std::string("x\x00y", 3), true).ok());
+  EXPECT_FALSE(c.Set("bind", std::string("127.0.0.1\x7f"), false).ok());
+  EXPECT_FALSE(c.Set("dir", std::string(".\x01", 2), false).ok());
+  EXPECT_FALSE(c.Set("logfile", "/var/log\r\n", false).ok());
+}
+
+TEST(Config, RewriteRoundTripsEscapedValues) {
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "port 7000\n");
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  // Set values with special characters that need escaping
+  ASSERT_TRUE(c.Set("requirepass", "say \"hi\"", true).ok());
+  ASSERT_TRUE(c.Set("logfile", "back\\slash", false).ok());
+  ASSERT_TRUE(c.Rewrite().ok());
+  Config reloaded;
+  ASSERT_TRUE(reloaded.LoadFile(path).ok());
+  EXPECT_EQ(reloaded.Snapshot().port, 7000);
+  EXPECT_EQ(reloaded.Snapshot().requirepass, "say \"hi\"");
+  EXPECT_EQ(reloaded.Snapshot().logfile, "back\\slash");
+}
+
+TEST(Config, RewriteHandlesEmptyAndSpacedValues) {
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "port 7000\n");
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  ASSERT_TRUE(c.Set("logfile", "", false).ok());
+  ASSERT_TRUE(c.Set("requirepass", "two words", true).ok());
+  ASSERT_TRUE(c.Rewrite().ok());
+  Config reloaded;
+  ASSERT_TRUE(reloaded.LoadFile(path).ok());
+  EXPECT_EQ(reloaded.Snapshot().logfile, "");
+  EXPECT_EQ(reloaded.Snapshot().requirepass, "two words");
+}
+
+TEST(Config, RewritePreservesFilePermissions) {
+  test::TempDir dir;
+  const std::string path = WriteFile(dir, "port 7000\n");
+  // Set permissions to 0600
+  std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::replace);
+  Config c;
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  ASSERT_TRUE(c.Set("requirepass", "test", true).ok());
+  ASSERT_TRUE(c.Rewrite().ok());
+  // Verify permissions are preserved
+  const auto perms = std::filesystem::status(path).permissions();
+  const auto expected = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+  EXPECT_EQ(perms & expected, expected);
+  // Verify no .tmp file remains
+  EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+}
 
 }  // namespace
 }  // namespace tideskv
