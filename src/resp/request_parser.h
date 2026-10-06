@@ -26,7 +26,9 @@ class RequestParser {
   const std::vector<std::string>& args() const { return args_; }  // valid after kCommand
   std::vector<std::string>& mutable_args() { return args_; }
   const std::string& error() const { return error_; }  // valid after kError (sticky)
-  size_t buffered_bytes() const { return buffered_; }  // partial-argument bytes held
+  size_t buffered_bytes() const {
+    return buffered_;
+  }  // bytes held in partial arguments, including per-argument overhead
 
  private:
   enum class State { kIdle, kArrayHeader, kBulkHeader, kBulkBody, kInline, kError };

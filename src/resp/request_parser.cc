@@ -117,7 +117,7 @@ RequestParser::Progress RequestParser::ParseArrayHeader(std::string_view d, size
   }
   int64_t n = 0;
   if (!ParseInt64(d.substr(*pos + 1, eol - *pos - 1), &n) ||
-      n > static_cast<int64_t>(limits_.max_multibulk_len)) {
+      (n > 0 && static_cast<uint64_t>(n) > limits_.max_multibulk_len)) {
     return Fail("Protocol error: invalid multibulk length");
   }
   *pos = eol + 2;
@@ -147,6 +147,7 @@ RequestParser::Progress RequestParser::ParseBulkHeader(std::string_view d, size_
   *pos = eol + 2;
   bulk_len_ = static_cast<size_t>(len);
   args_.emplace_back();
+  buffered_ += sizeof(std::string);
   args_.back().reserve(std::min<size_t>(bulk_len_, 64 * 1024));  // grow with data, never trust the header
   state_ = State::kBulkBody;
   return Progress::kContinue;
@@ -180,6 +181,7 @@ RequestParser::Progress RequestParser::ParseInline(std::string_view d, size_t* p
   if (LineTooLong(line.size())) return Fail("Protocol error: too big inline request");
   *pos = nl + 1;
   if (!SplitInline(line, &args_)) return Fail("Protocol error: unbalanced quotes in request");
+  buffered_ += args_.size() * sizeof(std::string);
   state_ = State::kIdle;
   return args_.empty() ? Progress::kContinue : Progress::kCommand;  // blank line: ignore
 }

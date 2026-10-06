@@ -120,7 +120,14 @@ TEST(RequestParser, BufferedBytesTracksPartialBulk) {
   size_t consumed = 0;
   ASSERT_EQ(p.Parse("*1\r\n$10\r\nabcd", &consumed), ParseStatus::kNeedMore);
   EXPECT_EQ(consumed, 13u);
-  EXPECT_EQ(p.buffered_bytes(), 4u);
+  EXPECT_EQ(p.buffered_bytes(), 4u + sizeof(std::string));
+}
+
+TEST(RequestParser, BufferedBytesIncludesEmptyArguments) {
+  RequestParser p;
+  size_t consumed = 0;
+  ASSERT_EQ(p.Parse("*4\r\n$0\r\n\r\n$0\r\n\r\n", &consumed), ParseStatus::kNeedMore);
+  EXPECT_GE(p.buffered_bytes(), 2u * sizeof(std::string));
 }
 
 RC_GTEST_PROP(RequestParserProp, ArbitrarySplitsYieldSameCommand, (std::vector<std::string> argv)) {
