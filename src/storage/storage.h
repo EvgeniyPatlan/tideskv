@@ -21,6 +21,7 @@ struct IterOptions {
 
 // A new Iterator is unpositioned (Valid() == false) until a Seek* call.
 // key()/value() require Valid().
+// Empty targets: Seek("") behaves as SeekToFirst(); SeekForPrev("") returns OK with Valid() == false.
 // Reaching the end is not an error: positioning calls return OK and Valid() turns false.
 // key()/value() remain valid until the next positioning call. An Iterator must be
 // destroyed before the ReadView/WriteTxn that created it.

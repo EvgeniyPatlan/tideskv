@@ -21,8 +21,10 @@ struct StorageOptions {
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.
-// Each WriteTxn/ReadView/Iterator must be used by one thread at a time and be
-// destroyed before this object.
+// Thread safety: BeginWrite/BeginRead/BeginSnapshot/Backup/Checkpoint may be called
+// concurrently from multiple threads (the engine is thread-safe). Each returned
+// WriteTxn/ReadView/Iterator is single-threaded: use it from one thread at a time,
+// and destroy it before this object.
 class TidesStorage final : public Storage {
  public:
   // Busy("... locked ...") when another handle or process holds the directory.

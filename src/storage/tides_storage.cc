@@ -74,11 +74,16 @@ class TidesIterator final : public Iterator {
   }
 
   Status Seek(std::string_view target) override {
+    if (target.empty()) return SeekToFirst();  // the engine rejects empty keys
     const std::string_view t = (!opts_.lower.empty() && target < opts_.lower) ? opts_.lower : target;
     return Position(RetryLocked([&] { return tidesdb_iter_seek(it_, Bytes(t), t.size()); }), "iter seek");
   }
 
   Status SeekForPrev(std::string_view target) override {
+    if (target.empty()) {  // no key is <= ""; the engine rejects empty keys
+      engine_valid_ = false;
+      return Status::Ok();
+    }
     if (!opts_.upper.empty() && target >= opts_.upper) return SeekToLast();
     return RawSeekForPrev(target);
   }
@@ -129,7 +134,12 @@ class TidesIterator final : public Iterator {
 Result<std::string> TxnGet(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, std::string_view key) {
   if (Status st = ValidateKey(key); !st.ok()) return st;
   TdbBuffer v;
-  const int rc = RetryLocked([&] { return tidesdb_txn_get(txn, cf, Bytes(key), key.size(), &v.data, &v.size); });
+  const int rc = RetryLocked([&] {
+    tidesdb_free(v.data);  // never leak a buffer from an earlier attempt
+    v.data = nullptr;
+    v.size = 0;
+    return tidesdb_txn_get(txn, cf, Bytes(key), key.size(), &v.data, &v.size);
+  });
   if (rc != TDB_SUCCESS) return FromTdb(rc, "get");
   return std::string(v.view());
 }
@@ -277,7 +287,7 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
 
   const int rc = tidesdb_open(&cfg, &impl->db);
   if (rc == TDB_ERR_LOCKED) {
-    return Status::Busy("open " + o.path + ": data directory is locked by another process");
+    return Status::Busy("open " + o.path + ": data directory is locked by another process or handle");
   }
   if (rc != TDB_SUCCESS) return FromTdb(rc, "open " + o.path);
   for (ColumnFamily cf : kAllColumnFamilies) {

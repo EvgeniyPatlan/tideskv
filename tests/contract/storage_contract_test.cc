@@ -434,6 +434,34 @@ TEST_P(StorageContractTest, IteratorBoundsWithHighBytes) {
   EXPECT_EQ(ScanCommitted(storage(), kMeta, {"\x80", "\xff"}), (Rows{{"\x80", "2"}, {"\x81", "3"}}));
 }
 
+// Seek("") == SeekToFirst; SeekForPrev("") is OK and leaves the iterator invalid.
+void ExpectEmptySeekTargets(ReadView& view, IterOptions opts, std::string_view first) {
+  auto created = view.NewIterator(kMeta, std::move(opts));
+  ASSERT_TRUE(created.ok());
+  std::unique_ptr<Iterator> it = std::move(created).value();
+  ASSERT_TRUE(it->Seek("").ok());
+  ASSERT_TRUE(it->Valid());
+  EXPECT_EQ(it->key(), first);
+  ASSERT_TRUE(it->SeekForPrev("").ok());
+  EXPECT_FALSE(it->Valid());
+}
+
+TEST_P(StorageContractTest, EmptySeekTargetsWithoutBounds) {
+  PutAll(storage(), kMeta, kAtoE);
+  auto view = storage().BeginRead();
+  ASSERT_TRUE(view.ok());
+  ExpectEmptySeekTargets(**view, {}, "a");
+  ExpectEmptySeekTargets(**view, {"", "d"}, "a");
+}
+
+TEST_P(StorageContractTest, EmptySeekTargetsWithBounds) {
+  PutAll(storage(), kMeta, kAtoE);
+  auto view = storage().BeginRead();
+  ASSERT_TRUE(view.ok());
+  ExpectEmptySeekTargets(**view, {"b", ""}, "b");
+  ExpectEmptySeekTargets(**view, {"b", "d"}, "b");
+}
+
 TEST_P(StorageContractTest, ReopenPreservesCommittedData) {
   if (!harness_->SupportsReopen()) GTEST_SKIP() << "backend is not persistent";
   MustPut(storage(), kMeta, "k", "v");
