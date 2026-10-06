@@ -38,7 +38,7 @@ class TidesStorage final : public Storage {
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override;
 
   Status Backup(const std::string& dir);  // consistent, directly-openable copy
-  Status Checkpoint();                     // flush + fsync WAL/vlog/manifest
+  Status Checkpoint();                    // flush + fsync WAL/vlog/manifest
 
  private:
   struct Impl;

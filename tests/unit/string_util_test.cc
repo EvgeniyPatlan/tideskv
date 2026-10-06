@@ -19,7 +19,8 @@ TEST(ParseInt64, AcceptsStrictDecimal) {
 
 TEST(ParseInt64, RejectsGarbage) {
   int64_t v = 0;
-  for (const char* bad : {"", "-", "+1", " 1", "1 ", "1a", "0x10", "9223372036854775808", "1.0", "007", "00", "-0"}) {
+  for (const char* bad :
+       {"", "-", "+1", " 1", "1 ", "1a", "0x10", "9223372036854775808", "1.0", "007", "00", "-0"}) {
     EXPECT_FALSE(ParseInt64(bad, &v)) << bad;
   }
 }

@@ -10,8 +10,8 @@ class TempDir {
  public:
   explicit TempDir(const std::string& tag = "tideskv") {
     std::random_device rd;
-    path_ = std::filesystem::temp_directory_path() /
-            (tag + "-" + std::to_string(rd()) + std::to_string(rd()));
+    path_ =
+        std::filesystem::temp_directory_path() / (tag + "-" + std::to_string(rd()) + std::to_string(rd()));
     std::filesystem::create_directories(path_);
   }
   ~TempDir() {

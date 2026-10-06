@@ -268,7 +268,8 @@ TEST_P(StorageContractTest, RejectsInvalidArguments) {
   EXPECT_EQ(t.Put(kMeta, "", "v").code(), StatusCode::kInvalidArgument);
   EXPECT_EQ(t.Get(kMeta, "").status().code(), StatusCode::kInvalidArgument);
   EXPECT_EQ(t.DeletePrefix(kMeta, "").code(), StatusCode::kInvalidArgument);
-  EXPECT_EQ(t.DeletePrefix(kMeta, std::string(kMaxRangeBoundSize + 1, 'x')).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(t.DeletePrefix(kMeta, std::string(kMaxRangeBoundSize + 1, 'x')).code(),
+            StatusCode::kInvalidArgument);
   EXPECT_TRUE(t.DeletePrefix(kMeta, std::string(kMaxRangeBoundSize, 'x')).ok());
   EXPECT_EQ(t.DeleteRange(kMeta, "", "b").code(), StatusCode::kInvalidArgument);
   EXPECT_EQ(t.DeleteRange(kMeta, "b", "a").code(), StatusCode::kInvalidArgument);

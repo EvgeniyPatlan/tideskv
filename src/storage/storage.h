@@ -28,12 +28,12 @@ struct IterOptions {
 class Iterator {
  public:
   virtual ~Iterator() = default;
-  virtual Status SeekToFirst() = 0;                          // first key >= lower
-  virtual Status SeekToLast() = 0;                           // last key < upper
-  virtual Status Seek(std::string_view target) = 0;          // first key >= target
-  virtual Status SeekForPrev(std::string_view target) = 0;   // last key <= target
-  virtual Status Next() = 0;                                 // InvalidArgument if !Valid()
-  virtual Status Prev() = 0;                                 // InvalidArgument if !Valid()
+  virtual Status SeekToFirst() = 0;                         // first key >= lower
+  virtual Status SeekToLast() = 0;                          // last key < upper
+  virtual Status Seek(std::string_view target) = 0;         // first key >= target
+  virtual Status SeekForPrev(std::string_view target) = 0;  // last key <= target
+  virtual Status Next() = 0;                                // InvalidArgument if !Valid()
+  virtual Status Prev() = 0;                                // InvalidArgument if !Valid()
   virtual bool Valid() const = 0;
   virtual std::string_view key() const = 0;
   virtual std::string_view value() const = 0;
@@ -74,9 +74,9 @@ class WriteTxn : public ReadView {
 class Storage {
  public:
   virtual ~Storage() = default;
-  virtual Result<std::unique_ptr<WriteTxn>> BeginWrite() = 0;      // read-committed
-  virtual Result<std::unique_ptr<ReadView>> BeginRead() = 0;       // latest committed data
-  virtual Result<std::unique_ptr<ReadView>> BeginSnapshot() = 0;   // frozen point in time
+  virtual Result<std::unique_ptr<WriteTxn>> BeginWrite() = 0;     // read-committed
+  virtual Result<std::unique_ptr<ReadView>> BeginRead() = 0;      // latest committed data
+  virtual Result<std::unique_ptr<ReadView>> BeginSnapshot() = 0;  // frozen point in time
 };
 
 }  // namespace tideskv

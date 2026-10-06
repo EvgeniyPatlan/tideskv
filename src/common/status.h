@@ -12,12 +12,12 @@ enum class StatusCode : uint8_t {
   kOk = 0,
   kNotFound,
   kInvalidArgument,
-  kBusy,        // transient: engine contention, retry later
-  kConflict,    // transaction conflict
-  kNoSpace,     // disk full
+  kBusy,      // transient: engine contention, retry later
+  kConflict,  // transaction conflict
+  kNoSpace,   // disk full
   kIOError,
   kCorruption,
-  kInternal,    // a bug: invariant violated
+  kInternal,  // a bug: invariant violated
 };
 
 std::string_view StatusCodeName(StatusCode code);
@@ -54,7 +54,7 @@ class [[nodiscard]] Status {
 template <typename T>
 class [[nodiscard]] Result {
  public:
-  Result(T value) : data_(std::move(value)) {}  // NOLINT(google-explicit-constructor)
+  Result(T value) : data_(std::move(value)) {}        // NOLINT(google-explicit-constructor)
   Result(Status status) : data_(std::move(status)) {  // NOLINT(google-explicit-constructor)
     assert(!std::get<Status>(data_).ok() && "Result must not hold an OK Status");
   }

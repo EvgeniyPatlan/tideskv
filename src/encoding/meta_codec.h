@@ -20,11 +20,11 @@ std::string_view TypeName(ValueType type);
 struct Metadata {
   ValueType type = ValueType::kString;
   uint8_t flags = 0;
-  int64_t expire_ms = 0;                   // absolute unix ms; 0 = never expires
-  uint64_t oid = 0;                        // collections only
-  uint64_t size = 0;                       // collections only: element count
-  uint64_t head = kListInitialIndex;       // list only: index of first element
-  uint64_t tail = kListInitialIndex - 1;   // list only: index of last; tail < head ⇒ empty
+  int64_t expire_ms = 0;                  // absolute unix ms; 0 = never expires
+  uint64_t oid = 0;                       // collections only
+  uint64_t size = 0;                      // collections only: element count
+  uint64_t head = kListInitialIndex;      // list only: index of first element
+  uint64_t tail = kListInitialIndex - 1;  // list only: index of last; tail < head ⇒ empty
 
   bool IsCollection() const { return type != ValueType::kString; }
   bool IsExpired(int64_t now_ms) const { return expire_ms > 0 && expire_ms <= now_ms; }

@@ -39,7 +39,7 @@ TEST(Glob, EscapesAndReversedRange) {
 }
 
 TEST(Glob, RangeToCloseBracket) {
-  EXPECT_TRUE(GlobMatch("[a-]", "^"));  // range from 'a' (97) to ']' (93), reversed to ']'..'^'
+  EXPECT_TRUE(GlobMatch("[a-]", "^"));   // range from 'a' (97) to ']' (93), reversed to ']'..'^'
   EXPECT_FALSE(GlobMatch("[a-]", "-"));  // '-' (45) not in range
 }
 
@@ -49,9 +49,7 @@ TEST(Glob, NoCase) {
   EXPECT_TRUE(GlobMatch("[A-C]x", "bx", true));
 }
 
-TEST(Glob, BinarySafe) {
-  EXPECT_TRUE(GlobMatch(std::string_view("a\0*", 3), std::string_view("a\0zz", 4)));
-}
+TEST(Glob, BinarySafe) { EXPECT_TRUE(GlobMatch(std::string_view("a\0*", 3), std::string_view("a\0zz", 4))); }
 
 TEST(Glob, PathologicalPatternIsFast) {
   const std::string str(200, 'a');

@@ -91,7 +91,8 @@ int RunCommit(const std::map<std::string, std::string> &f) {
         Die((*txn)->Put(ColumnFamily::kMeta, EncodeMetaKey(0, 0, key), value), "put meta");
         Die((*txn)->Put(ColumnFamily::kReplog, std::to_string(seq.fetch_add(1)), key + value), "put replog");
         Commit(**txn, "commit");
-        lat[static_cast<size_t>(t)].push_back(std::chrono::duration<double, std::micro>(Clock::now() - start).count());
+        lat[static_cast<size_t>(t)].push_back(
+            std::chrono::duration<double, std::micro>(Clock::now() - start).count());
       }
     });
   }
@@ -103,8 +104,8 @@ int RunCommit(const std::map<std::string, std::string> &f) {
   std::printf(
       "commit threads=%d ops=%zu ops/s=%.0f p50=%.1fus p99=%.1fus "
       "p999=%.1fus\n",
-      threads, all.size(), static_cast<double>(all.size()) / seconds, Percentile(all, 0.50), Percentile(all, 0.99),
-      Percentile(all, 0.999));
+      threads, all.size(), static_cast<double>(all.size()) / seconds, Percentile(all, 0.50),
+      Percentile(all, 0.99), Percentile(all, 0.999));
   return 0;
 }
 
@@ -141,8 +142,8 @@ ReadStats MeasureReads(TidesStorage &s, const std::vector<uint64_t> &live, uint6
 }
 
 void PrintReads(const char *phase, const ReadStats &r) {
-  std::printf("%-22s get p50=%.1fus p99=%.1fus | scan p50=%.1fus p99=%.1fus\n", phase, r.get_p50, r.get_p99, r.scan_p50,
-              r.scan_p99);
+  std::printf("%-22s get p50=%.1fus p99=%.1fus | scan p50=%.1fus p99=%.1fus\n", phase, r.get_p50, r.get_p99,
+              r.scan_p50, r.scan_p99);
 }
 
 // R1: read cost on surviving collections after many delete_prefix tombstones.
@@ -209,7 +210,8 @@ int RunBackup(const std::map<std::string, std::string> &f) {
   for (const auto &e : std::filesystem::recursive_directory_iterator(backup_dir)) {
     if (e.is_regular_file()) bytes += e.file_size();
   }
-  std::printf("backup bytes=%lu seconds=%.2f MB/s=%.1f\n", bytes, secs, static_cast<double>(bytes) / secs / 1e6);
+  std::printf("backup bytes=%lu seconds=%.2f MB/s=%.1f\n", bytes, secs,
+              static_cast<double>(bytes) / secs / 1e6);
   return 0;
 }
 

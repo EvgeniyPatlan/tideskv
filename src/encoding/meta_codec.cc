@@ -17,11 +17,16 @@ size_t ExpectedSize(ValueType type) { return type == ValueType::kList ? kListSiz
 
 std::string_view TypeName(ValueType type) {
   switch (type) {
-    case ValueType::kString: return "string";
-    case ValueType::kHash: return "hash";
-    case ValueType::kList: return "list";
-    case ValueType::kSet: return "set";
-    case ValueType::kZSet: return "zset";
+    case ValueType::kString:
+      return "string";
+    case ValueType::kHash:
+      return "hash";
+    case ValueType::kList:
+      return "list";
+    case ValueType::kSet:
+      return "set";
+    case ValueType::kZSet:
+      return "zset";
   }
   return "unknown";
 }

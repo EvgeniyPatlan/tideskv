@@ -14,10 +14,11 @@ class MemoryHarness final : public StorageHarness {
   InMemoryStorage storage_;
 };
 
-INSTANTIATE_TEST_SUITE_P(Memory, StorageContractTest,
-                         ::testing::Values(ContractParam{
-                             "Memory", [] { return std::unique_ptr<StorageHarness>(std::make_unique<MemoryHarness>()); }}),
-                         ContractParamName);
+INSTANTIATE_TEST_SUITE_P(
+    Memory, StorageContractTest,
+    ::testing::Values(ContractParam{
+        "Memory", [] { return std::unique_ptr<StorageHarness>(std::make_unique<MemoryHarness>()); }}),
+    ContractParamName);
 
 }  // namespace
 }  // namespace tideskv::test

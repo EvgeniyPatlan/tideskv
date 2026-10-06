@@ -22,7 +22,7 @@ TEST(KeySlot, HashTagsGroupKeys) {
 }
 
 TEST(KeySlot, EmptyOrUnclosedTagHashesWholeKey) {
-  EXPECT_EQ(KeySlot("foo{}{bar}"), 8363);           // empty first tag → whole key
+  EXPECT_EQ(KeySlot("foo{}{bar}"), 8363);                // empty first tag → whole key
   EXPECT_EQ(KeySlot("foo{{bar}}zap"), KeySlot("{bar"));  // tag is "{bar"
   EXPECT_EQ(KeySlot("foo{bar"), Crc16("foo{bar") % kSlotCount);
 }

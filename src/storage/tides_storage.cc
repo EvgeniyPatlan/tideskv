@@ -47,9 +47,12 @@ struct TdbBuffer {
 
 int ToTdbSync(SyncMode m) {
   switch (m) {
-    case SyncMode::kNone: return TDB_SYNC_NONE;
-    case SyncMode::kInterval: return TDB_SYNC_INTERVAL;
-    case SyncMode::kFull: return TDB_SYNC_FULL;
+    case SyncMode::kNone:
+      return TDB_SYNC_NONE;
+    case SyncMode::kInterval:
+      return TDB_SYNC_INTERVAL;
+    case SyncMode::kFull:
+      return TDB_SYNC_FULL;
   }
   return TDB_SYNC_INTERVAL;
 }
@@ -144,7 +147,8 @@ Result<std::string> TxnGet(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, std:
   return std::string(v.view());
 }
 
-Result<std::unique_ptr<Iterator>> TxnIterator(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, IterOptions opts) {
+Result<std::unique_ptr<Iterator>> TxnIterator(tidesdb_txn_t* txn, tidesdb_column_family_t* cf,
+                                              IterOptions opts) {
   tidesdb_iter_t* it = nullptr;
   int rc = 0;
   if (opts.upper.empty()) {
@@ -153,7 +157,8 @@ Result<std::unique_ptr<Iterator>> TxnIterator(tidesdb_txn_t* txn, tidesdb_column
     // A single NUL byte sorts at or below every possible (non-empty) key.
     const std::string lower = opts.lower.empty() ? std::string(1, '\0') : opts.lower;
     rc = RetryLocked([&] {
-      return tidesdb_iter_new_range(txn, cf, Bytes(lower), lower.size(), Bytes(opts.upper), opts.upper.size(), &it);
+      return tidesdb_iter_new_range(txn, cf, Bytes(lower), lower.size(), Bytes(opts.upper), opts.upper.size(),
+                                    &it);
     });
   }
   if (rc != TDB_SUCCESS) return FromTdb(rc, "iter_new");
@@ -165,8 +170,8 @@ class TidesReadView final : public ReadView {
   TidesReadView(tidesdb_txn_t* txn, tidesdb_snapshot_t* snapshot, CfHandles cfs)
       : txn_(txn), snapshot_(snapshot), cfs_(cfs) {}
   ~TidesReadView() override {
-    tidesdb_txn_free(txn_);                // first: it reads versions the snapshot keeps alive
-    tidesdb_snapshot_release(snapshot_);   // NULL is allowed
+    tidesdb_txn_free(txn_);               // first: it reads versions the snapshot keeps alive
+    tidesdb_snapshot_release(snapshot_);  // NULL is allowed
   }
 
   Result<std::string> Get(ColumnFamily cf, std::string_view key) override {
@@ -198,7 +203,8 @@ class TidesWriteTxn final : public WriteTxn {
 
   Status Put(ColumnFamily cf, std::string_view key, std::string_view value) override {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
-    return FromTdb(tidesdb_txn_put(txn_, Cf(cf), Bytes(key), key.size(), Bytes(value), value.size(), 0), "put");
+    return FromTdb(tidesdb_txn_put(txn_, Cf(cf), Bytes(key), key.size(), Bytes(value), value.size(), 0),
+                   "put");
   }
   Status Delete(ColumnFamily cf, std::string_view key) override {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
@@ -211,7 +217,8 @@ class TidesWriteTxn final : public WriteTxn {
   Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override {
     if (Status st = Check(ValidateRange(lo, hi)); !st.ok()) return st;
     const uint8_t* hi_ptr = hi.empty() ? nullptr : Bytes(hi);
-    return FromTdb(tidesdb_txn_delete_range(txn_, Cf(cf), Bytes(lo), lo.size(), hi_ptr, hi.size()), "delete_range");
+    return FromTdb(tidesdb_txn_delete_range(txn_, Cf(cf), Bytes(lo), lo.size(), hi_ptr, hi.size()),
+                   "delete_range");
   }
 
   Status Savepoint(std::string_view name) override {
@@ -323,7 +330,9 @@ Result<std::unique_ptr<ReadView>> TidesStorage::BeginSnapshot() {
   return std::unique_ptr<ReadView>(std::make_unique<TidesReadView>(txn, snapshot, impl_->cfs));
 }
 
-Status TidesStorage::Backup(const std::string& dir) { return FromTdb(tidesdb_backup(impl_->db, dir.c_str()), "backup"); }
+Status TidesStorage::Backup(const std::string& dir) {
+  return FromTdb(tidesdb_backup(impl_->db, dir.c_str()), "backup");
+}
 
 Status TidesStorage::Checkpoint() { return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint"); }
 

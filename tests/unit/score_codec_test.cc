@@ -19,7 +19,8 @@ TEST(ScoreCodec, NegativeZeroEqualsZero) {
 
 TEST(ScoreCodec, KnownOrdering) {
   const double inf = std::numeric_limits<double>::infinity();
-  const std::vector<double> ascending = {-inf, -1e300, -1.0, -0.5, -1e-300, 0.0, 1e-300, 0.5, 1.0, 1e300, inf};
+  const std::vector<double> ascending = {-inf,   -1e300, -1.0, -0.5,  -1e-300, 0.0,
+                                         1e-300, 0.5,    1.0,  1e300, inf};
   for (size_t i = 1; i < ascending.size(); ++i) {
     EXPECT_LT(EncodeScore(ascending[i - 1]), EncodeScore(ascending[i])) << ascending[i];
   }

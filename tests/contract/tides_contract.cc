@@ -33,14 +33,15 @@ class TidesHarness final : public StorageHarness {
     storage_ = std::move(opened).value();
   }
 
-  TempDir dir_{"tideskv-contract"};       // declared first: destroyed after storage_
+  TempDir dir_{"tideskv-contract"};  // declared first: destroyed after storage_
   std::unique_ptr<TidesStorage> storage_;
 };
 
-INSTANTIATE_TEST_SUITE_P(Tides, StorageContractTest,
-                         ::testing::Values(ContractParam{
-                             "Tides", [] { return std::unique_ptr<StorageHarness>(std::make_unique<TidesHarness>()); }}),
-                         ContractParamName);
+INSTANTIATE_TEST_SUITE_P(
+    Tides, StorageContractTest,
+    ::testing::Values(ContractParam{
+        "Tides", [] { return std::unique_ptr<StorageHarness>(std::make_unique<TidesHarness>()); }}),
+    ContractParamName);
 
 }  // namespace
 }  // namespace tideskv::test

@@ -19,9 +19,12 @@ bool StartsWith(std::string_view s, std::string_view prefix) { return s.substr(0
 bool OpCovers(const Op& op, std::string_view key) {
   switch (op.kind) {
     case Op::Kind::kPut:
-    case Op::Kind::kDelete: return op.a == key;
-    case Op::Kind::kDeletePrefix: return StartsWith(key, op.a);
-    case Op::Kind::kDeleteRange: return key >= op.a && (op.b.empty() || key < op.b);
+    case Op::Kind::kDelete:
+      return op.a == key;
+    case Op::Kind::kDeletePrefix:
+      return StartsWith(key, op.a);
+    case Op::Kind::kDeleteRange:
+      return key >= op.a && (op.b.empty() || key < op.b);
   }
   return false;
 }
@@ -50,9 +53,18 @@ class VectorIterator final : public Iterator {
  public:
   explicit VectorIterator(Rows rows) : rows_(std::move(rows)), pos_(rows_.size()) {}
 
-  Status SeekToFirst() override { pos_ = 0; return Status::Ok(); }
-  Status SeekToLast() override { pos_ = rows_.empty() ? 0 : rows_.size() - 1; return Status::Ok(); }
-  Status Seek(std::string_view target) override { pos_ = LowerBound(target); return Status::Ok(); }
+  Status SeekToFirst() override {
+    pos_ = 0;
+    return Status::Ok();
+  }
+  Status SeekToLast() override {
+    pos_ = rows_.empty() ? 0 : rows_.size() - 1;
+    return Status::Ok();
+  }
+  Status Seek(std::string_view target) override {
+    pos_ = LowerBound(target);
+    return Status::Ok();
+  }
   Status SeekForPrev(std::string_view target) override {
     const size_t ub = UpperBound(target);
     pos_ = ub == 0 ? rows_.size() : ub - 1;
@@ -74,14 +86,16 @@ class VectorIterator final : public Iterator {
 
  private:
   size_t LowerBound(std::string_view t) const {
-    return static_cast<size_t>(std::lower_bound(rows_.begin(), rows_.end(), t,
-                                                [](const auto& r, std::string_view v) { return r.first < v; }) -
-                               rows_.begin());
+    return static_cast<size_t>(
+        std::lower_bound(rows_.begin(), rows_.end(), t,
+                         [](const auto& r, std::string_view v) { return r.first < v; }) -
+        rows_.begin());
   }
   size_t UpperBound(std::string_view t) const {
-    return static_cast<size_t>(std::upper_bound(rows_.begin(), rows_.end(), t,
-                                                [](std::string_view v, const auto& r) { return v < r.first; }) -
-                               rows_.begin());
+    return static_cast<size_t>(
+        std::upper_bound(rows_.begin(), rows_.end(), t,
+                         [](std::string_view v, const auto& r) { return v < r.first; }) -
+        rows_.begin());
   }
 
   Rows rows_;
@@ -91,7 +105,8 @@ class VectorIterator final : public Iterator {
 std::unique_ptr<Iterator> MakeIterator(const Table& t, const IterOptions& o) {
   Rows rows;
   auto it = o.lower.empty() ? t.begin() : t.lower_bound(o.lower);
-  for (; it != t.end() && (o.upper.empty() || it->first < o.upper); ++it) rows.emplace_back(it->first, it->second);
+  for (; it != t.end() && (o.upper.empty() || it->first < o.upper); ++it)
+    rows.emplace_back(it->first, it->second);
   return std::make_unique<VectorIterator>(std::move(rows));
 }
 
@@ -134,8 +149,10 @@ class MemoryWriteTxn final : public WriteTxn {
     if (const auto it = t.find(key); it != t.end()) value = it->second;
     for (const Op& op : ops_) {
       if (op.cf != cf || !OpCovers(op, key)) continue;
-      if (op.kind == Op::Kind::kPut) value = op.b;
-      else value.reset();
+      if (op.kind == Op::Kind::kPut)
+        value = op.b;
+      else
+        value.reset();
     }
     if (!value) return Status::NotFound();
     return std::move(*value);

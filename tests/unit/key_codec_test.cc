@@ -9,7 +9,9 @@ namespace tideskv::encoding {
 namespace {
 
 TEST(MetaKey, Layout) {
-  EXPECT_EQ(EncodeMetaKey(0x0102, 3, "ab"), std::string("\x01\x02\x03" "ab", 5));
+  EXPECT_EQ(EncodeMetaKey(0x0102, 3, "ab"), std::string("\x01\x02\x03"
+                                                        "ab",
+                                                        5));
 }
 
 TEST(MetaKey, EmptyUserKeyIsAllowed) {  // Redis permits SET "" x

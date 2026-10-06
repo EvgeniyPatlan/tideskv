@@ -53,14 +53,22 @@ bool ParseMemory(std::string_view s, uint64_t* out) {
   if (!ParseUint64(s.substr(0, digits), &number)) return false;
   const std::string unit = ToLower(s.substr(digits));
   uint64_t mul = 0;
-  if (unit.empty()) mul = 1;
-  else if (unit == "k") mul = 1000;
-  else if (unit == "kb") mul = 1024;
-  else if (unit == "m") mul = 1000 * 1000;
-  else if (unit == "mb") mul = 1024 * 1024;
-  else if (unit == "g") mul = 1000ULL * 1000 * 1000;
-  else if (unit == "gb") mul = 1024ULL * 1024 * 1024;
-  else return false;
+  if (unit.empty())
+    mul = 1;
+  else if (unit == "k")
+    mul = 1000;
+  else if (unit == "kb")
+    mul = 1024;
+  else if (unit == "m")
+    mul = 1000 * 1000;
+  else if (unit == "mb")
+    mul = 1024 * 1024;
+  else if (unit == "g")
+    mul = 1000ULL * 1000 * 1000;
+  else if (unit == "gb")
+    mul = 1024ULL * 1024 * 1024;
+  else
+    return false;
   if (number > std::numeric_limits<uint64_t>::max() / mul) return false;
   *out = number * mul;
   return true;
@@ -73,8 +81,8 @@ std::string ToLower(std::string_view s) {
 }
 
 bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
-  return a.size() == b.size() &&
-         std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return LowerAscii(x) == LowerAscii(y); });
+  return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
+                                            [](char x, char y) { return LowerAscii(x) == LowerAscii(y); });
 }
 
 bool ConstantTimeEquals(std::string_view a, std::string_view b) {

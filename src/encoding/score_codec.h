@@ -8,6 +8,6 @@ namespace tideskv::encoding {
 
 void AppendScore(std::string* dst, double score);  // NaN is a caller bug (asserted)
 std::string EncodeScore(double score);
-double DecodeScore(std::string_view eight_bytes);   // requires size() >= 8
+double DecodeScore(std::string_view eight_bytes);  // requires size() >= 8
 
 }  // namespace tideskv::encoding
