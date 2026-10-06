@@ -64,6 +64,8 @@ inline bool GetVarint64(std::string_view* in, uint64_t* v) {
   uint64_t result = 0;
   for (size_t i = 0; i < in->size() && i < 10; ++i) {
     const auto byte = static_cast<unsigned char>((*in)[i]);
+    // 10th byte (i == 9) overflow check: (byte & 0x7F) must be <= 1 to fit in uint64_t
+    if (i == 9 && (byte & 0x7F) > 1) return false;
     result |= static_cast<uint64_t>(byte & 0x7F) << (7 * i);
     if ((byte & 0x80) == 0) {
       *v = result;

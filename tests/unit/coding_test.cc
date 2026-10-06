@@ -41,6 +41,35 @@ TEST(Coding, VarintRejectsOverlong) {
   EXPECT_FALSE(GetVarint64(&in, &v));
 }
 
+TEST(Coding, VarintRejectsTenContinuationBytesPlus11thByte) {
+  // 10 continuation bytes (0x80) followed by terminating byte (0x00) — 11 bytes total
+  std::string s(10, '\x80');
+  s.push_back('\x00');
+  std::string_view in(s);
+  uint64_t v = 0;
+  EXPECT_FALSE(GetVarint64(&in, &v));
+}
+
+TEST(Coding, VarintRejectsOverflowBitsIn10thByte) {
+  // 10th byte with overflow bits set: FF FF FF FF FF FF FF FF FF 7F
+  std::string s("\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F", 10);
+  std::string_view in(s);
+  uint64_t v = 0;
+  EXPECT_FALSE(GetVarint64(&in, &v));
+}
+
+TEST(Coding, VarintRoundTripsUINT64MAX) {
+  std::string s;
+  PutVarint64(&s, UINT64_MAX);
+  // UINT64_MAX should encode to exactly 10 bytes
+  ASSERT_EQ(s.size(), 10u);
+  std::string_view in(s);
+  uint64_t out = 0;
+  EXPECT_TRUE(GetVarint64(&in, &out));
+  EXPECT_EQ(out, UINT64_MAX);
+  EXPECT_TRUE(in.empty());
+}
+
 RC_GTEST_PROP(CodingProp, Fixed64RoundTrips, (uint64_t v)) {
   std::string s;
   PutFixed64BE(&s, v);
