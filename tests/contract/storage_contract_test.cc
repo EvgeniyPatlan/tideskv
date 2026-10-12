@@ -430,6 +430,25 @@ TEST_P(StorageContractTest, IteratorLowerBoundClampsSeeks) {
   EXPECT_FALSE(it->Valid());
 }
 
+TEST_P(StorageContractTest, LowerOnlyBoundStopsReverseIteration) {
+  PutAll(storage(), kMeta, kAtoE);
+  auto view = storage().BeginRead();
+  ASSERT_TRUE(view.ok());
+  auto created = (*view)->NewIterator(kMeta, {"b", ""});
+  ASSERT_TRUE(created.ok());
+  std::unique_ptr<Iterator> it = std::move(created).value();
+  ASSERT_TRUE(it->SeekForPrev("aa").ok());  // "a" is <= the target but below lower
+  EXPECT_FALSE(it->Valid());
+  ASSERT_TRUE(it->SeekForPrev("bb").ok());
+  ASSERT_TRUE(it->Valid());
+  EXPECT_EQ(it->key(), "b");
+  ASSERT_TRUE(it->Prev().ok());  // steps onto "a", below lower
+  EXPECT_FALSE(it->Valid());
+  ASSERT_TRUE(it->SeekToLast().ok());
+  ASSERT_TRUE(it->Valid());
+  EXPECT_EQ(it->key(), "e");
+}
+
 TEST_P(StorageContractTest, IteratorBoundsWithHighBytes) {
   PutAll(storage(), kMeta, {{"\x7f", "1"}, {"\x80", "2"}, {"\x81", "3"}, {"\xff", "4"}});
   EXPECT_EQ(ScanCommitted(storage(), kMeta, {"\x80", "\xff"}), (Rows{{"\x80", "2"}, {"\x81", "3"}}));

@@ -66,12 +66,14 @@ TEST(CollectionConcurrencyIT, SmovePingPongIsNeverSeenHalfDone) {
   std::atomic<int> errors{0}, both{0}, neither{0}, checks{0};
   std::thread mover([&] {
     auto c = s.Connect();
-    if (!c) return void(++errors);
-    for (int i = 0; i < 2000; ++i) {
-      if (c->Command({"SMOVE", "s1", "s2", "m"}).type != Type::kInteger) ++errors;
-      if (c->Command({"SMOVE", "s2", "s1", "m"}).type != Type::kInteger) ++errors;
+    for (int i = 0; c && i < 2000; ++i) {
+      const RespValue there = c->Command({"SMOVE", "s1", "s2", "m"});
+      if (there.type != Type::kInteger || there.integer != 1) ++errors;
+      const RespValue back = c->Command({"SMOVE", "s2", "s1", "m"});
+      if (back.type != Type::kInteger || back.integer != 1) ++errors;
     }
-    stop = true;
+    if (!c) ++errors;
+    stop = true;  // also when Connect failed: the checker must not spin forever
   });
   std::thread checker([&] {
     auto c = s.Connect();

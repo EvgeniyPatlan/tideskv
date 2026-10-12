@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <string>
+
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
@@ -45,6 +48,29 @@ TEST_F(RenameCollection, SameSlotRenameLeavesSubkeysInPlace) {
   const auto before = h.Cf(ColumnFamily::kSubkey);
   EXPECT_EQ(h.Run({"RENAME", "{t}a", "{t}b"}), kOk);
   EXPECT_EQ(h.Cf(ColumnFamily::kSubkey), before);  // O(1): same slot, same oid, same keys
+}
+
+void FillHash(CommandHarness& h, const std::string& key, int n) {
+  for (int i = 0; i < n; i += 100) {
+    ArgList argv = {"HSET", key};
+    for (int j = i; j < i + 100 && j < n; ++j) {
+      argv.push_back("f" + std::to_string(j));
+      argv.push_back(std::to_string(j));
+    }
+    EXPECT_EQ(h.Run(argv), Int(std::min(100, n - i)));
+  }
+}
+
+// 2048 = two full copy batches: the last pass reads a full batch, so one more (empty) pass runs.
+TEST_F(RenameCollection, HashOfExactlyTwoCopyBatchesMovesCompletely) {
+  FillHash(h, "src", 2048);
+  EXPECT_EQ(h.Run({"RENAME", "src", "dst"}), kOk);
+  EXPECT_EQ(h.Run({"HLEN", "dst"}), Int(2048));
+  EXPECT_EQ(h.Run({"HGET", "dst", "f0"}), Bulk("0"));
+  EXPECT_EQ(h.Run({"HGET", "dst", "f999"}), Bulk("999"));  // the last field in byte order
+  EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 2048u);
+  const std::string to = encoding::SubkeyPrefix(0, KeySlot("dst"), 0).substr(0, 3);  // [db][slot]
+  for (const auto& [key, value] : h.Cf(ColumnFamily::kSubkey)) EXPECT_EQ(key.substr(0, 3), to);
 }
 
 TEST_F(RenameCollection, LargeHashCrossesSeveralCopyBatches) {

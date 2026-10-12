@@ -2,7 +2,6 @@
 
 #include <gtest/gtest.h>
 
-#include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "storage/memory_storage.h"
 #include "types/errors.h"
@@ -179,6 +178,19 @@ TEST_F(CollectionTest, IterateRangeVisitsTheSampledPositions) {
                 got.emplace_back(f);
               }).ok());
   EXPECT_EQ(got, (std::vector<std::string>{"a", "c", "c"}));
+}
+
+TEST_F(CollectionTest, IterateRangePastTheStoredElementsIsCorruption) {
+  MakeHash("h", {{"a", "1"}, {"b", "2"}});
+  auto view = storage.BeginRead();
+  auto c = LoadCollection(**view, 0, "h", ValueType::kHash, 0);
+  ASSERT_TRUE(c.ok());
+  c->obj.meta.size = 3;  // meta claims an element the subkey CF does not hold
+  std::vector<std::string> got;
+  const Status st =
+      IterateRange(**view, *c, {1, 2}, [&](std::string_view f, std::string_view) { got.emplace_back(f); });
+  EXPECT_EQ(st.code(), StatusCode::kCorruption);
+  EXPECT_EQ(got, (std::vector<std::string>{"b"}));  // the positions that do exist were visited
 }
 
 TEST_F(CollectionTest, RandomElementsDistinctAndWithRepeats) {

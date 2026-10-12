@@ -56,6 +56,20 @@ TEST_F(SetAlgebraCmds, StoreReplacesAnyDstAndDropsItsTtl) {
   EXPECT_EQ(h.Run({"SMEMBERS", "dst"}), Arr({Bulk("1")}));
 }
 
+TEST_F(SetAlgebraCmds, StoreOntoAHashDropsItsFieldsAndMakesASet) {
+  for (const char* cmd : {"SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE"}) {
+    EXPECT_EQ(h.Run({"HSET", "dst", "f1", "x", "f2", "y", "f3", "z"}), Int(3)) << cmd;
+    EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 9u) << cmd;  // a, b and the hash's fields
+    const std::string reply = h.Run({cmd, "dst", "a", "b"});
+    EXPECT_EQ(reply.substr(0, 1), ":") << cmd;
+    EXPECT_EQ(h.Run({"TYPE", "dst"}), "+set\r\n") << cmd;
+    EXPECT_EQ(h.Run({"HGET", "dst", "f1"}), Err(kErrWrongType)) << cmd;
+    const int64_t members = std::stoll(reply.substr(1));
+    EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 6u + static_cast<size_t>(members)) << cmd;  // fields gone
+    EXPECT_EQ(h.Run({"DEL", "dst"}), Int(1)) << cmd;
+  }
+}
+
 TEST_F(SetAlgebraCmds, EmptyResultDeletesDst) {  // Review Focus #2
   EXPECT_EQ(h.Run({"SADD", "dst", "x"}), Int(1));
   EXPECT_EQ(h.Run({"SINTERSTORE", "dst", "a", "nope"}), Int(0));

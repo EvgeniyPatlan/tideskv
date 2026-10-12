@@ -199,5 +199,37 @@ TEST_F(ReaperTest, RecreatedCollectionWithANewDeadlineIsNotReaped) {
   EXPECT_EQ(h.Run({"SMEMBERS", "s"}), test::Arr({test::Bulk("new")}));
 }
 
+// A stale expire entry left by an earlier incarnation (old oid) with the same deadline as the
+// recreated collection, which is itself expired: only the oid tells them apart.
+TEST_F(ReaperTest, StaleEntryOfAnOlderOidDeletesNothing) {
+  constexpr uint64_t kOldOid = 41;
+  constexpr uint64_t kNewOid = 42;
+  const int64_t deadline = h.clock().NowMs() + 10;
+  encoding::Metadata meta;
+  meta.type = encoding::ValueType::kSet;
+  meta.oid = kNewOid;
+  meta.size = 1;
+  meta.expire_ms = deadline;
+  h.SeedMeta(0, "s", meta);
+  {
+    auto txn = h.services.storage_.BeginWrite();
+    ASSERT_TRUE(txn.ok());
+    ASSERT_TRUE(
+        (*txn)->Put(ColumnFamily::kSubkey, encoding::EncodeSubkey(0, KeySlot("s"), kNewOid, "m"), "").ok());
+    ASSERT_TRUE((*txn)
+                    ->Put(ColumnFamily::kExpire,
+                          encoding::ExpireKeyFor(0, static_cast<uint64_t>(deadline), "s"),
+                          ExpireValue(kOldOid))
+                    .ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  h.clock().Advance(10);
+  EXPECT_EQ(*reaper.RunOnce(), 0u);
+  EXPECT_EQ(reaper.expired_total(), 0u);
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).size(), 1u);  // the collection was not deleted
+  EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 1u);
+  EXPECT_EQ(h.Cf(ColumnFamily::kExpire).size(), 0u);  // the stale entry was dropped
+}
+
 }  // namespace
 }  // namespace tideskv

@@ -1,12 +1,15 @@
 // Regression pin for the "phantom keys after a range delete" bug seen by the Redis differential
 // test: keys removed by a committed DeleteRange must not reappear in iterators while a memtable
 // flush (Checkpoint) runs concurrently. Reads are tried through every combination of
-// {snapshot, read-committed view} x {bounded range iterator, unbounded iterator + manual bound}.
+// {snapshot, read-committed view} x {IterOptions bounds, no IterOptions + manual bound}. Both
+// columns use unbounded engine iterators (TidesStorage never opens a bounded one); "bounded" checks
+// TidesIterator's own enforcement of IterOptions.
 #include <gtest/gtest.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>

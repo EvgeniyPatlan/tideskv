@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "support/command_harness.h"
 #include "types/errors.h"
 
@@ -149,6 +151,11 @@ TEST_F(HashCmds, IncrBy) {
   EXPECT_EQ(h.Run({"HINCRBY", "h", "s", "1"}), Err(kErrHashValueNotInteger));
   EXPECT_EQ(h.Run({"HINCRBY", "h", "sp", "1"}), Err(kErrHashValueNotInteger));
   EXPECT_EQ(h.Run({"HINCRBY", "h", "max", "1"}), Err(kErrOverflow));
+  EXPECT_EQ(h.Run({"HSET", "h", "min", "-9223372036854775807"}), Int(1));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "min", "-1"}),
+            Int(std::numeric_limits<int64_t>::min()));  // exactly reaches the minimum
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "min", "-1"}), Err(kErrOverflow));
+  EXPECT_EQ(h.Run({"HGET", "h", "min"}), Bulk("-9223372036854775808"));  // unchanged by the failure
   EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "x"}), Err(kErrNotInteger));
   EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "1.5"}), Err(kErrNotInteger));
   EXPECT_EQ(h.Run({"SET", "str", "v"}), kOk);
