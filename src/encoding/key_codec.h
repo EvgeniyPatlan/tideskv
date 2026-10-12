@@ -36,4 +36,9 @@ std::string ExpireKeyFor(uint8_t db, uint64_t expire_ms, std::string_view user_k
 std::string ExpireUpperBound(uint8_t db, uint64_t now_ms);
 bool DecodeExpireKey(std::string_view encoded, ExpireKey* out);
 
+// Smallest string greater than every string starting with `prefix`, for an exclusive iterator
+// bound: trailing 0xff bytes are dropped and the last remaining byte is incremented. Empty when
+// no such bound exists (all bytes 0xff, or an empty prefix): iterate to the end.
+std::string PrefixUpperBound(std::string_view prefix);
+
 }  // namespace tideskv::encoding

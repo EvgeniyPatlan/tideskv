@@ -45,6 +45,12 @@ Status CheckMovable(const encoding::Metadata& meta, std::string_view src, std::s
 // expire entry. A collection keeps its oid, so both keys must share a slot (see CheckMovable).
 Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
                   const StoredObject& obj);
+// Rewrites the meta record of an object whose deadline is unchanged, or of a new object
+// without one (a collection's size changed). The expire index is not touched.
+Status PutObjectMeta(WriteTxn& txn, uint8_t db, std::string_view key, const encoding::Metadata& meta);
+// Deletes the meta record and expire entry of a collection whose elements were all removed
+// one by one. Unlike DeleteObject it writes no DeletePrefix tombstone (M3 plan E2).
+Status DeleteEmptyObject(WriteTxn& txn, uint8_t db, std::string_view key, const encoding::Metadata& meta);
 // For the expire reaper only (documented exception to "writers call LoadForWrite"): removes the
 // index entry (db, expire_ms, key) without touching meta.
 Status DeleteStaleExpireEntry(WriteTxn& txn, uint8_t db, std::string_view key, uint64_t expire_ms);

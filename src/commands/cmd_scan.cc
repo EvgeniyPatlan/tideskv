@@ -1,11 +1,11 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
-#include <random>
 #include <string>
 #include <vector>
 
 #include "commands/all_commands.h"
+#include "commands/command_rng.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
@@ -98,16 +98,11 @@ void Keys(ExecContext& ctx, const ArgList& argv) {
   for (const std::string& k : keys) ctx.reply.Bulk(k);
 }
 
-uint64_t NextRandom() {
-  thread_local std::mt19937_64 rng{std::random_device{}()};
-  return rng();
-}
-
 void RandomKeyCmd(ExecContext& ctx, const ArgList&) {
   Engine& e = ctx.server.engine();
   std::optional<std::string> key;
   const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
-    return MoveInto(RandomKey(v, ctx.session.db, now_ms, NextRandom()), &key);
+    return MoveInto(RandomKey(v, ctx.session.db, now_ms, CommandRng()()), &key);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   key ? ctx.reply.Bulk(*key) : ctx.reply.Null();

@@ -76,6 +76,15 @@ Status DeleteObject(WriteTxn& txn, uint8_t db, std::string_view key, const Metad
   return txn.DeletePrefix(ColumnFamily::kZScore, encoding::ZScorePrefix(db, slot, meta.oid));
 }
 
+Status PutObjectMeta(WriteTxn& txn, uint8_t db, std::string_view key, const Metadata& meta) {
+  return PutMeta(txn, db, key, meta, {});
+}
+
+Status DeleteEmptyObject(WriteTxn& txn, uint8_t db, std::string_view key, const Metadata& meta) {
+  if (Status st = txn.Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key)); !st.ok()) return st;
+  return DeleteExpireEntry(txn, db, key, meta);
+}
+
 Status WriteString(WriteTxn& txn, uint8_t db, std::string_view key, std::string_view value, int64_t expire_ms,
                    const StoredObject& old) {
   if (old.live()) {

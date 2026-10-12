@@ -77,6 +77,9 @@ struct CommandHarness {
     ASSERT_TRUE((*txn)->Commit().ok());
   }
 
+  // Switches the harness connection to RESP3 (as HELLO 3 would).
+  void Resp3() { reply.SetProtocol(3); }
+
   // A hash metadata record with object id `oid`; with_field also stores one subkey field, so
   // tests can assert that overwriting/deleting the key drops its collection data.
   void SeedHash(uint8_t db, const std::string& key, uint64_t oid, bool with_field) {

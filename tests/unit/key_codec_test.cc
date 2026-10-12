@@ -98,5 +98,11 @@ RC_GTEST_PROP(ExpireKeyProp, RoundTrips, (uint64_t ts, std::string key, uint8_t 
   RC_ASSERT(ek.user_key == key);
 }
 
+TEST(KeyCodec, PrefixUpperBound) {
+  EXPECT_EQ(PrefixUpperBound("ab"), "ac");
+  EXPECT_EQ(PrefixUpperBound(std::string("a\xff", 2)), "b");
+  EXPECT_EQ(PrefixUpperBound(std::string("\xff\xff", 2)), "");  // no upper bound
+  EXPECT_EQ(PrefixUpperBound(""), "");
+}
 }  // namespace
 }  // namespace tideskv::encoding

@@ -85,4 +85,11 @@ bool DecodeExpireKey(std::string_view in, ExpireKey* out) {
   return true;
 }
 
+std::string PrefixUpperBound(std::string_view prefix) {
+  std::string out(prefix);
+  while (!out.empty() && static_cast<uint8_t>(out.back()) == 0xff) out.pop_back();
+  if (!out.empty()) out.back() = static_cast<char>(static_cast<uint8_t>(out.back()) + 1);
+  return out;
+}
+
 }  // namespace tideskv::encoding

@@ -232,5 +232,24 @@ TEST_F(ObjectStoreTest, DeleteStaleExpireEntryRemovesOnlyTheIndexEntry) {
   EXPECT_EQ(Cf(ColumnFamily::kMeta).size(), 1u);
 }
 
+TEST_F(ObjectStoreTest, PutObjectMetaKeepsTheExpireEntry) {
+  // A collection meta with a deadline: rewriting it (size change) must not touch the index.
+  encoding::Metadata m;
+  m.type = encoding::ValueType::kSet;
+  m.oid = 3;
+  m.size = 1;
+  m.expire_ms = 9000;
+  auto txn = storage.BeginWrite();
+  ASSERT_TRUE(PutObjectMeta(**txn, 0, "s", m).ok());
+  ASSERT_TRUE((*txn)->Put(ColumnFamily::kExpire, encoding::ExpireKeyFor(0, 9000, "s"), ExpireValue(3)).ok());
+  m.size = 2;
+  ASSERT_TRUE(PutObjectMeta(**txn, 0, "s", m).ok());
+  ASSERT_TRUE((*txn)->Commit().ok());
+  auto view = storage.BeginRead();
+  auto obj = LoadObject(**view, 0, "s", 0);
+  ASSERT_TRUE(obj.ok());
+  EXPECT_EQ(obj->meta.size, 2u);
+  EXPECT_TRUE((*view)->Get(ColumnFamily::kExpire, encoding::ExpireKeyFor(0, 9000, "s")).ok());
+}
 }  // namespace
 }  // namespace tideskv
