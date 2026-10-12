@@ -4,6 +4,7 @@
 
 #include "commands/reply_util.h"
 #include "support/command_harness.h"
+#include "types/cursor_store.h"
 
 namespace tideskv {
 namespace {
@@ -136,6 +137,88 @@ TEST_F(ScanCmds, CursorErrorsAndRestarts) {
   ScanReply restarted = ParseScan(h.Run({"SCAN", page.cursor, "COUNT", "100"}));
   EXPECT_EQ(restarted.keys.size(), 30u);
   EXPECT_EQ(restarted.cursor, "0");
+}
+
+// Keys whose meta key exceeds CursorStore::kMaxPositionBytes are saved as a truncated
+// position. All of these share the hashtag {h}, so they sit in one slot ordered by bytes:
+// "{h}a" < every huge key < "{h}z". Huge keys share their first 1 MiB + 3 bytes, so their meta
+// keys share the whole saved prefix and differ only in `tail`.
+std::string HugeKey(const std::string& tail) {
+  return "{h}" + std::string(CursorStore::kMaxPositionBytes, 'x') + tail;
+}
+
+struct HugeKeyScan : ScanCmds {
+  static constexpr int kMaxCalls = 100;  // the livelock bug fails here instead of hanging
+
+  void SetKeys(const std::vector<std::string>& keys) {
+    for (const std::string& k : keys) ASSERT_EQ(h.Run({"SET", k, "v"}), kOk);
+  }
+  // Runs one SCAN page; returns false once the cursor is back to 0.
+  bool Step(std::string* cursor, const std::string& count, std::multiset<std::string>* seen) {
+    ScanReply r = ParseScan(h.Run({"SCAN", *cursor, "COUNT", count}));
+    seen->insert(r.keys.begin(), r.keys.end());
+    *cursor = r.cursor;
+    return *cursor != "0";
+  }
+  // Full scan; *finished is false if the cursor did not return to 0 within kMaxCalls.
+  std::multiset<std::string> ScanAll(const std::string& count, bool* finished) {
+    std::multiset<std::string> seen;
+    std::string cursor = "0";
+    for (int calls = 0; calls < kMaxCalls; ++calls) {
+      if (!Step(&cursor, count, &seen)) {
+        *finished = true;
+        return seen;
+      }
+    }
+    *finished = false;
+    return seen;
+  }
+  // EXPECT_TRUE rather than EXPECT_EQ: no multi-MiB failure dumps.
+  static void ExpectAllSeen(const std::multiset<std::string>& seen, const std::vector<std::string>& keys) {
+    for (size_t i = 0; i < keys.size(); ++i) EXPECT_TRUE(seen.count(keys[i]) >= 1) << "key #" << i;
+  }
+};
+
+TEST_F(HugeKeyScan, OneHugeKeyTerminatesForSmallCounts) {
+  const std::vector<std::string> keys = {"{h}a", HugeKey(""), "{h}z", "s1", "s2", "s3"};
+  SetKeys(keys);
+  for (const char* count : {"1", "2"}) {
+    bool finished = false;
+    const auto seen = ScanAll(count, &finished);
+    EXPECT_TRUE(finished) << "COUNT " << count << ": SCAN never finished";
+    ExpectAllSeen(seen, keys);
+  }
+}
+
+TEST_F(HugeKeyScan, HugeKeysSharingTheSavedPrefixEachReturned) {
+  const std::vector<std::string> keys = {"{h}a", HugeKey("1"), HugeKey("2"), HugeKey("3"), "{h}z", "s1"};
+  SetKeys(keys);
+  for (const char* count : {"1", "2", "3"}) {
+    bool finished = false;
+    const auto seen = ScanAll(count, &finished);
+    EXPECT_TRUE(finished) << "COUNT " << count << ": SCAN never finished";
+    ExpectAllSeen(seen, keys);
+  }
+}
+
+TEST_F(HugeKeyScan, HugeKeyDeletedBetweenCallsStillTerminates) {
+  for (const std::vector<std::string>& keys :
+       {std::vector<std::string>{"{h}a", HugeKey("1"), "{h}z", "s1"},
+        std::vector<std::string>{"{h}a", HugeKey("1"), HugeKey("2"), "{h}z", "s1"}}) {
+    ASSERT_EQ(h.Run({"FLUSHALL"}), kOk);
+    SetKeys(keys);
+    std::multiset<std::string> seen;
+    std::string cursor = "0";
+    int calls = 0;
+    bool more = true;
+    // Advance until the cursor sits on HugeKey("1"), then delete it.
+    while (more && seen.count(HugeKey("1")) == 0 && ++calls < kMaxCalls) more = Step(&cursor, "1", &seen);
+    ASSERT_TRUE(more) << "scan finished before the huge key was the cursor";
+    ASSERT_EQ(h.Run({"DEL", HugeKey("1")}), test::Int(1));
+    while (more && ++calls < kMaxCalls) more = Step(&cursor, "1", &seen);
+    EXPECT_FALSE(more) << "SCAN never finished after deleting the huge key";
+    ExpectAllSeen(seen, keys);  // the deleted key was returned before its deletion
+  }
 }
 
 // Redis 7.2 only treats exactly "*" as "no filter": an empty pattern matches only the empty key.

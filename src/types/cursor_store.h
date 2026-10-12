@@ -6,6 +6,8 @@
 #include <optional>
 #include <string>
 
+#include "types/scan_position.h"
+
 namespace tideskv {
 
 // Maps numeric SCAN cursors to scan positions (M2 plan D9): clients parse cursors as
@@ -19,19 +21,22 @@ class CursorStore {
   static constexpr size_t kMaxBytes = size_t{64} << 20;         // all saved positions together
   static constexpr size_t kMaxPositionBytes = size_t{1} << 20;  // one saved position
 
-  // A position longer than kMaxPositionBytes is saved as its prefix of that length: a
-  // prefix sorts at or before the full position, so resuming from it can repeat keys
-  // (allowed by SCAN) but never skip one.
+  // A position longer than kMaxPositionBytes is saved truncated: its prefix of that length
+  // plus the full position's size and PositionDigest. On resume ScanKeys steps past the key
+  // sharing the prefix with that size and digest; if it is gone, the scan resumes at the
+  // prefix, which sorts at or before the full position, so it can repeat keys (allowed by
+  // SCAN) but never skip one. Only a digest collision among same-size keys sharing the
+  // prefix could make it resume too far.
   uint64_t Save(std::string position);
-  std::optional<std::string> Load(uint64_t cursor) const;
+  std::optional<ScanPosition> Load(uint64_t cursor) const;
   size_t bytes() const;  // accounted size of the saved entries; never above kMaxBytes
 
  private:
   struct Entry {
     uint64_t cursor = 0;
-    std::string position;
+    ScanPosition position;
   };
-  static size_t Cost(const Entry& e) { return sizeof(Entry) + e.position.capacity(); }
+  static size_t Cost(const Entry& e) { return sizeof(Entry) + e.position.key.capacity(); }
 
   mutable std::mutex mu_;
   std::deque<Entry> entries_;  // consecutive cursors, oldest first

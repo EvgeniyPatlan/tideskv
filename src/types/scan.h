@@ -9,6 +9,7 @@
 #include "common/status.h"
 #include "encoding/meta_codec.h"
 #include "storage/storage.h"
+#include "types/scan_position.h"
 
 // Keyspace iteration (SCAN/KEYS/RANDOMKEY) over the db's contiguous meta range (D1).
 namespace tideskv {
@@ -25,9 +26,12 @@ struct ScanPage {
 };
 
 std::optional<encoding::ValueType> TypeFromName(std::string_view name);
-// Examines up to `count` meta entries of db strictly after `position` (empty = from the start).
-Status ScanKeys(ReadView& view, uint8_t db, std::string_view position, size_t count, const ScanFilter& filter,
-                int64_t now_ms, ScanPage* out);
+// Examines up to `count` meta entries of db strictly after `position` (empty key = from the
+// start). For a truncated position it first walks the keys starting with the saved prefix and
+// starts after the one matching full_size and digest, or at the prefix if none does; those
+// walked entries are neither counted nor returned.
+Status ScanKeys(ReadView& view, uint8_t db, const ScanPosition& position, size_t count,
+                const ScanFilter& filter, int64_t now_ms, ScanPage* out);
 Status MatchingKeys(ReadView& view, uint8_t db, std::string_view pattern, int64_t now_ms,
                     std::vector<std::string>* out);
 // A live key near a random slot, wrapping around; nullopt if db has no live key.

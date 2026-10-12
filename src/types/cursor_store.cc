@@ -4,13 +4,27 @@
 
 namespace tideskv {
 
-uint64_t CursorStore::Save(std::string position) {
-  if (position.size() > kMaxPositionBytes) {
-    position.resize(kMaxPositionBytes);
-    position.shrink_to_fit();
+namespace {
+
+ScanPosition MakePosition(std::string full, size_t max_bytes) {
+  ScanPosition pos;
+  pos.full_size = full.size();
+  if (full.size() > max_bytes) {
+    pos.digest = PositionDigest(full);
+    pos.truncated = true;
+    full.resize(max_bytes);
+    full.shrink_to_fit();
   }
+  pos.key = std::move(full);
+  return pos;
+}
+
+}  // namespace
+
+uint64_t CursorStore::Save(std::string position) {
+  ScanPosition pos = MakePosition(std::move(position), kMaxPositionBytes);
   std::lock_guard lock(mu_);
-  Entry entry{++last_, std::move(position)};
+  Entry entry{++last_, std::move(pos)};
   const size_t cost = Cost(entry);
   while (!entries_.empty() && (entries_.size() >= kCapacity || bytes_ + cost > kMaxBytes)) {
     bytes_ -= Cost(entries_.front());
@@ -21,7 +35,7 @@ uint64_t CursorStore::Save(std::string position) {
   return last_;
 }
 
-std::optional<std::string> CursorStore::Load(uint64_t cursor) const {
+std::optional<ScanPosition> CursorStore::Load(uint64_t cursor) const {
   if (cursor == 0) return std::nullopt;
   std::lock_guard lock(mu_);
   if (entries_.empty() || cursor < entries_.front().cursor || cursor > entries_.back().cursor) {

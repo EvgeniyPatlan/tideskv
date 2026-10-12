@@ -18,7 +18,7 @@ namespace tideskv {
 namespace {
 
 struct ScanArgs {
-  std::string position;  // where to resume; empty = start
+  ScanPosition position;  // where to resume; empty key = start
   size_t count = 10;
   ScanFilter filter;
 };
@@ -60,13 +60,13 @@ bool ParseScanCursor(const std::string& arg, uint64_t* cursor) {
 }
 
 // Resolves the cursor to a position inside the current db (D9: unknown or foreign = restart).
-Status ResolveCursor(ExecContext& ctx, const std::string& arg, std::string* position) {
+Status ResolveCursor(ExecContext& ctx, const std::string& arg, ScanPosition* position) {
   uint64_t cursor = 0;
   if (!ParseScanCursor(arg, &cursor)) return Status::UserError(std::string(kErrInvalidCursor));
-  position->clear();
+  *position = ScanPosition{};
   if (cursor == 0) return Status::Ok();
-  std::optional<std::string> saved = ctx.server.cursors().Load(cursor);
-  if (saved && saved->rfind(encoding::DbPrefix(ctx.session.db), 0) == 0) *position = std::move(*saved);
+  std::optional<ScanPosition> saved = ctx.server.cursors().Load(cursor);
+  if (saved && saved->key.starts_with(encoding::DbPrefix(ctx.session.db))) *position = std::move(*saved);
   return Status::Ok();
 }
 

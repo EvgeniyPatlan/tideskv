@@ -32,6 +32,28 @@ bool Matches(const ScanFilter& f, std::string_view key, ValueType type) {
   return !f.pattern || GlobMatch(*f.pattern, key);
 }
 
+// Positions `it` after the key matching a truncated position: walks the keys starting with the
+// saved prefix; if none has the full key's size and digest (deleted since), resumes at the
+// prefix, which can repeat keys but never skips one.
+Status SeekPastTruncated(Iterator& it, const ScanPosition& pos) {
+  Status st = it.Seek(pos.key);
+  for (; st.ok() && it.Valid() && it.key().starts_with(pos.key); st = it.Next()) {
+    const std::string_view key = it.key();
+    if (key.size() == pos.full_size && PositionDigest(key) == pos.digest) return it.Next();
+  }
+  if (!st.ok()) return st;
+  return it.Seek(pos.key);
+}
+
+// Positions `it` at the first entry strictly after `pos` (empty key = the first entry).
+Status SeekPast(Iterator& it, const ScanPosition& pos) {
+  if (pos.key.empty()) return it.SeekToFirst();
+  if (pos.truncated) return SeekPastTruncated(it, pos);
+  Status st = it.Seek(pos.key);
+  if (st.ok() && it.Valid() && it.key() == pos.key) st = it.Next();
+  return st;
+}
+
 }  // namespace
 
 std::optional<ValueType> TypeFromName(std::string_view name) {
@@ -42,13 +64,12 @@ std::optional<ValueType> TypeFromName(std::string_view name) {
   return std::nullopt;
 }
 
-Status ScanKeys(ReadView& view, uint8_t db, std::string_view position, size_t count, const ScanFilter& filter,
-                int64_t now_ms, ScanPage* out) {
+Status ScanKeys(ReadView& view, uint8_t db, const ScanPosition& position, size_t count,
+                const ScanFilter& filter, int64_t now_ms, ScanPage* out) {
   *out = ScanPage{};
   auto it = view.NewIterator(ColumnFamily::kMeta, DbRange(db));
   if (!it.ok()) return it.status();
-  Status st = position.empty() ? (*it)->SeekToFirst() : (*it)->Seek(position);
-  if (st.ok() && !position.empty() && (*it)->Valid() && (*it)->key() == position) st = (*it)->Next();
+  Status st = SeekPast(**it, position);
   for (size_t examined = 0; st.ok() && (*it)->Valid() && examined < count; ++examined) {
     std::string key;
     ValueType type{};
