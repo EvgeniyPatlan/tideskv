@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"reflect"
@@ -52,6 +53,9 @@ func mustDial(t *testing.T, addr string) *Conn {
 func TestDifferential(t *testing.T) {
 	ref := os.Getenv("TIDESKV_REF_ADDR")
 	if ref == "" {
+		if os.Getenv("TIDESKV_DIFF_REQUIRED") != "" {
+			t.Fatal("TIDESKV_DIFF_REQUIRED is set but TIDESKV_REF_ADDR is empty: no Redis 7.2 reference to diff against")
+		}
 		t.Skip("set TIDESKV_REF_ADDR to a Redis 7.2 server (scripts/compat.sh --diff does this)")
 	}
 	refConn := mustDial(t, ref)
@@ -79,23 +83,42 @@ func runSeed(t *testing.T, seed int64, ours, ref string) {
 	g := NewGen(seed)
 	var history []string
 	for step := 0; step < ops(); step++ {
-		cmd, sorted := g.Next()
+		cmd, norm := g.Next()
 		history = append(history, strconv.Quote(strings.Join(cmd, " ")))
-		ra, errA := a.Do(cmd...)
-		rb, errB := b.Do(cmd...)
+		ra, rawA, errA := a.DoRaw(cmd...)
+		rb, rawB, errB := b.DoRaw(cmd...)
 		if errA != nil || errB != nil {
-			t.Fatalf("seed %d step %d %s: transport error tideskv=%v redis=%v", seed, step, cmd, errA, errB)
+			t.Fatalf("seed %d step %d: transport error\ntideskv: %v\nredis:   %v\nlast commands:\n  %s", seed, step,
+				errA, errB, lastCommands(history))
 		}
-		if sorted {
-			ra, rb = SortElems(ra), SortElems(rb)
-		}
-		if !reflect.DeepEqual(ra, rb) {
-			from := len(history) - 20
-			if from < 0 {
-				from = 0
-			}
-			t.Fatalf("seed %d step %d diverged\ncommand: %s\ntideskv: %s\nredis:   %s\nlast commands:\n  %s", seed, step,
-				history[len(history)-1], ra, rb, strings.Join(history[from:], "\n  "))
+		if !sameReply(norm, ra, rb, rawA, rawB) {
+			t.Fatalf("seed %d step %d diverged\ncommand: %s\ntideskv: %s (wire %q)\nredis:   %s (wire %q)\n"+
+				"last commands:\n  %s", seed, step, history[len(history)-1], ra, rawA, rb, rawB, lastCommands(history))
 		}
 	}
+	for name, c := range map[string]*Conn{"tideskv": a, "redis": b} {
+		if err := c.AssertDrained(); err != nil {
+			t.Fatalf("seed %d: %s: %v\nlast commands:\n  %s", seed, name, err, lastCommands(history))
+		}
+	}
+}
+
+// sameReply compares un-normalised replies byte-for-byte on the wire; normalised ones
+// (KEYS order, positive TTLs) are compared after normalisation of the parsed reply.
+func sameReply(norm Norm, ra, rb Reply, rawA, rawB []byte) bool {
+	switch norm {
+	case NormSort:
+		return reflect.DeepEqual(SortElems(ra), SortElems(rb))
+	case NormTTL:
+		return reflect.DeepEqual(PositiveAsToken(ra), PositiveAsToken(rb))
+	}
+	return bytes.Equal(rawA, rawB)
+}
+
+func lastCommands(history []string) string {
+	from := len(history) - 20
+	if from < 0 {
+		from = 0
+	}
+	return strings.Join(history[from:], "\n  ")
 }

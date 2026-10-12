@@ -12,6 +12,7 @@ if [[ $# == 2 ]]; then
   DIFF=1
 fi
 BIN=$(realpath -e "$1") || { echo "compat.sh: binary not found: $1" >&2; exit 2; }
+[[ -f "$BIN" && -x "$BIN" ]] || { echo "compat.sh: not an executable file: $BIN" >&2; exit 2; }
 export GOTOOLCHAIN=local
 cd "$(dirname "$0")/../tests/compat"
 CID=""
@@ -31,5 +32,9 @@ if [[ $DIFF == 1 && -z "${TIDESKV_REF_ADDR:-}" ]]; then
   fi
   export TIDESKV_REF_ADDR="127.0.0.1:$PORT"
 fi
-[[ $DIFF == 0 ]] && unset TIDESKV_REF_ADDR
+if [[ $DIFF == 1 ]]; then
+  export TIDESKV_DIFF_REQUIRED=1 # TestDifferential fails instead of skipping without a reference
+else
+  unset TIDESKV_REF_ADDR TIDESKV_DIFF_REQUIRED
+fi
 go test ./... -count=1 -timeout 30m -binPath="$BIN"

@@ -64,10 +64,16 @@ jobs:
 
   compat:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     services:
       redis:
         image: redis:7.2.5
         ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

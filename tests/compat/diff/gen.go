@@ -49,10 +49,31 @@ func (g *Gen) int() string {
 func (g *Gen) farSec() string { return strconv.FormatInt(farUnix+g.r.Int63n(1_000_000), 10) }
 func (g *Gen) farMs() string  { return strconv.FormatInt((farUnix+g.r.Int63n(1_000_000))*1000, 10) }
 
-// Next returns the next command and whether its reply must be sorted before comparing.
-func (g *Gen) Next() ([]string, bool) {
+// Norm says how a reply is normalised before comparison. NormNone replies are compared
+// byte-for-byte on the wire.
+type Norm int
+
+const (
+	NormNone Norm = iota
+	NormSort      // order-free array (KEYS)
+	NormTTL       // positive TTL/PTTL values depend on the clock; -2/-1 compare exactly
+)
+
+// Next returns the next command and how its reply is normalised before comparing.
+func (g *Gen) Next() ([]string, Norm) {
+	cmd, sorted := g.next()
+	switch {
+	case sorted:
+		return cmd, NormSort
+	case cmd[0] == "TTL" || cmd[0] == "PTTL":
+		return cmd, NormTTL
+	}
+	return cmd, NormNone
+}
+
+func (g *Gen) next() ([]string, bool) {
 	k, v := g.key(), g.value()
-	switch g.r.Intn(30) {
+	switch g.r.Intn(34) {
 	case 0:
 		return append([]string{"SET", k, v}, g.setOptions()...), false
 	case 1, 2:
@@ -109,6 +130,20 @@ func (g *Gen) Next() ([]string, bool) {
 		return append([]string{"LCS", k, g.key()}, g.lcsOptions()...), false
 	case 28:
 		return append([]string{"GETEX", k}, g.getexOptions()...), false
+	case 29:
+		// Every connection starts in db 0 and both sides get the same SELECTs, so they stay in step.
+		return []string{"SELECT", g.pick("0", "1", "2")}, false
+	case 30:
+		// Only error paths: a valid SETEX/PSETEX would set a relative, clock-dependent TTL.
+		return [][]string{{"SETEX", k, "0", v}, {"SETEX", k, "x", v}, {"SETEX", k, "-3", v}, {"PSETEX", k, "0", v},
+			{"PSETEX", k, "abc", v}, {"SETEX", k, "10"}, {"PSETEX", k}}[g.r.Intn(7)], false
+	case 31:
+		if g.r.Intn(4) == 0 { // rare, so keyspaces have time to fill up between flushes
+			return []string{"FLUSHDB"}, false
+		}
+		return []string{"EXISTS", k}, false
+	case 32:
+		return []string{g.pick("TTL", "PTTL"), k}, false
 	default:
 		return g.malformed(), false
 	}
