@@ -121,7 +121,8 @@ ReadStats MeasureReads(TidesStorage &s, const std::vector<uint64_t> &live, uint6
     auto view = s.BeginRead();
     Die(view.status(), "begin read");
     const auto start = Clock::now();
-    auto v = (*view)->Get(ColumnFamily::kSubkey, EncodeSubkey(0, oid, "f" + std::to_string(rng() % fields)));
+    auto v =
+        (*view)->Get(ColumnFamily::kSubkey, EncodeSubkey(0, 0, oid, "f" + std::to_string(rng() % fields)));
     gets.push_back(std::chrono::duration<double, std::micro>(Clock::now() - start).count());
     Die(v.status(), "get");
   }
@@ -130,8 +131,8 @@ ReadStats MeasureReads(TidesStorage &s, const std::vector<uint64_t> &live, uint6
     auto view = s.BeginRead();
     Die(view.status(), "begin read");
     const auto start = Clock::now();
-    const std::string prefix = SubkeyPrefix(0, oid);
-    auto it = (*view)->NewIterator(ColumnFamily::kSubkey, {prefix, SubkeyPrefix(0, oid + 1)});
+    const std::string prefix = SubkeyPrefix(0, 0, oid);
+    auto it = (*view)->NewIterator(ColumnFamily::kSubkey, {prefix, SubkeyPrefix(0, 0, oid + 1)});
     Die(it.status(), "iter");
     uint64_t n = 0;
     for (Die((*it)->SeekToFirst(), "seek"); (*it)->Valid(); Die((*it)->Next(), "next")) ++n;
@@ -157,7 +158,7 @@ int RunTombstones(const std::map<std::string, std::string> &f) {
     auto txn = s->BeginWrite();
     Die(txn.status(), "begin");
     for (uint64_t i = 0; i < fields; ++i) {
-      Die((*txn)->Put(ColumnFamily::kSubkey, EncodeSubkey(0, oid, "f" + std::to_string(i)), value), "put");
+      Die((*txn)->Put(ColumnFamily::kSubkey, EncodeSubkey(0, 0, oid, "f" + std::to_string(i)), value), "put");
     }
     Commit(**txn, "commit load");
   }
@@ -171,7 +172,7 @@ int RunTombstones(const std::map<std::string, std::string> &f) {
     if (static_cast<int>(oid % 100) < deleted_pct) {
       auto txn = s->BeginWrite();
       Die(txn.status(), "begin");
-      Die((*txn)->DeletePrefix(ColumnFamily::kSubkey, SubkeyPrefix(0, oid)), "delete_prefix");
+      Die((*txn)->DeletePrefix(ColumnFamily::kSubkey, SubkeyPrefix(0, 0, oid)), "delete_prefix");
       Commit(**txn, "commit delete");
     } else {
       survivors.push_back(oid);
