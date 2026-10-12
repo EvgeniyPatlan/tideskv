@@ -222,11 +222,15 @@ func NormaliseScan(r Reply, pairs bool) Reply {
 	if r.Kind != '*' || len(r.Elems) != 2 {
 		return r
 	}
+	elems := append([]Reply(nil), r.Elems...) // never reorder the caller's backing array
 	if pairs {
-		r.Elems[1] = SortPairs(r.Elems[1])
+		elems[1] = SortPairs(elems[1])
 	} else {
-		r.Elems[1] = SortElems(r.Elems[1])
+		inner := elems[1]
+		inner.Elems = append([]Reply(nil), inner.Elems...)
+		elems[1] = SortElems(inner)
 	}
+	r.Elems = elems
 	return r
 }
 

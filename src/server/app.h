@@ -50,7 +50,6 @@ class App final : public ServerServices {
   std::unique_ptr<OidAllocator> oids_;
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;
-  std::unique_ptr<Compactor> compactor_;            // gates the scheduler's checkpoints on the engine
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it

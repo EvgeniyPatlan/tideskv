@@ -12,7 +12,6 @@
 
 #include "commands/all_commands.h"
 #include "common/version.h"
-#include "server/gated_compactor.h"
 #include "types/format_version.h"
 
 namespace tideskv {
@@ -76,9 +75,7 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   oids_ = std::make_unique<OidAllocator>(*storage_, [this] { return storage_->Checkpoint(); });
   CompactionScheduler::Options co;
   co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
-  compactor_ = std::make_unique<GatedCompactor>(
-      *storage_, [this](const std::function<Status()>& fn) { return engine_->RunExclusive(fn); });
-  scheduler_ = std::make_unique<CompactionScheduler>(*compactor_, std::move(co));
+  scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
   engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get());
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
@@ -138,10 +135,8 @@ void App::Stop() {
   stopped_ = true;
   server_->Stop();     // no command can touch storage after this
   reaper_.reset();     // joins the reaper thread; it writes through engine_
-  scheduler_->Stop();  // its checkpoints go through engine_, so its thread ends first
   engine_.reset();     // references storage_, so it goes first
   scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
-  compactor_.reset();  // wraps storage_ and engine_ (already gone, never called again)
   oids_.reset();       // likewise (its persist hook checkpoints storage_)
   storage_.reset();    // flushes and closes TidesDB
 }

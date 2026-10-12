@@ -149,20 +149,14 @@ Result<std::string> TxnGet(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, std:
   return std::string(v.view());
 }
 
+// Always an unbounded engine iterator: TidesIterator enforces IterOptions itself. The engine's
+// bounded tidesdb_iter_new_range prunes sstables by their point-key min/max, which ignores the
+// extent of a range tombstone, so a flushed DeleteRange whose table holds no key inside the range
+// is skipped and the older data it deleted reappears (see tests/stress).
 Result<std::unique_ptr<Iterator>> TxnIterator(tidesdb_txn_t* txn, tidesdb_column_family_t* cf,
                                               IterOptions opts) {
   tidesdb_iter_t* it = nullptr;
-  int rc = 0;
-  if (opts.upper.empty()) {
-    rc = RetryLocked([&] { return tidesdb_iter_new(txn, cf, &it); });
-  } else {
-    // A single NUL byte sorts at or below every possible (non-empty) key.
-    const std::string lower = opts.lower.empty() ? std::string(1, '\0') : opts.lower;
-    rc = RetryLocked([&] {
-      return tidesdb_iter_new_range(txn, cf, Bytes(lower), lower.size(), Bytes(opts.upper), opts.upper.size(),
-                                    &it);
-    });
-  }
+  const int rc = RetryLocked([&] { return tidesdb_iter_new(txn, cf, &it); });
   if (rc != TDB_SUCCESS) return FromTdb(rc, "iter_new");
   return std::unique_ptr<Iterator>(std::make_unique<TidesIterator>(it, std::move(opts)));
 }
