@@ -28,7 +28,7 @@ int RetryLocked(F&& call) {
   constexpr int kAttempts = 5;
   int rc = call();
   for (int i = 1; i < kAttempts && rc == TDB_ERR_LOCKED; ++i) {
-    std::this_thread::sleep_for(std::chrono::microseconds(50 << i));
+    std::this_thread::sleep_for(std::chrono::microseconds(50 << (i - 1)));
     rc = call();
   }
   return rc;
