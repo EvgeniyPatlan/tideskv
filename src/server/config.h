@@ -37,8 +37,10 @@ class Config {
   Status LoadFile(const std::string& path);                // Redis-style "name value" lines
   Status ApplyArgs(const std::vector<std::string>& args);  // {"--port", "7000", ...}
   // Reads TIDESKV_REQUIREPASS (spec §9: secrets may come from the environment). Values are
-  // validated like the config file's; never logged.
-  Status ApplyEnv(const std::function<const char*(const char*)>& getenv_fn);
+  // validated like the config file's; never logged. An empty variable counts as unset (fail-safe:
+  // an unexpanded ${PASS} must never disable auth); its name is appended to *ignored if non-null.
+  Status ApplyEnv(const std::function<const char*(const char*)>& getenv_fn,
+                  std::vector<std::string>* ignored = nullptr);
   Status Set(std::string_view name, std::string_view value, bool at_runtime);
   // All-or-nothing. On failure *failed_name (if non-null) names the offending option.
   Status SetMany(const Pairs& pairs, bool at_runtime, std::string* failed_name);

@@ -61,7 +61,10 @@ Status Server::Start() {
 }
 
 void Server::DoAccept() {
-  if (!acceptor_) return;  // engaged by Listen(); reset only by Stop() after the accept thread exits
+  if (!acceptor_) {  // engaged by Listen(); reset only by Stop() after the accept thread exits
+    spdlog::error("internal error: DoAccept() without an acceptor");
+    return;
+  }
   Worker& worker = *workers_[next_worker_++ % workers_.size()];
   acceptor_->async_accept(worker.ctx, [this, &worker](std::error_code ec, asio::ip::tcp::socket socket) {
     if (!running_) return;
@@ -80,7 +83,10 @@ void Server::OnAcceptError(const std::error_code& ec) {
     last_accept_warn_ = now;
     spdlog::warn("accept failed: {}", ec.message());
   }
-  if (!accept_backoff_) return;  // engaged by Start() before the first DoAccept()
+  if (!accept_backoff_) {  // engaged by Start() before the first DoAccept()
+    spdlog::error("internal error: accept backoff timer missing; accepting stopped");
+    return;
+  }
   accept_backoff_->expires_after(kAcceptBackoff);
   accept_backoff_->async_wait([this](std::error_code wait_ec) {
     if (!wait_ec && running_) DoAccept();

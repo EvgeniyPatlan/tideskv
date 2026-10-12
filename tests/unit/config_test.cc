@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string_view>
+#include <vector>
 
 #include "support/temp_dir.h"
 
@@ -223,7 +224,28 @@ TEST(Config, EnvironmentWithoutVariablesChangesNothing) {
 
 TEST(Config, EnvRequirepassIsValidated) {
   Config c;
-  EXPECT_FALSE(c.ApplyEnv([](const char*) -> const char* { return "bad\npass"; }).ok());
+  const Status st = c.ApplyEnv([](const char*) -> const char* { return "bad\npass"; });
+  EXPECT_FALSE(st.ok());
+  EXPECT_EQ(st.message().find("bad"), std::string::npos) << st.message();  // never echo the secret
+  EXPECT_EQ(st.message().find("pass\n"), std::string::npos);
+}
+
+TEST(Config, EnvironmentOverridesConfigFile) {
+  test::TempDir dir;
+  Config c;
+  ASSERT_TRUE(c.LoadFile(WriteFile(dir, "requirepass from-file\n")).ok());
+  ASSERT_TRUE(c.ApplyEnv([](const char*) -> const char* { return "from-env"; }).ok());
+  EXPECT_EQ(c.Snapshot().requirepass, "from-env");
+}
+
+TEST(Config, EmptyEnvRequirepassIsIgnored) {  // an unexpanded ${PASS} must never disable auth
+  test::TempDir dir;
+  Config c;
+  ASSERT_TRUE(c.LoadFile(WriteFile(dir, "requirepass x\n")).ok());
+  std::vector<std::string> ignored;
+  ASSERT_TRUE(c.ApplyEnv([](const char*) -> const char* { return ""; }, &ignored).ok());
+  EXPECT_EQ(c.Snapshot().requirepass, "x");
+  EXPECT_EQ(ignored, std::vector<std::string>{"TIDESKV_REQUIREPASS"});
 }
 
 }  // namespace

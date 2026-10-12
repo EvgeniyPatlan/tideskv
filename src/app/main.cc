@@ -22,7 +22,9 @@ int main(int argc, char** argv) {
     args.erase(args.begin());
   }
   // Precedence: config file < environment < command-line args.
-  if (const tideskv::Status st = config->ApplyEnv([](const char* n) { return std::getenv(n); }); !st.ok()) {
+  std::vector<std::string> ignored_env;
+  if (const tideskv::Status st = config->ApplyEnv([](const char* n) { return std::getenv(n); }, &ignored_env);
+      !st.ok()) {
     std::fprintf(stderr, "configuration error: %s\n", st.message().c_str());
     return 1;
   }
@@ -34,6 +36,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", st.message().c_str());
     return 1;
   }
+  for (const auto& var : ignored_env) spdlog::warn("{} is set but empty; ignored", var);
   auto app = tideskv::App::Create(std::move(config));
   if (!app.ok()) {
     spdlog::critical("cannot open storage: {}", app.status().message());

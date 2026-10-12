@@ -249,12 +249,17 @@ Status Config::ApplyArgs(const std::vector<std::string>& args) {
   return SetMany(pairs, false, nullptr);
 }
 
-Status Config::ApplyEnv(const std::function<const char*(const char*)>& getenv_fn) {
+Status Config::ApplyEnv(const std::function<const char*(const char*)>& getenv_fn,
+                        std::vector<std::string>* ignored) {
   static constexpr std::pair<const char*, std::string_view> kVars[] = {
       {"TIDESKV_REQUIREPASS", "requirepass"}};
   for (const auto& [var, option] : kVars) {
     const char* value = getenv_fn(var);
     if (value == nullptr) continue;
+    if (*value == '\0') {  // treat as unset; disabling auth needs the file or --requirepass ""
+      if (ignored != nullptr) ignored->emplace_back(var);
+      continue;
+    }
     if (Status st = Set(option, value, /*at_runtime=*/false); !st.ok()) {
       return Status::InvalidArgument(std::string(var) + ": " + st.message());
     }

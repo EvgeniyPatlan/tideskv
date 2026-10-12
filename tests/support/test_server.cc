@@ -14,6 +14,8 @@
 #include <string_view>
 #include <thread>
 
+extern char** environ;  // POSIX; declared explicitly rather than relying on _GNU_SOURCE
+
 namespace tideskv::test {
 
 uint16_t TestServer::FreePort() {
@@ -64,8 +66,9 @@ TestServer::TestServer(std::string binary, Options options) {
         std::any_of(options.env.begin(), options.env.end(), [&](const auto& kv) { return kv.first == name; });
     if (!overridden) env_strings.emplace_back(entry);
   }
-  for (const auto& [k, v] : options.env) env_strings.push_back(k + "=" + v);
+  for (const auto& [k, v] : options.env) env_strings.push_back(std::string(k).append("=").append(v));
   std::vector<char*> envp;
+  envp.reserve(env_strings.size() + 1);
   for (auto& e : env_strings) envp.push_back(e.data());
   envp.push_back(nullptr);
 
