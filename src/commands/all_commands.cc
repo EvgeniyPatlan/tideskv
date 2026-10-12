@@ -6,6 +6,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterConnectionCommands(registry);
   RegisterServerCommands(registry);
   RegisterStringCommands(registry);
+  RegisterStringEditCommands(registry);
 }
 
 }  // namespace tideskv

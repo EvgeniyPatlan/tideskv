@@ -32,9 +32,9 @@ TEST(StringsIT, PxExpiresInRealTime) {
   TestServer s(TIDESKV_SERVER_BIN);
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
-  EXPECT_EQ(c->Command({"SET", "k", "v", "PX", "100"}).str, "OK");
+  EXPECT_EQ(c->Command({"SET", "k", "v", "PX", "1000"}).str, "OK");
   EXPECT_EQ(c->Command({"GET", "k"}).str, "v");
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
   EXPECT_EQ(c->Command({"GET", "k"}).type, Type::kNull);
 }
 
@@ -44,6 +44,17 @@ TEST(StringsIT, Resp3NullForMissing) {
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(c->Command({"HELLO", "3"}).type, Type::kMap);
   EXPECT_EQ(c->Command({"GET", "nope"}).type, Type::kNull);
+}
+
+TEST(StringsIT, AppendSetRangeGetRange) {
+  TestServer s(TIDESKV_SERVER_BIN);
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(c->Command({"APPEND", "k", "Hello"}).integer, 5);
+  EXPECT_EQ(c->Command({"APPEND", "k", " World"}).integer, 11);
+  EXPECT_EQ(c->Command({"SETRANGE", "k", "6", "Redis"}).integer, 11);
+  EXPECT_EQ(c->Command({"GETRANGE", "k", "0", "-1"}).str, "Hello Redis");
+  EXPECT_EQ(c->Command({"GETEX", "k", "PX", "100000"}).str, "Hello Redis");
 }
 
 }  // namespace

@@ -82,4 +82,67 @@ Result<std::vector<std::optional<std::string>>> StringMultiGet(ReadView& view, u
   return out;
 }
 
+Result<std::optional<std::string>> StringGetEx(WriteTxn& txn, uint8_t db, std::string_view key,
+                                               const GetExResolver& resolve, int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (!obj->live()) return std::optional<std::string>();
+  if (!obj->IsString()) return WrongType();
+  auto change = resolve();
+  if (!change.ok()) return change.status();
+  Status st;
+  if (change->kind == GetExChange::Kind::kSetExpire) {
+    st = change->expire_ms <= now_ms ? DeleteObject(txn, db, key, obj->meta)
+                                     : SetObjectExpire(txn, db, key, *obj, change->expire_ms);
+  } else if (change->kind == GetExChange::Kind::kPersist && obj->meta.expire_ms != 0) {
+    st = SetObjectExpire(txn, db, key, *obj, 0);
+  }
+  if (!st.ok()) return st;
+  return std::optional<std::string>(std::move(obj->payload));
+}
+
+Result<int64_t> StringAppend(WriteTxn& txn, uint8_t db, std::string_view key, std::string_view tail,
+                             int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (obj->live() && !obj->IsString()) return WrongType();
+  if (obj->payload.size() + tail.size() > kMaxStringSize)
+    return Status::UserError(std::string(kErrStringTooLong));
+  std::string value = std::move(obj->payload);
+  value.append(tail);
+  const int64_t expire_ms = obj->live() ? obj->meta.expire_ms : 0;
+  if (Status st = WriteString(txn, db, key, value, expire_ms, *obj); !st.ok()) return st;
+  return static_cast<int64_t>(value.size());
+}
+
+Result<int64_t> StringSetRange(WriteTxn& txn, uint8_t db, std::string_view key, int64_t offset,
+                               std::string_view value, int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (obj->live() && !obj->IsString()) return WrongType();
+  std::string current = std::move(obj->payload);
+  if (value.empty()) return static_cast<int64_t>(current.size());
+  if (static_cast<uint64_t>(offset) + value.size() > kMaxStringSize) {
+    return Status::UserError(std::string(kErrStringTooLong));
+  }
+  const size_t end = static_cast<size_t>(offset) + value.size();
+  if (current.size() < end) current.resize(end, '\0');
+  current.replace(static_cast<size_t>(offset), value.size(), value);
+  const int64_t expire_ms = obj->live() ? obj->meta.expire_ms : 0;
+  if (Status st = WriteString(txn, db, key, current, expire_ms, *obj); !st.ok()) return st;
+  return static_cast<int64_t>(current.size());
+}
+
+std::string_view RedisRange(std::string_view s, int64_t start, int64_t end) {
+  const auto len = static_cast<int64_t>(s.size());
+  if (start < 0 && end < 0 && start > end) return {};
+  if (start < 0) start += len;
+  if (end < 0) end += len;
+  if (start < 0) start = 0;
+  if (end < 0) end = 0;
+  if (end >= len) end = len - 1;
+  if (start > end || len == 0) return {};
+  return s.substr(static_cast<size_t>(start), static_cast<size_t>(end - start + 1));
+}
+
 }  // namespace tideskv

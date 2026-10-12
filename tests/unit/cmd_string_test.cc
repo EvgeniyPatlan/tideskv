@@ -196,5 +196,30 @@ TEST_F(StringCmds, CommandTableEntries) {
   EXPECT_TRUE(h.services.registry().Find("get")->flags & kCmdReadOnly);
 }
 
+TEST_F(StringCmds, SetOptionsOnForeignAndExpiredKeys) {  // carried from Task 7 review
+  h.SeedHash(0, "h", 9, false);
+  EXPECT_EQ(h.Run({"SET", "h", "x", "GET", "EX", "0"}), Err("ERR invalid expire time in 'set' command"));
+  EXPECT_EQ(h.Run({"SET", "h", "x", "NX", "GET"}), Err(kErrWrongType));
+}
+
+TEST_F(StringCmds, KeepTtlOverHashKeepsDeadline) {
+  encoding::Metadata m;
+  m.type = encoding::ValueType::kHash;
+  m.oid = 9;
+  m.expire_ms = h.clock().NowMs() + 5000;
+  h.SeedMeta(0, "h", m);
+  EXPECT_EQ(h.Run({"SET", "h", "x", "KEEPTTL"}), kOk);
+  EXPECT_EQ(h.ExpireOf(0, "h"), m.expire_ms);
+}
+
+TEST_F(StringCmds, ExpiredButStoredKeys) {
+  EXPECT_EQ(h.Run({"SET", "e", "v", "PX", "10"}), kOk);
+  h.clock().Advance(10);
+  EXPECT_EQ(h.Run({"MSETNX", "e", "x"}), Int(1));
+  EXPECT_EQ(h.Run({"SET", "g", "v", "PX", "10"}), kOk);
+  h.clock().Advance(10);
+  EXPECT_EQ(h.Run({"GETDEL", "g"}), kNil);
+}
+
 }  // namespace
 }  // namespace tideskv
