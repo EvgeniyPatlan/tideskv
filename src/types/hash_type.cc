@@ -100,9 +100,9 @@ Result<int64_t> HashStrlen(ReadView& view, uint8_t db, std::string_view key, std
 
 Result<bool> HashExists(ReadView& view, uint8_t db, std::string_view key, std::string_view field,
                         int64_t now_ms) {
-  auto v = HashGet(view, db, key, field, now_ms);
-  if (!v.ok()) return v.status();
-  return v->has_value();
+  auto c = LoadCollection(view, db, key, kHash, now_ms);
+  if (!c.ok()) return c.status();
+  return HasElement(view, *c, field);
 }
 
 Result<std::vector<std::string>> HashGetAll(ReadView& view, uint8_t db, std::string_view key, HashPart part,
