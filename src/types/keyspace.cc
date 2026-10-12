@@ -68,4 +68,45 @@ Result<uint64_t> CountKeys(ReadView& view, uint8_t db, int64_t now_ms) {
   return n;
 }
 
+namespace {
+
+// Redis 7.2 expireGenericCommand condition checks; current == 0 means no deadline (infinite).
+bool ConditionHolds(const ExpireCondition& c, int64_t current, int64_t when) {
+  if (c.nx && current != 0) return false;
+  if (c.xx && current == 0) return false;
+  if (c.gt && (current == 0 || when <= current)) return false;
+  if (c.lt && current != 0 && when >= current) return false;
+  return true;
+}
+
+}  // namespace
+
+Result<int64_t> SetKeyExpire(WriteTxn& txn, uint8_t db, std::string_view key, int64_t when_ms,
+                             const ExpireCondition& cond, int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (!obj->live() || !ConditionHolds(cond, obj->meta.expire_ms, when_ms)) return int64_t{0};
+  const Status st = when_ms <= now_ms ? DeleteObject(txn, db, key, obj->meta)
+                                      : SetObjectExpire(txn, db, key, *obj, when_ms);
+  if (!st.ok()) return st;
+  return int64_t{1};
+}
+
+Result<int64_t> KeyTtlMs(ReadView& view, uint8_t db, std::string_view key, bool absolute, int64_t now_ms) {
+  auto obj = LoadObject(view, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (!obj->live()) return int64_t{-2};
+  if (obj->meta.expire_ms == 0) return int64_t{-1};
+  const int64_t v = absolute ? obj->meta.expire_ms : obj->meta.expire_ms - now_ms;
+  return v < 0 ? int64_t{0} : v;
+}
+
+Result<int64_t> PersistKey(WriteTxn& txn, uint8_t db, std::string_view key, int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (!obj->live() || obj->meta.expire_ms == 0) return int64_t{0};
+  if (Status st = SetObjectExpire(txn, db, key, *obj, 0); !st.ok()) return st;
+  return int64_t{1};
+}
+
 }  // namespace tideskv

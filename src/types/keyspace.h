@@ -28,4 +28,18 @@ Status FlushAll(WriteTxn& txn);
 // DBSIZE: live keys of db. O(number of stored keys).
 Result<uint64_t> CountKeys(ReadView& view, uint8_t db, int64_t now_ms);
 
+// EXPIRE options; every flag given is applied, as in Redis (XX LT is not the same as LT).
+struct ExpireCondition {
+  bool nx = false, xx = false, gt = false, lt = false;
+};
+
+// EXPIRE family. when_ms <= now_ms deletes the key. Returns 1 if the deadline was set or
+// the key deleted, 0 if the key is missing or the condition failed.
+Result<int64_t> SetKeyExpire(WriteTxn& txn, uint8_t db, std::string_view key, int64_t when_ms,
+                             const ExpireCondition& cond, int64_t now_ms);
+// TTL family: -2 missing, -1 no deadline, otherwise remaining ms (>= 0) or the absolute deadline.
+Result<int64_t> KeyTtlMs(ReadView& view, uint8_t db, std::string_view key, bool absolute, int64_t now_ms);
+// PERSIST: 1 if a deadline was removed.
+Result<int64_t> PersistKey(WriteTxn& txn, uint8_t db, std::string_view key, int64_t now_ms);
+
 }  // namespace tideskv
