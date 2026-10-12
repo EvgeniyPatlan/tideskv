@@ -116,6 +116,11 @@ const std::vector<Option>& Options() {
          return Choice(v, {"debug", "verbose", "notice", "warning"}, &c.loglevel);
        },
        [](const ConfigValues& c) { return c.loglevel; }},
+      {"compaction-collection-deletes", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetInt(v, 0, 1'000'000'000, &c.compaction_collection_deletes);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.compaction_collection_deletes); }},
       {"maxclients", true,
        [](ConfigValues& c, std::string_view v) { return SetInt(v, 1, 1'000'000, &c.maxclients); },
        [](const ConfigValues& c) { return std::to_string(c.maxclients); }},

@@ -11,6 +11,7 @@
 #include "exec/lock_manager.h"
 #include "expire/reaper.h"
 #include "net/server.h"
+#include "server/compaction_scheduler.h"
 #include "server/config.h"
 #include "storage/tides_storage.h"
 #include "types/cursor_store.h"
@@ -49,6 +50,7 @@ class App final : public ServerServices {
   std::unique_ptr<OidAllocator> oids_;
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;
+  std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it
   CommandRegistry registry_;

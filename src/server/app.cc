@@ -73,7 +73,10 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
   oids_ = std::make_unique<OidAllocator>(*storage_, [this] { return storage_->Checkpoint(); });
-  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_);
+  CompactionScheduler::Options co;
+  co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
+  scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
+  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get());
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
@@ -106,6 +109,7 @@ Status App::Start() {
   signals_.emplace(main_ctx_, SIGINT, SIGTERM);
   if (Status st = server_->Start(); !st.ok()) return st;
   reaper_->Start();
+  scheduler_->Start();
   return Status::Ok();
 }
 
@@ -129,11 +133,12 @@ void App::RequestShutdown() {
 void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
-  server_->Stop();   // no command can touch storage after this
-  reaper_.reset();   // joins the reaper thread; it writes through engine_
-  engine_.reset();   // references storage_, so it goes first
-  oids_.reset();     // likewise (its persist hook checkpoints storage_)
-  storage_.reset();  // flushes and closes TidesDB
+  server_->Stop();     // no command can touch storage after this
+  reaper_.reset();     // joins the reaper thread; it writes through engine_
+  engine_.reset();     // references storage_, so it goes first
+  scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
+  oids_.reset();       // likewise (its persist hook checkpoints storage_)
+  storage_.reset();    // flushes and closes TidesDB
 }
 
 ServerStats App::Stats() const {
@@ -158,6 +163,8 @@ ServerStats App::Stats() const {
     s.storage_flushes = st->flush_count;
     s.storage_compactions = st->compaction_count;
   }
+  s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
+  s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
   s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
   return s;
 }

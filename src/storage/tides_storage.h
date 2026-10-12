@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include "storage/compactor.h"
 #include "storage/storage.h"
 
 namespace tideskv {
@@ -44,7 +45,7 @@ struct StorageOptions {
 // concurrently from multiple threads (the engine is thread-safe). Each returned
 // WriteTxn/ReadView/Iterator is single-threaded: use it from one thread at a time,
 // and destroy it before this object.
-class TidesStorage final : public Storage {
+class TidesStorage final : public Storage, public Compactor {
  public:
   // Busy("... locked ...") when another handle or process holds the directory.
   static Result<std::unique_ptr<TidesStorage>> Open(const StorageOptions& options);
@@ -57,12 +58,12 @@ class TidesStorage final : public Storage {
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override;
 
   Status Backup(const std::string& dir);  // consistent, directly-openable copy
-  Status Checkpoint();                    // flush + fsync WAL/vlog/manifest
+  Status Checkpoint() override;           // flush + fsync WAL/vlog/manifest
 
   Compression compression() const;  // what Open applied (kNone if this build lacks the algorithm)
   // Synchronous. Empty lo/hi = unbounded on that side; both empty = whole CF.
   // InvalidArgument if lo >= hi (both non-empty); Busy if a compaction already holds the CF.
-  Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi);
+  Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override;
   Result<StorageStats> Stats();
 
  private:

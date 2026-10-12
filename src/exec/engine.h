@@ -6,6 +6,7 @@
 
 #include "common/clock.h"
 #include "common/status.h"
+#include "exec/commit_listener.h"
 #include "exec/gate.h"
 #include "exec/lock_manager.h"
 #include "storage/storage.h"
@@ -21,14 +22,17 @@ namespace tideskv {
 // Every fn receives now_ms: the clock read after the Gate (and, for writes, the key stripes)
 // is held, and re-read on each commit attempt. Expiry/liveness decisions must use it, never
 // a time taken before the call: a key can expire while the command waits for its locks.
+//
+// After a successful commit with range deletes, the listener (if any) is called on this thread,
+// still under the gate and key stripes.
 class Engine {
  public:
   using ReadFn = std::function<Status(ReadView&, int64_t now_ms)>;
   using WriteFn = std::function<Status(WriteTxn&, int64_t now_ms)>;
   static constexpr int kMaxCommitAttempts = 3;  // spec §5.4: TDB_ERR_CONFLICT
 
-  Engine(Storage& storage, LockManager& locks, const Clock& clock)
-      : storage_(storage), locks_(locks), clock_(clock) {}
+  Engine(Storage& storage, LockManager& locks, const Clock& clock, CommitListener* listener = nullptr)
+      : storage_(storage), locks_(locks), clock_(clock), listener_(listener) {}
 
   // For parse-time work only (turning a relative EX/PX into a deadline, as Redis does at
   // command start); never for an expiry decision, which uses the fn's now_ms.
@@ -50,6 +54,7 @@ class Engine {
   Storage& storage_;
   LockManager& locks_;
   const Clock& clock_;
+  CommitListener* listener_;  // may be null; told about committed range deletes
   Gate gate_;
 };
 

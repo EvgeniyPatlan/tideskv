@@ -47,14 +47,17 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                              {"expired_keys", std::to_string(s.expired_keys)}});
   }
   if (name == "persistence") {
-    return Section("Persistence", {{"loading", "0"},
-                                   {"storage_engine", "tidesdb"},
-                                   {"dir", s.data_dir},
-                                   {"sync_mode", s.sync_mode},
-                                   {"compression", s.storage_compression},
-                                   {"tombstones", std::to_string(s.storage_tombstones)},
-                                   {"flushes", std::to_string(s.storage_flushes)},
-                                   {"compactions", std::to_string(s.storage_compactions)}});
+    return Section("Persistence",
+                   {{"loading", "0"},
+                    {"storage_engine", "tidesdb"},
+                    {"dir", s.data_dir},
+                    {"sync_mode", s.sync_mode},
+                    {"compression", s.storage_compression},
+                    {"tombstones", std::to_string(s.storage_tombstones)},
+                    {"flushes", std::to_string(s.storage_flushes)},
+                    {"compactions", std::to_string(s.storage_compactions)},
+                    {"background_compactions", std::to_string(s.background_compactions)},
+                    {"background_compaction_failures", std::to_string(s.background_compaction_failures)}});
   }
   if (name == "keyspace") return Section("Keyspace", {});
   return "";

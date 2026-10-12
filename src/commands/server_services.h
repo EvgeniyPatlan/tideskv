@@ -27,7 +27,9 @@ struct ServerStats {
   uint64_t storage_tombstones = 0;
   uint64_t storage_flushes = 0;
   uint64_t storage_compactions = 0;
-  uint64_t expired_keys = 0;  // removed by the active-expiry reaper
+  uint64_t background_compactions = 0;          // CompactionScheduler jobs completed
+  uint64_t background_compaction_failures = 0;  // jobs given up after retries
+  uint64_t expired_keys = 0;                    // removed by the active-expiry reaper
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and

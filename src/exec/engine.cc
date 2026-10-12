@@ -6,6 +6,10 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include "exec/recording_txn.h"
+
+#include "exec/recording_txn.h"
+
 namespace tideskv {
 namespace {
 
@@ -63,9 +67,13 @@ Status Engine::RunTxn(const WriteFn& fn) {
   for (int attempt = 1; attempt <= kMaxCommitAttempts; ++attempt) {
     auto txn = storage_.BeginWrite();
     if (!txn.ok()) return txn.status();
-    st = fn(**txn, clock_.NowMs());  // read under the locks, fresh on every attempt
-    if (!st.ok()) return st;         // destroying the unfinished txn rolls it back
-    st = (*txn)->Commit();
+    RecordingTxn recorder(**txn);
+    WriteTxn& target = listener_ != nullptr ? static_cast<WriteTxn&>(recorder) : **txn;
+    st = fn(target, clock_.NowMs());  // read under the locks, fresh on every attempt
+    if (!st.ok()) return st;          // destroying the unfinished txn rolls it back
+    st = target.Commit();
+    if (st.ok() && listener_ != nullptr && !recorder.deletes().empty())
+      listener_->OnCommitted(recorder.deletes());
     if (st.code() != StatusCode::kConflict) return st;
     // Key locks make conflicts impossible (invariant I1), so one indicates a bug.
     spdlog::warn("commit conflict, attempt {}/{}: {}", attempt, kMaxCommitAttempts, st.message());

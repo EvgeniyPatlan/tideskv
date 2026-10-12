@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "exec/commit_listener.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 
@@ -262,6 +263,38 @@ TEST_F(EngineFixture, WriteExclusiveWaitsForInflightWrites) {
   writer.join();
   flusher.join();
   EXPECT_TRUE(exclusive_ran.load());
+}
+
+class RecordingListener final : public CommitListener {
+ public:
+  void OnCommitted(const std::vector<RangeDelete>& d) override { batches.push_back(d); }
+  std::vector<std::vector<RangeDelete>> batches;
+};
+
+TEST(EngineListener, ReportsCommittedRangeDeletesOnly) {
+  InMemoryStorage storage;
+  LockManager locks;
+  FakeClock clock;
+  RecordingListener listener;
+  Engine e(storage, locks, clock, &listener);
+  ASSERT_TRUE(
+      e.Write(0, {"k"}, [](WriteTxn& t, int64_t) { return t.Put(ColumnFamily::kMeta, "x", "y"); }).ok());
+  EXPECT_TRUE(listener.batches.empty());  // no range deletes: no call
+  ASSERT_TRUE(e.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
+                 return t.DeletePrefix(ColumnFamily::kSubkey, "p");
+               }).ok());
+  ASSERT_EQ(listener.batches.size(), 1u);
+  EXPECT_EQ(listener.batches[0][0].lo, "p");
+  const Status failed = e.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
+    (void)t.DeletePrefix(ColumnFamily::kSubkey, "q");
+    return Status::UserError("ERR nope");
+  });
+  EXPECT_FALSE(failed.ok());
+  EXPECT_EQ(listener.batches.size(), 1u);  // rolled back: not reported
+  ASSERT_TRUE(e.WriteExclusive([](WriteTxn& t, int64_t) {
+                 return t.DeletePrefix(ColumnFamily::kMeta, "\x01");
+               }).ok());
+  EXPECT_EQ(listener.batches.size(), 2u);
 }
 
 }  // namespace

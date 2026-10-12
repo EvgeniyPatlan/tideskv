@@ -118,7 +118,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 14u);
+  EXPECT_EQ(c.Get("*").size(), 15u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -246,6 +246,14 @@ TEST(Config, EmptyEnvRequirepassIsIgnored) {  // an unexpanded ${PASS} must neve
   ASSERT_TRUE(c.ApplyEnv([](const char*) -> const char* { return ""; }, &ignored).ok());
   EXPECT_EQ(c.Snapshot().requirepass, "x");
   EXPECT_EQ(ignored, std::vector<std::string>{"TIDESKV_REQUIREPASS"});
+}
+
+TEST(Config, CompactionCollectionDeletes) {
+  Config c;
+  EXPECT_EQ(c.Snapshot().compaction_collection_deletes, 1000u);
+  EXPECT_TRUE(c.Set("compaction-collection-deletes", "0", true).ok());  // runtime-mutable; 0 = never
+  EXPECT_EQ(c.Snapshot().compaction_collection_deletes, 0u);
+  EXPECT_FALSE(c.Set("compaction-collection-deletes", "-1", true).ok());
 }
 
 }  // namespace
