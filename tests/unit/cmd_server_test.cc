@@ -1,12 +1,18 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
+#include <filesystem>
+#include <fstream>
 
 #include "commands/info.h"
 #include "support/command_harness.h"
+#include "support/temp_dir.h"
 
 namespace tideskv {
 namespace {
 
 using test::CommandHarness;
+using test::TempDir;
+namespace fs = std::filesystem;
 
 ServerStats SampleStats() {
   ServerStats s;
@@ -40,6 +46,30 @@ TEST(FormatInfo, SelectedSectionsOnly) {
   EXPECT_NE(info.find("# Clients"), std::string::npos);
   EXPECT_EQ(info.find("# Server"), std::string::npos);
   EXPECT_EQ(FormatInfo(SampleStats(), {"nosuchsection"}), "");
+}
+
+TEST(FormatInfo, AllSectionsAnywhere) {
+  // "all" anywhere in the list means all sections
+  const std::string all_empty = FormatInfo(SampleStats(), {});
+  const std::string all_mixed = FormatInfo(SampleStats(), {"server", "all"});
+  EXPECT_EQ(all_empty, all_mixed);
+  EXPECT_EQ(all_empty, FormatInfo(SampleStats(), {"default"}));
+  EXPECT_EQ(all_empty, FormatInfo(SampleStats(), {"everything"}));
+}
+
+TEST(FormatInfo, Deduplication) {
+  // Same section requested twice should appear only once
+  const std::string once = FormatInfo(SampleStats(), {"server"});
+  const std::string twice = FormatInfo(SampleStats(), {"server", "server"});
+  EXPECT_EQ(once, twice);
+  // Count "# Server" occurrences
+  size_t count = 0;
+  size_t pos = 0;
+  while ((pos = twice.find("# Server", pos)) != std::string::npos) {
+    ++count;
+    pos += 8;
+  }
+  EXPECT_EQ(count, 1u);
 }
 
 TEST(Info, BulkInResp2VerbatimInResp3) {
@@ -78,6 +108,34 @@ TEST(ConfigCmd, ResetStatRewriteAndUnknown) {
   EXPECT_EQ(h.Run({"CONFIG", "REWRITE"}), "-ERR The server is running without a config file\r\n");
   EXPECT_EQ(h.Run({"CONFIG", "NOPE"}),
             "-ERR unknown subcommand or wrong number of arguments for 'NOPE'. Try CONFIG HELP.\r\n");
+}
+
+TEST(ConfigCmd, RewritePermissionErrorDoesntExposePathes) {
+  // Skip if running as root (permissions are ignored)
+  if (::geteuid() == 0) GTEST_SKIP();
+
+  TempDir temp("tideskv-rewrite-test");
+  CommandHarness h;
+
+  // Create a config file
+  std::string config_path = (temp.path() / "tideskv.conf").string();
+  std::ofstream cf(config_path);
+  cf << "port 6666\n";
+  cf.close();
+
+  // Load the config
+  EXPECT_TRUE(h.services.config_.LoadFile(config_path).ok());
+
+  // Make the directory read-only to prevent writing
+  fs::permissions(temp.path(), fs::perms::owner_read | fs::perms::owner_exec, fs::perm_options::replace);
+
+  // CONFIG REWRITE should fail without exposing the path
+  const std::string r = h.Run({"CONFIG", "REWRITE"});
+  EXPECT_EQ(r, "-ERR CONFIG REWRITE failed\r\n") << "Got: " << r;
+  EXPECT_EQ(r.find("/"), std::string::npos) << "Error message should not contain paths";
+
+  // Restore permissions before TempDir cleanup
+  fs::permissions(temp.path(), fs::perms::owner_all, fs::perm_options::replace);
 }
 
 TEST(CommandCmd, CountListInfoDocs) {

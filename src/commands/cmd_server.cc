@@ -1,4 +1,5 @@
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -6,6 +7,7 @@
 #include "commands/info.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "spdlog/spdlog.h"
 
 namespace tideskv {
 namespace {
@@ -100,7 +102,13 @@ void ConfigCmd(ExecContext& ctx, const ArgList& argv) {
   }
   if (sub == "rewrite" && argv.size() == 2) {
     const Status st = ctx.server.config().Rewrite();
-    return st.ok() ? ctx.reply.SimpleString("OK") : ctx.reply.Error("ERR " + st.message());
+    if (st.ok()) return ctx.reply.SimpleString("OK");
+    if (st.code() == StatusCode::kInvalidArgument) {
+      return ctx.reply.Error("ERR " + st.message());
+    }
+    // Log the detail server-side; don't expose paths in reply (spec §5.4)
+    spdlog::error("CONFIG REWRITE failed: {}", st.message());
+    return ctx.reply.Error("ERR CONFIG REWRITE failed");
   }
   UnknownSub(ctx, argv[1], "CONFIG");
 }
@@ -156,12 +164,17 @@ void Shutdown(ExecContext& ctx, const ArgList& argv) {
 
 std::string FormatInfo(const ServerStats& stats, const std::vector<std::string>& sections) {
   std::vector<std::string> wanted;
-  for (const std::string& s : sections) wanted.push_back(ToLower(s));
-  if (wanted.empty() || wanted[0] == "default" || wanted[0] == "all" || wanted[0] == "everything") {
-    wanted = AllSections();
+  bool all = sections.empty();
+  for (const std::string& s : sections) {
+    std::string name = ToLower(s);
+    if (name == "default" || name == "all" || name == "everything") all = true;
+    wanted.push_back(std::move(name));
   }
+  if (all) wanted = AllSections();
+  std::set<std::string> seen;  // each section printed at most once, first-request order
   std::string out;
   for (const std::string& name : wanted) {
+    if (!seen.insert(name).second) continue;
     const std::string section = RenderSection(name, stats);
     if (section.empty()) continue;
     if (!out.empty()) out += "\r\n";
