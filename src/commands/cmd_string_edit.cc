@@ -18,7 +18,7 @@ void GetEx(ExecContext& ctx, const ArgList& argv) {
   // Syntax only: Redis validates the expire value after the key lookup and type check.
   auto args = ParseExtendedArgs(argv, 2, ExtendedArgsKind::kGetEx);
   if (!args.ok()) return ReplyError(ctx, args.status());
-  const int64_t now = ctx.server.engine().NowMs();
+  const int64_t now = ctx.server.engine().NowMs();  // parse-time base for a relative EX/PX
   const GetExResolver resolve = [&]() -> Result<GetExChange> {
     GetExChange change;
     if (args->persist) change.kind = GetExChange::Kind::kPersist;
@@ -31,7 +31,7 @@ void GetEx(ExecContext& ctx, const ArgList& argv) {
     return change;
   };
   std::optional<std::string> value;
-  const bool ok = WriteOneKey(ctx, argv[1], now, [&](WriteTxn& txn, int64_t now_ms) {
+  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
     value.reset();
     return MoveInto(StringGetEx(txn, ctx.session.db, argv[1], resolve, now_ms), &value);
   });

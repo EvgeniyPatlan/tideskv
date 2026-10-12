@@ -18,10 +18,9 @@ void ReplyOptional(ExecContext& ctx, const std::optional<std::string>& v) {
 }
 
 // Runs StringSet for one key and replies like SET (OK / nil / old value with GET).
-void DoSet(ExecContext& ctx, std::string_view key, std::string_view value, const SetOptions& opts,
-           int64_t now) {
+void DoSet(ExecContext& ctx, std::string_view key, std::string_view value, const SetOptions& opts) {
   SetResult result;
-  const bool ok = WriteOneKey(ctx, key, now, [&](WriteTxn& txn, int64_t now_ms) {
+  const bool ok = WriteOneKey(ctx, key, [&](WriteTxn& txn, int64_t now_ms) {
     return StringSet(txn, ctx.session.db, key, value, opts, now_ms, &result);
   });
   if (!ok) return;
@@ -42,7 +41,7 @@ void Set(ExecContext& ctx, const ArgList& argv) {
     if (!when.ok()) return ReplyError(ctx, when.status());
     opts.expire_ms = *when;
   }
-  DoSet(ctx, argv[1], argv[2], opts, now);
+  DoSet(ctx, argv[1], argv[2], opts);
 }
 
 void SetNx(ExecContext& ctx, const ArgList& argv) {
@@ -61,7 +60,7 @@ void SetExGeneric(ExecContext& ctx, const ArgList& argv, ExpireUnit unit, std::s
   if (!when.ok()) return ReplyError(ctx, when.status());
   SetOptions opts;
   opts.expire_ms = *when;
-  DoSet(ctx, argv[1], argv[3], opts, now);
+  DoSet(ctx, argv[1], argv[3], opts);
 }
 
 void SetEx(ExecContext& ctx, const ArgList& argv) { SetExGeneric(ctx, argv, ExpireUnit::kSeconds, "setex"); }
@@ -70,7 +69,7 @@ void PSetEx(ExecContext& ctx, const ArgList& argv) { SetExGeneric(ctx, argv, Exp
 void GetSet(ExecContext& ctx, const ArgList& argv) {
   SetOptions opts;
   opts.get = true;
-  DoSet(ctx, argv[1], argv[2], opts, ctx.server.engine().NowMs());
+  DoSet(ctx, argv[1], argv[2], opts);
 }
 
 void Get(ExecContext& ctx, const ArgList& argv) {
@@ -94,12 +93,11 @@ void Strlen(ExecContext& ctx, const ArgList& argv) {
 }
 
 void MGet(ExecContext& ctx, const ArgList& argv) {
-  Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   const std::vector<std::string_view> keys(argv.begin() + 1, argv.end());
   std::vector<std::optional<std::string>> values;
-  const Status st = e.Snapshot(
-      [&](ReadView& v) { return MoveInto(StringMultiGet(v, ctx.session.db, keys, now), &values); });
+  const Status st = ctx.server.engine().Snapshot([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(StringMultiGet(v, ctx.session.db, keys, now_ms), &values);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.ArrayHeader(values.size());
   for (const auto& v : values) ReplyOptional(ctx, v);
@@ -107,8 +105,6 @@ void MGet(ExecContext& ctx, const ArgList& argv) {
 
 void MSetGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
   if (argv.size() % 2 == 0) return ctx.reply.Error(ArityError(nx ? "msetnx" : "mset"));
-  Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   std::vector<KeyValue> pairs;
   std::vector<std::string_view> keys;
   for (size_t i = 1; i + 1 < argv.size(); i += 2) {
@@ -116,8 +112,8 @@ void MSetGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
     keys.push_back(argv[i]);
   }
   bool written = false;
-  const Status st = e.Write(ctx.session.db, keys, [&](WriteTxn& txn) {
-    return MoveInto(StringMultiSet(txn, ctx.session.db, pairs, nx, now), &written);
+  const Status st = ctx.server.engine().Write(ctx.session.db, keys, [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(StringMultiSet(txn, ctx.session.db, pairs, nx, now_ms), &written);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   nx ? ctx.reply.Integer(written ? 1 : 0) : ctx.reply.SimpleString("OK");

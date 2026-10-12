@@ -63,7 +63,7 @@ class ConflictingStorage final : public Storage {
 
 std::string ReadMeta(Engine& e, const std::string& key) {
   std::string out = "<missing>";
-  EXPECT_TRUE(e.Read([&](ReadView& v) {
+  EXPECT_TRUE(e.Read([&](ReadView& v, int64_t) {
                  auto r = v.Get(ColumnFamily::kMeta, key);
                  if (r.ok()) out = *r;
                  return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
@@ -84,12 +84,13 @@ TEST_F(EngineFixture, NowComesFromTheClock) {
 }
 
 TEST_F(EngineFixture, WriteCommitsAndReadSeesIt) {
-  ASSERT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t) { return t.Put(ColumnFamily::kMeta, "k", "v"); }).ok());
+  ASSERT_TRUE(
+      engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) { return t.Put(ColumnFamily::kMeta, "k", "v"); }).ok());
   EXPECT_EQ(ReadMeta(engine, "k"), "v");
 }
 
 TEST_F(EngineFixture, FailingFnRollsBackAndReturnsItsStatus) {
-  const Status st = engine.Write(0, {"k"}, [](WriteTxn& t) {
+  const Status st = engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
     EXPECT_TRUE(t.Put(ColumnFamily::kMeta, "k", "v").ok());
     return Status::UserError("ERR nope");
   });
@@ -99,9 +100,10 @@ TEST_F(EngineFixture, FailingFnRollsBackAndReturnsItsStatus) {
 }
 
 TEST_F(EngineFixture, SnapshotDoesNotSeeLaterCommits) {
-  ASSERT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t) { return t.Put(ColumnFamily::kMeta, "k", "1"); }).ok());
+  ASSERT_TRUE(
+      engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) { return t.Put(ColumnFamily::kMeta, "k", "1"); }).ok());
   ASSERT_TRUE(engine
-                  .Snapshot([&](ReadView& v) {
+                  .Snapshot([&](ReadView& v, int64_t) {
                     auto txn = storage.BeginWrite();  // bypasses the gate on purpose (not re-entrant)
                     EXPECT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k", "2").ok());
                     EXPECT_TRUE((*txn)->Commit().ok());
@@ -118,12 +120,27 @@ TEST(Engine, ConflictIsRetriedUpToThreeAttempts) {
   FakeClock clock;
   Engine engine(storage, locks, clock);
   int calls = 0;
-  const Status st = engine.Write(0, {"k"}, [&](WriteTxn& t) {
+  const Status st = engine.Write(0, {"k"}, [&](WriteTxn& t, int64_t) {
     ++calls;
     return t.Put(ColumnFamily::kMeta, "k", "v");
   });
   EXPECT_TRUE(st.ok()) << st.ToString();
   EXPECT_EQ(calls, 3);
+}
+
+TEST(Engine, EachCommitAttemptReadsTheClockAgain) {
+  ConflictingStorage storage(2);
+  LockManager locks;
+  FakeClock clock(100);
+  Engine engine(storage, locks, clock);
+  std::vector<int64_t> seen;
+  const Status st = engine.Write(0, {"k"}, [&](WriteTxn&, int64_t now_ms) {
+    seen.push_back(now_ms);
+    clock.Advance(10);
+    return Status::Ok();
+  });
+  EXPECT_TRUE(st.ok()) << st.ToString();
+  EXPECT_EQ(seen, (std::vector<int64_t>{100, 110, 120}));
 }
 
 TEST(Engine, ConflictGivesUpAfterThreeAttempts) {
@@ -132,7 +149,7 @@ TEST(Engine, ConflictGivesUpAfterThreeAttempts) {
   FakeClock clock;
   Engine engine(storage, locks, clock);
   int calls = 0;
-  const Status st = engine.Write(0, {"k"}, [&](WriteTxn&) {
+  const Status st = engine.Write(0, {"k"}, [&](WriteTxn&, int64_t) {
     ++calls;
     return Status::Ok();
   });
@@ -147,7 +164,7 @@ TEST_F(EngineFixture, ConcurrentReadModifyWriteOnOneKeyIsSerialised) {
       for (int i = 0; i < 200; ++i) {
         ASSERT_TRUE(engine
                         .Write(0, {"ctr"},
-                               [](WriteTxn& txn) {
+                               [](WriteTxn& txn, int64_t) {
                                  auto cur = txn.Get(ColumnFamily::kMeta, "ctr");
                                  const int n = cur.ok() ? std::stoi(*cur) : 0;
                                  return txn.Put(ColumnFamily::kMeta, "ctr", std::to_string(n + 1));
@@ -160,12 +177,53 @@ TEST_F(EngineFixture, ConcurrentReadModifyWriteOnOneKeyIsSerialised) {
   EXPECT_EQ(ReadMeta(engine, "ctr"), "800");
 }
 
+TEST_F(EngineFixture, FnsGetTheClockReadAfterTheyAreCalled) {
+  clock.Set(1000);
+  int64_t seen = 0;
+  ASSERT_TRUE(engine.Read([&](ReadView&, int64_t now_ms) { return seen = now_ms, Status::Ok(); }).ok());
+  EXPECT_EQ(seen, 1000);
+  clock.Set(2000);
+  ASSERT_TRUE(engine.Snapshot([&](ReadView&, int64_t now_ms) { return seen = now_ms, Status::Ok(); }).ok());
+  EXPECT_EQ(seen, 2000);
+  clock.Set(3000);
+  ASSERT_TRUE(
+      engine.WriteExclusive([&](WriteTxn&, int64_t now_ms) { return seen = now_ms, Status::Ok(); }).ok());
+  EXPECT_EQ(seen, 3000);
+}
+
+TEST_F(EngineFixture, WriteReadsTheClockAfterAcquiringTheKeyLocks) {
+  std::atomic<bool> in_write{false}, release{false};
+  std::thread holder([&] {
+    EXPECT_TRUE(engine
+                    .Write(0, {"k"},
+                           [&](WriteTxn&, int64_t) {
+                             in_write = true;
+                             while (!release) std::this_thread::yield();
+                             return Status::Ok();
+                           })
+                    .ok());
+  });
+  while (!in_write) std::this_thread::yield();
+  int64_t seen = 0;
+  std::thread waiter([&] {
+    EXPECT_TRUE(
+        engine.Write(0, {"k"}, [&](WriteTxn&, int64_t now_ms) { return seen = now_ms, Status::Ok(); }).ok());
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  clock.Advance(500);  // while the waiter is blocked on the key stripe
+  const int64_t after = clock.NowMs();
+  release = true;
+  holder.join();
+  waiter.join();
+  EXPECT_EQ(seen, after);
+}
+
 TEST_F(EngineFixture, WriteExclusiveWaitsForInflightWrites) {
   std::atomic<bool> in_write{false}, release{false}, exclusive_ran{false};
   std::thread writer([&] {
     EXPECT_TRUE(engine
                     .Write(0, {"k"},
-                           [&](WriteTxn&) {
+                           [&](WriteTxn&, int64_t) {
                              in_write = true;
                              while (!release) std::this_thread::yield();
                              EXPECT_FALSE(exclusive_ran.load());
@@ -176,7 +234,7 @@ TEST_F(EngineFixture, WriteExclusiveWaitsForInflightWrites) {
   while (!in_write) std::this_thread::yield();
   std::thread flusher([&] {
     EXPECT_TRUE(engine
-                    .WriteExclusive([&](WriteTxn&) {
+                    .WriteExclusive([&](WriteTxn&, int64_t) {
                       exclusive_ran = true;
                       return Status::Ok();
                     })

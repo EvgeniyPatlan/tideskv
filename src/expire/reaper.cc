@@ -14,7 +14,7 @@ namespace tideskv {
 
 Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out) {
   out->clear();
-  return engine_.Read([&](ReadView& view) {
+  return engine_.Read([&](ReadView& view, int64_t) {
     auto it = view.NewIterator(
         ColumnFamily::kExpire,
         {encoding::DbPrefix(db), encoding::ExpireUpperBound(db, static_cast<uint64_t>(now_ms))});
@@ -32,12 +32,13 @@ Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* ou
   });
 }
 
-Result<size_t> ExpireReaper::DeleteDue(uint8_t db, int64_t now_ms, std::span<const Due> due) {
+Result<size_t> ExpireReaper::DeleteDue(uint8_t db, std::span<const Due> due) {
   std::vector<std::string_view> keys;
   keys.reserve(due.size());
   for (const Due& d : due) keys.push_back(d.key);
   size_t deleted = 0;
-  const Status st = engine_.Write(db, keys, [&](WriteTxn& txn) {
+  // now_ms is read under the key locks, so the re-check below sees current expiry.
+  const Status st = engine_.Write(db, keys, [&](WriteTxn& txn, int64_t now_ms) {
     deleted = 0;  // fn re-runs after a commit conflict
     for (const Due& d : due) {
       auto obj = LoadObject(txn, db, d.key, now_ms);
@@ -64,7 +65,7 @@ Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full) {
   size_t deleted = 0;
   for (size_t i = 0; i < due.size(); i += kKeysPerWrite) {
     const size_t n = std::min(kKeysPerWrite, due.size() - i);
-    auto chunk = DeleteDue(db, now_ms, std::span<const Due>(due).subspan(i, n));
+    auto chunk = DeleteDue(db, std::span<const Due>(due).subspan(i, n));
     if (!chunk.ok()) return chunk.status();
     deleted += *chunk;
   }
@@ -73,7 +74,7 @@ Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full) {
 
 Result<size_t> ExpireReaper::RunOnce() {
   const auto deadline = std::chrono::steady_clock::now() + options_.cycle_budget;
-  const int64_t now = engine_.NowMs();
+  const int64_t now = engine_.NowMs();  // selects candidates; each is re-checked under its lock
   size_t total = 0;
   for (uint8_t db = 0; db < encoding::kNumDatabases; ++db) {
     bool full = true;

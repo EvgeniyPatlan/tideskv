@@ -75,10 +75,9 @@ void Scan(ExecContext& ctx, const ArgList& argv) {
   if (Status st = ResolveCursor(ctx, argv[1], &args.position); !st.ok()) return ReplyError(ctx, st);
   if (Status st = ParseScanOptions(argv, &args); !st.ok()) return ReplyError(ctx, st);
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   ScanPage page;
-  const Status st = e.Snapshot([&](ReadView& v) {
-    return ScanKeys(v, ctx.session.db, args.position, args.count, args.filter, now, &page);
+  const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
+    return ScanKeys(v, ctx.session.db, args.position, args.count, args.filter, now_ms, &page);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   const uint64_t next =
@@ -91,10 +90,9 @@ void Scan(ExecContext& ctx, const ArgList& argv) {
 
 void Keys(ExecContext& ctx, const ArgList& argv) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   std::vector<std::string> keys;
-  const Status st =
-      e.Snapshot([&](ReadView& v) { return MatchingKeys(v, ctx.session.db, argv[1], now, &keys); });
+  const Status st = e.Snapshot(
+      [&](ReadView& v, int64_t now_ms) { return MatchingKeys(v, ctx.session.db, argv[1], now_ms, &keys); });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.ArrayHeader(keys.size());
   for (const std::string& k : keys) ctx.reply.Bulk(k);
@@ -107,10 +105,10 @@ uint64_t NextRandom() {
 
 void RandomKeyCmd(ExecContext& ctx, const ArgList&) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   std::optional<std::string> key;
-  const Status st = e.Snapshot(
-      [&](ReadView& v) { return MoveInto(RandomKey(v, ctx.session.db, now, NextRandom()), &key); });
+  const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(RandomKey(v, ctx.session.db, now_ms, NextRandom()), &key);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   key ? ctx.reply.Bulk(*key) : ctx.reply.Null();
 }

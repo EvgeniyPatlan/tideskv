@@ -40,10 +40,9 @@ Result<LcsArgs> ParseLcsArgs(const ArgList& argv) {
 // Reads both values on one snapshot; a missing key is "".
 Status LoadPair(ExecContext& ctx, const ArgList& argv, std::string* a, std::string* b) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
-  return e.Snapshot([&](ReadView& v) {
+  return e.Snapshot([&](ReadView& v, int64_t now_ms) {
     for (auto [key, out] : {std::pair{&argv[1], a}, std::pair{&argv[2], b}}) {
-      auto obj = LoadObject(v, ctx.session.db, *key, now);
+      auto obj = LoadObject(v, ctx.session.db, *key, now_ms);
       if (!obj.ok()) return obj.status();
       if (obj->live() && !obj->IsString()) {
         return Status::UserError(std::string(kErrLcsNotStrings));

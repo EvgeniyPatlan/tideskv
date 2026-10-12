@@ -16,16 +16,22 @@ namespace tideskv {
 // ExclusiveGate and M6 adds the Sequencer and replog here; command code never changes.
 //
 // Lock order: the Gate is always taken before any key stripe. The Gate is not re-entrant,
-// so a ReadFn/WriteFn must never call back into the Engine.
+// so a ReadFn/WriteFn must never call back into the Engine (debug builds assert this).
+//
+// Every fn receives now_ms: the clock read after the Gate (and, for writes, the key stripes)
+// is held, and re-read on each commit attempt. Expiry/liveness decisions must use it, never
+// a time taken before the call: a key can expire while the command waits for its locks.
 class Engine {
  public:
-  using ReadFn = std::function<Status(ReadView&)>;
-  using WriteFn = std::function<Status(WriteTxn&)>;
+  using ReadFn = std::function<Status(ReadView&, int64_t now_ms)>;
+  using WriteFn = std::function<Status(WriteTxn&, int64_t now_ms)>;
   static constexpr int kMaxCommitAttempts = 3;  // spec §5.4: TDB_ERR_CONFLICT
 
   Engine(Storage& storage, LockManager& locks, const Clock& clock)
       : storage_(storage), locks_(locks), clock_(clock) {}
 
+  // For parse-time work only (turning a relative EX/PX into a deadline, as Redis does at
+  // command start); never for an expiry decision, which uses the fn's now_ms.
   int64_t NowMs() const { return clock_.NowMs(); }
   // Latest committed data; no key locks.
   Status Read(const ReadFn& fn);

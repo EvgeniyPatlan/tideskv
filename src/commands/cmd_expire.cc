@@ -38,12 +38,13 @@ void ExpireGeneric(ExecContext& ctx, const ArgList& argv, ExpireUnit unit, std::
   auto cond = ParseCondition(argv);
   if (!cond.ok()) return ReplyError(ctx, cond.status());
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
-  auto when = ParseExpireCommandTime(argv[2], unit, now, name);
+  // Parse-time base for a relative deadline (as Redis does at command start); whether the
+  // deadline has already passed is judged with the Engine's under-lock now_ms.
+  auto when = ParseExpireCommandTime(argv[2], unit, e.NowMs(), name);
   if (!when.ok()) return ReplyError(ctx, when.status());
   int64_t result = 0;
-  const Status st = e.Write(ctx.session.db, {argv[1]}, [&](WriteTxn& txn) {
-    return MoveInto(SetKeyExpire(txn, ctx.session.db, argv[1], *when, *cond, now), &result);
+  const Status st = e.Write(ctx.session.db, {argv[1]}, [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(SetKeyExpire(txn, ctx.session.db, argv[1], *when, *cond, now_ms), &result);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(result);
@@ -60,10 +61,10 @@ void PExpireAt(ExecContext& ctx, const ArgList& a) {
 
 void TtlGeneric(ExecContext& ctx, const ArgList& argv, bool millis, bool absolute) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   int64_t ms = 0;
-  const Status st =
-      e.Read([&](ReadView& v) { return MoveInto(KeyTtlMs(v, ctx.session.db, argv[1], absolute, now), &ms); });
+  const Status st = e.Read([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(KeyTtlMs(v, ctx.session.db, argv[1], absolute, now_ms), &ms);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(ms < 0 || millis ? ms : (ms + 500) / 1000);
 }
@@ -75,8 +76,8 @@ void PExpireTime(ExecContext& ctx, const ArgList& a) { TtlGeneric(ctx, a, true, 
 
 void Persist(ExecContext& ctx, const ArgList& argv) {
   int64_t result = 0;
-  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now) {
-    return MoveInto(PersistKey(txn, ctx.session.db, argv[1], now), &result);
+  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(PersistKey(txn, ctx.session.db, argv[1], now_ms), &result);
   });
   if (ok) ctx.reply.Integer(result);
 }

@@ -20,11 +20,10 @@ std::vector<std::string_view> KeysFrom(const ArgList& argv, size_t first) {
 
 void Del(ExecContext& ctx, const ArgList& argv) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   const auto keys = KeysFrom(argv, 1);
   int64_t n = 0;
-  const Status st = e.Write(ctx.session.db, keys, [&](WriteTxn& txn) {
-    return MoveInto(DeleteKeys(txn, ctx.session.db, keys, now), &n);
+  const Status st = e.Write(ctx.session.db, keys, [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(DeleteKeys(txn, ctx.session.db, keys, now_ms), &n);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(n);
@@ -32,21 +31,21 @@ void Del(ExecContext& ctx, const ArgList& argv) {
 
 void Exists(ExecContext& ctx, const ArgList& argv) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   const auto keys = KeysFrom(argv, 1);
   int64_t n = 0;
-  const Status st =
-      e.Snapshot([&](ReadView& v) { return MoveInto(CountExisting(v, ctx.session.db, keys, now), &n); });
+  const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(CountExisting(v, ctx.session.db, keys, now_ms), &n);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(n);
 }
 
 void Type(ExecContext& ctx, const ArgList& argv) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   std::string type;
-  const Status st =
-      e.Read([&](ReadView& v) { return MoveInto(TypeOf(v, ctx.session.db, argv[1], now), &type); });
+  const Status st = e.Read([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(TypeOf(v, ctx.session.db, argv[1], now_ms), &type);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString(type);
 }
@@ -64,9 +63,9 @@ void Select(ExecContext& ctx, const ArgList& argv) {
 
 void DbSize(ExecContext& ctx, const ArgList&) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   uint64_t n = 0;
-  const Status st = e.Snapshot([&](ReadView& v) { return MoveInto(CountKeys(v, ctx.session.db, now), &n); });
+  const Status st = e.Snapshot(
+      [&](ReadView& v, int64_t now_ms) { return MoveInto(CountKeys(v, ctx.session.db, now_ms), &n); });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(static_cast<int64_t>(n));
 }
@@ -80,24 +79,24 @@ bool FlushArgsOk(const ArgList& argv) {
 void FlushDbCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
   const uint8_t db = ctx.session.db;
-  const Status st = ctx.server.engine().WriteExclusive([db](WriteTxn& txn) { return FlushDb(txn, db); });
+  const Status st =
+      ctx.server.engine().WriteExclusive([db](WriteTxn& txn, int64_t) { return FlushDb(txn, db); });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }
 
 void FlushAllCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
-  const Status st = ctx.server.engine().WriteExclusive([](WriteTxn& txn) { return FlushAll(txn); });
+  const Status st = ctx.server.engine().WriteExclusive([](WriteTxn& txn, int64_t) { return FlushAll(txn); });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }
 
 void RenameGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
   Engine& e = ctx.server.engine();
-  const int64_t now = e.NowMs();
   int64_t result = 0;
-  const Status st = e.Write(ctx.session.db, {argv[1], argv[2]}, [&](WriteTxn& txn) {
-    return MoveInto(RenameKey(txn, ctx.session.db, argv[1], argv[2], nx, now), &result);
+  const Status st = e.Write(ctx.session.db, {argv[1], argv[2]}, [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(RenameKey(txn, ctx.session.db, argv[1], argv[2], nx, now_ms), &result);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   nx ? ctx.reply.Integer(result) : ctx.reply.SimpleString("OK");

@@ -63,7 +63,7 @@ class ExpireReaper {
   };
   Status CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out);
   Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full);
-  Result<size_t> DeleteDue(uint8_t db, int64_t now_ms, std::span<const Due> due);
+  Result<size_t> DeleteDue(uint8_t db, std::span<const Due> due);
   void Loop();
 
   Engine& engine_;
