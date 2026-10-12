@@ -9,6 +9,7 @@
 #include "encoding/key_codec.h"
 #include "encoding/meta_codec.h"
 #include "support/fake_server_services.h"
+#include "types/object_store.h"
 
 namespace tideskv::test {
 
@@ -44,11 +45,10 @@ struct CommandHarness {
             ->Put(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key), encoding::EncodeMetadata(meta, payload))
             .ok());
     if (meta.expire_ms != 0) {
-      std::string oid;
-      coding::PutFixed64BE(&oid, meta.oid);
       ASSERT_TRUE((*txn)
                       ->Put(ColumnFamily::kExpire,
-                            encoding::ExpireKeyFor(db, static_cast<uint64_t>(meta.expire_ms), key), oid)
+                            encoding::ExpireKeyFor(db, static_cast<uint64_t>(meta.expire_ms), key),
+                            ExpireValue(meta.oid))
                       .ok());
     }
     ASSERT_TRUE((*txn)->Commit().ok());
