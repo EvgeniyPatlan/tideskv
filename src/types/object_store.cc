@@ -71,7 +71,8 @@ Status DeleteObject(WriteTxn& txn, uint8_t db, std::string_view key, const Metad
   if (Status st = DeleteExpireEntry(txn, db, key, meta); !st.ok()) return st;
   if (!meta.IsCollection()) return Status::Ok();
   const uint16_t slot = KeySlot(key);
-  // M3 revisits this per the Task 3 spike decision (R1: delete_prefix tombstone cost).
+  // One O(1) prefix tombstone per CF (M2 Task 3 spike, M3 E6); the CompactionScheduler counts
+  // these deletes and periodically compacts the subkey/zscore CFs to drop the dead entries.
   if (Status st = txn.DeletePrefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(db, slot, meta.oid));
       !st.ok()) {
     return st;

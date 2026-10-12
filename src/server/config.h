@@ -18,8 +18,11 @@ struct ConfigValues {
   uint16_t port = 6666;
   int workers = 0;  // 0 = number of CPUs
   std::string dir = "./data";
-  std::string sync_mode = "interval";             // none | interval | full
-  uint64_t compaction_collection_deletes = 1000;  // M3 E6; 0 = never
+  std::string sync_mode = "interval";  // none | interval | full
+  // M3 E6: compact the whole subkey/zscore CFs after this many collection deletes; 0 = never.
+  // Until that compaction runs, iterating in a slot right after a very large collection was
+  // deleted can be slow (dead subkeys are skipped one by one); with 0 that cost stays.
+  uint64_t compaction_collection_deletes = 1000;
   uint64_t sync_interval_us = 1'000'000;
   uint64_t block_cache_size = 4ULL << 30;
   uint64_t memtable_size = 64ULL << 20;
