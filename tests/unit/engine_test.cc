@@ -143,6 +143,22 @@ TEST(Engine, EachCommitAttemptReadsTheClockAgain) {
   EXPECT_EQ(seen, (std::vector<int64_t>{100, 110, 120}));
 }
 
+#ifndef NDEBUG
+TEST(EngineDeathTest, NestedEngineCallAssertsInDebugBuilds) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        InMemoryStorage storage;
+        LockManager locks;
+        FakeClock clock;
+        Engine engine(storage, locks, clock);
+        (void)engine.Read(
+            [&](ReadView&, int64_t) { return engine.Read([](ReadView&, int64_t) { return Status::Ok(); }); });
+      },
+      "called back into the Engine");
+}
+#endif
+
 TEST(Engine, ConflictGivesUpAfterThreeAttempts) {
   ConflictingStorage storage(100);
   LockManager locks;
