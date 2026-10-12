@@ -60,6 +60,12 @@ Status Engine::WriteExclusive(const WriteFn& fn) {
   return RunTxn(fn);
 }
 
+Status Engine::RunExclusive(const std::function<Status()>& fn) {
+  [[maybe_unused]] const ReentryCheck reentry;
+  std::unique_lock gate(gate_);
+  return fn();
+}
+
 Status Engine::RunTxn(const WriteFn& fn) {
   Status st;
   for (int attempt = 1; attempt <= kMaxCommitAttempts; ++attempt) {

@@ -47,6 +47,8 @@ class Engine {
   Status Write(uint8_t db, const std::vector<std::string_view>& keys, const WriteFn& fn);
   // Whole-keyspace write (FLUSHDB/FLUSHALL): waits for in-flight commands, then runs alone.
   Status WriteExclusive(const WriteFn& fn);
+  // Runs fn with every command drained and held off (no transaction, snapshot or iterator open).
+  Status RunExclusive(const std::function<Status()>& fn);
 
  private:
   Status RunTxn(const WriteFn& fn);

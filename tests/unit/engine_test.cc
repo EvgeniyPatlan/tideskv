@@ -265,6 +265,39 @@ TEST_F(EngineFixture, WriteExclusiveWaitsForInflightWrites) {
   EXPECT_TRUE(exclusive_ran.load());
 }
 
+TEST_F(EngineFixture, RunExclusiveWaitsForInflightSnapshots) {
+  std::atomic<bool> in_snapshot{false}, release{false}, exclusive_ran{false};
+  std::thread reader([&] {
+    EXPECT_TRUE(engine
+                    .Snapshot([&](ReadView&, int64_t) {
+                      in_snapshot = true;
+                      while (!release) std::this_thread::yield();
+                      EXPECT_FALSE(exclusive_ran.load());
+                      return Status::Ok();
+                    })
+                    .ok());
+  });
+  while (!in_snapshot) std::this_thread::yield();
+  std::thread exclusive([&] {
+    EXPECT_TRUE(engine
+                    .RunExclusive([&] {
+                      exclusive_ran = true;
+                      return Status::Ok();
+                    })
+                    .ok());
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(exclusive_ran.load());
+  release = true;
+  reader.join();
+  exclusive.join();
+  EXPECT_TRUE(exclusive_ran.load());
+}
+
+TEST_F(EngineFixture, RunExclusiveReturnsTheCallbacksStatus) {
+  EXPECT_EQ(engine.RunExclusive([] { return Status::Busy("x"); }).code(), StatusCode::kBusy);
+}
+
 class RecordingListener final : public CommitListener {
  public:
   void OnCommitted(const std::vector<RangeDelete>& d) override { batches.push_back(d); }
