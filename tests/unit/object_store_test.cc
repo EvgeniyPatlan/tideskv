@@ -109,6 +109,37 @@ TEST_F(ObjectStoreTest, OverwriteWithoutExpireDropsTheEntry) {
   EXPECT_EQ(Load(0, "k").meta.expire_ms, 0);
 }
 
+TEST_F(ObjectStoreTest, MoveObjectMovesMetaAndExpire) {
+  PutString(0, "a", "v", kNow + 100);
+  Write([&](WriteTxn& t) {
+    auto obj = LoadForWrite(t, 0, "a", kNow);
+    if (!obj.ok()) return obj.status();
+    return MoveObject(t, 0, "a", "b", *obj);
+  });
+  const auto& meta = Cf(ColumnFamily::kMeta);
+  ASSERT_EQ(meta.size(), 1u);
+  EXPECT_EQ(meta.begin()->first, MetaKeyFor(0, "b"));
+  const StoredObject moved = Load(0, "b");
+  EXPECT_TRUE(moved.IsString());
+  EXPECT_EQ(moved.payload, "v");
+  EXPECT_EQ(moved.meta.expire_ms, kNow + 100);
+  EXPECT_EQ(Load(0, "a").state, ObjectState::kMissing);
+  const auto& idx = Cf(ColumnFamily::kExpire);
+  ASSERT_EQ(idx.size(), 1u);
+  EXPECT_EQ(idx.begin()->first, ExpireKeyFor(0, kNow + 100, "b"));
+}
+
+TEST_F(ObjectStoreTest, CheckMovableRefusesOnlyCollectionsAcrossSlots) {
+  Metadata hash;
+  hash.type = ValueType::kHash;
+  Metadata str;
+  str.type = ValueType::kString;
+  ASSERT_NE(KeySlot("h1"), KeySlot("h2"));
+  EXPECT_TRUE(CheckMovable(str, "h1", "h2").ok());
+  EXPECT_TRUE(CheckMovable(hash, "{t}1", "{t}2").ok());
+  EXPECT_FALSE(CheckMovable(hash, "h1", "h2").ok());
+}
+
 TEST_F(ObjectStoreTest, DbsAreIsolated) {
   PutString(0, "k", "zero", 0);
   PutString(1, "k", "one", 0);

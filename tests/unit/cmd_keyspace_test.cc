@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
 #include "commands/reply_util.h"
+#include "common/crc16.h"
+#include "encoding/key_codec.h"
 #include "support/command_harness.h"
+#include "types/errors.h"
 #include "types/format_version.h"
 
 namespace tideskv {
@@ -108,6 +111,69 @@ TEST_F(KeyspaceCmds, FlushAllClearsEveryDbButNotSys) {
   EXPECT_EQ(h.Cf(ColumnFamily::kSys).count(std::string(kFormatVersionKey)), 1u);
   EXPECT_EQ(h.Run({"FLUSHALL", "ASYNC"}), kOk);
   EXPECT_EQ(h.Run({"FLUSHALL", "x"}), Err(kErrSyntax));
+}
+
+TEST_F(KeyspaceCmds, RenameMovesValueAndTtl) {
+  const int64_t now = h.clock().NowMs();
+  EXPECT_EQ(h.Run({"SET", "a", "v", "PX", "500"}), kOk);
+  EXPECT_EQ(h.Run({"RENAME", "a", "b"}), kOk);
+  EXPECT_EQ(h.Run({"GET", "a"}), kNil);
+  EXPECT_EQ(h.Run({"GET", "b"}), Bulk("v"));
+  const auto& idx = h.Cf(ColumnFamily::kExpire);
+  ASSERT_EQ(idx.size(), 1u);
+  EXPECT_EQ(idx.begin()->first, encoding::ExpireKeyFor(0, now + 500, "b"));
+}
+
+TEST_F(KeyspaceCmds, RenameOverwritesAndRenameNxDoesNot) {
+  EXPECT_EQ(h.Run({"MSET", "a", "1", "b", "2"}), kOk);
+  EXPECT_EQ(h.Run({"RENAMENX", "a", "b"}), Int(0));
+  EXPECT_EQ(h.Run({"GET", "a"}), Bulk("1"));
+  h.SeedHash(0, "h", 3, true);
+  EXPECT_EQ(h.Run({"RENAME", "a", "h"}), kOk);  // dst hash is replaced, its field dropped
+  EXPECT_EQ(h.Run({"GET", "h"}), Bulk("1"));
+  EXPECT_TRUE(h.Cf(ColumnFamily::kSubkey).empty());
+  EXPECT_EQ(h.Run({"RENAMENX", "h", "fresh"}), Int(1));
+}
+
+TEST_F(KeyspaceCmds, RenameEdgeCases) {
+  EXPECT_EQ(h.Run({"RENAME", "nope", "x"}), Err(kErrNoSuchKey));
+  EXPECT_EQ(h.Run({"RENAMENX", "nope", "x"}), Err(kErrNoSuchKey));
+  EXPECT_EQ(h.Run({"SET", "a", "1"}), kOk);
+  EXPECT_EQ(h.Run({"RENAME", "a", "a"}), kOk);
+  EXPECT_EQ(h.Run({"RENAMENX", "a", "a"}), Int(0));
+  EXPECT_EQ(h.Run({"GET", "a"}), Bulk("1"));
+  EXPECT_EQ(h.Run({"SET", "e", "v", "PX", "10"}), kOk);
+  h.clock().Advance(10);
+  EXPECT_EQ(h.Run({"RENAME", "e", "x"}), Err(kErrNoSuchKey));  // Review Focus #1
+}
+
+TEST_F(KeyspaceCmds, RenameBinaryAndHashtagKeys) {  // Review Focus #4
+  const std::string src("s\0\xff", 3), dst("d\r\n", 3);
+  EXPECT_EQ(h.Run({"SET", src, "v"}), kOk);
+  EXPECT_EQ(h.Run({"RENAME", src, dst}), kOk);
+  EXPECT_EQ(h.Run({"GET", dst}), Bulk("v"));
+  EXPECT_EQ(h.Run({"SET", "{t}x", "1"}), kOk);
+  EXPECT_EQ(h.Run({"RENAME", "{t}x", "{t}y"}), kOk);
+  EXPECT_EQ(h.Run({"GET", "{t}y"}), Bulk("1"));
+}
+
+TEST_F(KeyspaceCmds, RenameCollectionWithinSlotKeepsData) {
+  h.SeedHash(0, "{u}a", 21, true);
+  EXPECT_EQ(h.Run({"RENAME", "{u}a", "{u}b"}), kOk);
+  EXPECT_EQ(h.Run({"TYPE", "{u}b"}), "+hash\r\n");
+  EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 1u);  // same oid, data untouched
+}
+
+TEST_F(KeyspaceCmds, RenameCollectionAcrossSlotsIsRefusedForNow) {
+  ASSERT_NE(KeySlot("h1"), KeySlot("h2"));
+  h.SeedHash(0, "h1", 22, true);
+  EXPECT_EQ(h.Run({"RENAME", "h1", "h2"}), Err(kErrRenameCrossSlot));
+  EXPECT_EQ(h.Run({"TYPE", "h1"}), "+hash\r\n");  // nothing changed
+  h.SeedHash(0, "h3", 23, true);
+  EXPECT_EQ(h.Run({"SET", "s", "v"}), kOk);
+  ASSERT_NE(KeySlot("h3"), KeySlot("s"));
+  EXPECT_EQ(h.Run({"RENAME", "h3", "s"}), Err(kErrRenameCrossSlot));
+  EXPECT_EQ(h.Run({"GET", "s"}), Bulk("v"));  // a refused rename never drops dst
 }
 
 }  // namespace

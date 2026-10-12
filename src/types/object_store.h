@@ -38,6 +38,13 @@ Status WriteString(WriteTxn& txn, uint8_t db, std::string_view key, std::string_
 // Changes the deadline of a live object (0 = persist) and moves its expire entry.
 Status SetObjectExpire(WriteTxn& txn, uint8_t db, std::string_view key, const StoredObject& obj,
                        int64_t expire_ms);
+// OK unless obj is a collection and src/dst hash to different slots: a collection keeps its oid,
+// and its subkeys are keyed by slot, so it cannot move across slots until M3 copies (UserError).
+Status CheckMovable(const encoding::Metadata& meta, std::string_view src, std::string_view dst);
+// Moves the live object obj (loaded from src) to dst, which the caller made absent. Moves its
+// expire entry. A collection keeps its oid, so both keys must share a slot (see CheckMovable).
+Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
+                  const StoredObject& obj);
 // For the expire reaper only (documented exception to "writers call LoadForWrite"): removes the
 // index entry (db, expire_ms, key) without touching meta.
 Status DeleteStaleExpireEntry(WriteTxn& txn, uint8_t db, std::string_view key, uint64_t expire_ms);

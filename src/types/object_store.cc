@@ -4,6 +4,7 @@
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -96,6 +97,22 @@ Status SetObjectExpire(WriteTxn& txn, uint8_t db, std::string_view key, const St
   m.expire_ms = expire_ms;
   if (Status st = PutMeta(txn, db, key, m, obj.payload); !st.ok()) return st;
   return PutExpireEntry(txn, db, key, m);
+}
+
+Status CheckMovable(const Metadata& meta, std::string_view src, std::string_view dst) {
+  if (meta.IsCollection() && KeySlot(src) != KeySlot(dst)) {
+    return Status::UserError(std::string(kErrRenameCrossSlot));
+  }
+  return Status::Ok();
+}
+
+Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
+                  const StoredObject& obj) {
+  if (Status st = CheckMovable(obj.meta, src, dst); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(db, src)); !st.ok()) return st;
+  if (Status st = DeleteExpireEntry(txn, db, src, obj.meta); !st.ok()) return st;
+  if (Status st = PutMeta(txn, db, dst, obj.meta, obj.payload); !st.ok()) return st;
+  return PutExpireEntry(txn, db, dst, obj.meta);
 }
 
 }  // namespace tideskv

@@ -2,6 +2,7 @@
 
 #include "encoding/key_codec.h"
 #include "encoding/meta_codec.h"
+#include "types/errors.h"
 #include "types/object_store.h"
 
 namespace tideskv {
@@ -106,6 +107,24 @@ Result<int64_t> PersistKey(WriteTxn& txn, uint8_t db, std::string_view key, int6
   if (!obj.ok()) return obj.status();
   if (!obj->live() || obj->meta.expire_ms == 0) return int64_t{0};
   if (Status st = SetObjectExpire(txn, db, key, *obj, 0); !st.ok()) return st;
+  return int64_t{1};
+}
+
+Result<int64_t> RenameKey(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst, bool nx,
+                          int64_t now_ms) {
+  auto from = LoadForWrite(txn, db, src, now_ms);
+  if (!from.ok()) return from.status();
+  if (!from->live()) return Status::UserError(std::string(kErrNoSuchKey));
+  if (src == dst) return int64_t{nx ? 0 : 1};
+  auto to = LoadForWrite(txn, db, dst, now_ms);
+  if (!to.ok()) return to.status();
+  if (to->live()) {
+    if (nx) return int64_t{0};
+    // Checked before dropping dst so a refused rename leaves both keys intact.
+    if (Status st = CheckMovable(from->meta, src, dst); !st.ok()) return st;
+    if (Status st = DeleteObject(txn, db, dst, to->meta); !st.ok()) return st;
+  }
+  if (Status st = MoveObject(txn, db, src, dst, *from); !st.ok()) return st;
   return int64_t{1};
 }
 

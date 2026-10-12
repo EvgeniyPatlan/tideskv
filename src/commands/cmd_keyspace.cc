@@ -92,6 +92,20 @@ void FlushAllCmd(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.SimpleString("OK");
 }
 
+void RenameGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
+  Engine& e = ctx.server.engine();
+  const int64_t now = e.NowMs();
+  int64_t result = 0;
+  const Status st = e.Write(ctx.session.db, {argv[1], argv[2]}, [&](WriteTxn& txn) {
+    return MoveInto(RenameKey(txn, ctx.session.db, argv[1], argv[2], nx, now), &result);
+  });
+  if (!st.ok()) return ReplyError(ctx, st);
+  nx ? ctx.reply.Integer(result) : ctx.reply.SimpleString("OK");
+}
+
+void Rename(ExecContext& ctx, const ArgList& argv) { RenameGeneric(ctx, argv, false); }
+void RenameNx(ExecContext& ctx, const ArgList& argv) { RenameGeneric(ctx, argv, true); }
+
 }  // namespace
 
 void RegisterKeyspaceCommands(CommandRegistry& r) {
@@ -103,6 +117,8 @@ void RegisterKeyspaceCommands(CommandRegistry& r) {
   r.Register({"dbsize", 1, kCmdReadOnly | kCmdFast, 0, 0, 0, &DbSize});
   r.Register({"flushdb", -1, kCmdWrite, 0, 0, 0, &FlushDbCmd});
   r.Register({"flushall", -1, kCmdWrite, 0, 0, 0, &FlushAllCmd});
+  r.Register({"rename", 3, kCmdWrite, 1, 2, 1, &Rename});
+  r.Register({"renamenx", 3, kCmdWrite | kCmdFast, 1, 2, 1, &RenameNx});
 }
 
 }  // namespace tideskv
