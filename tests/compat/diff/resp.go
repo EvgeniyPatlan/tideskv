@@ -192,3 +192,55 @@ func PositiveAsToken(r Reply) Reply {
 	}
 	return r
 }
+
+// SortPairs normalises a flat field/value array (HGETALL, HRANDFIELD ... WITHVALUES) by pair.
+func SortPairs(r Reply) Reply {
+	if r.Kind != '*' || len(r.Elems)%2 != 0 {
+		return r
+	}
+	type pair struct{ k, v Reply }
+	ps := make([]pair, 0, len(r.Elems)/2)
+	for i := 0; i < len(r.Elems); i += 2 {
+		ps = append(ps, pair{r.Elems[i], r.Elems[i+1]})
+	}
+	sort.Slice(ps, func(i, j int) bool {
+		if ps[i].k.Str != ps[j].k.Str {
+			return ps[i].k.Str < ps[j].k.Str
+		}
+		return ps[i].v.Str < ps[j].v.Str
+	})
+	out := Reply{Kind: '*', Elems: make([]Reply, 0, len(r.Elems))}
+	for _, p := range ps {
+		out.Elems = append(out.Elems, p.k, p.v)
+	}
+	return out
+}
+
+// NormaliseScan sorts the element page of a [cursor, elements] HSCAN/SSCAN reply; the cursor
+// still compares exactly.
+func NormaliseScan(r Reply, pairs bool) Reply {
+	if r.Kind != '*' || len(r.Elems) != 2 {
+		return r
+	}
+	if pairs {
+		r.Elems[1] = SortPairs(r.Elems[1])
+	} else {
+		r.Elems[1] = SortElems(r.Elems[1])
+	}
+	return r
+}
+
+// sameShape compares random-pick replies (SRANDMEMBER/HRANDFIELD): errors and scalars exactly
+// by kind/nullness, arrays by length only.
+func sameShape(a, b Reply) bool {
+	if a.Kind != b.Kind || a.Null != b.Null {
+		return false
+	}
+	switch a.Kind {
+	case '-':
+		return a.Str == b.Str
+	case '*':
+		return len(a.Elems) == len(b.Elems)
+	}
+	return true
+}

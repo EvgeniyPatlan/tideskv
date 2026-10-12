@@ -54,13 +54,20 @@ func (g *Gen) farMs() string  { return strconv.FormatInt((farUnix+g.r.Int63n(1_0
 type Norm int
 
 const (
-	NormNone Norm = iota
-	NormSort      // order-free array (KEYS)
-	NormTTL       // positive TTL/PTTL values depend on the clock; -2/-1 compare exactly
+	NormNone      Norm = iota
+	NormSort           // order-free array (KEYS)
+	NormTTL            // positive TTL/PTTL values depend on the clock; -2/-1 compare exactly
+	NormLen            // random picks: same kind and array length (errors exact)
+	NormPairs          // order-free field/value pairs (HGETALL)
+	NormScanPairs      // HSCAN page: cursor exact, pairs order-free
+	NormScanElems      // SSCAN page: cursor exact, elements order-free
 )
 
 // Next returns the next command and how its reply is normalised before comparing.
 func (g *Gen) Next() ([]string, Norm) {
+	if g.r.Intn(2) == 0 { // half the stream exercises hashes and sets
+		return g.collection(g.key())
+	}
 	cmd, sorted := g.next()
 	switch {
 	case sorted:
@@ -190,4 +197,82 @@ func (g *Gen) malformed() []string {
 	return [][]string{{"SET", "k0"}, {"GET"}, {"SET", "k0", "v", "BOGUS"}, {"SET", "k0", "v", "NX", "XX"},
 		{"MSET", "k0"}, {"EXPIRE", "k0", "10", "NX", "XX"}, {"EXPIRE", "k0", "abc"}, {"SETRANGE", "k0", "-1", "x"},
 		{"INCRBY", "k0", "1.5"}, {"SELECT", "99"}, {"GETEX", "k0", "BOGUS"}, {"LCS", "k0", "k1", "BOGUS"}}[g.r.Intn(12)]
+}
+
+func (g *Gen) field() string { return g.pick("f0", "f1", "f2", "f3", "", "f\x00b", "7", "-3") }
+
+// collection returns the next hash/set command and its normalisation. Hashes and sets stay
+// small (at most 8 fields/members) so Redis keeps listpack/intset encodings, which return
+// HSCAN/SSCAN in one page with cursor 0, as TidesKV does with COUNT 1000.
+func (g *Gen) collection(k string) ([]string, Norm) {
+	f, v := g.field(), g.value()
+	switch g.r.Intn(30) {
+	case 0, 1:
+		return []string{"HSET", k, f, v, g.field(), g.value()}, NormNone
+	case 2:
+		return []string{"HSETNX", k, f, v}, NormNone
+	case 3:
+		return []string{"HGET", k, f}, NormNone
+	case 4:
+		return []string{"HMGET", k, f, g.field()}, NormNone
+	case 5:
+		return []string{"HDEL", k, f, g.field()}, NormNone
+	case 6:
+		if cmd := g.pick("HLEN", "HKEYS", "HVALS"); cmd != "HLEN" {
+			return []string{cmd, k}, NormSort
+		}
+		return []string{"HLEN", k}, NormNone
+	case 7:
+		return []string{"HGETALL", k}, NormPairs
+	case 8:
+		return []string{"HSTRLEN", k, f}, NormNone
+	case 9:
+		return []string{"HEXISTS", k, f}, NormNone
+	case 10:
+		return []string{"HINCRBY", k, f, g.int()}, NormNone
+	case 11:
+		return []string{"HINCRBYFLOAT", k, f, g.pick("0.1", "-1.5", "1e3", "abc", "3", "inf")}, NormNone
+	case 12:
+		return append([]string{"HRANDFIELD", k}, g.randCount()...), NormLen
+	case 13:
+		return []string{"HSCAN", k, "0", "COUNT", "1000"}, NormScanPairs
+	case 14, 15:
+		return []string{"SADD", k, f, g.field(), g.field()}, NormNone
+	case 16:
+		return []string{"SREM", k, f, g.field()}, NormNone
+	case 17:
+		return []string{g.pick("SCARD", "SMEMBERS"), k}, NormSort
+	case 18:
+		return []string{"SISMEMBER", k, f}, NormNone
+	case 19:
+		return []string{"SMISMEMBER", k, f, g.field()}, NormNone
+	case 20:
+		return [][]string{{"SPOP", k, "1000"}, {"SPOP", k, "0"}, {"SPOP", k, "-1"}, {"SPOP", k, "x"}, {"SPOP", k, "1", "2"}}[g.r.Intn(5)], NormSort
+	case 21:
+		return append([]string{"SRANDMEMBER", k}, g.randCount()...), NormLen
+	case 22:
+		return []string{"SMOVE", k, g.key(), f}, NormNone
+	case 23:
+		return []string{g.pick("SINTER", "SUNION", "SDIFF"), k, g.key(), g.key()}, NormSort
+	case 24:
+		return []string{g.pick("SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE"), g.key(), k, g.key()}, NormNone
+	case 25:
+		return append([]string{"SINTERCARD", g.pick("2", "1", "0", "3", "x"), k, g.key()}, g.limit()...), NormNone
+	case 26:
+		return []string{"SSCAN", k, "0", "COUNT", "1000"}, NormScanElems
+	case 27:
+		return [][]string{{"HSET", k, f}, {"HSET", k, f, v, f}, {"HMSET", k, f}, {"HSCAN", k, "x"},
+			{"HSCAN", k, "0", "TYPE", "hash"}, {"HRANDFIELD", k, "1", "BOGUS"}, {"HRANDFIELD", k, "-9223372036854775808"},
+			{"HRANDFIELD", k, "4611686018427387904", "WITHVALUES"}}[g.r.Intn(8)], NormNone
+	default:
+		return []string{"TYPE", k}, NormNone
+	}
+}
+
+func (g *Gen) randCount() []string {
+	return [][]string{nil, {"100"}, {"0"}, {"-5"}, {"3"}, {"100", "WITHVALUES"}, {"-4", "withvalues"}, {"x"}}[g.r.Intn(8)]
+}
+
+func (g *Gen) limit() []string {
+	return [][]string{nil, {"LIMIT", "1"}, {"LIMIT", "0"}, {"LIMIT", "-1"}, {"LIMIT"}}[g.r.Intn(5)]
 }

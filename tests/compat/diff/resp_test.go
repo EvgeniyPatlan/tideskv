@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"reflect"
 	"testing"
 )
 
@@ -67,5 +68,29 @@ func TestAssertDrainedDetectsTrailingReply(t *testing.T) {
 	}
 	if err := clean.AssertDrained(); err != nil {
 		t.Fatalf("clean connection reported %v", err)
+	}
+}
+
+func TestShapeNormalisers(t *testing.T) {
+	a := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "x"}, {Kind: '$', Str: "y"}}}
+	b := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "z"}, {Kind: '$', Str: "z"}}}
+	if !sameShape(a, b) {
+		t.Fatal("arrays of equal length must compare equal under NormLen")
+	}
+	if sameShape(a, Reply{Kind: '*'}) {
+		t.Fatal("different lengths must differ")
+	}
+	if sameShape(Reply{Kind: '-', Str: "ERR a"}, Reply{Kind: '-', Str: "ERR b"}) {
+		t.Fatal("errors must still compare exactly")
+	}
+	p := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "b"}, {Kind: '$', Str: "2"}, {Kind: '$', Str: "a"}, {Kind: '$', Str: "1"}}}
+	q := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "a"}, {Kind: '$', Str: "1"}, {Kind: '$', Str: "b"}, {Kind: '$', Str: "2"}}}
+	if !reflect.DeepEqual(SortPairs(p), SortPairs(q)) {
+		t.Fatal("pair order must not matter")
+	}
+	s1 := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "0"}, p}}
+	s2 := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "0"}, q}}
+	if !reflect.DeepEqual(NormaliseScan(s1, true), NormaliseScan(s2, true)) {
+		t.Fatal("HSCAN pages with the same pairs must compare equal")
 	}
 }

@@ -111,6 +111,14 @@ func sameReply(norm Norm, ra, rb Reply, rawA, rawB []byte) bool {
 		return reflect.DeepEqual(SortElems(ra), SortElems(rb))
 	case NormTTL:
 		return reflect.DeepEqual(PositiveAsToken(ra), PositiveAsToken(rb))
+	case NormLen:
+		return sameShape(ra, rb)
+	case NormPairs:
+		return reflect.DeepEqual(SortPairs(ra), SortPairs(rb))
+	case NormScanPairs:
+		return reflect.DeepEqual(NormaliseScan(ra, true), NormaliseScan(rb, true))
+	case NormScanElems:
+		return reflect.DeepEqual(NormaliseScan(ra, false), NormaliseScan(rb, false))
 	}
 	return bytes.Equal(rawA, rawB)
 }
