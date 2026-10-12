@@ -39,29 +39,37 @@ TEST(CollectionPersistenceIT, HashesSetsAndTtlsSurviveRestart) {
   EXPECT_LE(pttl, 100000);
 }
 
+// All keys share one hash slot ({o}), so subkeys live under (db, slot, oid) alone: a new hash given
+// an old hash's oid would list that old hash's surviving fields (and the old hash the new field).
 TEST(CollectionPersistenceIT, OidsAreNeverReusedAfterKill9) {
+  constexpr int kHashes = 100;
   TempDir dir("tideskv-coll");
   {
-    TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--sync-mode", "full"}, .dir = dir.str()});
+    TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});  // default (interval) sync mode
     auto c = s.Connect();
     ASSERT_NE(c, nullptr);
-    for (int i = 0; i < 100; ++i) {
-      ASSERT_EQ(c->Command({"HSET", "old" + std::to_string(i), "of" + std::to_string(i), "v"}).integer, 1);
+    for (int i = 0; i < kHashes; ++i) {
+      const std::string n = std::to_string(i);
+      ASSERT_EQ(c->Command({"HSET", "{o}old" + n, "of" + n, "v"}).integer, 1);
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // past one WAL sync interval
     s.Kill9();
   }
-  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--sync-mode", "full"}, .dir = dir.str()});
+  TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
-  for (int i = 0; i < 100; ++i) {
-    ASSERT_EQ(c->Command({"HSET", "new" + std::to_string(i), "nf", "v"}).integer, 1);
+  ASSERT_EQ(c->Command({"HLEN", "{o}old0"}).integer, 1);  // the old data survived the kill
+  for (int i = 0; i < kHashes; ++i) {
+    ASSERT_EQ(c->Command({"HSET", "{o}new" + std::to_string(i), "nf", "v"}).integer, 1);
   }
-  for (int i = 0; i < 100; ++i) {
-    // A reused oid would make a new hash show an old hash's field (or the reverse).
-    EXPECT_EQ(c->Command({"HGETALL", "new" + std::to_string(i)}).elements.size(), 2u) << i;
-    const RespValue old = c->Command({"HGETALL", "old" + std::to_string(i)});
-    ASSERT_EQ(old.elements.size(), 2u) << i;
-    EXPECT_EQ(old.elements[0].str, "of" + std::to_string(i));
+  for (int i = 0; i < kHashes; ++i) {
+    const std::string n = std::to_string(i);
+    const RespValue fresh = c->Command({"HGETALL", "{o}new" + n});
+    ASSERT_EQ(fresh.elements.size(), 2u) << i << ": " << ToDebugString(fresh);
+    EXPECT_EQ(fresh.elements[0].str, "nf");
+    const RespValue old = c->Command({"HGETALL", "{o}old" + n});
+    ASSERT_EQ(old.elements.size(), 2u) << i << ": " << ToDebugString(old);
+    EXPECT_EQ(old.elements[0].str, "of" + n);
   }
 }
 
