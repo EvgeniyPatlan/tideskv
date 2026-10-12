@@ -13,10 +13,6 @@
 namespace tideskv {
 namespace {
 
-void ReplyOptional(ExecContext& ctx, const std::optional<std::string>& v) {
-  v ? ctx.reply.Bulk(*v) : ctx.reply.Null();
-}
-
 // Runs StringSet for one key and replies like SET (OK / nil / old value with GET).
 void DoSet(ExecContext& ctx, std::string_view key, std::string_view value, const SetOptions& opts) {
   SetResult result;

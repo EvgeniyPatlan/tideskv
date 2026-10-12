@@ -17,6 +17,7 @@ void RegisterLcsCommand(CommandRegistry& registry);          // cmd_lcs.cc
 void RegisterKeyspaceCommands(CommandRegistry& registry);    // cmd_keyspace.cc
 void RegisterExpireCommands(CommandRegistry& registry);      // cmd_expire.cc
 void RegisterScanCommands(CommandRegistry& registry);        // cmd_scan.cc
+void RegisterHashCommands(CommandRegistry& registry);        // cmd_hash.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv

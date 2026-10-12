@@ -34,4 +34,27 @@ bool WriteOneKey(ExecContext& ctx, std::string_view key, Fn&& fn) {
   return false;
 }
 
+// Replies a bulk string, or nil for nullopt.
+inline void ReplyOptional(ExecContext& ctx, const std::optional<std::string>& v) {
+  v ? ctx.reply.Bulk(*v) : ctx.reply.Null();
+}
+
+// Runs fn(ReadView&, int64_t now_ms) -> Status through Engine::Read (Engine::Snapshot for
+// RunSnapshot). Returns true on success; otherwise replies the error and returns false.
+template <typename Fn>
+bool RunRead(ExecContext& ctx, Fn&& fn) {
+  const Status st = ctx.server.engine().Read(fn);
+  if (st.ok()) return true;
+  ReplyError(ctx, st);
+  return false;
+}
+
+template <typename Fn>
+bool RunSnapshot(ExecContext& ctx, Fn&& fn) {
+  const Status st = ctx.server.engine().Snapshot(fn);
+  if (st.ok()) return true;
+  ReplyError(ctx, st);
+  return false;
+}
+
 }  // namespace tideskv
