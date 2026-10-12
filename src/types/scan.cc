@@ -29,7 +29,7 @@ Status Current(const Iterator& it, int64_t now_ms, std::string* user_key, ValueT
 bool Matches(const ScanFilter& f, std::string_view key, ValueType type) {
   if (f.match_nothing) return false;
   if (f.type && *f.type != type) return false;
-  return f.pattern.empty() || GlobMatch(f.pattern, key);
+  return !f.pattern || GlobMatch(*f.pattern, key);
 }
 
 }  // namespace
@@ -68,7 +68,8 @@ Status MatchingKeys(ReadView& view, uint8_t db, std::string_view pattern, int64_
   out->clear();
   auto it = view.NewIterator(ColumnFamily::kMeta, DbRange(db));
   if (!it.ok()) return it.status();
-  const ScanFilter filter{pattern == "*" ? std::string_view() : pattern, std::nullopt, false};
+  ScanFilter filter;
+  if (pattern != "*") filter.pattern = pattern;  // Redis 7.2 keysCommand: only "*" means all keys
   Status st = (*it)->SeekToFirst();
   for (; st.ok() && (*it)->Valid(); st = (*it)->Next()) {
     std::string key;

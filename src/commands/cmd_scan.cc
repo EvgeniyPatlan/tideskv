@@ -34,7 +34,8 @@ Status ParseScanOptions(const ArgList& argv, ScanArgs* out) {
       if (n < 1) return Status::UserError(std::string(kErrSyntax));
       out->count = static_cast<size_t>(n);
     } else if (EqualsIgnoreCase(argv[i], "MATCH")) {
-      out->filter.pattern = value == "*" ? std::string_view() : std::string_view(value);
+      // Redis 7.2 scanGenericCommand: use_pattern unless the pattern is exactly "*".
+      out->filter.pattern = value == "*" ? std::nullopt : std::optional<std::string_view>(value);
     } else if (EqualsIgnoreCase(argv[i], "TYPE")) {
       out->filter.type = TypeFromName(value);
       out->filter.match_nothing = !out->filter.type.has_value();

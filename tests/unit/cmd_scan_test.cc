@@ -126,12 +126,26 @@ TEST_F(ScanCmds, CursorErrorsAndRestarts) {
   ScanReply unknown = ParseScan(Run({"SCAN", "987654321", "COUNT", "100"}));  // unknown cursor: restart
   EXPECT_EQ(unknown.keys.size(), 30u);
   EXPECT_EQ(unknown.cursor, "0");
-  ScanReply page = ParseScan(Run({"SCAN", "0", "COUNT", "10"}));
+  // A cursor saved in db 1 sorts after all of db 0; used in db 0 it must restart (D9), not
+  // resume past every db-0 key.
+  h.session.db = 1;
+  for (int i = 0; i < 20; ++i) h.Run({"SET", "db1-" + std::to_string(i), "v"});
+  ScanReply page = ParseScan(Run({"SCAN", "0", "COUNT", "5"}));
   ASSERT_NE(page.cursor, "0");
-  h.session.db = 1;  // a cursor from db 0 restarts in db 1
-  ScanReply other = ParseScan(h.Run({"SCAN", page.cursor}));
-  EXPECT_TRUE(other.keys.empty());
-  EXPECT_EQ(other.cursor, "0");
+  h.session.db = 0;
+  ScanReply restarted = ParseScan(h.Run({"SCAN", page.cursor, "COUNT", "100"}));
+  EXPECT_EQ(restarted.keys.size(), 30u);
+  EXPECT_EQ(restarted.cursor, "0");
+}
+
+// Redis 7.2 only treats exactly "*" as "no filter": an empty pattern matches only the empty key.
+TEST_F(ScanCmds, EmptyPatternMatchesOnlyTheEmptyKey) {
+  EXPECT_EQ(Run({"MSET", "", "x", "a", "y"}), kOk);
+  EXPECT_EQ(Run({"KEYS", ""}), test::Arr({test::Bulk("")}));
+  EXPECT_EQ(FullScan({"MATCH", ""}), std::multiset<std::string>{""});
+  EXPECT_EQ(Run({"DEL", ""}), test::Int(1));
+  EXPECT_EQ(Run({"KEYS", ""}), "*0\r\n");
+  EXPECT_TRUE(FullScan({"MATCH", ""}).empty());
 }
 
 TEST_F(ScanCmds, Keys) {

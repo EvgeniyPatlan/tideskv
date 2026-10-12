@@ -14,7 +14,7 @@
 namespace tideskv {
 
 struct ScanFilter {
-  std::string_view pattern;                 // empty = everything
+  std::optional<std::string_view> pattern;  // nullopt = everything; Redis: set unless exactly "*"
   std::optional<encoding::ValueType> type;  // nullopt = any type
   bool match_nothing = false;               // unknown TYPE name: Redis 7.2 returns no keys
 };
