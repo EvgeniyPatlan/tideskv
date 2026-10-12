@@ -8,6 +8,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterStringCommands(registry);
   RegisterStringEditCommands(registry);
   RegisterCounterCommands(registry);
+  RegisterLcsCommand(registry);
 }
 
 }  // namespace tideskv
