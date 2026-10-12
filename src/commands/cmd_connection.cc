@@ -84,9 +84,9 @@ void WriteHelloReply(ExecContext& ctx) {
 
 // Result of parsing HELLO options.
 struct HelloOptions {
-  int proto;
-  std::optional<std::pair<std::string_view, std::string_view>> auth;  // user, pass
-  std::optional<std::string_view> setname;
+  int proto = 2;
+  std::optional<std::pair<std::string_view, std::string_view>> auth{};  // user, pass
+  std::optional<std::string_view> setname{};
 };
 
 // Parses "HELLO [protover [AUTH user pass] [SETNAME name]]". Collects options without applying.
@@ -118,7 +118,7 @@ std::optional<std::string> ParseHello(const ArgList& argv, int current_proto, He
 }
 
 void Hello(ExecContext& ctx, const ArgList& argv) {
-  HelloOptions opts;
+  HelloOptions opts{};
   // Step a: Parse everything first, return error if syntax invalid (no session mutation)
   if (auto err = ParseHello(argv, ctx.session.protocol, &opts)) return ctx.reply.Error(*err);
 

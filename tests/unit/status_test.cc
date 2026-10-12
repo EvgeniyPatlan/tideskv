@@ -33,12 +33,23 @@ TEST(Status, ToStringIncludesCodeAndMessage) {
   EXPECT_EQ(Status::NotFound().ToString(), "NotFound");
 }
 
+// GCC -O2 emits a known -Wmaybe-uninitialized false positive from the inlined
+// std::variant<int, Status> destructor when the active alternative is the int (the
+// std::string inside the inactive Status alternative is reported as uninitialized).
+// Result is correct (see HoldsError); suppress narrowly for this test only.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 TEST(Result, HoldsValue) {
   Result<int> r(42);
   ASSERT_TRUE(r.ok());
   EXPECT_EQ(*r, 42);
   EXPECT_TRUE(r.status().ok());
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 TEST(Result, HoldsError) {
   Result<int> r(Status::NotFound("missing"));
