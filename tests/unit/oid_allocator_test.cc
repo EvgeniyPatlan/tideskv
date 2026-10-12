@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <set>
 #include <thread>
 #include <vector>
@@ -86,7 +87,8 @@ TEST(OidAllocator, PersistFailureIsReturnedAndRetried) {
   fail = false;
   auto id = a.Next();
   ASSERT_TRUE(id.ok());
-  EXPECT_GE(*id, 1u);
+  EXPECT_EQ(*id, 1u);
+  EXPECT_EQ(a.hwm(), 1 + OidAllocator::kLeaseSize);
 }
 
 TEST(OidAllocator, ConcurrentCallersGetDistinctIds) {
@@ -94,13 +96,22 @@ TEST(OidAllocator, ConcurrentCallersGetDistinctIds) {
   OidAllocator a(s);
   ASSERT_TRUE(a.Init().ok());
   std::vector<std::vector<uint64_t>> got(4);
+  std::atomic<bool> failed{false};
   std::vector<std::thread> threads;
   for (int t = 0; t < 4; ++t) {
     threads.emplace_back([&, t] {
-      for (int i = 0; i < 20000; ++i) got[t].push_back(*a.Next());
+      for (int i = 0; i < 20000; ++i) {
+        auto id = a.Next();
+        if (!id.ok()) {
+          failed = true;
+          return;
+        }
+        got[t].push_back(*id);
+      }
     });
   }
   for (auto& th : threads) th.join();
+  ASSERT_FALSE(failed);
   std::set<uint64_t> all;
   for (const auto& v : got) all.insert(v.begin(), v.end());
   EXPECT_EQ(all.size(), 80000u);
