@@ -1,6 +1,7 @@
 #pragma once
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -51,6 +52,7 @@ class Server {
 
   Status Listen();
   void DoAccept();
+  void OnAcceptError(const std::error_code& ec);
   void OnAccept(asio::ip::tcp::socket socket, Worker& worker);
 
   ServerOptions options_;
@@ -58,6 +60,8 @@ class Server {
   std::shared_ptr<ConnStats> stats_ = std::make_shared<ConnStats>();
   asio::io_context accept_ctx_;
   std::optional<asio::ip::tcp::acceptor> acceptor_;
+  std::optional<asio::steady_timer> accept_backoff_;  // accept thread only
+  std::chrono::steady_clock::time_point last_accept_warn_{};
   std::thread accept_thread_;
   std::vector<std::unique_ptr<Worker>> workers_;
   size_t next_worker_ = 0;  // only touched on the accept thread

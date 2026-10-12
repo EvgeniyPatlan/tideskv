@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 
 #include "support/resp_client.h"
@@ -16,7 +17,9 @@ using namespace std::chrono_literals;
 
 // Test executor: echoes argv joined by spaces; ID/NAME expose session fields; QUIT closes.
 void TestExecutor(Session& s, const std::vector<std::string>& argv, resp::ReplyBuilder& r) {
-  if (argv[0] == "QUIT") {
+  if (argv[0] == "BOOM") {
+    throw std::runtime_error("boom");
+  } else if (argv[0] == "QUIT") {
     r.SimpleString("OK");
     s.close_after_reply = true;
   } else if (argv[0] == "ID") {
@@ -187,6 +190,29 @@ TEST(NetServer, BadBindAddressFailsStart) {
   o.port = 0;
   Server server(std::move(o), &TestExecutor);
   EXPECT_EQ(server.Start().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(NetServer, ExecutorExceptionRepliesErrorAndCloses) {
+  auto server = StartServer();
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->Send({"BOOM"}));
+  auto r = c->Read();
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->type, RespValue::Type::kError);
+  EXPECT_EQ(r->str, "ERR internal error");
+  EXPECT_TRUE(c->WaitForClose());
+  auto c2 = RespClient::Connect(server->port());
+  ASSERT_NE(c2, nullptr);
+  EXPECT_EQ(c2->Command({"alive"}).str, "alive");
+}
+
+TEST(NetServer, StartTwiceFails) {
+  auto server = StartServer();
+  EXPECT_EQ(server->Start().code(), StatusCode::kInvalidArgument);
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(c->Command({"ok"}).str, "ok");
 }
 
 }  // namespace

@@ -12,6 +12,11 @@ Server::Server(ServerOptions options, CommandExecutor executor)
 
 Server::~Server() { Stop(); }
 
+namespace {
+constexpr auto kAcceptBackoff = std::chrono::milliseconds(50);
+constexpr auto kAcceptWarnInterval = std::chrono::seconds(1);
+}  // namespace
+
 Status Server::Listen() {
   std::error_code ec;
   const asio::ip::address addr = asio::ip::make_address(options_.bind, ec);
@@ -32,11 +37,14 @@ Status Server::Listen() {
   if (ec) return fail("bind");
   acceptor_->listen(asio::socket_base::max_listen_connections, ec);
   if (ec) return fail("listen");
-  port_ = acceptor_->local_endpoint(ec).port();
+  const auto local = acceptor_->local_endpoint(ec);
+  if (ec) return fail("local_endpoint");
+  port_ = local.port();
   return Status::Ok();
 }
 
 Status Server::Start() {
+  if (running_ || acceptor_) return Status::InvalidArgument("server already started");
   if (Status st = Listen(); !st.ok()) return st;
   const int n = std::max(1, options_.workers);
   for (int i = 0; i < n; ++i) {
@@ -45,6 +53,7 @@ Status Server::Start() {
     w->thread = std::thread([ctx = &w->ctx] { ctx->run(); });
     workers_.push_back(std::move(w));
   }
+  accept_backoff_.emplace(accept_ctx_);
   running_ = true;
   DoAccept();
   accept_thread_ = std::thread([this] { accept_ctx_.run(); });
@@ -55,12 +64,24 @@ void Server::DoAccept() {
   Worker& worker = *workers_[next_worker_++ % workers_.size()];
   acceptor_->async_accept(worker.ctx, [this, &worker](std::error_code ec, asio::ip::tcp::socket socket) {
     if (!running_) return;
-    if (ec) {
-      spdlog::warn("accept failed: {}", ec.message());
-    } else {
-      OnAccept(std::move(socket), worker);
-    }
+    if (ec == asio::error::operation_aborted) return;
+    if (ec == asio::error::connection_aborted) return DoAccept();
+    if (ec) return OnAcceptError(ec);
+    OnAccept(std::move(socket), worker);
     DoAccept();
+  });
+}
+
+// Persistent failures (EMFILE/ENFILE) would otherwise spin: back off before re-arming.
+void Server::OnAcceptError(const std::error_code& ec) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_accept_warn_ >= kAcceptWarnInterval) {
+    last_accept_warn_ = now;
+    spdlog::warn("accept failed: {}", ec.message());
+  }
+  accept_backoff_->expires_after(kAcceptBackoff);
+  accept_backoff_->async_wait([this](std::error_code wait_ec) {
+    if (!wait_ec && running_) DoAccept();
   });
 }
 
@@ -87,6 +108,7 @@ void Server::Stop() {
   asio::post(accept_ctx_, [this] {
     std::error_code ignored;
     acceptor_->close(ignored);  // the pending accept completes with operation_aborted
+    accept_backoff_->cancel();
   });
   if (accept_thread_.joinable()) accept_thread_.join();
   for (auto& w : workers_) {

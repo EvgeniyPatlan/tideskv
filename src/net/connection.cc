@@ -54,7 +54,13 @@ void Connection::ProcessInput() {
       break;
     }
     stats_->total_commands.fetch_add(1, std::memory_order_relaxed);
-    executor_(session_, parser_.args(), reply_);
+    try {
+      executor_(session_, parser_.args(), reply_);
+    } catch (const std::exception& e) {
+      spdlog::error("command failed for client id={}: {}", session_.id, e.what());
+      reply_.Error("ERR internal error");
+      session_.close_after_reply = true;
+    }
   }
   in_.erase(0, offset);
 }
