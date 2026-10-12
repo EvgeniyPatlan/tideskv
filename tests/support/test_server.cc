@@ -8,8 +8,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 namespace tideskv::test {
@@ -53,13 +55,27 @@ TestServer::TestServer(std::string binary, Options options) {
   for (auto& a : args) cargs.push_back(a.data());
   cargs.push_back(nullptr);
 
+  // Build the child's environment before fork(): the child may only make async-signal-safe calls.
+  std::vector<std::string> env_strings;
+  for (char** e = environ; *e != nullptr; ++e) {
+    const std::string_view entry(*e);
+    const std::string_view name = entry.substr(0, entry.find('='));
+    const bool overridden =
+        std::any_of(options.env.begin(), options.env.end(), [&](const auto& kv) { return kv.first == name; });
+    if (!overridden) env_strings.emplace_back(entry);
+  }
+  for (const auto& [k, v] : options.env) env_strings.push_back(k + "=" + v);
+  std::vector<char*> envp;
+  for (auto& e : env_strings) envp.push_back(e.data());
+  envp.push_back(nullptr);
+
   pid_ = ::fork();
   if (pid_ == 0) {  // child: async-signal-safe calls only
     const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) ::_exit(126);
     ::dup2(fd, STDOUT_FILENO);
     ::dup2(fd, STDERR_FILENO);
-    ::execv(cargs[0], cargs.data());
+    ::execve(cargs[0], cargs.data(), envp.data());
     ::_exit(127);
   }
   if (pid_ < 0) ADD_FAILURE() << "fork failed";

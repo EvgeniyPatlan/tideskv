@@ -156,5 +156,14 @@ TEST(ServerIT, BadConfigExitsWithCode1) {
   EXPECT_EQ(s.Wait(), 1) << s.Stderr();
 }
 
+TEST(ServerIT, RequirepassFromEnvironment) {
+  TestServer s(TIDESKV_SERVER_BIN, {.env = {{"TIDESKV_REQUIREPASS", "envpw"}}});
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(c->Command({"PING"}).str, "NOAUTH Authentication required.");
+  EXPECT_EQ(c->Command({"AUTH", "envpw"}).str, "OK");
+  EXPECT_EQ(s.Stderr().find("envpw"), std::string::npos);  // never logged
+}
+
 }  // namespace
 }  // namespace tideskv::test

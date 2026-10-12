@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "support/resp_client.h"
@@ -16,10 +17,11 @@ namespace tideskv::test {
 class TestServer {
  public:
   struct Options {
-    std::vector<std::string> extra_args;  // appended last, so they override defaults
-    std::string dir;                      // data dir; empty = a private temp dir
-    uint16_t port = 0;                    // 0 = a free port
-    bool wait_ready = true;               // wait until the server answers
+    std::vector<std::string> extra_args;                   // appended last, so they override defaults
+    std::string dir;                                       // data dir; empty = a private temp dir
+    uint16_t port = 0;                                     // 0 = a free port
+    bool wait_ready = true;                                // wait until the server answers
+    std::vector<std::pair<std::string, std::string>> env;  // overrides the child's environment
   };
 
   // Two overloads rather than a defaulted Options: GCC cannot default-construct a

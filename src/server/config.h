@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -35,6 +36,9 @@ class Config {
 
   Status LoadFile(const std::string& path);                // Redis-style "name value" lines
   Status ApplyArgs(const std::vector<std::string>& args);  // {"--port", "7000", ...}
+  // Reads TIDESKV_REQUIREPASS (spec §9: secrets may come from the environment). Values are
+  // validated like the config file's; never logged.
+  Status ApplyEnv(const std::function<const char*(const char*)>& getenv_fn);
   Status Set(std::string_view name, std::string_view value, bool at_runtime);
   // All-or-nothing. On failure *failed_name (if non-null) names the offending option.
   Status SetMany(const Pairs& pairs, bool at_runtime, std::string* failed_name);

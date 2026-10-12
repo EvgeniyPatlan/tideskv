@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 
 #include "support/temp_dir.h"
 
@@ -201,6 +202,28 @@ TEST(Config, CompressionOption) {
   EXPECT_TRUE(c.Set("compression", "no", false).ok());
   EXPECT_FALSE(c.Set("compression", "snappy", false).ok());
   EXPECT_FALSE(c.Set("compression", "lz4", /*at_runtime=*/true).ok());  // startup-only
+}
+
+TEST(Config, RequirepassFromEnvironment) {
+  Config c;
+  auto env = [](const char* name) -> const char* {
+    return std::string_view(name) == "TIDESKV_REQUIREPASS" ? "from-env" : nullptr;
+  };
+  ASSERT_TRUE(c.ApplyEnv(env).ok());
+  EXPECT_EQ(c.Snapshot().requirepass, "from-env");
+  ASSERT_TRUE(c.ApplyArgs({"--requirepass", "from-args"}).ok());  // args win
+  EXPECT_EQ(c.Snapshot().requirepass, "from-args");
+}
+
+TEST(Config, EnvironmentWithoutVariablesChangesNothing) {
+  Config c;
+  ASSERT_TRUE(c.ApplyEnv([](const char*) -> const char* { return nullptr; }).ok());
+  EXPECT_EQ(c.Snapshot().requirepass, "");
+}
+
+TEST(Config, EnvRequirepassIsValidated) {
+  Config c;
+  EXPECT_FALSE(c.ApplyEnv([](const char*) -> const char* { return "bad\npass"; }).ok());
 }
 
 }  // namespace

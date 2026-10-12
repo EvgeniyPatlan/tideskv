@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,11 @@ int main(int argc, char** argv) {
       return 1;
     }
     args.erase(args.begin());
+  }
+  // Precedence: config file < environment < command-line args.
+  if (const tideskv::Status st = config->ApplyEnv([](const char* n) { return std::getenv(n); }); !st.ok()) {
+    std::fprintf(stderr, "configuration error: %s\n", st.message().c_str());
+    return 1;
   }
   if (const tideskv::Status st = config->ApplyArgs(args); !st.ok()) {
     std::fprintf(stderr, "configuration error: %s\n", st.message().c_str());

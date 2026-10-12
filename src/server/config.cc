@@ -249,6 +249,19 @@ Status Config::ApplyArgs(const std::vector<std::string>& args) {
   return SetMany(pairs, false, nullptr);
 }
 
+Status Config::ApplyEnv(const std::function<const char*(const char*)>& getenv_fn) {
+  static constexpr std::pair<const char*, std::string_view> kVars[] = {
+      {"TIDESKV_REQUIREPASS", "requirepass"}};
+  for (const auto& [var, option] : kVars) {
+    const char* value = getenv_fn(var);
+    if (value == nullptr) continue;
+    if (Status st = Set(option, value, /*at_runtime=*/false); !st.ok()) {
+      return Status::InvalidArgument(std::string(var) + ": " + st.message());
+    }
+  }
+  return Status::Ok();
+}
+
 Status Config::Set(std::string_view name, std::string_view value, bool at_runtime) {
   return SetMany({{std::string(name), std::string(value)}}, at_runtime, nullptr);
 }
