@@ -29,4 +29,22 @@ Result<std::vector<int64_t>> SetMultiIsMember(ReadView& view, uint8_t db, std::s
 // SMEMBERS, in byte order.
 Result<std::vector<std::string>> SetMembers(ReadView& view, uint8_t db, std::string_view key, int64_t now_ms);
 
+// SPOP key: one random member, or nullopt for a missing key.
+Result<std::optional<std::string>> SetPopOne(WriteTxn& txn, uint8_t db, std::string_view key,
+                                             std::mt19937_64& rng, int64_t now_ms);
+// SPOP key count: min(count, size) distinct random members, removed with point deletes; the key
+// goes with its last member.
+Result<std::vector<std::string>> SetPop(WriteTxn& txn, uint8_t db, std::string_view key, uint64_t count,
+                                        std::mt19937_64& rng, int64_t now_ms);
+// SRANDMEMBER key: nullopt for a missing key.
+Result<std::optional<std::string>> SetRandomMember(ReadView& view, uint8_t db, std::string_view key,
+                                                   std::mt19937_64& rng, int64_t now_ms);
+// SRANDMEMBER key count (count != INT64_MIN): see RandomElements.
+Result<std::vector<std::string>> SetRandomMembers(ReadView& view, uint8_t db, std::string_view key,
+                                                  int64_t count, std::mt19937_64& rng, int64_t now_ms);
+// SMOVE (Redis 7.2 smoveCommand order): a missing src is 0; then src and dst must be sets;
+// src == dst answers membership; otherwise 1 if member left src (and joined dst).
+Result<int64_t> SetMove(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view src,
+                        std::string_view dst, std::string_view member, int64_t now_ms);
+
 }  // namespace tideskv
