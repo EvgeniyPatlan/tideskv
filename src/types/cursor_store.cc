@@ -21,10 +21,10 @@ ScanPosition MakePosition(std::string full, size_t max_bytes) {
 
 }  // namespace
 
-uint64_t CursorStore::Save(std::string position) {
+uint64_t CursorStore::Save(std::string position, CursorKind kind) {
   ScanPosition pos = MakePosition(std::move(position), kMaxPositionBytes);
   std::lock_guard lock(mu_);
-  Entry entry{++last_, std::move(pos)};
+  Entry entry{++last_, kind, std::move(pos)};
   const size_t cost = Cost(entry);
   while (!entries_.empty() && (entries_.size() >= kCapacity || bytes_ + cost > kMaxBytes)) {
     bytes_ -= Cost(entries_.front());
@@ -35,13 +35,15 @@ uint64_t CursorStore::Save(std::string position) {
   return last_;
 }
 
-std::optional<ScanPosition> CursorStore::Load(uint64_t cursor) const {
+std::optional<ScanPosition> CursorStore::Load(uint64_t cursor, CursorKind kind) const {
   if (cursor == 0) return std::nullopt;
   std::lock_guard lock(mu_);
   if (entries_.empty() || cursor < entries_.front().cursor || cursor > entries_.back().cursor) {
     return std::nullopt;
   }
-  return entries_[cursor - entries_.front().cursor].position;
+  const Entry& entry = entries_[cursor - entries_.front().cursor];
+  if (entry.kind != kind) return std::nullopt;
+  return entry.position;
 }
 
 size_t CursorStore::bytes() const {

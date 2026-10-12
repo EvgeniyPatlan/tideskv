@@ -49,6 +49,8 @@ Status SeekPastTruncated(Iterator& it, const ScanPosition& pos) {
   return it.Seek(pos.key);
 }
 
+}  // namespace
+
 // Positions `it` at the first entry strictly after `pos` (empty key = the first entry).
 Status SeekPast(Iterator& it, const ScanPosition& pos) {
   if (pos.key.empty()) return it.SeekToFirst();
@@ -57,8 +59,6 @@ Status SeekPast(Iterator& it, const ScanPosition& pos) {
   if (st.ok() && it.Valid() && it.key() == pos.key) st = it.Next();
   return st;
 }
-
-}  // namespace
 
 std::optional<ValueType> TypeFromName(std::string_view name) {
   for (ValueType t :
@@ -123,6 +123,28 @@ Result<std::optional<std::string>> RandomKey(ReadView& view, uint8_t db, int64_t
     if (!st.ok()) return st;
   }
   return std::optional<std::string>();
+}
+
+Status ScanElements(ReadView& view, std::string_view prefix, const ScanPosition& position, size_t count,
+                    std::optional<std::string_view> pattern, bool with_values, ElementPage* out) {
+  *out = ElementPage{};
+  auto it =
+      view.NewIterator(ColumnFamily::kSubkey, {std::string(prefix), encoding::PrefixUpperBound(prefix)});
+  if (!it.ok()) return it.status();
+  Status st = SeekPast(**it, position);
+  for (size_t examined = 0; st.ok() && (*it)->Valid() && examined < count; ++examined) {
+    const std::string_view key = (*it)->key();
+    const std::string_view field = key.substr(prefix.size());
+    if (!pattern || GlobMatch(*pattern, field)) {
+      out->items.emplace_back(field);
+      if (with_values) out->items.emplace_back((*it)->value());
+    }
+    out->next_position = std::string(key);
+    st = (*it)->Next();
+  }
+  if (!st.ok()) return st;
+  if (!(*it)->Valid()) out->next_position.clear();  // nothing left
+  return Status::Ok();
 }
 
 }  // namespace tideskv

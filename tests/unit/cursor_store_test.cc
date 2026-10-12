@@ -92,5 +92,15 @@ TEST(CursorStore, TruncatedPositionsStayWithinTheByteBound) {
   EXPECT_TRUE(cs.Load(cursors.back()).has_value());
 }
 
+TEST(CursorStore, KindsDoNotMix) {
+  CursorStore cs;
+  const uint64_t keys = cs.Save("k");
+  const uint64_t elems = cs.Save("e", CursorKind::kElements);
+  EXPECT_TRUE(cs.Load(keys).has_value());
+  EXPECT_FALSE(cs.Load(keys, CursorKind::kElements).has_value());
+  EXPECT_TRUE(cs.Load(elems, CursorKind::kElements).has_value());
+  EXPECT_FALSE(cs.Load(elems).has_value());
+}
+
 }  // namespace
 }  // namespace tideskv

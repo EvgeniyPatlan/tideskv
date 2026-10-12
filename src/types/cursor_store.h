@@ -10,6 +10,10 @@
 
 namespace tideskv {
 
+// What a saved position points into: the keyspace (SCAN) or one collection's elements
+// (HSCAN/SSCAN). A cursor loaded as the other kind is treated as unknown and restarts.
+enum class CursorKind : uint8_t { kKeys, kElements };
+
 // Maps numeric SCAN cursors to scan positions (M2 plan D9): clients parse cursors as
 // integers, so the encoded meta key can't be the cursor itself. Thread-safe; shared by all
 // connections, like Redis cursors. Bounded by entry count and by bytes: the oldest entries
@@ -28,13 +32,14 @@ class CursorStore {
   // SCAN) but never skip one. A digest collision among same-size keys sharing the prefix
   // could make a scan resume too far or loop forever; PositionDigest is keyed per process,
   // so producing one requires breaking a keyed PRF (SipHash-2-4).
-  uint64_t Save(std::string position);
-  std::optional<ScanPosition> Load(uint64_t cursor) const;
+  uint64_t Save(std::string position, CursorKind kind = CursorKind::kKeys);
+  std::optional<ScanPosition> Load(uint64_t cursor, CursorKind kind = CursorKind::kKeys) const;
   size_t bytes() const;  // accounted size of the saved entries; never above kMaxBytes
 
  private:
   struct Entry {
     uint64_t cursor = 0;
+    CursorKind kind = CursorKind::kKeys;
     ScanPosition position;
   };
   static size_t Cost(const Entry& e) { return sizeof(Entry) + e.position.key.capacity(); }

@@ -1,12 +1,10 @@
-#include <cctype>
-#include <cerrno>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "commands/all_commands.h"
 #include "commands/command_rng.h"
 #include "commands/reply_util.h"
+#include "commands/scan_args.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "encoding/key_codec.h"
@@ -16,48 +14,6 @@
 
 namespace tideskv {
 namespace {
-
-struct ScanArgs {
-  ScanPosition position;  // where to resume; empty key = start
-  size_t count = 10;
-  ScanFilter filter;
-};
-
-// Redis 7.2 scanGenericCommand option parsing (argv[2..]).
-Status ParseScanOptions(const ArgList& argv, ScanArgs* out) {
-  for (size_t i = 2; i < argv.size(); i += 2) {
-    if (i + 1 >= argv.size()) return Status::UserError(std::string(kErrSyntax));
-    const std::string& value = argv[i + 1];
-    if (EqualsIgnoreCase(argv[i], "COUNT")) {
-      int64_t n = 0;
-      if (!ParseInt64(value, &n)) return Status::UserError(std::string(kErrNotInteger));
-      if (n < 1) return Status::UserError(std::string(kErrSyntax));
-      out->count = static_cast<size_t>(n);
-    } else if (EqualsIgnoreCase(argv[i], "MATCH")) {
-      // Redis 7.2 scanGenericCommand: use_pattern unless the pattern is exactly "*".
-      out->filter.pattern = value == "*" ? std::nullopt : std::optional<std::string_view>(value);
-    } else if (EqualsIgnoreCase(argv[i], "TYPE")) {
-      out->filter.type = TypeFromName(value);
-      out->filter.match_nothing = !out->filter.type.has_value();
-    } else {
-      return Status::UserError(std::string(kErrSyntax));
-    }
-  }
-  return Status::Ok();
-}
-
-// Redis 7.2 parseScanCursorOrReply: strtoul semantics, so '-1' wraps, '+5', '007' and ''
-// parse, while leading whitespace, trailing junk and out-of-range values are rejected.
-bool ParseScanCursor(const std::string& arg, uint64_t* cursor) {
-  const char* begin = arg.c_str();
-  if (std::isspace(static_cast<unsigned char>(begin[0]))) return false;
-  char* end = nullptr;
-  errno = 0;
-  const unsigned long long v = std::strtoull(begin, &end, 10);
-  if (*end != '\0' || errno == ERANGE) return false;
-  *cursor = v;
-  return true;
-}
 
 // Resolves the cursor to a position inside the current db (D9: unknown or foreign = restart).
 Status ResolveCursor(ExecContext& ctx, const std::string& arg, ScanPosition* position) {
@@ -71,13 +27,14 @@ Status ResolveCursor(ExecContext& ctx, const std::string& arg, ScanPosition* pos
 }
 
 void Scan(ExecContext& ctx, const ArgList& argv) {
-  ScanArgs args;
-  if (Status st = ResolveCursor(ctx, argv[1], &args.position); !st.ok()) return ReplyError(ctx, st);
-  if (Status st = ParseScanOptions(argv, &args); !st.ok()) return ReplyError(ctx, st);
+  ScanPosition position;  // where to resume; empty key = start
+  ScanOptions opts;
+  if (Status st = ResolveCursor(ctx, argv[1], &position); !st.ok()) return ReplyError(ctx, st);
+  if (Status st = ParseScanOptions(argv, 2, /*allow_type=*/true, &opts); !st.ok()) return ReplyError(ctx, st);
   Engine& e = ctx.server.engine();
   ScanPage page;
   const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
-    return ScanKeys(v, ctx.session.db, args.position, args.count, args.filter, now_ms, &page);
+    return ScanKeys(v, ctx.session.db, position, opts.count, opts.filter, now_ms, &page);
   });
   if (!st.ok()) return ReplyError(ctx, st);
   const uint64_t next =
