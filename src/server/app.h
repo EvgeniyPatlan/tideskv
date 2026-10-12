@@ -12,6 +12,7 @@
 #include "net/server.h"
 #include "server/config.h"
 #include "storage/tides_storage.h"
+#include "types/cursor_store.h"
 
 namespace tideskv {
 
@@ -34,6 +35,7 @@ class App final : public ServerServices {
   void ResetStats() override { server_->ResetCounters(); }
   void RequestShutdown() override;
   Engine& engine() override { return *engine_; }
+  CursorStore& cursors() override { return cursors_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -45,6 +47,7 @@ class App final : public ServerServices {
   SystemClock clock_;
   std::unique_ptr<Engine> engine_;
   CommandRegistry registry_;
+  CursorStore cursors_;
   std::unique_ptr<net::Server> server_;
   asio::io_context main_ctx_;
   std::optional<asio::signal_set> signals_;  // registered in Start(), before accepting

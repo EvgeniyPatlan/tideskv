@@ -11,6 +11,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterLcsCommand(registry);
   RegisterKeyspaceCommands(registry);
   RegisterExpireCommands(registry);
+  RegisterScanCommands(registry);
 }
 
 }  // namespace tideskv

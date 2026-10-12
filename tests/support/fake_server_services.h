@@ -5,6 +5,7 @@
 #include "exec/lock_manager.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
+#include "types/cursor_store.h"
 
 namespace tideskv::test {
 
@@ -16,12 +17,14 @@ class FakeServerServices final : public ServerServices {
   void ResetStats() override { ++reset_calls_; }
   void RequestShutdown() override { shutdown_requested_ = true; }
   Engine& engine() override { return engine_; }
+  CursorStore& cursors() override { return cursors_; }
 
   CommandRegistry registry_;
   Config config_;
   ServerStats stats_;
   int reset_calls_ = 0;
   bool shutdown_requested_ = false;
+  CursorStore cursors_;
   InMemoryStorage storage_;
   LockManager locks_;
   FakeClock clock_;

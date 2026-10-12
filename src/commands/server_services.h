@@ -7,6 +7,7 @@
 namespace tideskv {
 
 class CommandRegistry;
+class CursorStore;
 class Engine;
 
 struct ServerStats {
@@ -34,6 +35,7 @@ class ServerServices {
   virtual void ResetStats() = 0;
   virtual void RequestShutdown() = 0;  // must not block; the main thread performs the shutdown
   virtual Engine& engine() = 0;        // data access for commands (Task 5)
+  virtual CursorStore& cursors() = 0;  // SCAN cursor table (Task 14)
 };
 
 }  // namespace tideskv
