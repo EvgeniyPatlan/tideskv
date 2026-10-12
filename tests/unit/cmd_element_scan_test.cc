@@ -65,6 +65,18 @@ TEST_F(ElementScan, HscanErrorOrderFollowsRedis) {
   EXPECT_EQ(h.Run({"SET", "s", "v"}), kOk);
   EXPECT_EQ(h.Run({"HSCAN", "s", "0"}), Err(kErrWrongType));
   EXPECT_EQ(h.Run({"HSCAN", "s", "x"}), Err(kErrInvalidCursor));
+  EXPECT_EQ(h.Run({"HSCAN", "s", "0", "BOGUS", "1"}), Err(kErrWrongType));  // type check before options
+  EXPECT_EQ(h.Run({"HSCAN", "h", "0", "COUNT", "x"}), Err(kErrNotInteger));
+}
+
+TEST_F(ElementScan, ScanRestartsOnAnHscanCursor) {
+  EXPECT_EQ(h.Run({"HSET", "h", "a", "1", "b", "2"}), Int(2));
+  EXPECT_EQ(h.Run({"MSET", "k1", "v", "k2", "v"}), kOk);
+  const ScanReply first = ParseScan(h.Run({"SCAN", "0", "COUNT", "1"}));
+  const ScanReply element = ParseScan(h.Run({"HSCAN", "h", "0", "COUNT", "1"}));
+  ASSERT_NE(element.cursor, "0");
+  const ScanReply r = ParseScan(h.Run({"SCAN", element.cursor, "COUNT", "1"}));
+  EXPECT_EQ(r.keys, first.keys);  // restarted, as from cursor 0
 }
 
 TEST_F(ElementScan, ForeignAndStaleCursorsRestart) {
@@ -105,6 +117,7 @@ TEST_F(ElementScan, ScanHandlesBinaryAndHashtagKeys) {  // M2 Task 14 carry-over
     seen.insert(r.keys.begin(), r.keys.end());
     cursor = r.cursor;
   } while (cursor != "0" && ++calls < 100);
+  EXPECT_LT(calls, 100) << "SCAN never finished";
   EXPECT_EQ(seen, (std::multiset<std::string>{bin, "{t}a", "{t}b", ""}));
 }
 
