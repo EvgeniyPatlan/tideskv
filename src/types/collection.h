@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -62,5 +63,15 @@ Status ForEachElement(ReadView& view, const Collection& c, const ElementFn& fn);
 // position is visited repeatedly). Corruption if the collection holds fewer elements than its size.
 Status IterateRange(ReadView& view, const Collection& c, const std::vector<uint64_t>& sorted_positions,
                     const std::function<void(std::string_view field, std::string_view value)>& fn);
+
+struct Element {
+  std::string field;
+  std::string value;
+};
+
+// count >= 0: min(count, size) distinct elements in byte order; count < 0: |count| picks with
+// repeats, in random order (M3 plan E3). count must not be INT64_MIN. One pass, O(size).
+Result<std::vector<Element>> RandomElements(ReadView& view, const Collection& c, int64_t count,
+                                            std::mt19937_64& rng);
 
 }  // namespace tideskv

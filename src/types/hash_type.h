@@ -49,4 +49,12 @@ Result<int64_t> HashIncrBy(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::s
 Result<std::string> HashIncrByFloat(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view key,
                                     std::string_view field, long double delta, int64_t now_ms);
 
+// HRANDFIELD key: nullopt for a missing key.
+Result<std::optional<std::string>> HashRandomField(ReadView& view, uint8_t db, std::string_view key,
+                                                   std::mt19937_64& rng, int64_t now_ms);
+// HRANDFIELD key count [WITHVALUES] (count != INT64_MIN): fields, or f1, v1, ... with values.
+Result<std::vector<std::string>> HashRandomFields(ReadView& view, uint8_t db, std::string_view key,
+                                                  int64_t count, bool with_values, std::mt19937_64& rng,
+                                                  int64_t now_ms);
+
 }  // namespace tideskv

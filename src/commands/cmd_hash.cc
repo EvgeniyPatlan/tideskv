@@ -1,10 +1,13 @@
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "commands/all_commands.h"
 #include "commands/cmd_util.h"
+#include "commands/command_rng.h"
+#include "commands/count_args.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/number_format.h"
@@ -135,6 +138,46 @@ void HIncrByFloat(ExecContext& ctx, const ArgList& argv) {
   if (ok) ctx.reply.Bulk(value);
 }
 
+void ReplyRandomFields(ExecContext& ctx, const std::vector<std::string>& items, bool with_values) {
+  if (!with_values || ctx.reply.protocol() == 2) {
+    ctx.reply.ArrayHeader(items.size());  // RESP2 WITHVALUES: one flat array
+    for (const std::string& s : items) ctx.reply.Bulk(s);
+    return;
+  }
+  ctx.reply.ArrayHeader(items.size() / 2);  // RESP3: [field, value] pairs
+  for (size_t i = 0; i + 1 < items.size(); i += 2) {
+    ctx.reply.ArrayHeader(2);
+    ctx.reply.Bulk(items[i]);
+    ctx.reply.Bulk(items[i + 1]);
+  }
+}
+
+// Redis 7.2 hrandfieldCommand: count, then syntax, then the WITHVALUES range, then the lookup.
+void HRandField(ExecContext& ctx, const ArgList& argv) {
+  if (argv.size() == 2) {
+    std::optional<std::string> field;
+    const bool ok = RunRead(ctx, [&](ReadView& view, int64_t now_ms) {
+      return MoveInto(HashRandomField(view, ctx.session.db, argv[1], CommandRng(), now_ms), &field);
+    });
+    if (ok) ReplyOptional(ctx, field);
+    return;
+  }
+  int64_t count = 0;
+  if (Status st = ParseRandomCount(argv[2], &count); !st.ok()) return ReplyError(ctx, st);
+  const bool with_values = argv.size() == 4;
+  if (argv.size() > 4 || (with_values && !EqualsIgnoreCase(argv[3], "WITHVALUES"))) {
+    return ctx.reply.Error(kErrSyntax);
+  }
+  constexpr int64_t kHalf = std::numeric_limits<int64_t>::max() / 2;
+  if (with_values && (count < -kHalf || count > kHalf)) return ctx.reply.Error(kErrValueOutOfRange);
+  std::vector<std::string> items;
+  const bool ok = RunRead(ctx, [&](ReadView& view, int64_t now_ms) {
+    return MoveInto(HashRandomFields(view, ctx.session.db, argv[1], count, with_values, CommandRng(), now_ms),
+                    &items);
+  });
+  if (ok) ReplyRandomFields(ctx, items, with_values);
+}
+
 }  // namespace
 
 void RegisterHashCommands(CommandRegistry& r) {
@@ -152,6 +195,7 @@ void RegisterHashCommands(CommandRegistry& r) {
   r.Register({"hgetall", 2, kCmdReadOnly, 1, 1, 1, &HGetAll});
   r.Register({"hincrby", 4, kCmdWrite | kCmdFast, 1, 1, 1, &HIncrBy});
   r.Register({"hincrbyfloat", 4, kCmdWrite | kCmdFast, 1, 1, 1, &HIncrByFloat});
+  r.Register({"hrandfield", -2, kCmdReadOnly, 1, 1, 1, &HRandField});
 }
 
 }  // namespace tideskv

@@ -154,4 +154,30 @@ Result<std::string> HashIncrByFloat(WriteTxn& txn, OidAllocator& oids, uint8_t d
   return out;
 }
 
+Result<std::optional<std::string>> HashRandomField(ReadView& view, uint8_t db, std::string_view key,
+                                                   std::mt19937_64& rng, int64_t now_ms) {
+  auto c = LoadCollection(view, db, key, kHash, now_ms);
+  if (!c.ok()) return c.status();
+  auto picked = RandomElements(view, *c, 1, rng);
+  if (!picked.ok()) return picked.status();
+  if (picked->empty()) return std::optional<std::string>();
+  return std::optional<std::string>(std::move((*picked)[0].field));
+}
+
+Result<std::vector<std::string>> HashRandomFields(ReadView& view, uint8_t db, std::string_view key,
+                                                  int64_t count, bool with_values, std::mt19937_64& rng,
+                                                  int64_t now_ms) {
+  auto c = LoadCollection(view, db, key, kHash, now_ms);
+  if (!c.ok()) return c.status();
+  auto picked = RandomElements(view, *c, count, rng);
+  if (!picked.ok()) return picked.status();
+  std::vector<std::string> out;
+  out.reserve(with_values ? 2 * picked->size() : picked->size());
+  for (Element& e : *picked) {
+    out.push_back(std::move(e.field));
+    if (with_values) out.push_back(std::move(e.value));
+  }
+  return out;
+}
+
 }  // namespace tideskv

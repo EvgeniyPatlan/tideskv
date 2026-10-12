@@ -1,11 +1,13 @@
 #include "types/collection.h"
 
+#include <algorithm>
 #include <memory>
 
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
 #include "types/errors.h"
+#include "types/sample.h"
 
 namespace tideskv {
 namespace {
@@ -135,6 +137,21 @@ Status IterateRange(ReadView& view, const Collection& c, const std::vector<uint6
   if (next < sorted_positions.size())
     return Status::Corruption("collection holds fewer elements than its size");
   return Status::Ok();
+}
+
+Result<std::vector<Element>> RandomElements(ReadView& view, const Collection& c, int64_t count,
+                                            std::mt19937_64& rng) {
+  const bool distinct = count >= 0;
+  const uint64_t wanted = distinct ? static_cast<uint64_t>(count) : static_cast<uint64_t>(-count);
+  const std::vector<uint64_t> positions = SamplePositions(c.size(), wanted, distinct, rng);
+  std::vector<Element> out;
+  out.reserve(positions.size());
+  Status st = IterateRange(view, c, positions, [&](std::string_view f, std::string_view v) {
+    out.push_back({std::string(f), std::string(v)});
+  });
+  if (!st.ok()) return st;
+  if (!distinct) std::shuffle(out.begin(), out.end(), rng);
+  return out;
 }
 
 }  // namespace tideskv

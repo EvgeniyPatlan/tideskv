@@ -176,5 +176,41 @@ TEST_F(HashCmds, BulkReadsAndIncrOnWrongType) {  // Review Focus #3
     EXPECT_EQ(h.Run({cmd, "s"}), Err(kErrWrongType)) << cmd;
 }
 
+TEST_F(HashCmds, RandFieldShapes) {
+  EXPECT_EQ(h.Run({"HRANDFIELD", "nokey"}), kNil);
+  EXPECT_EQ(h.Run({"HRANDFIELD", "nokey", "3"}), "*0\r\n");
+  EXPECT_EQ(h.Run({"HSET", "h", "a", "1", "b", "2", "c", "3"}), Int(3));
+  const std::string one = h.Run({"HRANDFIELD", "h"});
+  EXPECT_TRUE(one == Bulk("a") || one == Bulk("b") || one == Bulk("c")) << one;
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "0"}), "*0\r\n");
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "5"}), Arr({Bulk("a"), Bulk("b"), Bulk("c")}));  // whole hash
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "5", "WITHVALUES"}),
+            Arr({Bulk("a"), Bulk("1"), Bulk("b"), Bulk("2"), Bulk("c"), Bulk("3")}));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "-4"}).substr(0, 4), "*4\r\n");
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "-4", "withvalues"}).substr(0, 4), "*8\r\n");
+}
+
+TEST_F(HashCmds, RandFieldWithValuesNestsPairsInResp3) {
+  EXPECT_EQ(h.Run({"HSET", "h", "a", "1"}), Int(1));
+  h.Resp3();
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "1", "WITHVALUES"}), "*1\r\n*2\r\n" + Bulk("a") + Bulk("1"));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "-2", "WITHVALUES"}),
+            "*2\r\n*2\r\n" + Bulk("a") + Bulk("1") + "*2\r\n" + Bulk("a") + Bulk("1"));
+}
+
+TEST_F(HashCmds, RandFieldErrorsInRedisOrder) {
+  EXPECT_EQ(h.Run({"HSET", "h", "a", "1"}), Int(1));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "x"}), Err(kErrNotInteger));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "-9223372036854775808"}), Err(kErrCountOutOfRange));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "1", "BOGUS"}), Err(kErrSyntax));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "1", "WITHVALUES", "x"}), Err(kErrSyntax));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "4611686018427387904", "WITHVALUES"}), Err(kErrValueOutOfRange));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "h", "-4611686018427387904", "WITHVALUES"}), Err(kErrValueOutOfRange));
+  EXPECT_EQ(h.Run({"SET", "s", "v"}), kOk);
+  EXPECT_EQ(h.Run({"HRANDFIELD", "s"}), Err(kErrWrongType));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "s", "2"}), Err(kErrWrongType));
+  EXPECT_EQ(h.Run({"HRANDFIELD", "s", "x"}), Err(kErrNotInteger));  // count parsed before the lookup
+}
+
 }  // namespace
 }  // namespace tideskv

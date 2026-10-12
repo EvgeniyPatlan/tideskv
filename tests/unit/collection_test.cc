@@ -181,5 +181,25 @@ TEST_F(CollectionTest, IterateRangeVisitsTheSampledPositions) {
   EXPECT_EQ(got, (std::vector<std::string>{"a", "c", "c"}));
 }
 
+TEST_F(CollectionTest, RandomElementsDistinctAndWithRepeats) {
+  MakeHash("h", {{"a", "1"}, {"b", "2"}, {"c", "3"}});
+  auto view = storage.BeginRead();
+  auto c = LoadCollection(**view, 0, "h", ValueType::kHash, 0);
+  std::mt19937_64 rng(5);
+  auto all = RandomElements(**view, *c, 10, rng);
+  ASSERT_TRUE(all.ok());
+  ASSERT_EQ(all->size(), 3u);  // count >= size: the whole hash, in byte order
+  EXPECT_EQ((*all)[0].field, "a");
+  EXPECT_EQ((*all)[2].value, "3");
+  auto two = RandomElements(**view, *c, 2, rng);
+  ASSERT_EQ(two->size(), 2u);
+  EXPECT_NE((*two)[0].field, (*two)[1].field);
+  auto rep = RandomElements(**view, *c, -20, rng);
+  ASSERT_EQ(rep->size(), 20u);
+  for (const Element& e : *rep) EXPECT_TRUE(e.field == "a" || e.field == "b" || e.field == "c");
+  auto none = RandomElements(**view, *c, 0, rng);
+  EXPECT_TRUE(none->empty());
+}
+
 }  // namespace
 }  // namespace tideskv
