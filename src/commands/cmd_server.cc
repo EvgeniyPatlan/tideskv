@@ -38,12 +38,18 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
   }
   if (name == "stats") {
     return Section("Stats", {{"total_connections_received", std::to_string(s.total_connections)},
-                             {"total_commands_processed", std::to_string(s.total_commands)}});
+                             {"total_commands_processed", std::to_string(s.total_commands)},
+                             {"expired_keys", std::to_string(s.expired_keys)}});
   }
   if (name == "persistence") {
-    return Section(
-        "Persistence",
-        {{"loading", "0"}, {"storage_engine", "tidesdb"}, {"dir", s.data_dir}, {"sync_mode", s.sync_mode}});
+    return Section("Persistence", {{"loading", "0"},
+                                   {"storage_engine", "tidesdb"},
+                                   {"dir", s.data_dir},
+                                   {"sync_mode", s.sync_mode},
+                                   {"compression", s.storage_compression},
+                                   {"tombstones", std::to_string(s.storage_tombstones)},
+                                   {"flushes", std::to_string(s.storage_flushes)},
+                                   {"compactions", std::to_string(s.storage_compactions)}});
   }
   if (name == "keyspace") return Section("Keyspace", {});
   return "";

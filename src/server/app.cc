@@ -148,6 +148,13 @@ ServerStats App::Stats() const {
   s.total_commands = k.total_commands;
   s.data_dir = v.dir;
   s.sync_mode = v.sync_mode;
+  s.storage_compression = std::string(CompressionName(storage_->compression()));
+  if (auto st = storage_->Stats(); st.ok()) {  // stats are best-effort; never fail INFO
+    for (const CfStats& cf : st->cf) s.storage_tombstones += cf.total_tombstones;
+    s.storage_flushes = st->flush_count;
+    s.storage_compactions = st->compaction_count;
+  }
+  s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
   return s;
 }
 

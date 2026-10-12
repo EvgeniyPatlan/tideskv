@@ -22,6 +22,11 @@ struct ServerStats {
   uint64_t total_commands = 0;
   std::string data_dir;
   std::string sync_mode;
+  std::string storage_compression;  // "no", "lz4" or "zstd"
+  uint64_t storage_tombstones = 0;
+  uint64_t storage_flushes = 0;
+  uint64_t storage_compactions = 0;
+  uint64_t expired_keys = 0;  // removed by the active-expiry reaper
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and
