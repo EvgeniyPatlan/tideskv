@@ -98,6 +98,7 @@ TEST(OidAllocator, ConcurrentCallersGetDistinctIds) {
   std::vector<std::vector<uint64_t>> got(4);
   std::atomic<bool> failed{false};
   std::vector<std::thread> threads;
+  threads.reserve(4);
   for (int t = 0; t < 4; ++t) {
     threads.emplace_back([&, t] {
       for (int i = 0; i < 20000; ++i) {

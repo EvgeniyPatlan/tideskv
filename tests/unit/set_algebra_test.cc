@@ -17,13 +17,13 @@ struct SetAlgebraTest : ::testing::Test {
     Add("b", {"2", "3", "5"});
     Add("c", {"3", "4", "6"});
   }
-  void Add(const std::string& key, std::vector<std::string_view> m) {
+  void Add(const std::string& key, const std::vector<std::string_view>& m) {
     auto txn = storage.BeginWrite();
     int64_t n = 0;
     ASSERT_TRUE(MoveInto(SetAdd(**txn, oids, 0, key, m, 0), &n).ok());
     ASSERT_TRUE((*txn)->Commit().ok());
   }
-  std::vector<std::string> Combine(SetOp op, std::vector<std::string_view> keys) {
+  std::vector<std::string> Combine(SetOp op, const std::vector<std::string_view>& keys) {
     auto view = storage.BeginRead();
     auto r = SetCombine(**view, 0, op, keys, 0);
     EXPECT_TRUE(r.ok()) << r.status().ToString();

@@ -22,7 +22,7 @@ std::unique_ptr<TidesStorage> OpenStorage(const TempDir& dir) {
   o.path = (dir.path() / "db").string();
   o.sync_mode = SyncMode::kNone;
   o.compression = Compression::kNone;
-  o.memtable_size = 64 * 1024;  // many flushes and engine compactions, as under real load
+  o.memtable_size = size_t{64} * 1024;  // many flushes and engine compactions, as under real load
   auto s = TidesStorage::Open(o);
   EXPECT_TRUE(s.ok()) << s.status().ToString();
   return s.ok() ? std::move(s).value() : nullptr;
@@ -90,7 +90,7 @@ TEST_P(CompactionReclaim, FlushDbCompactionPhysicallyDropsThatDbOnly) {
   sched.OnCommitted({{cf, encoding::DbPrefix(2), {}, true}});  // what the Engine reports for FLUSHDB 2
   Drain(sched);
 
-  EXPECT_LE(SstableKeys(*s, cf), uint64_t{2 * kLiveKeysPerDb});  // only the live keys are left
+  EXPECT_LE(SstableKeys(*s, cf), (2 * uint64_t{kLiveKeysPerDb}));  // only the live keys are left
   EXPECT_EQ(CountKeys(*s, cf, 0), uint64_t{kLiveKeysPerDb});
   EXPECT_EQ(CountKeys(*s, cf, 2), 0u);
   EXPECT_EQ(CountKeys(*s, cf, 3), uint64_t{kLiveKeysPerDb});

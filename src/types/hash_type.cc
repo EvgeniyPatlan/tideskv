@@ -95,7 +95,8 @@ Result<int64_t> HashStrlen(ReadView& view, uint8_t db, std::string_view key, std
                            int64_t now_ms) {
   auto v = HashGet(view, db, key, field, now_ms);
   if (!v.ok()) return v.status();
-  return *v ? static_cast<int64_t>((*v)->size()) : int64_t{0};
+  const auto& val = v.value();
+  return val.has_value() ? static_cast<int64_t>(val->size()) : int64_t{0};
 }
 
 Result<bool> HashExists(ReadView& view, uint8_t db, std::string_view key, std::string_view field,
@@ -127,7 +128,9 @@ Result<int64_t> HashIncrBy(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::s
   auto cur = GetElement(txn, *c, field);
   if (!cur.ok()) return cur.status();
   int64_t value = 0;
-  if (*cur && !ParseInt64(**cur, &value)) return Status::UserError(std::string(kErrHashValueNotInteger));
+  const auto& old = cur.value();
+  if (old.has_value() && !ParseInt64(*old, &value))
+    return Status::UserError(std::string(kErrHashValueNotInteger));
   if ((delta < 0 && value < 0 && delta < std::numeric_limits<int64_t>::min() - value) ||
       (delta > 0 && value > 0 && delta > std::numeric_limits<int64_t>::max() - value)) {
     return Status::UserError(std::string(kErrOverflow));
@@ -145,7 +148,9 @@ Result<std::string> HashIncrByFloat(WriteTxn& txn, OidAllocator& oids, uint8_t d
   auto cur = GetElement(txn, *c, field);
   if (!cur.ok()) return cur.status();
   long double value = 0;
-  if (*cur && !ParseLongDouble(**cur, &value)) return Status::UserError(std::string(kErrHashValueNotFloat));
+  const auto& old = cur.value();
+  if (old.has_value() && !ParseLongDouble(*old, &value))
+    return Status::UserError(std::string(kErrHashValueNotFloat));
   value += delta;
   if (std::isnan(value) || std::isinf(value)) return Status::UserError(std::string(kErrNanOrInfinity));
   std::string out = FormatLongDouble(value);

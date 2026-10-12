@@ -61,7 +61,11 @@ void FillDb(RespClient& c, int n) {
     for (int j = i; j < i + kBatch && j < n; ++j)
       batch += EncodeCommand({"SET", "key" + std::to_string(j), "x"});
     ASSERT_TRUE(c.SendRaw(batch));
-    for (int j = i; j < i + kBatch && j < n; ++j) ASSERT_EQ(c.Read()->str, "OK");
+    for (int j = i; j < i + kBatch && j < n; ++j) {
+      auto reply = c.Read();
+      if (!reply.has_value()) FAIL() << "no reply to SET";
+      ASSERT_EQ(reply->str, "OK");
+    }
   }
 }
 

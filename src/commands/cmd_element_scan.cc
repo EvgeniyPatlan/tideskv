@@ -21,7 +21,7 @@ void ElementScanCommand(ExecContext& ctx, const ArgList& argv, ValueType type) {
   uint64_t cursor = 0;
   if (!ParseScanCursor(argv[2], &cursor)) return ctx.reply.Error(kErrInvalidCursor);
   ScanOptions opts;
-  const Status opts_status = ParseScanOptions(argv, 3, /*allow_type=*/false, &opts);
+  Status opts_status = ParseScanOptions(argv, 3, /*allow_type=*/false, &opts);
   const std::optional<ScanPosition> saved =
       cursor == 0 ? std::nullopt : ctx.server.cursors().Load(cursor, CursorKind::kElements);
   ElementPage page;

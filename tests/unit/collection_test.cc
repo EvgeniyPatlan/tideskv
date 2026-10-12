@@ -100,8 +100,14 @@ TEST_F(CollectionTest, GetAndHasElement) {
   MakeHash("h", {{"f", "v"}});
   auto view = storage.BeginRead();
   auto c = LoadCollection(**view, 0, "h", ValueType::kHash, 0);
-  EXPECT_EQ(**GetElement(**view, *c, "f"), "v");
-  EXPECT_FALSE(GetElement(**view, *c, "g")->has_value());
+  auto present = GetElement(**view, *c, "f");
+  ASSERT_TRUE(present.ok());
+  const auto& value = present.value();
+  if (!value.has_value()) FAIL() << "field f missing";
+  EXPECT_EQ(*value, "v");
+  auto missing = GetElement(**view, *c, "g");
+  ASSERT_TRUE(missing.ok());
+  EXPECT_FALSE(missing->has_value());
   EXPECT_TRUE(*HasElement(**view, *c, "f"));
   EXPECT_FALSE(*HasElement(**view, *c, "g"));
 }

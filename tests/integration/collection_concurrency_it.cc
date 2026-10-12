@@ -18,6 +18,7 @@ TEST(CollectionConcurrencyIT, ParallelHincrbyIsExact) {
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<int> errors{0};
   std::vector<std::thread> threads;
+  threads.reserve(8);
   for (int t = 0; t < 8; ++t) {
     threads.emplace_back([&] {
       auto c = s.Connect();
@@ -38,6 +39,7 @@ TEST(CollectionConcurrencyIT, ParallelSaddCountsEveryMember) {
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<int> errors{0};
   std::vector<std::thread> threads;
+  threads.reserve(8);
   for (int t = 0; t < 8; ++t) {
     threads.emplace_back([&, t] {
       auto c = s.Connect();
@@ -103,6 +105,7 @@ TEST(CollectionConcurrencyIT, ConcurrentCreatesCrossALeaseBoundary) {
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<int> errors{0};
   std::vector<std::thread> threads;
+  threads.reserve(kClients);
   for (int t = 0; t < kClients; ++t) {
     threads.emplace_back([&, t] {
       auto c = s.Connect();
