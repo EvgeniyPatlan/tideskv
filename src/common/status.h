@@ -81,4 +81,12 @@ class [[nodiscard]] Result {
   std::variant<T, Status> data_;
 };
 
+// Moves the value of r into *out, or returns its error.
+template <typename T>
+Status MoveInto(Result<T>&& r, T* out) {
+  if (!r.ok()) return r.status();
+  *out = std::move(r).value();
+  return Status::Ok();
+}
+
 }  // namespace tideskv
