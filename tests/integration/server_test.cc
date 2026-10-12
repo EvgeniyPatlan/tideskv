@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
+
 #include "support/test_server.h"
 
 // Designated initializers deliberately leave most TestServer::Options fields defaulted.
@@ -77,7 +80,13 @@ TEST(ServerIT, InfoReportsPortAndClients) {
   TestServer s(TIDESKV_SERVER_BIN);
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
-  const std::string info = c->Command({"INFO"}).str;
+  // WaitReady's probe connection is released asynchronously; poll until it is gone.
+  std::string info;
+  for (int i = 0; i < 100; ++i) {
+    info = c->Command({"INFO"}).str;
+    if (info.find("connected_clients:1") != std::string::npos) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
   EXPECT_NE(info.find("tcp_port:" + std::to_string(s.port())), std::string::npos) << info;
   EXPECT_NE(info.find("connected_clients:1"), std::string::npos) << info;
   EXPECT_NE(info.find("storage_engine:tidesdb"), std::string::npos) << info;

@@ -28,6 +28,10 @@ spdlog::level::level_enum ToLevel(const std::string& s) {
   return spdlog::level::info;  // verbose, notice
 }
 
+int EffectiveWorkers(int configured) {
+  return configured > 0 ? configured : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
 }  // namespace
 
 Status SetupLogging(const ConfigValues& v) {
@@ -77,7 +81,7 @@ net::ServerOptions App::MakeServerOptions() {
   net::ServerOptions o;
   o.bind = v.bind;
   o.port = v.port;
-  o.workers = v.workers > 0 ? v.workers : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  o.workers = EffectiveWorkers(v.workers);
   o.maxclients = [this] { return config_->Snapshot().maxclients; };
   o.query_buffer_limit = [this] {
     return static_cast<size_t>(config_->Snapshot().client_query_buffer_limit);
@@ -86,11 +90,16 @@ net::ServerOptions App::MakeServerOptions() {
   return o;
 }
 
-Status App::Start() { return server_->Start(); }
+Status App::Start() {
+  // Handle signals before any socket is bound: a SIGTERM arriving while starting up is
+  // queued by asio and delivered once Run() arms the wait.
+  signals_.emplace(main_ctx_, SIGINT, SIGTERM);
+  return server_->Start();
+}
 
 void App::Run() {
-  asio::signal_set signals(main_ctx_, SIGINT, SIGTERM);
-  signals.async_wait([this](std::error_code ec, int sig) {
+  if (!signals_) signals_.emplace(main_ctx_, SIGINT, SIGTERM);
+  signals_->async_wait([this](std::error_code ec, int sig) {
     if (!ec) spdlog::info("received signal {}, shutting down", sig);
     main_ctx_.stop();
   });
@@ -121,7 +130,7 @@ ServerStats App::Stats() const {
   s.tcp_port = server_->port();
   s.uptime_seconds =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_).count();
-  s.workers = v.workers;
+  s.workers = EffectiveWorkers(v.workers);
   s.maxclients = v.maxclients;
   s.connected_clients = k.connected;
   s.total_connections = k.total_connections;

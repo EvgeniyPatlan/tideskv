@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,7 @@ class TestServer {
   std::string Stderr() const;
 
  private:
+  static int DecodeStatus(int status);
   bool WaitReady(std::chrono::milliseconds timeout);
   static uint16_t FreePort();
 
@@ -48,6 +50,8 @@ class TestServer {
   std::string dir_;
   uint16_t port_ = 0;
   pid_t pid_ = -1;
+  std::optional<int> exit_code_;  // set once the child is reaped
+  bool exit_consumed_ = false;    // a test already looked at exit_code_ via Wait()
 };
 
 }  // namespace tideskv::test

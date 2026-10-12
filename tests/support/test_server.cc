@@ -15,15 +15,23 @@
 namespace tideskv::test {
 
 uint16_t TestServer::FreePort() {
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
   socklen_t len = sizeof(addr);
-  ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
-  ::close(fd);
+  const bool ok = fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                  ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+  if (fd >= 0) ::close(fd);
+  if (!ok) {
+    ADD_FAILURE() << "could not find a free port";
+    return 0;
+  }
   return ntohs(addr.sin_port);
+}
+
+int TestServer::DecodeStatus(int status) {
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
 TestServer::TestServer(std::string binary) : TestServer(std::move(binary), Options{}) {}
@@ -41,25 +49,37 @@ TestServer::TestServer(std::string binary, Options options) {
   args.insert(args.end(), options.extra_args.begin(), options.extra_args.end());
   const std::string log = (log_dir_.path() / "stderr.log").string();
 
+  std::vector<char*> cargs;
+  for (auto& a : args) cargs.push_back(a.data());
+  cargs.push_back(nullptr);
+
   pid_ = ::fork();
-  if (pid_ == 0) {  // child
+  if (pid_ == 0) {  // child: async-signal-safe calls only
     const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) ::_exit(126);
     ::dup2(fd, STDOUT_FILENO);
     ::dup2(fd, STDERR_FILENO);
-    std::vector<char*> cargs;
-    for (auto& a : args) cargs.push_back(a.data());
-    cargs.push_back(nullptr);
-    ::execv(binary.c_str(), cargs.data());
+    ::execv(cargs[0], cargs.data());
     ::_exit(127);
   }
+  if (pid_ < 0) ADD_FAILURE() << "fork failed";
   if (options.wait_ready && !WaitReady(std::chrono::seconds(10))) {
     ADD_FAILURE() << "tideskv-server did not become ready; stderr:\n" << Stderr();
   }
 }
 
 TestServer::~TestServer() {
-  if (pid_ <= 0) return;
-  if (Terminate() < 0) Kill9();
+  if (pid_ > 0) {
+    const int code = Terminate();
+    if (code < 0) {
+      Kill9();
+      ADD_FAILURE() << "tideskv-server did not exit after SIGTERM; stderr:\n" << Stderr();
+    } else if (code != 0) {
+      ADD_FAILURE() << "tideskv-server exited with " << code << "; stderr:\n" << Stderr();
+    }
+  } else if (exit_code_ && !exit_consumed_ && *exit_code_ != 0) {
+    ADD_FAILURE() << "tideskv-server exited unexpectedly with " << *exit_code_ << "; stderr:\n" << Stderr();
+  }
 }
 
 bool TestServer::WaitReady(std::chrono::milliseconds timeout) {
@@ -81,23 +101,22 @@ bool TestServer::IsRunning() {
   int status = 0;
   const pid_t r = ::waitpid(pid_, &status, WNOHANG);
   if (r == 0) return true;
-  pid_ = -1;  // reaped (status lost; use Wait() when the code matters)
+  pid_ = -1;
+  exit_code_ = r > 0 ? DecodeStatus(status) : 255;  // keep the status for Wait()/the destructor
   return false;
 }
 
 int TestServer::Wait(std::chrono::milliseconds timeout) {
-  if (pid_ <= 0) return -1;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    int status = 0;
-    const pid_t r = ::waitpid(pid_, &status, WNOHANG);
-    if (r == pid_) {
-      pid_ = -1;
-      return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+  while (true) {
+    if (!IsRunning()) {
+      if (!exit_code_) return -1;
+      exit_consumed_ = true;
+      return *exit_code_;
     }
+    if (std::chrono::steady_clock::now() >= deadline) return -1;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  return -1;
 }
 
 int TestServer::Terminate() {
@@ -112,6 +131,7 @@ void TestServer::Kill9() {
   int status = 0;
   ::waitpid(pid_, &status, 0);
   pid_ = -1;
+  exit_consumed_ = true;
 }
 
 std::string TestServer::Stderr() const {

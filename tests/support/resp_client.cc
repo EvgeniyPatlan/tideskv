@@ -39,7 +39,7 @@ std::string ToDebugString(const RespValue& v) {
 }
 
 std::unique_ptr<RespClient> RespClient::Connect(uint16_t port, std::chrono::milliseconds timeout) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return nullptr;
   timeval tv{static_cast<time_t>(timeout.count() / 1000),
              static_cast<suseconds_t>((timeout.count() % 1000) * 1000)};

@@ -2,6 +2,7 @@
 #include <asio.hpp>
 #include <chrono>
 #include <memory>
+#include <optional>
 
 #include "commands/registry.h"
 #include "commands/server_services.h"
@@ -39,6 +40,7 @@ class App final : public ServerServices {
   CommandRegistry registry_;
   std::unique_ptr<net::Server> server_;
   asio::io_context main_ctx_;
+  std::optional<asio::signal_set> signals_;  // registered in Start(), before accepting
   std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
   bool stopped_ = false;
 };
