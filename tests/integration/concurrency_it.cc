@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -34,25 +37,58 @@ TEST(ConcurrencyIT, ParallelIncrIsExact) {  // Review Focus #2
 TEST(ConcurrencyIT, MsetIsNeverSeenHalfApplied) {  // Review Focus #2
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<bool> stop{false};
+  std::atomic<bool> reader_ready{false};
   std::atomic<int> torn{0};
+  std::atomic<int> errors{0};
+  std::atomic<int> reads{0};
+  std::atomic<int> non_null_reads{0};
+  std::set<std::string> distinct;  // touched only by the reader thread until it is joined
+  std::thread reader([&] {
+    auto c = s.Connect();
+    if (!c) {
+      ++errors;
+      reader_ready = true;
+      return;
+    }
+    reader_ready = true;
+    while (!stop) {
+      const RespValue r = c->Command({"MGET", "a", "b"});
+      if (r.elements.size() != 2) {
+        ++errors;
+        continue;
+      }
+      ++reads;
+      if (r.elements[0].str != r.elements[1].str) ++torn;
+      if (r.elements[0].type != RespValue::Type::kNull) {
+        ++non_null_reads;
+        distinct.insert(r.elements[0].str);
+      }
+    }
+  });
   std::thread writer([&] {
     auto c = s.Connect();
-    for (int i = 0; i < 2000; ++i) {
+    while (!reader_ready) std::this_thread::yield();
+    if (!c) {
+      ++errors;
+      stop = true;
+      return;
+    }
+    // Keep writing until the reader has demonstrably observed values (bounded by a deadline).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (int i = 0; i < 2000 || (non_null_reads.load() < 20 && std::chrono::steady_clock::now() < deadline);
+         ++i) {
       const std::string v = std::to_string(i);
-      c->Command({"MSET", "a", v, "b", v});
+      if (c->Command({"MSET", "a", v, "b", v}).str != "OK") ++errors;
     }
     stop = true;
   });
-  std::thread reader([&] {
-    auto c = s.Connect();
-    while (!stop) {
-      const RespValue r = c->Command({"MGET", "a", "b"});
-      if (r.elements.size() == 2 && r.elements[0].str != r.elements[1].str) ++torn;
-    }
-  });
   writer.join();
   reader.join();
+  EXPECT_EQ(errors.load(), 0);
   EXPECT_EQ(torn.load(), 0);
+  EXPECT_GT(reads.load(), 0);
+  EXPECT_GE(non_null_reads.load(), 20);
+  EXPECT_GT(distinct.size(), 1u);
 }
 
 TEST(ConcurrencyIT, FlushAllUnderWriteLoadStaysConsistent) {
@@ -63,6 +99,10 @@ TEST(ConcurrencyIT, FlushAllUnderWriteLoadStaysConsistent) {
   for (int t = 0; t < 4; ++t) {
     writers.emplace_back([&, t] {
       auto c = s.Connect();
+      if (!c) {
+        ++errors;
+        return;
+      }
       while (!stop) {
         if (c->Command({"INCR", "w" + std::to_string(t)}).type != RespValue::Type::kInteger) ++errors;
       }

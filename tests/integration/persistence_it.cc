@@ -74,8 +74,13 @@ TEST(PersistenceIT, InfoReportsStorageFields) {
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
   const std::string info = c->Command({"INFO", "persistence"}).str;
-  EXPECT_NE(info.find("compression:"), std::string::npos);
+  const bool known_compression = info.find("compression:no\r\n") != std::string::npos ||
+                                 info.find("compression:lz4\r\n") != std::string::npos ||
+                                 info.find("compression:zstd\r\n") != std::string::npos;
+  EXPECT_TRUE(known_compression) << info;
   EXPECT_NE(info.find("tombstones:"), std::string::npos);
+  EXPECT_NE(info.find("flushes:"), std::string::npos);
+  EXPECT_NE(info.find("compactions:"), std::string::npos);
 }
 
 TEST(PersistenceIT, FlushDbOnHighDbLeavesOtherDbsOnRealBackend) {
