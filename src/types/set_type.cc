@@ -90,8 +90,17 @@ Result<std::vector<std::string>> SetPop(WriteTxn& txn, uint8_t db, std::string_v
   if (!c.ok()) return c.status();
   std::vector<std::string> out;
   if (!c->exists() || count == 0) return out;
-  const int64_t wanted = count >= c->size() ? static_cast<int64_t>(c->size()) : static_cast<int64_t>(count);
-  auto picked = RandomElements(txn, *c, wanted, rng);
+  if (count >= c->size()) {  // the whole set, in byte order; one prefix tombstone like Redis's dbDelete
+    out.reserve(c->size());
+    Status st = ForEachElement(txn, *c, [&](std::string_view m, std::string_view) {
+      out.emplace_back(m);
+      return true;
+    });
+    if (!st.ok()) return st;
+    if (st = DeleteObject(txn, db, key, c->obj.meta); !st.ok()) return st;
+    return out;
+  }
+  auto picked = RandomElements(txn, *c, static_cast<int64_t>(count), rng);
   if (!picked.ok()) return picked.status();
   out.reserve(picked->size());
   for (Element& e : *picked) {

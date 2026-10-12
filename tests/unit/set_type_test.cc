@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include "encoding/object_codec.h"
+#include "exec/recording_txn.h"
 #include "storage/memory_storage.h"
 #include "types/errors.h"
 #include "types/oid_allocator.h"
@@ -73,14 +75,41 @@ TEST_F(SetTypeTest, PopRemovesWhatItReturns) {
   EXPECT_EQ(*SetCard(**view, 0, "s", 0), 1);
 }
 
-TEST_F(SetTypeTest, PopEverythingDeletesTheKeyWithPointDeletes) {
-  Add("s", {"a", "b"});
+// Like Redis's dbDelete: popping the whole set drops the object with one prefix tombstone, which
+// the Engine reports to the compaction scheduler as a collection delete.
+TEST_F(SetTypeTest, PopEverythingDeletesTheObjectWithOnePrefixTombstone) {
+  Add("s", {"b", "a", "c"});
   std::mt19937_64 rng(1);
   std::vector<std::string> popped;
-  ASSERT_TRUE(Write([&](WriteTxn& t) { return MoveInto(SetPop(t, 0, "s", 99, rng, 0), &popped); }).ok());
-  EXPECT_EQ(popped, (std::vector<std::string>{"a", "b"}));
+  std::vector<RangeDelete> deletes;
+  ASSERT_TRUE(Write([&](WriteTxn& t) {
+                RecordingTxn rec(t);
+                const Status st = MoveInto(SetPop(rec, 0, "s", 3, rng, 0), &popped);
+                deletes = rec.deletes();
+                return st;
+              }).ok());
+  EXPECT_EQ(popped, (std::vector<std::string>{"a", "b", "c"}));
+  ASSERT_EQ(deletes.size(), 1u);
+  EXPECT_EQ(deletes[0].cf, ColumnFamily::kSubkey);
+  EXPECT_TRUE(deletes[0].is_prefix);
+  EXPECT_EQ(deletes[0].lo.size(), encoding::kObjectPrefixSize);
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kMeta)].empty());
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].empty());
+}
+
+TEST_F(SetTypeTest, PopFewerThanAllUsesPointDeletes) {
+  Add("s", {"a", "b", "c"});
+  std::mt19937_64 rng(1);
+  std::vector<std::string> popped;
+  std::vector<RangeDelete> deletes;
+  ASSERT_TRUE(Write([&](WriteTxn& t) {
+                RecordingTxn rec(t);
+                const Status st = MoveInto(SetPop(rec, 0, "s", 2, rng, 0), &popped);
+                deletes = rec.deletes();
+                return st;
+              }).ok());
+  EXPECT_EQ(popped.size(), 2u);
+  EXPECT_TRUE(deletes.empty());
 }
 
 TEST_F(SetTypeTest, MoveSemantics) {
