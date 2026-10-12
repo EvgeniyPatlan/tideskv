@@ -27,12 +27,19 @@ TEST(ServerIT, InlineAndPipelinedRequests) {
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
   ASSERT_TRUE(c->SendRaw("PING\r\nPING\r\n"));
-  EXPECT_EQ(c->Read()->str, "PONG");
-  EXPECT_EQ(c->Read()->str, "PONG");
+  for (int i = 0; i < 2; ++i) {
+    auto r = c->Read();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->str, "PONG");
+  }
   std::string batch;
   for (int i = 0; i < 50; ++i) batch += EncodeCommand({"ECHO", std::to_string(i)});
   ASSERT_TRUE(c->SendRaw(batch));
-  for (int i = 0; i < 50; ++i) EXPECT_EQ(c->Read()->str, std::to_string(i));
+  for (int i = 0; i < 50; ++i) {
+    auto r = c->Read();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->str, std::to_string(i));
+  }
 }
 
 TEST(ServerIT, Hello3ReturnsMap) {
@@ -72,7 +79,9 @@ TEST(ServerIT, UnknownCommandAndProtocolError) {
   ASSERT_NE(c, nullptr);
   EXPECT_EQ(c->Command({"NOPE"}).str, "ERR unknown command 'NOPE', with args beginning with: ");
   ASSERT_TRUE(c->SendRaw("*1\r\n$abc\r\n"));
-  EXPECT_EQ(c->Read()->str, "ERR Protocol error: invalid bulk length");
+  auto r = c->Read();
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->str, "ERR Protocol error: invalid bulk length");
   EXPECT_TRUE(c->WaitForClose());
 }
 

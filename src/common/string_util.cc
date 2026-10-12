@@ -60,9 +60,9 @@ bool ParseMemory(std::string_view s, uint64_t* out) {
   else if (unit == "kb")
     mul = 1024;
   else if (unit == "m")
-    mul = 1000 * 1000;
+    mul = 1000ULL * 1000;
   else if (unit == "mb")
-    mul = 1024 * 1024;
+    mul = 1024ULL * 1024;
   else if (unit == "g")
     mul = 1000ULL * 1000 * 1000;
   else if (unit == "gb")

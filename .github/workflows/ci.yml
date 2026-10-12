@@ -88,3 +88,14 @@ jobs:
         env:
           TIDESKV_REF_ADDR: 127.0.0.1:6379
           TIDESKV_DIFF_SEEDS: "1-20"
+
+  tidy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 clang-tidy-18 liblz4-dev libzstd-dev
+      - run: cmake --preset debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+      - run: cmake --build --preset debug -j
+      - run: run-clang-tidy-18 -p build/debug -quiet "^${GITHUB_WORKSPACE}/src/"

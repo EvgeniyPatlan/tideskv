@@ -1,5 +1,5 @@
 Checks: >
   -*,bugprone-*,performance-*,modernize-use-override,modernize-use-nullptr,
-  -bugprone-easily-swappable-parameters
-WarningsAsErrors: ''
-HeaderFilterRegex: 'src/.*'
+  -bugprone-easily-swappable-parameters,-performance-enum-size
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/src/.*'

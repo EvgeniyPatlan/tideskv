@@ -50,7 +50,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   resp::ReplyBuilder reply_;
   std::string in_;
   std::string out_;
-  std::array<char, 16 * 1024> read_buf_{};
+  std::array<char, size_t{16} * 1024> read_buf_{};
   bool closed_ = false;
 };
 

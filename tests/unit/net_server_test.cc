@@ -118,8 +118,12 @@ TEST(NetServer, UnauthenticatedLimitsApplyUntilAuth) {
   // AUTH and a 20-arg command pipelined: the limit must switch per command.
   std::vector<std::string> wide(20, "a");
   ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"AUTH", "pw"}) + test::EncodeCommand(wide)));
-  EXPECT_EQ(c->Read()->str, "2");
-  EXPECT_EQ(c->Read()->str, "20");
+  auto r1 = c->Read();
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(r1->str, "2");
+  auto r2 = c->Read();
+  ASSERT_TRUE(r2.has_value());
+  EXPECT_EQ(r2->str, "20");
 
   auto u = RespClient::Connect(server->port());
   ASSERT_NE(u, nullptr);

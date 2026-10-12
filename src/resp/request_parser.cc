@@ -154,7 +154,8 @@ RequestParser::Progress RequestParser::ParseBulkHeader(std::string_view d, size_
   bulk_len_ = static_cast<size_t>(len);
   args_.emplace_back();
   buffered_ += sizeof(std::string);
-  args_.back().reserve(std::min<size_t>(bulk_len_, 64 * 1024));  // grow with data, never trust the header
+  args_.back().reserve(
+      std::min<size_t>(bulk_len_, size_t{64} * 1024));  // grow with data, never trust the header
   state_ = State::kBulkBody;
   return Progress::kContinue;
 }

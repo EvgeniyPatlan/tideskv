@@ -37,8 +37,8 @@ void Set(ExecContext& ctx, const ArgList& argv) {
   opts.condition = args->condition;
   opts.get = args->get;
   opts.keep_ttl = args->keep_ttl;
-  if (args->unit) {
-    auto when = ParsePositiveExpire(args->expire_arg, *args->unit, now, "set");
+  if (const std::optional<ExpireUnit> unit = args->unit) {
+    auto when = ParsePositiveExpire(args->expire_arg, *unit, now, "set");
     if (!when.ok()) return ReplyError(ctx, when.status());
     opts.expire_ms = *when;
   }

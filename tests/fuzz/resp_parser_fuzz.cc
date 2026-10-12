@@ -8,11 +8,16 @@
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   using tideskv::resp::ParseStatus;
+  if (size == 0) return 0;
+  const bool unauthenticated = (data[0] & 1) != 0;  // first byte picks the pre-AUTH limits
+  ++data;
+  --size;
   tideskv::resp::ParserLimits limits;
   limits.max_bulk_len = 1 << 20;
   limits.max_multibulk_len = 1024;
   limits.max_inline_len = 4096;
   tideskv::resp::RequestParser parser(limits);
+  parser.SetUnauthenticated(unauthenticated);
   const std::string_view input(reinterpret_cast<const char*>(data), size);
   std::string pending;
   const size_t half = size / 2;  // two chunks exercise partial-state handling

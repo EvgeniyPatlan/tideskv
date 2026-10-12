@@ -11,9 +11,9 @@ inline constexpr size_t kUnauthMaxMultibulkLen = 10;
 inline constexpr size_t kUnauthMaxBulkLen = 16384;
 
 struct ParserLimits {
-  size_t max_bulk_len = 512ULL * 1024 * 1024;  // proto-max-bulk-len
-  size_t max_multibulk_len = 1024 * 1024;      // max arguments in one command
-  size_t max_inline_len = 64 * 1024;           // inline command or header line
+  size_t max_bulk_len = 512ULL * 1024 * 1024;      // proto-max-bulk-len
+  size_t max_multibulk_len = size_t{1024} * 1024;  // max arguments in one command
+  size_t max_inline_len = size_t{64} * 1024;       // inline command or header line
 };
 
 enum class ParseStatus { kNeedMore, kCommand, kError };

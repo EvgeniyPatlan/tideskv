@@ -16,7 +16,12 @@ using Fields = std::vector<std::pair<std::string, std::string>>;
 
 std::string Section(const std::string& title, const Fields& fields) {
   std::string out = "# " + title + "\r\n";
-  for (const auto& [k, v] : fields) out += k + ":" + v + "\r\n";
+  for (const auto& [k, v] : fields) {
+    out += k;
+    out += ':';
+    out += v;
+    out += "\r\n";
+  }
   return out;
 }
 
