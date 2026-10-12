@@ -92,6 +92,24 @@ TEST_F(SetCmds, WrongTypeEverywhere) {  // Review Focus #3
   EXPECT_EQ(h.Run({"HGET", "hash", "f"}), Bulk("v"));
 }
 
+TEST_F(SetCmds, PopRandMemberMoveWrongType) {  // type check precedes the count-0 shortcut
+  EXPECT_EQ(h.Run({"SET", "str", "v"}), kOk);
+  EXPECT_EQ(h.Run({"HSET", "hash", "f", "v"}), Int(1));
+  EXPECT_EQ(h.Run({"SADD", "s", "a"}), Int(1));
+  for (const char* key : {"str", "hash"}) {
+    for (const ArgList& cmd : std::vector<ArgList>{{"SPOP", key},
+                                                   {"SPOP", key, "2"},
+                                                   {"SPOP", key, "0"},
+                                                   {"SRANDMEMBER", key},
+                                                   {"SRANDMEMBER", key, "2"},
+                                                   {"SMOVE", key, "s", "a"},
+                                                   {"SMOVE", "s", key, "a"}}) {
+      EXPECT_EQ(h.Run(cmd), Err(kErrWrongType)) << cmd[0] << " " << key;
+    }
+  }
+  EXPECT_EQ(h.Run({"SMEMBERS", "s"}), Arr({Bulk("a")}));
+}
+
 TEST_F(SetCmds, SpopShapesAndErrors) {
   EXPECT_EQ(h.Run({"SPOP", "nokey"}), test::kNil);
   EXPECT_EQ(h.Run({"SPOP", "nokey", "3"}), "*0\r\n");
