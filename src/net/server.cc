@@ -1,0 +1,112 @@
+#include "net/server.h"
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <utility>
+
+namespace tideskv::net {
+
+Server::Server(ServerOptions options, CommandExecutor executor)
+    : options_(std::move(options)), executor_(std::move(executor)) {}
+
+Server::~Server() { Stop(); }
+
+Status Server::Listen() {
+  std::error_code ec;
+  const asio::ip::address addr = asio::ip::make_address(options_.bind, ec);
+  if (ec) return Status::InvalidArgument("invalid bind address '" + options_.bind + "'");
+  const asio::ip::tcp::endpoint endpoint(addr, options_.port);
+  acceptor_.emplace(accept_ctx_);
+  const auto fail = [&](const char* step) {
+    acceptor_.reset();
+    return Status::IOError(std::string(step) + " " + options_.bind + ":" + std::to_string(options_.port) +
+                           ": " + ec.message());
+  };
+  // With ASIO_NO_DEPRECATED these error_code overloads return void: check ec after each.
+  acceptor_->open(endpoint.protocol(), ec);
+  if (ec) return fail("open");
+  acceptor_->set_option(asio::socket_base::reuse_address(true), ec);
+  if (ec) return fail("setsockopt");
+  acceptor_->bind(endpoint, ec);
+  if (ec) return fail("bind");
+  acceptor_->listen(asio::socket_base::max_listen_connections, ec);
+  if (ec) return fail("listen");
+  port_ = acceptor_->local_endpoint(ec).port();
+  return Status::Ok();
+}
+
+Status Server::Start() {
+  if (Status st = Listen(); !st.ok()) return st;
+  const int n = std::max(1, options_.workers);
+  for (int i = 0; i < n; ++i) {
+    auto w = std::make_unique<Worker>();
+    w->guard.emplace(asio::make_work_guard(w->ctx));
+    w->thread = std::thread([ctx = &w->ctx] { ctx->run(); });
+    workers_.push_back(std::move(w));
+  }
+  running_ = true;
+  DoAccept();
+  accept_thread_ = std::thread([this] { accept_ctx_.run(); });
+  return Status::Ok();
+}
+
+void Server::DoAccept() {
+  Worker& worker = *workers_[next_worker_++ % workers_.size()];
+  acceptor_->async_accept(worker.ctx, [this, &worker](std::error_code ec, asio::ip::tcp::socket socket) {
+    if (!running_) return;
+    if (ec) {
+      spdlog::warn("accept failed: {}", ec.message());
+    } else {
+      OnAccept(std::move(socket), worker);
+    }
+    DoAccept();
+  });
+}
+
+void Server::OnAccept(asio::ip::tcp::socket socket, Worker& worker) {
+  std::error_code ec;
+  if (stats_->connected.load() >= static_cast<uint64_t>(options_.maxclients())) {
+    asio::write(socket, asio::buffer(std::string_view("-ERR max number of clients reached\r\n")), ec);
+    socket.close(ec);
+    return;
+  }
+  socket.set_option(asio::ip::tcp::no_delay(true), ec);
+  Session session;
+  session.id = stats_->next_id.fetch_add(1);
+  const auto remote = socket.remote_endpoint(ec);
+  session.peer = ec ? "?" : remote.address().to_string() + ":" + std::to_string(remote.port());
+  if (options_.init_session) options_.init_session(session);
+  auto conn = std::make_shared<Connection>(std::move(socket), std::move(session), executor_, stats_,
+                                           options_.query_buffer_limit());
+  asio::post(worker.ctx, [conn] { conn->Start(); });  // start on the connection's own thread
+}
+
+void Server::Stop() {
+  if (!running_.exchange(false)) return;
+  asio::post(accept_ctx_, [this] {
+    std::error_code ignored;
+    acceptor_->close(ignored);  // the pending accept completes with operation_aborted
+  });
+  if (accept_thread_.joinable()) accept_thread_.join();
+  for (auto& w : workers_) {
+    w->guard.reset();
+    w->ctx.stop();
+  }
+  for (auto& w : workers_) {
+    if (w->thread.joinable()) w->thread.join();
+  }
+  workers_.clear();  // destroys pending handlers → last shared_ptr<Connection> → sockets close
+  acceptor_.reset();
+}
+
+ServerCounters Server::counters() const {
+  return {stats_->connected.load(), stats_->total_connections.load(), stats_->total_commands.load()};
+}
+
+void Server::ResetCounters() {
+  stats_->total_connections.store(0);
+  stats_->total_commands.store(0);
+}
+
+}  // namespace tideskv::net
