@@ -69,6 +69,14 @@ TEST(Config, ApplyArgs) {
   EXPECT_FALSE(c.ApplyArgs({"port", "1"}).ok());
 }
 
+TEST(Config, ApplyArgsErrorDoesNotEchoValue) {
+  Config c;
+  const Status st = c.ApplyArgs({"--port", "7001", "s3cret-password", "x"});
+  ASSERT_FALSE(st.ok());
+  EXPECT_EQ(st.message(), "expected --option at argument 3");
+  EXPECT_EQ(st.message().find("s3cret"), std::string::npos);
+}
+
 TEST(Config, RuntimeSetRejectsImmutable) {
   Config c;
   const Status st = c.Set("port", "7000", /*at_runtime=*/true);

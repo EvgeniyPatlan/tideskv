@@ -238,8 +238,8 @@ Status Config::LoadFile(const std::string& path) {
 Status Config::ApplyArgs(const std::vector<std::string>& args) {
   Pairs pairs;
   for (size_t i = 0; i < args.size(); i += 2) {
-    if (args[i].rfind("--", 0) != 0)
-      return Status::InvalidArgument("expected --option, got '" + args[i] + "'");
+    if (args[i].rfind("--", 0) != 0)  // never echo the value: it may be a password
+      return Status::InvalidArgument("expected --option at argument " + std::to_string(i + 1));
     if (i + 1 >= args.size()) return Status::InvalidArgument("missing value for " + args[i]);
     pairs.emplace_back(args[i].substr(2), args[i + 1]);
   }
