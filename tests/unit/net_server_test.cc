@@ -98,6 +98,36 @@ TEST(NetServer, ProtocolErrorRepliesThenCloses) {  // Review Focus #2
   EXPECT_TRUE(c->WaitForClose());
 }
 
+TEST(NetServer, UnauthenticatedLimitsApplyUntilAuth) {
+  ServerOptions o;
+  o.init_session = [](Session& s) { s.authenticated = false; };
+  o.port = 0;
+  o.workers = 2;
+  auto server = std::make_unique<Server>(
+      std::move(o), [](Session& s, const std::vector<std::string>& argv, resp::ReplyBuilder& r) {
+        if (argv[0] == "AUTH") s.authenticated = true;
+        r.Bulk(std::to_string(argv.size()));
+      });
+  ASSERT_TRUE(server->Start().ok());
+
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  // AUTH and a 20-arg command pipelined: the limit must switch per command.
+  std::vector<std::string> wide(20, "a");
+  ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"AUTH", "pw"}) + test::EncodeCommand(wide)));
+  EXPECT_EQ(c->Read()->str, "2");
+  EXPECT_EQ(c->Read()->str, "20");
+
+  auto u = RespClient::Connect(server->port());
+  ASSERT_NE(u, nullptr);
+  ASSERT_TRUE(u->SendRaw(test::EncodeCommand(std::vector<std::string>(11, "a"))));
+  auto r = u->Read();
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->type, RespValue::Type::kError);
+  EXPECT_EQ(r->str, "ERR Protocol error: unauthenticated multibulk length");
+  EXPECT_TRUE(u->WaitForClose());
+}
+
 TEST(NetServer, QuitClosesAfterReply) {
   auto server = StartServer();
   auto c = RespClient::Connect(server->port());

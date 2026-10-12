@@ -6,6 +6,10 @@
 
 namespace tideskv::resp {
 
+// Limits for clients that have not authenticated yet.
+inline constexpr size_t kUnauthMaxMultibulkLen = 10;
+inline constexpr size_t kUnauthMaxBulkLen = 16384;
+
 struct ParserLimits {
   size_t max_bulk_len = 512ULL * 1024 * 1024;  // proto-max-bulk-len
   size_t max_multibulk_len = 1024 * 1024;      // max arguments in one command
@@ -20,6 +24,10 @@ enum class ParseStatus { kNeedMore, kCommand, kError };
 class RequestParser {
  public:
   explicit RequestParser(ParserLimits limits = {}) : limits_(limits) {}
+
+  // Marks the next command as coming from an unauthenticated client: stricter
+  // multibulk/bulk limits apply (Redis 6.2.6+, CVE-2021-32675). Inline is unaffected.
+  void SetUnauthenticated(bool v) { unauthenticated_ = v; }
 
   ParseStatus Parse(std::string_view data, size_t* consumed);
 
@@ -49,6 +57,7 @@ class RequestParser {
   size_t remaining_ = 0;  // bulk strings still expected in this array
   size_t bulk_len_ = 0;   // length of the bulk string being read
   size_t buffered_ = 0;
+  bool unauthenticated_ = false;
 };
 
 }  // namespace tideskv::resp

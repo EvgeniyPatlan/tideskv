@@ -116,8 +116,11 @@ RequestParser::Progress RequestParser::ParseArrayHeader(std::string_view d, size
                                         : Progress::kNeedMore;
   }
   int64_t n = 0;
-  if (!ParseInt64(d.substr(*pos + 1, eol - *pos - 1), &n) ||
-      (n > 0 && static_cast<uint64_t>(n) > limits_.max_multibulk_len)) {
+  const bool parsed = ParseInt64(d.substr(*pos + 1, eol - *pos - 1), &n);
+  if (parsed && unauthenticated_ && n > static_cast<int64_t>(kUnauthMaxMultibulkLen)) {
+    return Fail("Protocol error: unauthenticated multibulk length");
+  }
+  if (!parsed || (n > 0 && static_cast<uint64_t>(n) > limits_.max_multibulk_len)) {
     return Fail("Protocol error: invalid multibulk length");
   }
   *pos = eol + 2;
@@ -140,8 +143,11 @@ RequestParser::Progress RequestParser::ParseBulkHeader(std::string_view d, size_
                                         : Progress::kNeedMore;
   }
   int64_t len = 0;
-  if (!ParseInt64(d.substr(*pos + 1, eol - *pos - 1), &len) || len < 0 ||
-      static_cast<uint64_t>(len) > limits_.max_bulk_len) {
+  const bool parsed = ParseInt64(d.substr(*pos + 1, eol - *pos - 1), &len);
+  if (parsed && unauthenticated_ && len > static_cast<int64_t>(kUnauthMaxBulkLen)) {
+    return Fail("Protocol error: unauthenticated bulk length");
+  }
+  if (!parsed || len < 0 || static_cast<uint64_t>(len) > limits_.max_bulk_len) {
     return Fail("Protocol error: invalid bulk length");
   }
   *pos = eol + 2;

@@ -45,6 +45,7 @@ void Connection::ProcessInput() {
   size_t offset = 0;
   while (!session_.close_after_reply) {
     size_t consumed = 0;
+    parser_.SetUnauthenticated(!session_.authenticated);
     const resp::ParseStatus st = parser_.Parse(std::string_view(in_).substr(offset), &consumed);
     offset += consumed;
     if (st == resp::ParseStatus::kNeedMore) break;

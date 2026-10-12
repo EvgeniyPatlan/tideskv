@@ -108,6 +108,42 @@ TEST(RequestParser, OverlongLinesRejected) {
   EXPECT_EQ(ErrorFor("*1\r\n$111111111111111111", small), "Protocol error: too big bulk count string");
 }
 
+// Parses `wire` with the unauthenticated flag set, like a connection before AUTH.
+std::string UnauthErrorFor(const std::string& wire) {
+  RequestParser parser;
+  parser.SetUnauthenticated(true);
+  size_t consumed = 0;
+  return parser.Parse(wire, &consumed) == ParseStatus::kError ? parser.error() : "";
+}
+
+TEST(RequestParser, UnauthenticatedMultibulkLimit) {
+  EXPECT_EQ(UnauthErrorFor("*11\r\n"), "Protocol error: unauthenticated multibulk length");
+  EXPECT_EQ(UnauthErrorFor("*10\r\n"), "");
+}
+
+TEST(RequestParser, UnauthenticatedBulkLimit) {
+  EXPECT_EQ(UnauthErrorFor("*1\r\n$16385\r\n"), "Protocol error: unauthenticated bulk length");
+  EXPECT_EQ(UnauthErrorFor("*1\r\n$16384\r\n"), "");
+}
+
+TEST(RequestParser, NormalLimitsApplyWhenAuthenticated) {
+  RequestParser parser;
+  parser.SetUnauthenticated(false);
+  std::vector<std::string> argv(20, std::string(20000, 'x'));
+  const std::string wire = Encode(argv);
+  size_t consumed = 0;
+  ASSERT_EQ(parser.Parse(wire, &consumed), ParseStatus::kCommand);
+  EXPECT_EQ(parser.args().size(), 20u);
+}
+
+TEST(RequestParser, UnauthenticatedKeepsInlineLimit) {
+  RequestParser parser;
+  parser.SetUnauthenticated(true);
+  const std::string wire = "PING " + std::string(20000, 'x') + "\r\n";
+  size_t consumed = 0;
+  EXPECT_EQ(parser.Parse(wire, &consumed), ParseStatus::kCommand);
+}
+
 TEST(RequestParser, ErrorIsSticky) {
   RequestParser p;
   size_t consumed = 0;
