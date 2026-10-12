@@ -42,7 +42,9 @@ class ExpireReaper {
   ExpireReaper& operator=(const ExpireReaper&) = delete;
 
   // One cycle over all dbs; returns the number of objects deleted. Every db gets at least
-  // one batch, even with a zero budget. Must not be called from inside an Engine fn.
+  // one batch, even with a zero budget. An error in one db does not stop the others; the
+  // first error is returned after the cycle. Undecodable index entries are skipped and
+  // logged once per cycle. Must not be called from inside an Engine fn.
   Result<size_t> RunOnce();
   // Start and Stop must not be called concurrently with each other (App calls them from one thread).
   void Start();
@@ -61,8 +63,9 @@ class ExpireReaper {
     uint64_t expire_ms;
     uint64_t oid;
   };
-  Status CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out);
-  Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full);
+  // Entries that do not decode are skipped and counted in *skipped.
+  Status CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out, size_t* skipped);
+  Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped);
   Result<size_t> DeleteDue(uint8_t db, std::span<const Due> due);
   void Loop();
 

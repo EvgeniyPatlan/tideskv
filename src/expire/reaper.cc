@@ -12,7 +12,7 @@
 
 namespace tideskv {
 
-Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out) {
+Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out, size_t* skipped) {
   out->clear();
   return engine_.Read([&](ReadView& view, int64_t) {
     auto it = view.NewIterator(
@@ -23,7 +23,8 @@ Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* ou
     for (; st.ok() && (*it)->Valid() && out->size() < options_.batch_size; st = (*it)->Next()) {
       encoding::ExpireKey ek;
       if (!encoding::DecodeExpireKey((*it)->key(), &ek) || (*it)->value().size() != 8) {
-        return Status::Corruption("bad expire entry");
+        ++*skipped;  // undecodable: leave it, keep reaping the rest (RunOnce logs the count)
+        continue;
       }
       out->push_back(
           {std::string(ek.user_key), ek.expire_ms, coding::DecodeFixed64BE((*it)->value().data())});
@@ -58,9 +59,9 @@ Result<size_t> ExpireReaper::DeleteDue(uint8_t db, std::span<const Due> due) {
   return deleted;
 }
 
-Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full) {
+Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped) {
   std::vector<Due> due;
-  if (Status st = CollectDue(db, now_ms, &due); !st.ok()) return st;
+  if (Status st = CollectDue(db, now_ms, &due, skipped); !st.ok()) return st;
   *full = due.size() >= options_.batch_size;
   size_t deleted = 0;
   for (size_t i = 0; i < due.size(); i += kKeysPerWrite) {
@@ -76,15 +77,22 @@ Result<size_t> ExpireReaper::RunOnce() {
   const auto deadline = std::chrono::steady_clock::now() + options_.cycle_budget;
   const int64_t now = engine_.NowMs();  // selects candidates; each is re-checked under its lock
   size_t total = 0;
+  size_t skipped = 0;
+  Status first_error;
   for (uint8_t db = 0; db < encoding::kNumDatabases; ++db) {
     bool full = true;
     while (full) {
-      auto n = ReapBatch(db, now, &full);
-      if (!n.ok()) return n.status();  // ends the cycle; committed deletes are already counted
+      auto n = ReapBatch(db, now, &full, &skipped);
+      if (!n.ok()) {  // give up on this db for the cycle, but still reap the others
+        if (first_error.ok()) first_error = n.status();
+        break;
+      }
       total += *n;
       if (std::chrono::steady_clock::now() >= deadline) full = false;
     }
   }
+  if (skipped > 0) spdlog::warn("expire reaper: skipped {} undecodable expire entries", skipped);
+  if (!first_error.ok()) return first_error;  // committed deletes are already counted
   return total;
 }
 

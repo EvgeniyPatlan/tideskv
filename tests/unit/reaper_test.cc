@@ -144,6 +144,22 @@ TEST_F(ReaperTest, BogusEntryNeverDeletesPersistentKey) {
   EXPECT_TRUE(h.Cf(ColumnFamily::kExpire).empty());  // the bogus entry is dropped
 }
 
+TEST_F(ReaperTest, UndecodableEntryIsSkippedAndLaterDbsAreStillReaped) {
+  {  // db 0: a due entry whose value is not an 8-byte oid; it must not end the cycle
+    auto txn = h.services.storage_.BeginWrite();
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kExpire, encoding::ExpireKeyFor(0, 1, "bad"), "xyz").ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  h.session.db = 1;
+  EXPECT_EQ(Run({"SET", "k", "v", "PX", "1"}), kOk);
+  h.clock().Advance(1);
+  auto n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok()) << n.status().ToString();
+  EXPECT_EQ(*n, 1u);
+  EXPECT_EQ(Run({"EXISTS", "k"}), test::Int(0));
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).size(), 0u);
+}
+
 TEST_F(ReaperTest, ThreadSurvivesAnException) {
   ThrowingStorage storage(h.services.storage_, /*throws=*/1);
   LockManager locks;
