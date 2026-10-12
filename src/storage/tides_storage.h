@@ -1,14 +1,32 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "storage/storage.h"
 
 namespace tideskv {
 
 enum class SyncMode : uint8_t { kNone, kInterval, kFull };
+
+enum class Compression : uint8_t { kNone, kLz4, kZstd };
+std::string_view CompressionName(Compression c);  // "no", "lz4", "zstd"
+
+struct CfStats {
+  uint64_t total_keys = 0;        // in sstables (not the memtable)
+  uint64_t total_tombstones = 0;  // point + range tombstones in sstables
+  uint64_t compaction_count = 0;
+};
+
+struct StorageStats {
+  std::array<CfStats, kColumnFamilyCount> cf{};
+  uint64_t flush_count = 0;
+  uint64_t compaction_count = 0;
+  int immutable_memtables = 0;
+};
 
 struct StorageOptions {
   std::string path;
@@ -18,6 +36,7 @@ struct StorageOptions {
   size_t memtable_size = 0;     // 0 = engine default
   int flush_threads = 0;        // 0 = engine default
   int compaction_threads = 0;   // 0 = engine default
+  Compression compression = Compression::kLz4;
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.
@@ -39,6 +58,12 @@ class TidesStorage final : public Storage {
 
   Status Backup(const std::string& dir);  // consistent, directly-openable copy
   Status Checkpoint();                    // flush + fsync WAL/vlog/manifest
+
+  Compression compression() const;  // what Open applied (kNone if this build lacks the algorithm)
+  // Synchronous. Empty lo/hi = unbounded on that side; both empty = whole CF.
+  // InvalidArgument if lo >= hi (both non-empty); Busy if a compaction already holds the CF.
+  Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi);
+  Result<StorageStats> Stats();
 
  private:
   struct Impl;

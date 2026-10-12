@@ -24,6 +24,7 @@ struct ConfigValues {
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   uint64_t client_query_buffer_limit = 1ULL << 30;
+  std::string compression = "lz4";  // no | lz4 | zstd (startup only)
   std::string loglevel = "notice";  // debug | verbose | notice | warning
   std::string logfile;              // empty = stderr
 };

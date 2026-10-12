@@ -95,6 +95,9 @@ const std::vector<Option>& Options() {
          return Memory(v, 1ULL << 20, &c.client_query_buffer_limit);
        },
        [](const ConfigValues& c) { return std::to_string(c.client_query_buffer_limit); }},
+      {"compression", false,
+       [](ConfigValues& c, std::string_view v) { return Choice(v, {"no", "lz4", "zstd"}, &c.compression); },
+       [](const ConfigValues& c) { return c.compression; }},
       {"dir", false,
        [](ConfigValues& c, std::string_view v) {
          if (Status st = ValidateNoControlChars(v); !st.ok()) return st;

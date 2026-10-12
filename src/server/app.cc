@@ -58,6 +58,9 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   so.sync_interval_us = v.sync_interval_us;
   so.block_cache_size = v.block_cache_size;
   so.memtable_size = v.memtable_size;
+  so.compression = v.compression == "zstd" ? Compression::kZstd
+                   : v.compression == "no" ? Compression::kNone
+                                           : Compression::kLz4;
   auto storage = TidesStorage::Open(so);
   if (!storage.ok()) return storage.status();
   return std::unique_ptr<App>(new App(std::move(config), std::move(storage).value()));

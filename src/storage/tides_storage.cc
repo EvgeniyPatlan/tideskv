@@ -5,6 +5,8 @@
 #include <thread>
 #include <utility>
 
+#include <spdlog/spdlog.h>
+
 #include "storage/tides_status.h"
 #include "storage/validation.h"
 
@@ -255,11 +257,40 @@ class TidesWriteTxn final : public WriteTxn {
   bool finished_ = false;
 };
 
-Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, tidesdb_column_family_t** out) {
+// The compression algorithm actually usable for `wanted` in this build.
+Compression Effective(Compression wanted) {
+  if (wanted == Compression::kNone) return Compression::kNone;
+  const auto algo = wanted == Compression::kZstd ? TDB_COMPRESS_ZSTD : TDB_COMPRESS_LZ4;
+  if (tidesdb_compression_available(algo) != 0) return wanted;
+  spdlog::warn("compression '{}' is not available in this build; storing data uncompressed",
+               CompressionName(wanted));
+  return Compression::kNone;
+}
+
+void SetPipeline(tidesdb_column_family_config_t* cfg, Compression c) {
+  cfg->encoding_count = 0;
+  if (c == Compression::kNone) return;
+  cfg->encoding_pipeline[0] =
+      static_cast<uint8_t>(c == Compression::kZstd ? TDB_COMPRESS_ZSTD : TDB_COMPRESS_LZ4);
+  cfg->encoding_count = 1;
+}
+
+// Existing families keep the pipeline persisted in the manifest unless we change it.
+Status ApplyPipeline(tidesdb_t* db, tidesdb_column_family_t* cf, Compression c) {
+  tidesdb_cf_stats_t st{};
+  if (int rc = tidesdb_get_cf_stats(cf, &st); rc != TDB_SUCCESS) return FromTdb(rc, "get_cf_stats");
+  tidesdb_column_family_config_t cfg = st.config;
+  SetPipeline(&cfg, c);
+  return FromTdb(tidesdb_cf_update_runtime_config(db, cf, &cfg, /*persist_to_disk=*/1),
+                 "cf_update_runtime_config");
+}
+
+Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, Compression c, tidesdb_column_family_t** out) {
   const std::string name(ColumnFamilyName(cf));
   *out = tidesdb_get_column_family(db, name.c_str());
-  if (*out != nullptr) return Status::Ok();
-  const tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+  if (*out != nullptr) return ApplyPipeline(db, *out, c);
+  tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+  SetPipeline(&cfg, c);
   const int rc = tidesdb_create_column_family(db, name.c_str(), &cfg);
   if (rc != TDB_SUCCESS && rc != TDB_ERR_EXISTS) return FromTdb(rc, "create column family " + name);
   *out = tidesdb_get_column_family(db, name.c_str());
@@ -271,6 +302,7 @@ Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, tidesdb_column_family_
 struct TidesStorage::Impl {
   tidesdb_t* db = nullptr;
   CfHandles cfs{};
+  Compression compression = Compression::kNone;
   ~Impl() {
     if (db != nullptr) tidesdb_close(db);
   }
@@ -297,9 +329,11 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
     return Status::Busy("open " + o.path + ": data directory is locked by another process or handle");
   }
   if (rc != TDB_SUCCESS) return FromTdb(rc, "open " + o.path);
+  const Compression comp = Effective(o.compression);
   for (ColumnFamily cf : kAllColumnFamilies) {
-    if (Status st = EnsureColumnFamily(impl->db, cf, &impl->cfs[CfIndex(cf)]); !st.ok()) return st;
+    if (Status st = EnsureColumnFamily(impl->db, cf, comp, &impl->cfs[CfIndex(cf)]); !st.ok()) return st;
   }
+  impl->compression = comp;
   return std::unique_ptr<TidesStorage>(new TidesStorage(std::move(impl)));
 }
 
@@ -335,5 +369,46 @@ Status TidesStorage::Backup(const std::string& dir) {
 }
 
 Status TidesStorage::Checkpoint() { return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint"); }
+
+std::string_view CompressionName(Compression c) {
+  switch (c) {
+    case Compression::kNone:
+      return "no";
+    case Compression::kLz4:
+      return "lz4";
+    case Compression::kZstd:
+      return "zstd";
+  }
+  return "no";
+}
+
+Compression TidesStorage::compression() const { return impl_->compression; }
+
+Status TidesStorage::CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) {
+  tidesdb_column_family_t* handle = impl_->cfs[CfIndex(cf)];
+  if (lo.empty() && hi.empty()) return FromTdb(tidesdb_compact(impl_->db, handle), "compact");
+  if (!lo.empty() && !hi.empty() && lo >= hi)
+    return Status::InvalidArgument("compact range: lo must be < hi");
+  return FromTdb(tidesdb_compact_range(impl_->db, handle, lo.empty() ? nullptr : Bytes(lo), lo.size(),
+                                       hi.empty() ? nullptr : Bytes(hi), hi.size()),
+                 "compact_range");
+}
+
+Result<StorageStats> TidesStorage::Stats() {
+  StorageStats out;
+  tidesdb_db_stats_t db{};
+  if (int rc = tidesdb_get_db_stats(impl_->db, &db); rc != TDB_SUCCESS) return FromTdb(rc, "get_db_stats");
+  out.flush_count = db.flush_count;
+  out.compaction_count = db.compaction_count;
+  out.immutable_memtables = db.immutable_memtable_count;
+  for (ColumnFamily cf : kAllColumnFamilies) {
+    tidesdb_cf_stats_t st{};
+    if (int rc = tidesdb_get_cf_stats(impl_->cfs[CfIndex(cf)], &st); rc != TDB_SUCCESS) {
+      return FromTdb(rc, "get_cf_stats");
+    }
+    out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count};
+  }
+  return out;
+}
 
 }  // namespace tideskv

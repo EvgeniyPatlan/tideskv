@@ -116,7 +116,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 13u);
+  EXPECT_EQ(c.Get("*").size(), 14u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -191,6 +191,16 @@ TEST(Config, RewritePreservesFilePermissions) {
   EXPECT_EQ(perms & std::filesystem::perms::all, expected);
   // Verify no .tmp file remains
   EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+}
+
+TEST(Config, CompressionOption) {
+  Config c;
+  EXPECT_EQ(c.Snapshot().compression, "lz4");
+  EXPECT_TRUE(c.Set("compression", "ZSTD", false).ok());
+  EXPECT_EQ(c.Snapshot().compression, "zstd");
+  EXPECT_TRUE(c.Set("compression", "no", false).ok());
+  EXPECT_FALSE(c.Set("compression", "snappy", false).ok());
+  EXPECT_FALSE(c.Set("compression", "lz4", /*at_runtime=*/true).ok());  // startup-only
 }
 
 }  // namespace
