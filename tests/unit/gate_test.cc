@@ -70,5 +70,45 @@ TEST(Gate, WriterExcludesWriter) {
   EXPECT_EQ(counter, 20000);
 }
 
+TEST(Gate, TryLockFailsWhileAnyHolderExists) {
+  Gate gate;
+  {
+    std::shared_lock r(gate);
+    EXPECT_FALSE(gate.try_lock());
+  }
+  ASSERT_TRUE(gate.try_lock());
+  EXPECT_FALSE(gate.try_lock());
+  gate.unlock();
+  EXPECT_TRUE(gate.try_lock());
+  gate.unlock();
+}
+
+TEST(Gate, TryLockSharedFailsWhileAWriterHoldsOrWaits) {
+  Gate gate;
+  ASSERT_TRUE(gate.try_lock_shared());
+  EXPECT_TRUE(gate.try_lock_shared());  // readers overlap
+  std::atomic<bool> writer_in{false};
+  std::thread writer([&] {
+    std::unique_lock w(gate);  // queues behind the two readers
+    writer_in = true;
+  });
+  // Once the writer is waiting, new readers are refused (writer priority).
+  while (gate.try_lock_shared()) {
+    gate.unlock_shared();
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(writer_in.load());
+  gate.unlock_shared();
+  gate.unlock_shared();
+  writer.join();
+  EXPECT_TRUE(writer_in.load());
+  {
+    std::unique_lock w(gate);
+    EXPECT_FALSE(gate.try_lock_shared());
+  }
+  EXPECT_TRUE(gate.try_lock_shared());
+  gate.unlock_shared();
+}
+
 }  // namespace
 }  // namespace tideskv

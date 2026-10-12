@@ -16,7 +16,7 @@ file(GLOB UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cc)
 add_executable(unit_tests ${UNIT_SOURCES})
 target_link_libraries(unit_tests PRIVATE test_support tidesdb GTest::gtest_main rapidcheck rapidcheck_gtest)
 tideskv_defaults(unit_tests)
-gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 60)
 
 file(GLOB CONTRACT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/contract/*.cc)
 if(CONTRACT_SOURCES)

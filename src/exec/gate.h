@@ -13,6 +13,8 @@ class Gate {
   void unlock();
   void lock_shared();
   void unlock_shared();
+  bool try_lock();         // succeeds iff no reader or writer holds the gate
+  bool try_lock_shared();  // succeeds iff no writer holds or waits for the gate
 
  private:
   std::mutex mu_;

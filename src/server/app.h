@@ -6,6 +6,9 @@
 
 #include "commands/registry.h"
 #include "commands/server_services.h"
+#include "common/clock.h"
+#include "exec/engine.h"
+#include "exec/lock_manager.h"
 #include "net/server.h"
 #include "server/config.h"
 #include "storage/tides_storage.h"
@@ -30,6 +33,7 @@ class App final : public ServerServices {
   ServerStats Stats() const override;
   void ResetStats() override { server_->ResetCounters(); }
   void RequestShutdown() override;
+  Engine& engine() override { return *engine_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -37,6 +41,9 @@ class App final : public ServerServices {
 
   std::unique_ptr<Config> config_;
   std::unique_ptr<TidesStorage> storage_;
+  std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
+  SystemClock clock_;
+  std::unique_ptr<Engine> engine_;
   CommandRegistry registry_;
   std::unique_ptr<net::Server> server_;
   asio::io_context main_ctx_;

@@ -12,6 +12,7 @@
 
 #include "commands/all_commands.h"
 #include "common/version.h"
+#include "types/format_version.h"
 
 namespace tideskv {
 namespace {
@@ -63,11 +64,13 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
                                            : Compression::kLz4;
   auto storage = TidesStorage::Open(so);
   if (!storage.ok()) return storage.status();
+  if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
   return std::unique_ptr<App>(new App(std::move(config), std::move(storage).value()));
 }
 
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
+  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_);
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
       MakeServerOptions(),
@@ -121,6 +124,7 @@ void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
   server_->Stop();   // no command can touch storage after this
+  engine_.reset();   // references storage_, so it goes first
   storage_.reset();  // flushes and closes TidesDB
 }
 

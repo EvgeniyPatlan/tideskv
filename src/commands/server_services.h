@@ -7,6 +7,7 @@
 namespace tideskv {
 
 class CommandRegistry;
+class Engine;
 
 struct ServerStats {
   std::string version;
@@ -32,6 +33,7 @@ class ServerServices {
   virtual ServerStats Stats() const = 0;
   virtual void ResetStats() = 0;
   virtual void RequestShutdown() = 0;  // must not block; the main thread performs the shutdown
+  virtual Engine& engine() = 0;        // data access for commands (Task 5)
 };
 
 }  // namespace tideskv

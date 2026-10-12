@@ -17,7 +17,8 @@ enum class StatusCode : uint8_t {
   kNoSpace,   // disk full
   kIOError,
   kCorruption,
-  kInternal,  // a bug: invariant violated
+  kInternal,   // a bug: invariant violated
+  kUserError,  // a command-level error; message is the exact Redis reply text
 };
 
 std::string_view StatusCodeName(StatusCode code);
@@ -35,6 +36,7 @@ class [[nodiscard]] Status {
   static Status IOError(std::string msg) { return {StatusCode::kIOError, std::move(msg)}; }
   static Status Corruption(std::string msg) { return {StatusCode::kCorruption, std::move(msg)}; }
   static Status Internal(std::string msg) { return {StatusCode::kInternal, std::move(msg)}; }
+  static Status UserError(std::string reply) { return {StatusCode::kUserError, std::move(reply)}; }
 
   bool ok() const { return code_ == StatusCode::kOk; }
   bool IsNotFound() const { return code_ == StatusCode::kNotFound; }

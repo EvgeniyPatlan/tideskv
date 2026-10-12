@@ -1,0 +1,20 @@
+#pragma once
+#include <string>
+#include <string_view>
+
+#include "commands/registry.h"
+#include "common/status.h"
+#include "types/errors.h"  // re-exported: handlers use the kErr* constants
+
+// Status -> reply mapping and message helpers for the data commands.
+namespace tideskv {
+
+std::string InvalidExpireError(std::string_view command);  // "ERR invalid expire time in 'set' command"
+std::string ArityError(std::string_view command);          // "ERR wrong number of arguments for 'x' command"
+std::string UnsupportedOptionError(std::string_view opt);  // "ERR Unsupported option KEEPTTL"
+
+// Error reply for a failed status: kUserError verbatim; storage failures per spec §5.4,
+// with details logged server-side and never sent to the client.
+void ReplyError(ExecContext& ctx, const Status& st);
+
+}  // namespace tideskv

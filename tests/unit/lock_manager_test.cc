@@ -57,13 +57,8 @@ TEST(LockManager, OppositeKeyOrderCannotDeadlock) {
   };
   auto a = std::async(std::launch::async, run, std::vector<std::string_view>{"x", "y", "z"});
   auto b = std::async(std::launch::async, run, std::vector<std::string_view>{"z", "y", "x"});
-  // On timeout the futures' destructors would block on the deadlocked threads; fail loudly instead.
-  const bool a_ready = a.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
-  const bool b_ready = b.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
-  if (!a_ready || !b_ready) {
-    ADD_FAILURE() << "deadlock: opposite-order lockers did not finish";
-    std::_Exit(1);
-  }
+  ASSERT_EQ(a.wait_for(std::chrono::seconds(20)), std::future_status::ready);
+  ASSERT_EQ(b.wait_for(std::chrono::seconds(20)), std::future_status::ready);
 }
 
 TEST(LockManager, DifferentStripesDoNotBlockEachOther) {

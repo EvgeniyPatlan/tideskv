@@ -22,6 +22,8 @@ std::string_view StatusCodeName(StatusCode code) {
       return "Corruption";
     case StatusCode::kInternal:
       return "Internal";
+    case StatusCode::kUserError:
+      return "UserError";
   }
   return "Unknown";
 }

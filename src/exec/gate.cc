@@ -21,6 +21,20 @@ void Gate::lock() {
   writer_ = true;
 }
 
+bool Gate::try_lock() {
+  std::lock_guard l(mu_);
+  if (writer_ || readers_ != 0) return false;
+  writer_ = true;
+  return true;
+}
+
+bool Gate::try_lock_shared() {
+  std::lock_guard l(mu_);
+  if (writer_ || writers_waiting_ != 0) return false;
+  ++readers_;
+  return true;
+}
+
 void Gate::unlock() {
   std::lock_guard l(mu_);
   writer_ = false;

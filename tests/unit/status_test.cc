@@ -65,5 +65,13 @@ TEST(Result, SupportsMoveOnlyTypes) {
   EXPECT_EQ(*p, 7);
 }
 
+TEST(Status, UserErrorCarriesTheReplyText) {
+  const Status st = Status::UserError("WRONGTYPE Operation against a key holding the wrong kind of value");
+  EXPECT_FALSE(st.ok());
+  EXPECT_EQ(st.code(), StatusCode::kUserError);
+  EXPECT_EQ(st.message(), "WRONGTYPE Operation against a key holding the wrong kind of value");
+  EXPECT_EQ(StatusCodeName(StatusCode::kUserError), "UserError");
+}
+
 }  // namespace
 }  // namespace tideskv
