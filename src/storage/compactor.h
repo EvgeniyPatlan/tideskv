@@ -1,6 +1,4 @@
 #pragma once
-#include <string_view>
-
 #include "common/status.h"
 #include "storage/column_family.h"
 
@@ -13,8 +11,9 @@ class Compactor {
   virtual ~Compactor() = default;
   // Flushes memtables, so range tombstones reach sstables where compaction can drop them.
   virtual Status Checkpoint() = 0;
-  // Synchronous. Empty lo/hi = unbounded on that side; Busy when a compaction holds the CF.
-  virtual Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) = 0;
+  // Synchronous compaction of the whole CF; Busy when a compaction already holds it. Whole-CF on
+  // purpose: an engine range compaction cannot reclaim a FLUSHDB (see TidesStorage::Compact).
+  virtual Status Compact(ColumnFamily cf) = 0;
 };
 
 }  // namespace tideskv

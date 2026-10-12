@@ -28,6 +28,7 @@ ServerStats SampleStats() {
   s.data_dir = "/data";
   s.sync_mode = "interval";
   s.storage_compression = "lz4";
+  s.storage_keys = 77;
   s.storage_tombstones = 12;
   s.storage_flushes = 3;
   s.storage_compactions = 4;
@@ -41,8 +42,8 @@ TEST(FormatInfo, AllSectionsByDefault) {
        {"# Server\r\n", "redis_version:7.2.0\r\n", "tideskv_version:0.1.0\r\n", "tcp_port:6666\r\n",
         "uptime_in_days:1\r\n", "# Clients\r\n", "connected_clients:3\r\n", "# Stats\r\n",
         "total_commands_processed:99\r\n", "# Persistence\r\n", "storage_engine:tidesdb\r\n",
-        "compression:lz4\r\n", "tombstones:12\r\n", "flushes:3\r\n", "compactions:4\r\n",
-        "expired_keys:9\r\n", "# Keyspace\r\n"}) {
+        "compression:lz4\r\n", "sstable_keys:77\r\n", "tombstones:12\r\n", "flushes:3\r\n",
+        "compactions:4\r\n", "expired_keys:9\r\n", "# Keyspace\r\n"}) {
     EXPECT_NE(info.find(needle), std::string::npos) << needle;
   }
   EXPECT_EQ(FormatInfo(SampleStats(), {"everything"}), info);

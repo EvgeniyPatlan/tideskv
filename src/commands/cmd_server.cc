@@ -53,6 +53,7 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                     {"dir", s.data_dir},
                     {"sync_mode", s.sync_mode},
                     {"compression", s.storage_compression},
+                    {"sstable_keys", std::to_string(s.storage_keys)},
                     {"tombstones", std::to_string(s.storage_tombstones)},
                     {"flushes", std::to_string(s.storage_flushes)},
                     {"compactions", std::to_string(s.storage_compactions)},

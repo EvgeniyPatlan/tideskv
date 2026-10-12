@@ -41,9 +41,9 @@ struct StorageOptions {
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.
-// Thread safety: BeginWrite/BeginRead/BeginSnapshot/Backup/Checkpoint/CompactRange/Stats may be
+// Thread safety: BeginWrite/BeginRead/BeginSnapshot/Backup/Checkpoint/Compact/Stats may be
 // called concurrently from multiple threads (the engine is thread-safe; the background
-// compaction scheduler calls CompactRange from its own thread while transactions run). Each returned
+// compaction scheduler calls Compact from its own thread while transactions run). Each returned
 // WriteTxn/ReadView/Iterator is single-threaded: use it from one thread at a time,
 // and destroy it before this object.
 class TidesStorage final : public Storage, public Compactor {
@@ -62,9 +62,9 @@ class TidesStorage final : public Storage, public Compactor {
   Status Checkpoint() override;           // flush + fsync WAL/vlog/manifest
 
   Compression compression() const;  // what Open applied (kNone if this build lacks the algorithm)
-  // Synchronous. Empty lo/hi = unbounded on that side; both empty = whole CF.
-  // InvalidArgument if lo >= hi (both non-empty); Busy if a compaction already holds the CF.
-  Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override;
+  // Synchronous whole-CF compaction; drops data covered by range tombstones. Busy if a
+  // compaction already holds the CF.
+  Status Compact(ColumnFamily cf) override;
   Result<StorageStats> Stats();
 
  private:

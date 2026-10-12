@@ -392,14 +392,12 @@ std::string_view CompressionName(Compression c) {
 
 Compression TidesStorage::compression() const { return impl_->compression; }
 
-Status TidesStorage::CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) {
-  tidesdb_column_family_t* handle = impl_->cfs[CfIndex(cf)];
-  if (lo.empty() && hi.empty()) return FromTdb(tidesdb_compact(impl_->db, handle), "compact");
-  if (!lo.empty() && !hi.empty() && lo >= hi)
-    return Status::InvalidArgument("compact range: lo must be < hi");
-  return FromTdb(tidesdb_compact_range(impl_->db, handle, lo.empty() ? nullptr : Bytes(lo), lo.size(),
-                                       hi.empty() ? nullptr : Bytes(hi), hi.size()),
-                 "compact_range");
+// Whole-CF only. tidesdb_compact_range (v10.1.1) picks its inputs by each sstable's point-key
+// min/max. The flush of a memtable that held only a range delete (the usual FLUSHDB) writes an
+// sstable with the tombstone and no keys, whose empty min/max never meets a range starting at a
+// db prefix, so the merge runs without the tombstone and keeps every deleted key.
+Status TidesStorage::Compact(ColumnFamily cf) {
+  return FromTdb(tidesdb_compact(impl_->db, impl_->cfs[CfIndex(cf)]), "compact");
 }
 
 Result<StorageStats> TidesStorage::Stats() {

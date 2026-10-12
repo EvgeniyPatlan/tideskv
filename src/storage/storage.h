@@ -25,6 +25,10 @@ struct IterOptions {
 // Reaching the end is not an error: positioning calls return OK and Valid() turns false.
 // key()/value() remain valid until the next positioning call. An Iterator must be
 // destroyed before the ReadView/WriteTxn that created it.
+// Cost: TidesStorage enforces the bounds over an unbounded engine iterator, so the call that leaves
+// the range (the last Next()/Seek(), or Prev()/SeekForPrev() below `lower`) can step over every
+// deleted-but-not-yet-compacted key beyond that bound: O(dead keys past the bound) until compaction
+// physically drops them.
 class Iterator {
  public:
   virtual ~Iterator() = default;

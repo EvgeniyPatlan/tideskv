@@ -192,7 +192,7 @@ TEST(TidesStorageMaint, StatsCountKeysAndTombstonesAfterFlush) {
   EXPECT_GT(stats->cf[CfIndex(ColumnFamily::kMeta)].total_tombstones, 0u);
 }
 
-TEST(TidesStorageMaint, CompactRangeKeepsLiveDataAndRejectsBadBounds) {
+TEST(TidesStorageMaint, CompactKeepsLiveDataAndDropsDeletedData) {
   TempDir dir;
   auto s = MustOpen(OptionsWith(dir, Compression::kNone));
   ASSERT_NE(s, nullptr);
@@ -209,17 +209,12 @@ TEST(TidesStorageMaint, CompactRangeKeepsLiveDataAndRejectsBadBounds) {
   }
   ASSERT_TRUE(s->Checkpoint().ok());
   // A background compaction may hold the CF: Busy is a legal answer, retry a few times.
-  auto compact = [&](std::string_view lo, std::string_view hi) {
-    Status st = s->CompactRange(ColumnFamily::kSubkey, lo, hi);
-    for (int i = 0; i < 20 && st.code() == StatusCode::kBusy; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      st = s->CompactRange(ColumnFamily::kSubkey, lo, hi);
-    }
-    return st;
-  };
-  EXPECT_TRUE(compact("a", "b").ok());
-  EXPECT_TRUE(compact("", "").ok());  // whole CF
-  EXPECT_EQ(s->CompactRange(ColumnFamily::kSubkey, "b", "a").code(), StatusCode::kInvalidArgument);
+  Status st = s->Compact(ColumnFamily::kSubkey);
+  for (int i = 0; i < 20 && st.code() == StatusCode::kBusy; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    st = s->Compact(ColumnFamily::kSubkey);
+  }
+  EXPECT_TRUE(st.ok()) << st.ToString();
   auto view = s->BeginRead();
   EXPECT_TRUE((*view)->Get(ColumnFamily::kSubkey, "a1").status().IsNotFound());
   EXPECT_EQ(*(*view)->Get(ColumnFamily::kSubkey, "b1"), "y");

@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cassert>
 
-#include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
 
 namespace tideskv {
@@ -15,28 +14,23 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
   std::lock_guard lock(mu_);
   const size_t before = queue_.size();
   for (const RangeDelete& d : deletes) {
-    if (!d.is_prefix) {
-      EnqueueLocked({d.cf, {}, {}});
-    } else if (d.lo.size() == 1) {
-      EnqueueLocked({d.cf, d.lo, encoding::PrefixUpperBound(d.lo)});
+    if (!d.is_prefix || d.lo.size() == 1) {
+      EnqueueLocked({d.cf});
     } else if (d.cf == ColumnFamily::kSubkey && d.lo.size() == encoding::kObjectPrefixSize) {
       ++collection_deletes_;
     }
   }
   if (threshold > 0 && collection_deletes_ >= threshold) {
     collection_deletes_ = 0;
-    EnqueueLocked({ColumnFamily::kSubkey, {}, {}});
-    EnqueueLocked({ColumnFamily::kZScore, {}, {}});
+    EnqueueLocked({ColumnFamily::kSubkey});
+    EnqueueLocked({ColumnFamily::kZScore});
   }
   if (queue_.size() != before) cv_.notify_one();
 }
 
 void CompactionScheduler::EnqueueLocked(Job job) {
-  for (const Job& q : queue_) {
-    if (q.cf == job.cf && (q.whole() || (q.lo == job.lo && q.hi == job.hi))) return;  // already covered
-  }
-  if (job.whole()) std::erase_if(queue_, [&](const Job& q) { return q.cf == job.cf; });
-  queue_.push_back(std::move(job));
+  if (std::any_of(queue_.begin(), queue_.end(), [&](const Job& q) { return q.cf == job.cf; })) return;
+  queue_.push_back(job);
 }
 
 size_t CompactionScheduler::RunPending() {
@@ -50,13 +44,13 @@ size_t CompactionScheduler::RunPending() {
   size_t finished = 0;
   for (Job& job : jobs) {
     if (stop_.load()) break;  // shutting down: drop the rest (neither completed nor failed)
-    const Status st = checkpoint.ok() ? compactor_.CompactRange(job.cf, job.lo, job.hi) : checkpoint;
+    const Status st = checkpoint.ok() ? compactor_.Compact(job.cf) : checkpoint;
     if (st.ok()) {
       completed_.fetch_add(1, std::memory_order_relaxed);
       ++finished;
     } else if (++job.attempts < options_.max_attempts) {
       std::lock_guard lock(mu_);
-      EnqueueLocked(std::move(job));
+      EnqueueLocked(job);
     } else {
       spdlog::warn("background compaction of CF {} gave up after {} attempts: {}", ColumnFamilyName(job.cf),
                    job.attempts, st.ToString());

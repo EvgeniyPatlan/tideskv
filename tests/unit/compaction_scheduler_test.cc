@@ -16,19 +16,18 @@ namespace {
 struct Call {
   std::string what;  // "checkpoint" or "compact"
   ColumnFamily cf = ColumnFamily::kMeta;
-  std::string lo, hi;
 };
 
 class FakeCompactor final : public Compactor {
  public:
   Status Checkpoint() override {
     std::lock_guard lock(mu);
-    calls.push_back({"checkpoint", ColumnFamily::kMeta, {}, {}});
+    calls.push_back({"checkpoint", ColumnFamily::kMeta});
     return Status::Ok();
   }
-  Status CompactRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override {
+  Status Compact(ColumnFamily cf) override {
     std::lock_guard lock(mu);
-    calls.push_back({"compact", cf, std::string(lo), std::string(hi)});
+    calls.push_back({"compact", cf});
     if (busy_left > 0) {
       --busy_left;
       return Status::Busy("compaction running");
@@ -52,7 +51,7 @@ CompactionScheduler::Options Opts(uint64_t threshold) {
   return o;
 }
 
-TEST(CompactionScheduler, FlushDbCompactsThatDbsRangeAfterACheckpoint) {
+TEST(CompactionScheduler, FlushDbCompactsEachDeletedCfAfterACheckpoint) {
   FakeCompactor c;
   CompactionScheduler s(c, Opts(1000));
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(3)),
@@ -61,8 +60,9 @@ TEST(CompactionScheduler, FlushDbCompactsThatDbsRangeAfterACheckpoint) {
   const auto calls = c.Calls();
   ASSERT_EQ(calls.size(), 3u);
   EXPECT_EQ(calls[0].what, "checkpoint");
-  EXPECT_EQ(calls[1].lo, encoding::DbPrefix(3));
-  EXPECT_EQ(calls[1].hi, encoding::DbPrefix(4));
+  EXPECT_EQ(calls[1].what, "compact");
+  EXPECT_EQ(calls[1].cf, ColumnFamily::kMeta);
+  EXPECT_EQ(calls[2].cf, ColumnFamily::kSubkey);
   EXPECT_EQ(s.completed(), 2u);
 }
 
@@ -71,8 +71,8 @@ TEST(CompactionScheduler, FlushAllCompactsWholeColumnFamilies) {
   CompactionScheduler s(c, Opts(1000));
   s.OnCommitted({{ColumnFamily::kMeta, encoding::DbPrefix(0), encoding::DbPrefix(16), false}});
   EXPECT_EQ(s.RunPending(), 1u);
-  EXPECT_EQ(c.Calls()[1].lo, "");
-  EXPECT_EQ(c.Calls()[1].hi, "");
+  EXPECT_EQ(c.Calls()[1].what, "compact");
+  EXPECT_EQ(c.Calls()[1].cf, ColumnFamily::kMeta);
 }
 
 TEST(CompactionScheduler, CollectionDeletesTriggerAtTheThreshold) {
@@ -95,16 +95,17 @@ TEST(CompactionScheduler, ThresholdZeroNeverCompactsForCollections) {
   EXPECT_EQ(s.pending(), 0u);
 }
 
-TEST(CompactionScheduler, DuplicatesAreDroppedAndWholeCfJobsSubsumeRanges) {
+TEST(CompactionScheduler, QueuedJobsAreDeduplicatedPerColumnFamily) {
   FakeCompactor c;
   CompactionScheduler s(c, Opts(1000));
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(1))});
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(1))});
   EXPECT_EQ(s.pending(), 1u);
   s.OnCommitted({{ColumnFamily::kMeta, encoding::DbPrefix(0), encoding::DbPrefix(16), false}});
-  EXPECT_EQ(s.pending(), 1u);  // the whole-CF job replaced the range job
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(2))});
-  EXPECT_EQ(s.pending(), 1u);  // already covered
+  EXPECT_EQ(s.pending(), 1u);  // all covered by the one queued meta compaction
+  s.OnCommitted({Prefix(ColumnFamily::kExpire, encoding::DbPrefix(2))});
+  EXPECT_EQ(s.pending(), 2u);
 }
 
 TEST(CompactionScheduler, BusyIsRetriedThenCountedAsAFailure) {
@@ -137,7 +138,7 @@ TEST(CompactionScheduler, WorkerThreadRunsJobs) {
 class BlockingCompactor final : public Compactor {
  public:
   Status Checkpoint() override { return Status::Ok(); }
-  Status CompactRange(ColumnFamily, std::string_view, std::string_view) override {
+  Status Compact(ColumnFamily) override {
     std::unique_lock lock(mu);
     ++started;
     cv.notify_all();
@@ -167,10 +168,10 @@ TEST(CompactionScheduler, StopDropsJobsThatHaveNotStarted) {
   o.tick = std::chrono::milliseconds(5);
   CompactionScheduler s(c, o);
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(1)),
-                 Prefix(ColumnFamily::kMeta, encoding::DbPrefix(2))});
+                 Prefix(ColumnFamily::kExpire, encoding::DbPrefix(1))});
   ASSERT_EQ(s.pending(), 2u);
   s.Start();
-  c.WaitStarted();  // first job is inside CompactRange
+  c.WaitStarted();  // first job is inside Compact
   std::thread stopper([&] { s.Stop(); });
   std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let Stop raise the flag
   c.Release();

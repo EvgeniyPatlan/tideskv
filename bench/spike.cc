@@ -229,10 +229,10 @@ int RunCompact(const std::map<std::string, std::string> &f) {
   PrintReads("after delete_prefix", MeasureReads(*s, survivors, fields));
   Die(s->Checkpoint(), "checkpoint");
   const auto cstart = Clock::now();
-  Status cst = s->CompactRange(ColumnFamily::kSubkey, "", "");
+  Status cst = s->Compact(ColumnFamily::kSubkey);
   for (int attempt = 0; cst.code() == StatusCode::kBusy && attempt < 600; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    cst = s->CompactRange(ColumnFamily::kSubkey, "", "");
+    cst = s->Compact(ColumnFamily::kSubkey);
   }
   Die(cst, "compact");
   std::printf("compact whole subkey CF: %.2fs\n",

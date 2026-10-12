@@ -6,7 +6,6 @@
 #include <deque>
 #include <functional>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -16,13 +15,15 @@
 namespace tideskv {
 
 // Background compaction (M3 plan E6, M2 Task 3 verdict). Classifies committed range deletes:
-//  - a 1-byte prefix (FLUSHDB of that db)    -> compact [db, db+1) of that CF;
-//  - a DeleteRange (FLUSHALL)                -> compact the whole CF;
+//  - a 1-byte prefix (FLUSHDB of that db) or a DeleteRange (FLUSHALL) -> compact that whole CF
+//    (a range compaction cannot reclaim a FLUSHDB: see TidesStorage::Compact);
 //  - an 11-byte subkey prefix (collection deleted) -> counted; at the threshold the whole subkey
 //    and zscore CFs are compacted and the count restarts.
 // Each batch of jobs starts with one Checkpoint (range tombstones still in the memtable are not
 // compacted). A failed job is retried on later ticks up to max_attempts, then counted as failed.
-// Queued jobs are deduplicated; a whole-CF job replaces queued ranges of that CF.
+// Queued jobs are deduplicated per CF.
+// All scheduler state is in memory only: queued compactions are lost on a crash or Stop (a startup
+// compaction pass is an M8 item).
 class CompactionScheduler final : public CommitListener {
  public:
   struct Options {
@@ -41,7 +42,7 @@ class CompactionScheduler final : public CommitListener {
   // Runs the queued jobs on the calling thread; returns how many finished (done or given up).
   size_t RunPending();
   // Start/Stop are not concurrent with each other. Stop drops queued and not-yet-started jobs;
-  // a CompactRange already running is not interrupted.
+  // a Compact already running is not interrupted.
   void Start();
   void Stop();
 
@@ -52,9 +53,7 @@ class CompactionScheduler final : public CommitListener {
  private:
   struct Job {
     ColumnFamily cf = ColumnFamily::kMeta;
-    std::string lo, hi;  // both empty = the whole CF
     int attempts = 0;
-    bool whole() const { return lo.empty() && hi.empty(); }
   };
   void EnqueueLocked(Job job);  // requires mu_
   void Loop();
