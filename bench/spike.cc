@@ -4,6 +4,8 @@
 //   tideskv-spike commit     --dir D --threads 8 --seconds 10 --sync interval|full|none
 //   tideskv-spike tombstones --dir D --collections 100000 --fields 20 --deleted-pct 50
 //   tideskv-spike backup     --dir D --gb 1
+//   tideskv-spike compact    --dir D --collections 50000 --fields 20 --deleted-pct 90
+//   tideskv-spike flushdb    --dir D --cycles 10000 --keys 100
 // clang-format on
 #include <algorithm>
 #include <atomic>
@@ -185,6 +187,98 @@ int RunTombstones(const std::map<std::string, std::string> &f) {
   return 0;
 }
 
+// D5: does compact_range undo the R1 costs (scan tail + super-linear delete commits)?
+int RunCompact(const std::map<std::string, std::string> &f) {
+  const uint64_t collections = std::stoull(Flag(f, "--collections", "50000"));
+  const uint64_t fields = std::stoull(Flag(f, "--fields", "20"));
+  const int deleted_pct = std::stoi(Flag(f, "--deleted-pct", "90"));
+  auto s = OpenFresh(Flag(f, "--dir", "/tmp/tideskv-spike"), SyncMode::kNone);
+  const std::string value(32, 'x');
+  for (uint64_t oid = 1; oid <= collections; ++oid) {
+    auto txn = s->BeginWrite();
+    Die(txn.status(), "begin");
+    for (uint64_t i = 0; i < fields; ++i) {
+      Die((*txn)->Put(ColumnFamily::kSubkey, EncodeSubkey(0, 0, oid, "f" + std::to_string(i)), value), "put");
+    }
+    Commit(**txn, "commit load");
+  }
+  std::vector<uint64_t> survivors, doomed;
+  for (uint64_t oid = 1; oid <= collections; ++oid) {
+    (static_cast<int>(oid % 100) < deleted_pct ? doomed : survivors).push_back(oid);
+  }
+  PrintReads("baseline", MeasureReads(*s, survivors, fields));
+  // Delete all but the last 1000 doomed collections; one line per 1000-delete chunk.
+  const size_t tail = std::min<size_t>(1000, doomed.size());
+  auto time_deletes = [&](size_t from, size_t to, const char *label) {
+    constexpr size_t kChunk = 1000;
+    for (size_t lo = from; lo < to; lo += kChunk) {
+      const size_t hi = std::min(to, lo + kChunk);
+      const auto start = Clock::now();
+      for (size_t i = lo; i < hi; ++i) {
+        auto txn = s->BeginWrite();
+        Die(txn.status(), "begin");
+        Die((*txn)->DeletePrefix(ColumnFamily::kSubkey, SubkeyPrefix(0, 0, doomed[i])), "delete_prefix");
+        Commit(**txn, "commit delete");
+      }
+      const double secs = std::chrono::duration<double>(Clock::now() - start).count();
+      std::printf("%-22s [%6zu..%6zu) %zu deletes in %.2fs (%.3f ms/delete)\n", label, lo, hi, hi - lo, secs,
+                  1000.0 * secs / static_cast<double>(hi - lo));
+    }
+  };
+  time_deletes(0, doomed.size() - tail, "delete phase");
+  PrintReads("after delete_prefix", MeasureReads(*s, survivors, fields));
+  Die(s->Checkpoint(), "checkpoint");
+  const auto cstart = Clock::now();
+  Status cst = s->CompactRange(ColumnFamily::kSubkey, "", "");
+  for (int attempt = 0; cst.code() == StatusCode::kBusy && attempt < 600; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cst = s->CompactRange(ColumnFamily::kSubkey, "", "");
+  }
+  Die(cst, "compact");
+  std::printf("compact whole subkey CF: %.2fs\n",
+              std::chrono::duration<double>(Clock::now() - cstart).count());
+  PrintReads("after compact", MeasureReads(*s, survivors, fields));
+  time_deletes(doomed.size() - tail, doomed.size(), "deletes after compact");
+  auto stats = s->Stats();
+  Die(stats.status(), "stats");
+  std::printf("subkey tombstones after: %lu\n",
+              static_cast<unsigned long>(stats->cf[CfIndex(ColumnFamily::kSubkey)].total_tombstones));
+  return 0;
+}
+
+// D5: does a FLUSHDB-heavy workload (4 prefix deletes per cycle) slow down over time?
+int RunFlushDb(const std::map<std::string, std::string> &f) {
+  const int cycles = std::stoi(Flag(f, "--cycles", "10000"));
+  const int keys = std::stoi(Flag(f, "--keys", "100"));
+  auto s = OpenFresh(Flag(f, "--dir", "/tmp/tideskv-spike"), SyncMode::kNone);
+  std::vector<double> lat;
+  for (int c = 1; c <= cycles; ++c) {
+    {
+      auto txn = s->BeginWrite();
+      Die(txn.status(), "begin");
+      for (int k = 0; k < keys; ++k) {
+        Die((*txn)->Put(ColumnFamily::kMeta, EncodeMetaKey(1, 0, "k" + std::to_string(k)), "v"), "put");
+      }
+      Commit(**txn, "commit load");
+    }
+    const auto start = Clock::now();
+    auto txn = s->BeginWrite();
+    Die(txn.status(), "begin");
+    for (ColumnFamily cf :
+         {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore, ColumnFamily::kExpire}) {
+      Die((*txn)->DeletePrefix(cf, std::string(1, '\x01')), "delete_prefix");
+    }
+    Commit(**txn, "commit flush");
+    lat.push_back(std::chrono::duration<double, std::micro>(Clock::now() - start).count());
+    if (c % 1000 == 0) {
+      std::printf("cycles %5d..%5d flush p50=%.1fus p99=%.1fus\n", c - 999, c, Percentile(lat, 0.5),
+                  Percentile(lat, 0.99));
+      lat.clear();
+    }
+  }
+  return 0;
+}
+
 // R4: tidesdb_backup throughput (copy, not hardlink) — basis of replication
 // full sync.
 int RunBackup(const std::map<std::string, std::string> &f) {
@@ -220,7 +314,8 @@ int RunBackup(const std::map<std::string, std::string> &f) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: tideskv-spike commit|tombstones|backup [--flag value ...]\n");
+    std::fprintf(stderr,
+                 "usage: tideskv-spike commit|tombstones|backup|compact|flushdb [--flag value ...]\n");
     return 2;
   }
   const std::string mode = argv[1];
@@ -228,6 +323,8 @@ int main(int argc, char **argv) {
   if (mode == "commit") return RunCommit(flags);
   if (mode == "tombstones") return RunTombstones(flags);
   if (mode == "backup") return RunBackup(flags);
+  if (mode == "compact") return RunCompact(flags);
+  if (mode == "flushdb") return RunFlushDb(flags);
   std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
   return 2;
 }
