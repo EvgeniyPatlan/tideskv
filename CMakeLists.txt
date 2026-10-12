@@ -11,6 +11,7 @@ option(TIDESKV_BUILD_BENCH "Build the M0 spike/bench tools" OFF)
 option(TIDESKV_FUZZ "Build libFuzzer targets (clang only)" OFF)
 option(TIDESKV_COMPRESSION "Build TidesDB with LZ4+Zstd (needs liblz4-dev libzstd-dev)" ON)
 option(TIDESKV_COVERAGE "Clang source-based coverage" OFF)
+option(TIDESKV_WERROR "Treat warnings in our own targets as errors" OFF)
 set(TIDESKV_SANITIZE "" CACHE STRING "Sanitizer: empty, address or thread")
 
 include(cmake/Sanitizers.cmake)

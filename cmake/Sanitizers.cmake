@@ -19,4 +19,7 @@ endif()
 # Warnings for our own targets only (third-party code is not ours to fix).
 function(tideskv_defaults target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type)
+  if(TIDESKV_WERROR)
+    target_compile_options(${target} PRIVATE -Werror)
+  endif()
 endfunction()

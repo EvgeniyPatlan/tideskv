@@ -33,6 +33,7 @@
     { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
     { "name": "coverage", "configurePreset": "coverage", "output": { "outputOnFailure": true } }
   ]
 }

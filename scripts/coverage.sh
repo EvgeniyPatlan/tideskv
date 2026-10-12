@@ -2,7 +2,8 @@
 # Builds the coverage preset, runs every test, and fails if src/ line coverage < 80% (spec §10.5).
 set -euo pipefail
 BUILD=build/coverage
-cmake --preset coverage >/dev/null
+# shellcheck disable=SC2086
+cmake --preset coverage ${TIDESKV_CMAKE_ARGS:-} >/dev/null
 cmake --build --preset coverage -j
 rm -rf "$BUILD/profiles" && mkdir -p "$BUILD/profiles"
 LLVM_PROFILE_FILE="$PWD/$BUILD/profiles/%p-%m.profraw" ctest --preset coverage
