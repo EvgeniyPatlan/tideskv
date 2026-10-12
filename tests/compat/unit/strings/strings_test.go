@@ -388,7 +388,6 @@ func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("MGET against non-string key", func(t *testing.T) {
-		t.Skip("tideskv: needs SADD, M3")
 		require.NoError(t, rdb.SAdd(ctx, "myset", "ciao", "bau").Err())
 		require.Equal(t, []interface{}{"BAR", nil, "FOO", nil}, rdb.MGet(ctx, "foo", "baazz", "bar", "myset").Val())
 	})
