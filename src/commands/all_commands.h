@@ -19,6 +19,7 @@ void RegisterExpireCommands(CommandRegistry& registry);       // cmd_expire.cc
 void RegisterScanCommands(CommandRegistry& registry);         // cmd_scan.cc
 void RegisterHashCommands(CommandRegistry& registry);         // cmd_hash.cc
 void RegisterElementScanCommands(CommandRegistry& registry);  // cmd_element_scan.cc
+void RegisterSetCommands(CommandRegistry& registry);          // cmd_set.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv

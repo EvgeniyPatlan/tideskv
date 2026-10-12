@@ -108,5 +108,14 @@ TEST_F(ElementScan, ScanHandlesBinaryAndHashtagKeys) {  // M2 Task 14 carry-over
   EXPECT_EQ(seen, (std::multiset<std::string>{bin, "{t}a", "{t}b", ""}));
 }
 
+TEST_F(ElementScan, SscanReturnsMembersOnly) {
+  EXPECT_EQ(h.Run({"SADD", "s", "a", "b", "c", "d", "e"}), Int(5));
+  EXPECT_EQ(Full("SSCAN", "s", {"COUNT", "2"}), (std::multiset<std::string>{"a", "b", "c", "d", "e"}));
+  EXPECT_EQ(Full("SSCAN", "s", {"MATCH", "[ac]"}), (std::multiset<std::string>{"a", "c"}));
+  EXPECT_EQ(h.Run({"SSCAN", "nokey", "0"}), kEmptyScan);
+  EXPECT_EQ(h.Run({"HSET", "h", "f", "v"}), Int(1));
+  EXPECT_EQ(h.Run({"SSCAN", "h", "0"}), Err(kErrWrongType));
+}
+
 }  // namespace
 }  // namespace tideskv

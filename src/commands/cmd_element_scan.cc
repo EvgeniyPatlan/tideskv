@@ -48,11 +48,13 @@ void ElementScanCommand(ExecContext& ctx, const ArgList& argv, ValueType type) {
 }
 
 void HScan(ExecContext& ctx, const ArgList& argv) { ElementScanCommand(ctx, argv, ValueType::kHash); }
+void SScan(ExecContext& ctx, const ArgList& argv) { ElementScanCommand(ctx, argv, ValueType::kSet); }
 
 }  // namespace
 
 void RegisterElementScanCommands(CommandRegistry& r) {
   r.Register({"hscan", -3, kCmdReadOnly, 1, 1, 1, &HScan});
+  r.Register({"sscan", -3, kCmdReadOnly, 1, 1, 1, &SScan});
 }
 
 }  // namespace tideskv

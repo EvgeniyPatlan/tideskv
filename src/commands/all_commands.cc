@@ -13,6 +13,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterExpireCommands(registry);
   RegisterScanCommands(registry);
   RegisterHashCommands(registry);
+  RegisterSetCommands(registry);
   RegisterElementScanCommands(registry);
 }
 
