@@ -1,5 +1,10 @@
 #include "types/string_type.h"
 
+#include <cmath>
+#include <limits>
+
+#include "common/number_format.h"
+#include "common/string_util.h"
 #include "types/errors.h"
 #include "types/object_store.h"
 
@@ -143,6 +148,39 @@ std::string_view RedisRange(std::string_view s, int64_t start, int64_t end) {
   if (end >= len) end = len - 1;
   if (start > end || len == 0) return {};
   return s.substr(static_cast<size_t>(start), static_cast<size_t>(end - start + 1));
+}
+
+Result<int64_t> StringIncrBy(WriteTxn& txn, uint8_t db, std::string_view key, int64_t delta, int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (obj->live() && !obj->IsString()) return WrongType();
+  int64_t value = 0;
+  if (obj->live() && !ParseInt64(obj->payload, &value)) return Status::UserError(std::string(kErrNotInteger));
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+  if ((delta < 0 && value < 0 && delta < kMin - value) || (delta > 0 && value > 0 && delta > kMax - value)) {
+    return Status::UserError(std::string(kErrOverflow));
+  }
+  value += delta;
+  const int64_t expire_ms = obj->live() ? obj->meta.expire_ms : 0;
+  if (Status st = WriteString(txn, db, key, std::to_string(value), expire_ms, *obj); !st.ok()) return st;
+  return value;
+}
+
+Result<std::string> StringIncrByFloat(WriteTxn& txn, uint8_t db, std::string_view key, long double delta,
+                                      int64_t now_ms) {
+  auto obj = LoadForWrite(txn, db, key, now_ms);
+  if (!obj.ok()) return obj.status();
+  if (obj->live() && !obj->IsString()) return WrongType();
+  long double value = 0;
+  if (obj->live() && !ParseLongDouble(obj->payload, &value))
+    return Status::UserError(std::string(kErrNotFloat));
+  value += delta;
+  if (std::isnan(value) || std::isinf(value)) return Status::UserError(std::string(kErrNanOrInfinity));
+  std::string text = FormatLongDouble(value);
+  const int64_t expire_ms = obj->live() ? obj->meta.expire_ms : 0;
+  if (Status st = WriteString(txn, db, key, text, expire_ms, *obj); !st.ok()) return st;
+  return text;
 }
 
 }  // namespace tideskv

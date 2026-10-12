@@ -12,6 +12,7 @@ void RegisterConnectionCommands(CommandRegistry& registry);  // cmd_connection.c
 void RegisterServerCommands(CommandRegistry& registry);      // cmd_server.cc (Task 17)
 void RegisterStringCommands(CommandRegistry& registry);      // cmd_string.cc
 void RegisterStringEditCommands(CommandRegistry& registry);  // cmd_string_edit.cc
+void RegisterCounterCommands(CommandRegistry& registry);     // cmd_counter.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv

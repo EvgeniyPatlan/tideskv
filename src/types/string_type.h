@@ -64,5 +64,10 @@ Result<int64_t> StringSetRange(WriteTxn& txn, uint8_t db, std::string_view key, 
                                std::string_view value, int64_t now_ms);
 // GETRANGE/SUBSTR index arithmetic (Redis 7.2 getrangeCommand).
 std::string_view RedisRange(std::string_view s, int64_t start, int64_t end);
+// INCR/DECR/INCRBY/DECRBY: returns the new value. Keeps an existing TTL.
+Result<int64_t> StringIncrBy(WriteTxn& txn, uint8_t db, std::string_view key, int64_t delta, int64_t now_ms);
+// INCRBYFLOAT: returns the new value as stored (FormatLongDouble). Keeps an existing TTL.
+Result<std::string> StringIncrByFloat(WriteTxn& txn, uint8_t db, std::string_view key, long double delta,
+                                      int64_t now_ms);
 
 }  // namespace tideskv
