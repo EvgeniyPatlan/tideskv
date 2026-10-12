@@ -49,3 +49,10 @@ endif()
 add_test(NAME engine_boundary
   COMMAND ${PROJECT_SOURCE_DIR}/scripts/check_engine_boundary.sh
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
+option(TIDESKV_COMPAT "Run the Go compatibility suites (needs Go >= 1.22; first run downloads modules)" OFF)
+find_program(GO_EXECUTABLE go)
+if(TIDESKV_COMPAT AND GO_EXECUTABLE AND TARGET tideskv-server)
+  add_test(NAME compat_kvrocks COMMAND ${PROJECT_SOURCE_DIR}/scripts/compat.sh $<TARGET_FILE:tideskv-server>)
+  set_tests_properties(compat_kvrocks PROPERTIES TIMEOUT 1800 LABELS compat)
+endif()

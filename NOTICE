@@ -1,0 +1,18 @@
+TidesKV
+Copyright 2026 The TidesKV authors
+
+This product includes software developed at The Apache Software Foundation
+(https://www.apache.org/).
+
+tests/compat/util/helpers.go, tests/compat/util/tcp_client.go and the files under
+tests/compat/unit/ are derived from Apache Kvrocks (https://github.com/apache/kvrocks,
+tag v2.17.0, tests/gocase), licensed under the Apache License, Version 2.0; see
+tests/compat/LICENSE. Modifications are marked with "tideskv:" comments.
+
+The NOTICE file of Apache Kvrocks contains the following attribution notices:
+
+Apache Kvrocks
+Copyright 2022-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
