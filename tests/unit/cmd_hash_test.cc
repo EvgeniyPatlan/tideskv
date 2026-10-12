@@ -124,5 +124,57 @@ TEST_F(HashCmds, HashesArePerDb) {
   EXPECT_EQ(h.Run({"HGET", "h", "f"}), Bulk("db0"));
 }
 
+TEST_F(HashCmds, KeysValsGetAllInFieldOrder) {
+  EXPECT_EQ(h.Run({"HSET", "h", "b", "2", "a", "1", "c", "3"}), Int(3));
+  EXPECT_EQ(h.Run({"HKEYS", "h"}), Arr({Bulk("a"), Bulk("b"), Bulk("c")}));
+  EXPECT_EQ(h.Run({"HVALS", "h"}), Arr({Bulk("1"), Bulk("2"), Bulk("3")}));
+  EXPECT_EQ(h.Run({"HGETALL", "h"}), Arr({Bulk("a"), Bulk("1"), Bulk("b"), Bulk("2"), Bulk("c"), Bulk("3")}));
+  EXPECT_EQ(h.Run({"HGETALL", "nokey"}), "*0\r\n");
+  EXPECT_EQ(h.Run({"HKEYS", "nokey"}), "*0\r\n");
+}
+
+TEST_F(HashCmds, GetAllIsAMapInResp3) {
+  EXPECT_EQ(h.Run({"HSET", "h", "f", "v"}), Int(1));
+  h.Resp3();
+  EXPECT_EQ(h.Run({"HGETALL", "h"}), "%1\r\n" + Bulk("f") + Bulk("v"));
+  EXPECT_EQ(h.Run({"HGETALL", "nokey"}), "%0\r\n");
+  EXPECT_EQ(h.Run({"HKEYS", "h"}), "*1\r\n" + Bulk("f"));
+}
+
+TEST_F(HashCmds, IncrBy) {
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "5"}), Int(5));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "-7"}), Int(-2));
+  EXPECT_EQ(h.Run({"HGET", "h", "f"}), Bulk("-2"));
+  EXPECT_EQ(h.Run({"HSET", "h", "s", "abc", "sp", " 1", "max", "9223372036854775807"}), Int(3));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "s", "1"}), Err(kErrHashValueNotInteger));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "sp", "1"}), Err(kErrHashValueNotInteger));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "max", "1"}), Err(kErrOverflow));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "x"}), Err(kErrNotInteger));
+  EXPECT_EQ(h.Run({"HINCRBY", "h", "f", "1.5"}), Err(kErrNotInteger));
+  EXPECT_EQ(h.Run({"SET", "str", "v"}), kOk);
+  EXPECT_EQ(h.Run({"HINCRBY", "str", "f", "1"}), Err(kErrWrongType));
+  EXPECT_EQ(h.Run({"HINCRBY", "str", "f", "x"}), Err(kErrNotInteger));  // argument parsed first
+}
+
+TEST_F(HashCmds, IncrByFloat) {
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "x", "10.5"}), Bulk("10.5"));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "x", "0.1"}), Bulk("10.6"));
+  EXPECT_EQ(h.Run({"HSET", "h", "n", "5", "s", "abc", "m", "1.1e4932"}), Int(3));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "n", "3.0e3"}), Bulk("3005"));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "x", "abc"}), Err(kErrNotFloat));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "x", "inf"}), Err(kErrValueNanOrInfinity));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "s", "1"}), Err(kErrHashValueNotFloat));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "h", "m", "1e4932"}), Err(kErrNanOrInfinity));
+  EXPECT_EQ(h.Run({"SET", "str", "v"}), kOk);
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "str", "f", "1"}), Err(kErrWrongType));
+  EXPECT_EQ(h.Run({"HINCRBYFLOAT", "str", "f", "inf"}), Err(kErrValueNanOrInfinity));  // checked first
+}
+
+TEST_F(HashCmds, BulkReadsAndIncrOnWrongType) {  // Review Focus #3
+  EXPECT_EQ(h.Run({"SET", "s", "v"}), kOk);
+  for (const char* cmd : {"HKEYS", "HVALS", "HGETALL"})
+    EXPECT_EQ(h.Run({cmd, "s"}), Err(kErrWrongType)) << cmd;
+}
+
 }  // namespace
 }  // namespace tideskv

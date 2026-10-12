@@ -1,3 +1,4 @@
+#include <cmath>
 #include <optional>
 #include <string>
 #include <vector>
@@ -6,6 +7,8 @@
 #include "commands/cmd_util.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
+#include "common/number_format.h"
+#include "common/string_util.h"
 #include "exec/engine.h"
 #include "types/hash_type.h"
 
@@ -92,6 +95,46 @@ void HExists(ExecContext& ctx, const ArgList& argv) {
   if (ok) ctx.reply.Integer(exists ? 1 : 0);
 }
 
+void HGetAllGeneric(ExecContext& ctx, const ArgList& argv, HashPart part) {
+  std::vector<std::string> items;
+  const bool ok = RunRead(ctx, [&](ReadView& view, int64_t now_ms) {
+    return MoveInto(HashGetAll(view, ctx.session.db, argv[1], part, now_ms), &items);
+  });
+  if (!ok) return;
+  // Redis genericHgetallCommand: a map for HGETALL (flat array in RESP2), an array otherwise.
+  part == HashPart::kBoth ? ctx.reply.MapHeader(items.size() / 2) : ctx.reply.ArrayHeader(items.size());
+  for (const std::string& s : items) ctx.reply.Bulk(s);
+}
+
+void HKeys(ExecContext& ctx, const ArgList& argv) { HGetAllGeneric(ctx, argv, HashPart::kFields); }
+void HVals(ExecContext& ctx, const ArgList& argv) { HGetAllGeneric(ctx, argv, HashPart::kValues); }
+void HGetAll(ExecContext& ctx, const ArgList& argv) { HGetAllGeneric(ctx, argv, HashPart::kBoth); }
+
+// Redis 7.2 hincrbyCommand: the increment is parsed before the key is looked up.
+void HIncrBy(ExecContext& ctx, const ArgList& argv) {
+  int64_t delta = 0;
+  if (!ParseInt64(argv[3], &delta)) return ctx.reply.Error(kErrNotInteger);
+  int64_t value = 0;
+  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(HashIncrBy(txn, ctx.server.oids(), ctx.session.db, argv[1], argv[2], delta, now_ms),
+                    &value);
+  });
+  if (ok) ctx.reply.Integer(value);
+}
+
+// Redis 7.2 hincrbyfloatCommand: parse, then reject NaN/Infinity, then look the key up.
+void HIncrByFloat(ExecContext& ctx, const ArgList& argv) {
+  long double delta = 0;
+  if (!ParseLongDouble(argv[3], &delta)) return ctx.reply.Error(kErrNotFloat);
+  if (std::isnan(delta) || std::isinf(delta)) return ctx.reply.Error(kErrValueNanOrInfinity);
+  std::string value;
+  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(HashIncrByFloat(txn, ctx.server.oids(), ctx.session.db, argv[1], argv[2], delta, now_ms),
+                    &value);
+  });
+  if (ok) ctx.reply.Bulk(value);
+}
+
 }  // namespace
 
 void RegisterHashCommands(CommandRegistry& r) {
@@ -104,6 +147,11 @@ void RegisterHashCommands(CommandRegistry& r) {
   r.Register({"hlen", 2, kCmdReadOnly | kCmdFast, 1, 1, 1, &HLen});
   r.Register({"hstrlen", 3, kCmdReadOnly | kCmdFast, 1, 1, 1, &HStrlen});
   r.Register({"hexists", 3, kCmdReadOnly | kCmdFast, 1, 1, 1, &HExists});
+  r.Register({"hkeys", 2, kCmdReadOnly, 1, 1, 1, &HKeys});
+  r.Register({"hvals", 2, kCmdReadOnly, 1, 1, 1, &HVals});
+  r.Register({"hgetall", 2, kCmdReadOnly, 1, 1, 1, &HGetAll});
+  r.Register({"hincrby", 4, kCmdWrite | kCmdFast, 1, 1, 1, &HIncrBy});
+  r.Register({"hincrbyfloat", 4, kCmdWrite | kCmdFast, 1, 1, 1, &HIncrByFloat});
 }
 
 }  // namespace tideskv

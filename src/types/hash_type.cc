@@ -1,6 +1,12 @@
 #include "types/hash_type.h"
 
+#include <cmath>
+#include <limits>
+
+#include "common/number_format.h"
+#include "common/string_util.h"
 #include "types/collection.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -97,6 +103,55 @@ Result<bool> HashExists(ReadView& view, uint8_t db, std::string_view key, std::s
   auto v = HashGet(view, db, key, field, now_ms);
   if (!v.ok()) return v.status();
   return v->has_value();
+}
+
+Result<std::vector<std::string>> HashGetAll(ReadView& view, uint8_t db, std::string_view key, HashPart part,
+                                            int64_t now_ms) {
+  auto c = LoadCollection(view, db, key, kHash, now_ms);
+  if (!c.ok()) return c.status();
+  std::vector<std::string> out;
+  out.reserve(part == HashPart::kBoth ? 2 * c->size() : c->size());
+  Status st = ForEachElement(view, *c, [&](std::string_view f, std::string_view v) {
+    if (part != HashPart::kValues) out.emplace_back(f);
+    if (part != HashPart::kFields) out.emplace_back(v);
+    return true;
+  });
+  if (!st.ok()) return st;
+  return out;
+}
+
+Result<int64_t> HashIncrBy(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view key,
+                           std::string_view field, int64_t delta, int64_t now_ms) {
+  auto c = OpenForWrite(txn, oids, db, key, now_ms);
+  if (!c.ok()) return c.status();
+  auto cur = GetElement(txn, *c, field);
+  if (!cur.ok()) return cur.status();
+  int64_t value = 0;
+  if (*cur && !ParseInt64(**cur, &value)) return Status::UserError(std::string(kErrHashValueNotInteger));
+  if ((delta < 0 && value < 0 && delta < std::numeric_limits<int64_t>::min() - value) ||
+      (delta > 0 && value > 0 && delta > std::numeric_limits<int64_t>::max() - value)) {
+    return Status::UserError(std::string(kErrOverflow));
+  }
+  value += delta;
+  if (auto put = PutElement(txn, *c, field, std::to_string(value)); !put.ok()) return put.status();
+  if (Status st = SaveCollection(txn, *c); !st.ok()) return st;
+  return value;
+}
+
+Result<std::string> HashIncrByFloat(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view key,
+                                    std::string_view field, long double delta, int64_t now_ms) {
+  auto c = OpenForWrite(txn, oids, db, key, now_ms);
+  if (!c.ok()) return c.status();
+  auto cur = GetElement(txn, *c, field);
+  if (!cur.ok()) return cur.status();
+  long double value = 0;
+  if (*cur && !ParseLongDouble(**cur, &value)) return Status::UserError(std::string(kErrHashValueNotFloat));
+  value += delta;
+  if (std::isnan(value) || std::isinf(value)) return Status::UserError(std::string(kErrNanOrInfinity));
+  std::string out = FormatLongDouble(value);
+  if (auto put = PutElement(txn, *c, field, out); !put.ok()) return put.status();
+  if (Status st = SaveCollection(txn, *c); !st.ok()) return st;
+  return out;
 }
 
 }  // namespace tideskv

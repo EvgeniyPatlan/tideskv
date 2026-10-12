@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "storage/memory_storage.h"
 #include "types/errors.h"
 #include "types/object_store.h"
@@ -89,6 +91,32 @@ TEST_F(HashTypeTest, WrongTypeWritesNothing) {
   }();
   EXPECT_EQ(r.message(), kErrWrongType);
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].empty());
+}
+
+TEST_F(HashTypeTest, IncrByOnAMissingKeyCreatesIt) {
+  int64_t v = 0;
+  ASSERT_TRUE(Write([&](WriteTxn& t) { return MoveInto(HashIncrBy(t, oids, 0, "h", "f", 3, 0), &v); }).ok());
+  EXPECT_EQ(v, 3);
+  auto view = storage.BeginRead();
+  EXPECT_EQ(*HashLen(**view, 0, "h", 0), 1);
+}
+
+TEST_F(HashTypeTest, FailedIncrOnAMissingKeyStoresNothing) {
+  std::string out;
+  const Status st = Write([&](WriteTxn& t) {
+    return MoveInto(HashIncrByFloat(t, oids, 0, "h", "f", std::numeric_limits<long double>::infinity(), 0),
+                    &out);
+  });
+  EXPECT_EQ(st.message(), kErrNanOrInfinity);
+  EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kMeta)].empty());
+}
+
+TEST_F(HashTypeTest, GetAllParts) {
+  Set("h", {{"b", "2"}, {"a", "1"}});
+  auto view = storage.BeginRead();
+  EXPECT_EQ(*HashGetAll(**view, 0, "h", HashPart::kFields, 0), (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(*HashGetAll(**view, 0, "h", HashPart::kValues, 0), (std::vector<std::string>{"1", "2"}));
+  EXPECT_EQ(*HashGetAll(**view, 0, "h", HashPart::kBoth, 0), (std::vector<std::string>{"a", "1", "b", "2"}));
 }
 
 }  // namespace
