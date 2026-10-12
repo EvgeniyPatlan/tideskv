@@ -44,6 +44,7 @@ class ExpireReaper {
   // One cycle over all dbs; returns the number of objects deleted. Every db gets at least
   // one batch, even with a zero budget. Must not be called from inside an Engine fn.
   Result<size_t> RunOnce();
+  // Start and Stop must not be called concurrently with each other (App calls them from one thread).
   void Start();
   void Stop();  // idempotent
   uint64_t expired_total() const { return expired_total_.load(std::memory_order_relaxed); }

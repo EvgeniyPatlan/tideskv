@@ -2,11 +2,16 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
+#include "exec/engine.h"
+#include "exec/lock_manager.h"
 #include "support/command_harness.h"
 #include "types/object_store.h"
 
@@ -22,6 +27,23 @@ ExpireReaper::Options Fast() {
   o.cycle_budget = std::chrono::seconds(10);
   return o;
 }
+
+// Forwards to a real storage, but the first `throws` BeginRead calls throw, as a bad_alloc
+// or a bug below Engine would.
+class ThrowingStorage final : public Storage {
+ public:
+  ThrowingStorage(Storage& inner, int throws) : inner_(inner), throws_left_(throws) {}
+  Result<std::unique_ptr<WriteTxn>> BeginWrite() override { return inner_.BeginWrite(); }
+  Result<std::unique_ptr<ReadView>> BeginRead() override {
+    if (throws_left_.fetch_sub(1) > 0) throw std::runtime_error("injected failure");
+    return inner_.BeginRead();
+  }
+  Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+
+ private:
+  Storage& inner_;
+  std::atomic<int> throws_left_;
+};
 
 struct ReaperTest : ::testing::Test {
   CommandHarness h;
@@ -108,6 +130,33 @@ TEST_F(ReaperTest, BackgroundThreadReapsAndStops) {
   reaper.Stop();
   reaper.Stop();  // idempotent
   EXPECT_EQ(reaper.expired_total(), 10u);
+}
+
+TEST_F(ReaperTest, BogusEntryNeverDeletesPersistentKey) {
+  EXPECT_EQ(Run({"SET", "k", "v"}), kOk);
+  {  // an index entry that does not match meta (expire_ms 0, oid 0), e.g. from a bug
+    auto txn = h.services.storage_.BeginWrite();
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kExpire, encoding::ExpireKeyFor(0, 0, "k"), ExpireValue(0)).ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  EXPECT_EQ(*reaper.RunOnce(), 0u);
+  EXPECT_EQ(Run({"GET", "k"}), test::Bulk("v"));
+  EXPECT_TRUE(h.Cf(ColumnFamily::kExpire).empty());  // the bogus entry is dropped
+}
+
+TEST_F(ReaperTest, ThreadSurvivesAnException) {
+  ThrowingStorage storage(h.services.storage_, /*throws=*/1);
+  LockManager locks;
+  Engine engine(storage, locks, h.clock());
+  ExpireReaper survivor(engine, Fast());
+  EXPECT_EQ(Run({"SET", "k", "v", "PX", "1"}), kOk);
+  h.clock().Advance(1);
+  survivor.Start();  // the first pass throws; the next one must still reap
+  for (int i = 0; i < 200 && survivor.expired_total() < 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  survivor.Stop();
+  EXPECT_EQ(survivor.expired_total(), 1u);
 }
 
 }  // namespace

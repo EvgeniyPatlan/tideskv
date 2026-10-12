@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <exception>
 #include <span>
 
 #include "common/coding.h"
@@ -41,7 +42,8 @@ Result<size_t> ExpireReaper::DeleteDue(uint8_t db, int64_t now_ms, std::span<con
     for (const Due& d : due) {
       auto obj = LoadObject(txn, db, d.key, now_ms);
       if (!obj.ok()) return obj.status();
-      const bool same = obj->state != ObjectState::kMissing &&
+      // kExpired (not just "exists"): a bogus entry can never delete live, non-expiring data.
+      const bool same = obj->state == ObjectState::kExpired &&
                         static_cast<uint64_t>(obj->meta.expire_ms) == d.expire_ms && obj->meta.oid == d.oid;
       const Status s = same ? DeleteObject(txn, db, d.key, obj->meta)
                             : DeleteStaleExpireEntry(txn, db, d.key, d.expire_ms);
@@ -105,7 +107,11 @@ void ExpireReaper::Loop() {
   std::unique_lock lock(mu_);
   while (!stop_) {
     lock.unlock();
-    if (auto n = RunOnce(); !n.ok()) spdlog::error("expire reaper: {}", n.status().ToString());
+    try {  // an exception escaping this thread would std::terminate the server
+      if (auto n = RunOnce(); !n.ok()) spdlog::error("expire reaper: {}", n.status().ToString());
+    } catch (const std::exception& e) {
+      spdlog::error("expire reaper: {}", e.what());
+    }
     lock.lock();
     cv_.wait_for(lock, options_.interval, [this] { return stop_; });
   }
