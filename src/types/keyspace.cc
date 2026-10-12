@@ -120,8 +120,6 @@ Result<int64_t> RenameKey(WriteTxn& txn, uint8_t db, std::string_view src, std::
   if (!to.ok()) return to.status();
   if (to->live()) {
     if (nx) return int64_t{0};
-    // Checked before dropping dst so a refused rename leaves both keys intact.
-    if (Status st = CheckMovable(from->meta, src, dst); !st.ok()) return st;
     if (Status st = DeleteObject(txn, db, dst, to->meta); !st.ok()) return st;
   }
   if (Status st = MoveObject(txn, db, src, dst, *from); !st.ok()) return st;

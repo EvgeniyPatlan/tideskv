@@ -43,7 +43,7 @@ Result<int64_t> KeyTtlMs(ReadView& view, uint8_t db, std::string_view key, bool 
 Result<int64_t> PersistKey(WriteTxn& txn, uint8_t db, std::string_view key, int64_t now_ms);
 
 // RENAME / RENAMENX: 1 renamed, 0 not renamed (nx with an existing dst). UserError(kErrNoSuchKey)
-// if src is absent; a collection cannot cross hash slots yet (CheckMovable).
+// if src is absent; a collection moving to another slot is O(its size).
 Result<int64_t> RenameKey(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst, bool nx,
                           int64_t now_ms);
 

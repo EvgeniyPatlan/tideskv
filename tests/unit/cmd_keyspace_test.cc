@@ -164,16 +164,18 @@ TEST_F(KeyspaceCmds, RenameCollectionWithinSlotKeepsData) {
   EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 1u);  // same oid, data untouched
 }
 
-TEST_F(KeyspaceCmds, RenameCollectionAcrossSlotsIsRefusedForNow) {
+TEST_F(KeyspaceCmds, RenameCollectionAcrossSlotsMovesItsData) {
   ASSERT_NE(KeySlot("h1"), KeySlot("h2"));
   h.SeedHash(0, "h1", 22, true);
-  EXPECT_EQ(h.Run({"RENAME", "h1", "h2"}), Err(kErrRenameCrossSlot));
-  EXPECT_EQ(h.Run({"TYPE", "h1"}), "+hash\r\n");  // nothing changed
+  EXPECT_EQ(h.Run({"RENAME", "h1", "h2"}), kOk);
+  EXPECT_EQ(h.Run({"TYPE", "h1"}), "+none\r\n");
+  EXPECT_EQ(h.Run({"HGET", "h2", "field"}), Bulk("value"));
+  EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 1u);  // moved, not copied
   h.SeedHash(0, "h3", 23, true);
   EXPECT_EQ(h.Run({"SET", "s", "v"}), kOk);
   ASSERT_NE(KeySlot("h3"), KeySlot("s"));
-  EXPECT_EQ(h.Run({"RENAME", "h3", "s"}), Err(kErrRenameCrossSlot));
-  EXPECT_EQ(h.Run({"GET", "s"}), Bulk("v"));  // a refused rename never drops dst
+  EXPECT_EQ(h.Run({"RENAME", "h3", "s"}), kOk);  // dst replaced
+  EXPECT_EQ(h.Run({"HGET", "s", "field"}), Bulk("value"));
 }
 
 }  // namespace

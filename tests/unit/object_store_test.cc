@@ -129,17 +129,6 @@ TEST_F(ObjectStoreTest, MoveObjectMovesMetaAndExpire) {
   EXPECT_EQ(idx.begin()->first, ExpireKeyFor(0, kNow + 100, "b"));
 }
 
-TEST_F(ObjectStoreTest, CheckMovableRefusesOnlyCollectionsAcrossSlots) {
-  Metadata hash;
-  hash.type = ValueType::kHash;
-  Metadata str;
-  str.type = ValueType::kString;
-  ASSERT_NE(KeySlot("h1"), KeySlot("h2"));
-  EXPECT_TRUE(CheckMovable(str, "h1", "h2").ok());
-  EXPECT_TRUE(CheckMovable(hash, "{t}1", "{t}2").ok());
-  EXPECT_FALSE(CheckMovable(hash, "h1", "h2").ok());
-}
-
 TEST_F(ObjectStoreTest, DbsAreIsolated) {
   PutString(0, "k", "zero", 0);
   PutString(1, "k", "one", 0);

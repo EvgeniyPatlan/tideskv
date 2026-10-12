@@ -38,11 +38,9 @@ Status WriteString(WriteTxn& txn, uint8_t db, std::string_view key, std::string_
 // Changes the deadline of a live object (0 = persist) and moves its expire entry.
 Status SetObjectExpire(WriteTxn& txn, uint8_t db, std::string_view key, const StoredObject& obj,
                        int64_t expire_ms);
-// OK unless obj is a collection and src/dst hash to different slots: a collection keeps its oid,
-// and its subkeys are keyed by slot, so it cannot move across slots until M3 copies (UserError).
-Status CheckMovable(const encoding::Metadata& meta, std::string_view src, std::string_view dst);
-// Moves the live object obj (loaded from src) to dst, which the caller made absent. Moves its
-// expire entry. A collection keeps its oid, so both keys must share a slot (see CheckMovable).
+// Moves the live object obj (loaded from src) to dst, which the caller made absent, with its
+// expire entry. A collection keeps its oid; if src and dst hash to different slots its elements
+// are copied to dst's slot prefix (O(size)), otherwise nothing but meta moves (O(1)).
 Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
                   const StoredObject& obj);
 // Rewrites the meta record of an object whose deadline is unchanged, or of a new object

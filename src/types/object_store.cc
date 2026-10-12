@@ -1,5 +1,9 @@
 #include "types/object_store.h"
 
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "common/coding.h"
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
@@ -108,16 +112,61 @@ Status SetObjectExpire(WriteTxn& txn, uint8_t db, std::string_view key, const St
   return PutExpireEntry(txn, db, key, m);
 }
 
-Status CheckMovable(const Metadata& meta, std::string_view src, std::string_view dst) {
-  if (meta.IsCollection() && KeySlot(src) != KeySlot(dst)) {
-    return Status::UserError(std::string(kErrRenameCrossSlot));
+namespace {
+
+constexpr size_t kRehomeBatch = 1024;  // entries copied per iterator pass
+
+// Reads up to kRehomeBatch entries of cf under `prefix` strictly after `after` (empty = from the
+// first). The iterator is closed before the caller writes, so no write lands mid-iteration.
+Status ReadBatch(WriteTxn& txn, ColumnFamily cf, const std::string& prefix, const std::string& after,
+                 std::vector<std::pair<std::string, std::string>>* out) {
+  out->clear();
+  auto it = txn.NewIterator(cf, {prefix, encoding::PrefixUpperBound(prefix)});
+  if (!it.ok()) return it.status();
+  Status st = after.empty() ? (*it)->SeekToFirst() : (*it)->Seek(after);
+  if (st.ok() && !after.empty() && (*it)->Valid() && (*it)->key() == after) st = (*it)->Next();
+  for (; st.ok() && (*it)->Valid() && out->size() < kRehomeBatch; st = (*it)->Next()) {
+    out->emplace_back(std::string((*it)->key()), std::string((*it)->value()));
   }
-  return Status::Ok();
+  return st;
 }
+
+// Copies a collection's entries of cf from its old slot's prefix to the new slot's (the oid,
+// and so every suffix, is kept), then range-deletes the old prefix. O(size) (M3 plan E5).
+Status RehomeEntries(WriteTxn& txn, ColumnFamily cf, uint8_t db, uint16_t from_slot, uint16_t to_slot,
+                     uint64_t oid) {
+  const std::string from = encoding::SubkeyPrefix(db, from_slot, oid);
+  const std::string to = encoding::SubkeyPrefix(db, to_slot, oid);
+  std::vector<std::pair<std::string, std::string>> batch;
+  std::string last;
+  do {
+    if (Status st = ReadBatch(txn, cf, from, last, &batch); !st.ok()) return st;
+    for (const auto& [key, value] : batch) {
+      if (Status st = txn.Put(cf, to + key.substr(from.size()), value); !st.ok()) return st;
+    }
+    if (!batch.empty()) last = batch.back().first;
+  } while (batch.size() == kRehomeBatch);
+  return txn.DeletePrefix(cf, from);
+}
+
+}  // namespace
 
 Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
                   const StoredObject& obj) {
-  if (Status st = CheckMovable(obj.meta, src, dst); !st.ok()) return st;
+  const uint16_t from_slot = KeySlot(src);
+  const uint16_t to_slot = KeySlot(dst);
+  if (obj.meta.IsCollection() && from_slot != to_slot) {
+    if (Status st = RehomeEntries(txn, ColumnFamily::kSubkey, db, from_slot, to_slot, obj.meta.oid);
+        !st.ok()) {
+      return st;
+    }
+    if (obj.meta.type == ValueType::kZSet) {
+      if (Status st = RehomeEntries(txn, ColumnFamily::kZScore, db, from_slot, to_slot, obj.meta.oid);
+          !st.ok()) {
+        return st;
+      }
+    }
+  }
   if (Status st = txn.Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(db, src)); !st.ok()) return st;
   if (Status st = DeleteExpireEntry(txn, db, src, obj.meta); !st.ok()) return st;
   if (Status st = PutMeta(txn, db, dst, obj.meta, obj.payload); !st.ok()) return st;

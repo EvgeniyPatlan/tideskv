@@ -28,8 +28,6 @@ inline constexpr std::string_view kErrExpireNxCombo =
     "ERR NX and XX, GT or LT options at the same time are not compatible";
 inline constexpr std::string_view kErrExpireGtLt =
     "ERR GT and LT options at the same time are not compatible";
-inline constexpr std::string_view kErrRenameCrossSlot =
-    "ERR RENAME of a collection across hash slots is not supported yet";  // M2 limitation; M3 copies
 // M3 (Redis 7.2.5 t_hash.c / t_set.c / object.c).
 inline constexpr std::string_view kErrHashValueNotInteger = "ERR hash value is not an integer";
 inline constexpr std::string_view kErrHashValueNotFloat = "ERR hash value is not a float";
