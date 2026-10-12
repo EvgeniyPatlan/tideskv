@@ -61,3 +61,24 @@ jobs:
           sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
       - run: cmake --preset fuzz -DTIDESKV_WERROR=ON && cmake --build --preset fuzz -j --target resp_parser_fuzz
       - run: mkdir -p corpus && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=1800 -max_len=65536
+
+  compat:
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7.2.5
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: tests/compat/go.sum
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
+      - run: cmake --preset release -DTIDESKV_WERROR=ON && cmake --build --preset release -j --target tideskv-server
+      - run: scripts/compat.sh build/release/src/tideskv-server --diff
+        env:
+          TIDESKV_REF_ADDR: 127.0.0.1:6379
+          TIDESKV_DIFF_SEEDS: "1-20"
