@@ -14,6 +14,7 @@
 #include "server/config.h"
 #include "storage/tides_storage.h"
 #include "types/cursor_store.h"
+#include "types/oid_allocator.h"
 
 namespace tideskv {
 
@@ -37,6 +38,7 @@ class App final : public ServerServices {
   void RequestShutdown() override;
   Engine& engine() override { return *engine_; }
   CursorStore& cursors() override { return cursors_; }
+  OidAllocator& oids() override { return *oids_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -44,6 +46,7 @@ class App final : public ServerServices {
 
   std::unique_ptr<Config> config_;
   std::unique_ptr<TidesStorage> storage_;
+  std::unique_ptr<OidAllocator> oids_;
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;
   std::unique_ptr<Engine> engine_;

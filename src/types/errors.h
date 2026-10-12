@@ -30,6 +30,20 @@ inline constexpr std::string_view kErrExpireGtLt =
     "ERR GT and LT options at the same time are not compatible";
 inline constexpr std::string_view kErrRenameCrossSlot =
     "ERR RENAME of a collection across hash slots is not supported yet";  // M2 limitation; M3 copies
-inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;            // proto-max-bulk-len
+// M3 (Redis 7.2.5 t_hash.c / t_set.c / object.c).
+inline constexpr std::string_view kErrHashValueNotInteger = "ERR hash value is not an integer";
+inline constexpr std::string_view kErrHashValueNotFloat = "ERR hash value is not a float";
+inline constexpr std::string_view kErrValueNanOrInfinity = "ERR value is NaN or Infinity";
+inline constexpr std::string_view kErrValueOutOfRange = "ERR value is out of range";
+// getRangeLongFromObjectOrReply(-LONG_MAX, LONG_MAX) with no message (HRANDFIELD/SRANDMEMBER count).
+inline constexpr std::string_view kErrCountOutOfRange =
+    "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807";
+// getPositiveLongFromObjectOrReply with no message (SPOP count): used for parse errors too.
+inline constexpr std::string_view kErrMustBePositive = "ERR value is out of range, must be positive";
+inline constexpr std::string_view kErrNumkeysNotPositive = "ERR numkeys should be greater than 0";
+inline constexpr std::string_view kErrNumkeysTooMany =
+    "ERR Number of keys can't be greater than number of args";
+inline constexpr std::string_view kErrLimitNegative = "ERR LIMIT can't be negative";
+inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
 }  // namespace tideskv

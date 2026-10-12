@@ -9,6 +9,7 @@ namespace tideskv {
 class CommandRegistry;
 class CursorStore;
 class Engine;
+class OidAllocator;
 
 struct ServerStats {
   std::string version;
@@ -40,6 +41,7 @@ class ServerServices {
   virtual void ResetStats() = 0;
   virtual void RequestShutdown() = 0;  // must not block; the main thread performs the shutdown
   virtual Engine& engine() = 0;        // data access for commands (Task 5)
+  virtual OidAllocator& oids() = 0;    // collection object ids (M3 E1)
   virtual CursorStore& cursors() = 0;  // SCAN cursor table (Task 14)
 };
 

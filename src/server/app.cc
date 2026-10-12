@@ -65,11 +65,14 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   auto storage = TidesStorage::Open(so);
   if (!storage.ok()) return storage.status();
   if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
-  return std::unique_ptr<App>(new App(std::move(config), std::move(storage).value()));
+  std::unique_ptr<App> app(new App(std::move(config), std::move(storage).value()));
+  if (Status st = app->oids_->Init(); !st.ok()) return st;
+  return app;
 }
 
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
+  oids_ = std::make_unique<OidAllocator>(*storage_, [this] { return storage_->Checkpoint(); });
   engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_);
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
@@ -129,6 +132,7 @@ void App::Stop() {
   server_->Stop();   // no command can touch storage after this
   reaper_.reset();   // joins the reaper thread; it writes through engine_
   engine_.reset();   // references storage_, so it goes first
+  oids_.reset();     // likewise (its persist hook checkpoints storage_)
   storage_.reset();  // flushes and closes TidesDB
 }
 

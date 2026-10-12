@@ -1,4 +1,7 @@
 #pragma once
+#include <stdexcept>
+#include <string>
+
 #include "commands/registry.h"
 #include "commands/server_services.h"
 #include "exec/engine.h"
@@ -6,11 +9,17 @@
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 #include "types/cursor_store.h"
+#include "types/oid_allocator.h"
 
 namespace tideskv::test {
 
 class FakeServerServices final : public ServerServices {
  public:
+  FakeServerServices() {
+    const Status st = oids_.Init();
+    if (!st.ok()) throw std::runtime_error("OidAllocator::Init: " + st.ToString());
+  }
+
   Config& config() override { return config_; }
   const CommandRegistry& registry() const override { return registry_; }
   ServerStats Stats() const override { return stats_; }
@@ -18,6 +27,7 @@ class FakeServerServices final : public ServerServices {
   void RequestShutdown() override { shutdown_requested_ = true; }
   Engine& engine() override { return engine_; }
   CursorStore& cursors() override { return cursors_; }
+  OidAllocator& oids() override { return oids_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -28,6 +38,7 @@ class FakeServerServices final : public ServerServices {
   InMemoryStorage storage_;
   LockManager locks_;
   FakeClock clock_;
+  OidAllocator oids_{storage_};              // after storage_
   Engine engine_{storage_, locks_, clock_};  // declared after what it references
 };
 
