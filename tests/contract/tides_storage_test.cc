@@ -142,11 +142,29 @@ TEST(TidesStorageMaint, ReopenWithDifferentCompressionKeepsData) {
     auto txn = s->BeginWrite();
     ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k", "v").ok());
     ASSERT_TRUE((*txn)->Commit().ok());
+    ASSERT_TRUE(s->Checkpoint().ok());
   }
   auto s = MustOpen(OptionsWith(dir, Compression::kLz4));  // existing CFs get the new pipeline
   ASSERT_NE(s, nullptr);
   auto view = s->BeginRead();
   EXPECT_EQ(*(*view)->Get(ColumnFamily::kMeta, "k"), "v");
+}
+
+TEST(TidesStorageMaint, ReopenWithSameCompressionKeepsData) {
+  TempDir dir;
+  for (int round = 0; round < 2; ++round) {
+    auto s = MustOpen(OptionsWith(dir, Compression::kLz4));
+    ASSERT_NE(s, nullptr);
+    if (round == 0) {
+      auto txn = s->BeginWrite();
+      ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k", "v").ok());
+      ASSERT_TRUE((*txn)->Commit().ok());
+      ASSERT_TRUE(s->Checkpoint().ok());
+    } else {
+      auto view = s->BeginRead();
+      EXPECT_EQ(*(*view)->Get(ColumnFamily::kMeta, "k"), "v");
+    }
+  }
 }
 
 TEST(TidesStorageMaint, StatsCountKeysAndTombstonesAfterFlush) {
