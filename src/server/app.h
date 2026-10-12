@@ -9,6 +9,7 @@
 #include "common/clock.h"
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
+#include "expire/reaper.h"
 #include "net/server.h"
 #include "server/config.h"
 #include "storage/tides_storage.h"
@@ -46,6 +47,7 @@ class App final : public ServerServices {
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;
   std::unique_ptr<Engine> engine_;
+  std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it
   CommandRegistry registry_;
   CursorStore cursors_;
   std::unique_ptr<net::Server> server_;

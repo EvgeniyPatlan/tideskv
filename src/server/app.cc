@@ -71,6 +71,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
   engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_);
+  reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
       MakeServerOptions(),
@@ -100,7 +101,9 @@ Status App::Start() {
   // Handle signals before any socket is bound: a SIGTERM arriving while starting up is
   // queued by asio and delivered once Run() arms the wait.
   signals_.emplace(main_ctx_, SIGINT, SIGTERM);
-  return server_->Start();
+  if (Status st = server_->Start(); !st.ok()) return st;
+  reaper_->Start();
+  return Status::Ok();
 }
 
 void App::Run() {
@@ -124,6 +127,7 @@ void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
   server_->Stop();   // no command can touch storage after this
+  reaper_.reset();   // joins the reaper thread; it writes through engine_
   engine_.reset();   // references storage_, so it goes first
   storage_.reset();  // flushes and closes TidesDB
 }
