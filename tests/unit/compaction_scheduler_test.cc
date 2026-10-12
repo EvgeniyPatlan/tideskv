@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -131,6 +132,52 @@ TEST(CompactionScheduler, WorkerThreadRunsJobs) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   s.Stop();
   EXPECT_EQ(s.completed(), 1u);
+}
+
+class BlockingCompactor final : public Compactor {
+ public:
+  Status Checkpoint() override { return Status::Ok(); }
+  Status CompactRange(ColumnFamily, std::string_view, std::string_view) override {
+    std::unique_lock lock(mu);
+    ++started;
+    cv.notify_all();
+    cv.wait(lock, [this] { return released; });
+    return Status::Ok();
+  }
+  void WaitStarted() {
+    std::unique_lock lock(mu);
+    cv.wait(lock, [this] { return started > 0; });
+  }
+  void Release() {
+    {
+      std::lock_guard lock(mu);
+      released = true;
+    }
+    cv.notify_all();
+  }
+  std::mutex mu;
+  std::condition_variable cv;
+  int started = 0;
+  bool released = false;
+};
+
+TEST(CompactionScheduler, StopDropsJobsThatHaveNotStarted) {
+  BlockingCompactor c;
+  auto o = Opts(1000);
+  o.tick = std::chrono::milliseconds(5);
+  CompactionScheduler s(c, o);
+  s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(1)),
+                 Prefix(ColumnFamily::kMeta, encoding::DbPrefix(2))});
+  ASSERT_EQ(s.pending(), 2u);
+  s.Start();
+  c.WaitStarted();  // first job is inside CompactRange
+  std::thread stopper([&] { s.Stop(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let Stop raise the flag
+  c.Release();
+  stopper.join();
+  EXPECT_EQ(s.completed(), 1u);
+  EXPECT_EQ(s.failed(), 0u);
+  EXPECT_EQ(c.started, 1);  // the second job never ran
 }
 
 }  // namespace

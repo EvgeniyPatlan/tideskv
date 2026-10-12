@@ -8,8 +8,6 @@
 
 #include "exec/recording_txn.h"
 
-#include "exec/recording_txn.h"
-
 namespace tideskv {
 namespace {
 

@@ -41,8 +41,9 @@ struct StorageOptions {
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.
-// Thread safety: BeginWrite/BeginRead/BeginSnapshot/Backup/Checkpoint may be called
-// concurrently from multiple threads (the engine is thread-safe). Each returned
+// Thread safety: BeginWrite/BeginRead/BeginSnapshot/Backup/Checkpoint/CompactRange/Stats may be
+// called concurrently from multiple threads (the engine is thread-safe; the background
+// compaction scheduler calls CompactRange from its own thread while transactions run). Each returned
 // WriteTxn/ReadView/Iterator is single-threaded: use it from one thread at a time,
 // and destroy it before this object.
 class TidesStorage final : public Storage, public Compactor {

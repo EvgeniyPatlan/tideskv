@@ -40,7 +40,8 @@ class CompactionScheduler final : public CommitListener {
   void OnCommitted(const std::vector<RangeDelete>& deletes) override;  // only enqueues
   // Runs the queued jobs on the calling thread; returns how many finished (done or given up).
   size_t RunPending();
-  // Start/Stop are not concurrent with each other. Stop drops jobs still queued.
+  // Start/Stop are not concurrent with each other. Stop drops queued and not-yet-started jobs;
+  // a CompactRange already running is not interrupted.
   void Start();
   void Stop();
 
@@ -66,7 +67,7 @@ class CompactionScheduler final : public CommitListener {
   uint64_t collection_deletes_ = 0;  // since the last collection-triggered compaction
   std::atomic<uint64_t> completed_{0};
   std::atomic<uint64_t> failed_{0};
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};  // written under mu_; also read between jobs without it
   std::thread thread_;
 };
 

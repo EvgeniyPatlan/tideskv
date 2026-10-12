@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cassert>
 
 #include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
@@ -48,6 +49,7 @@ size_t CompactionScheduler::RunPending() {
   const Status checkpoint = compactor_.Checkpoint();
   size_t finished = 0;
   for (Job& job : jobs) {
+    if (stop_.load()) break;  // shutting down: drop the rest (neither completed nor failed)
     const Status st = checkpoint.ok() ? compactor_.CompactRange(job.cf, job.lo, job.hi) : checkpoint;
     if (st.ok()) {
       completed_.fetch_add(1, std::memory_order_relaxed);
@@ -71,6 +73,7 @@ size_t CompactionScheduler::pending() const {
 }
 
 void CompactionScheduler::Start() {
+  assert(!thread_.joinable());
   {
     std::lock_guard lock(mu_);
     stop_ = false;
@@ -95,7 +98,7 @@ void CompactionScheduler::Loop() {
     lock.unlock();
     RunPending();
     lock.lock();
-    cv_.wait_for(lock, options_.tick, [this] { return stop_; });  // pace retries of failed jobs
+    cv_.wait_for(lock, options_.tick, [this] { return stop_.load(); });  // pace retries of failed jobs
   }
 }
 
