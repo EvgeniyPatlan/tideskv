@@ -25,8 +25,9 @@ class CursorStore {
   // plus the full position's size and PositionDigest. On resume ScanKeys steps past the key
   // sharing the prefix with that size and digest; if it is gone, the scan resumes at the
   // prefix, which sorts at or before the full position, so it can repeat keys (allowed by
-  // SCAN) but never skip one. Only a digest collision among same-size keys sharing the
-  // prefix could make it resume too far.
+  // SCAN) but never skip one. A digest collision among same-size keys sharing the prefix
+  // could make a scan resume too far or loop forever; PositionDigest is keyed per process,
+  // so producing one requires breaking a keyed PRF (SipHash-2-4).
   uint64_t Save(std::string position);
   std::optional<ScanPosition> Load(uint64_t cursor) const;
   size_t bytes() const;  // accounted size of the saved entries; never above kMaxBytes

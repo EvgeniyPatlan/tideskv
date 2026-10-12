@@ -35,6 +35,10 @@ bool Matches(const ScanFilter& f, std::string_view key, ValueType type) {
 // Positions `it` after the key matching a truncated position: walks the keys starting with the
 // saved prefix; if none has the full key's size and digest (deleted since), resumes at the
 // prefix, which can repeat keys but never skips one.
+// The walk costs O(keys sharing the prefix) per call and is not bounded by COUNT.
+// TODO(M8): cap the walk and fall back to resuming at the prefix (a repeat) past the cap.
+// A writer that deletes the last-examined huge key before every call can stall progress
+// within the group (each resume falls back to the prefix); SCAN's guarantees allow this.
 Status SeekPastTruncated(Iterator& it, const ScanPosition& pos) {
   Status st = it.Seek(pos.key);
   for (; st.ok() && it.Valid() && it.key().starts_with(pos.key); st = it.Next()) {

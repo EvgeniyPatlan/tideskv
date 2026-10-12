@@ -221,6 +221,39 @@ TEST_F(HugeKeyScan, HugeKeyDeletedBetweenCallsStillTerminates) {
   }
 }
 
+TEST_F(HugeKeyScan, LaterHugeKeyDeletedAfterItsPageStillTerminates) {
+  const std::vector<std::string> keys = {"{h}a", HugeKey("1"), HugeKey("2"), "{h}z", "s1"};
+  SetKeys(keys);
+  std::multiset<std::string> seen;
+  std::string cursor = "0";
+  int calls = 0;
+  bool more = true;
+  // COUNT 1: the page that returns HugeKey("2") ends on it, so the cursor sits on it.
+  while (more && seen.count(HugeKey("2")) == 0 && ++calls < kMaxCalls) more = Step(&cursor, "1", &seen);
+  ASSERT_TRUE(more) << "scan finished before the later huge key was the cursor";
+  ASSERT_EQ(h.Run({"DEL", HugeKey("2")}), test::Int(1));
+  while (more && ++calls < kMaxCalls) more = Step(&cursor, "1", &seen);
+  EXPECT_FALSE(more) << "SCAN never finished after deleting the later huge key";
+  ExpectAllSeen(seen, keys);
+}
+
+// Meta key = [db][slot u16][user key], so its size is user key size + 3.
+std::string KeyWithMetaSize(size_t meta_size, char fill) { return "{h}" + std::string(meta_size - 6, fill); }
+
+TEST_F(HugeKeyScan, MetaKeysAtAndJustPastTheSavedLimit) {
+  const std::vector<std::string> keys = {"{h}a",
+                                         KeyWithMetaSize(CursorStore::kMaxPositionBytes, 'x'),
+                                         KeyWithMetaSize(CursorStore::kMaxPositionBytes + 1, 'x'),
+                                         KeyWithMetaSize(CursorStore::kMaxPositionBytes + 1, 'y'),
+                                         "{h}z",
+                                         "s1"};
+  SetKeys(keys);
+  bool finished = false;
+  const auto seen = ScanAll("1", &finished);
+  EXPECT_TRUE(finished) << "SCAN never finished";
+  ExpectAllSeen(seen, keys);
+}
+
 // Redis 7.2 only treats exactly "*" as "no filter": an empty pattern matches only the empty key.
 TEST_F(ScanCmds, EmptyPatternMatchesOnlyTheEmptyKey) {
   EXPECT_EQ(Run({"MSET", "", "x", "a", "y"}), kOk);

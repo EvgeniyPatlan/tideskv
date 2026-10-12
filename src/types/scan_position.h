@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -17,7 +18,15 @@ struct ScanPosition {
   bool truncated = false;
 };
 
-// 64-bit FNV-1a: deterministic across processes and builds. Not collision resistant.
+// SipHash-2-4 of `s` under a 128-bit key drawn once per process from std::random_device.
+// Cursors live only in memory, so digests need not agree across processes. Keying matters:
+// two same-size keys sharing the saved prefix with equal digests can make a SCAN loop (the
+// resume walk matches the earlier key, re-examines up to the later one and saves it again),
+// so crafting such a pair must require breaking a keyed PRF.
 uint64_t PositionDigest(std::string_view s);
+
+using SipHashKey = std::array<uint8_t, 16>;
+// SipHash-2-4 with an explicit key (k0 = bytes 0..7, k1 = bytes 8..15, little-endian).
+uint64_t SipHash24(const SipHashKey& key, std::string_view s);
 
 }  // namespace tideskv
