@@ -68,6 +68,19 @@ TEST(ReplyBuilder, Verbatim) {
   EXPECT_EQ(Build3([](ReplyBuilder& r) { r.Verbatim("hi"); }), "=6\r\ntxt:hi\r\n");
 }
 
+TEST(ReplyBuilder, TruncateDropsTrailingBytes) {
+  ReplyBuilder r;
+  r.SimpleString("OK");
+  const size_t mark = r.size();
+  r.ArrayHeader(2);
+  r.Truncate(mark);
+  EXPECT_EQ(r.buffer(), "+OK\r\n");
+  r.Truncate(mark + 100);  // larger than the buffer: no-op
+  EXPECT_EQ(r.buffer(), "+OK\r\n");
+  r.Truncate(0);
+  EXPECT_TRUE(r.empty());
+}
+
 TEST(ReplyBuilder, ProtocolSwitchAndTake) {
   ReplyBuilder r(2);
   r.SetProtocol(3);

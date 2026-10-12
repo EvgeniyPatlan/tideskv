@@ -19,6 +19,9 @@ using namespace std::chrono_literals;
 void TestExecutor(Session& s, const std::vector<std::string>& argv, resp::ReplyBuilder& r) {
   if (argv[0] == "BOOM") {
     throw std::runtime_error("boom");
+  } else if (argv[0] == "PARTIAL_BOOM") {
+    r.ArrayHeader(2);  // half-written reply before the failure
+    throw std::runtime_error("boom");
   } else if (argv[0] == "QUIT") {
     r.SimpleString("OK");
     s.close_after_reply = true;
@@ -235,6 +238,21 @@ TEST(NetServer, ExecutorExceptionRepliesErrorAndCloses) {
   auto c2 = RespClient::Connect(server->port());
   ASSERT_NE(c2, nullptr);
   EXPECT_EQ(c2->Command({"alive"}).str, "alive");
+}
+
+TEST(NetServer, ThrowAfterPartialReplyDropsPartialBytes) {
+  auto server = StartServer();
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"ok"}) + test::EncodeCommand({"PARTIAL_BOOM"})));
+  auto first = c->Read();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->str, "ok");  // earlier pipelined replies survive
+  auto r = c->Read();
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->type, RespValue::Type::kError);  // not the stray "*2" array header
+  EXPECT_EQ(r->str, "ERR internal error");
+  EXPECT_TRUE(c->WaitForClose());
 }
 
 TEST(NetServer, StartTwiceFails) {

@@ -55,10 +55,12 @@ void Connection::ProcessInput() {
       break;
     }
     stats_->total_commands.fetch_add(1, std::memory_order_relaxed);
+    const size_t reply_mark = reply_.size();
     try {
       executor_(session_, parser_.args(), reply_);
     } catch (const std::exception& e) {
       spdlog::error("command failed for client id={}: {}", session_.id, e.what());
+      reply_.Truncate(reply_mark);  // drop any half-written reply
       reply_.Error("ERR internal error");
       session_.close_after_reply = true;
     }
