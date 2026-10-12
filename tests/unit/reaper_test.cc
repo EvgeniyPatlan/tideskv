@@ -175,5 +175,29 @@ TEST_F(ReaperTest, ThreadSurvivesAnException) {
   EXPECT_EQ(survivor.expired_total(), 1u);
 }
 
+TEST_F(ReaperTest, ReapsExpiredCollectionsWithTheirElements) {
+  EXPECT_EQ(h.Run({"HSET", "h", "a", "1", "b", "2"}), test::Int(2));
+  EXPECT_EQ(h.Run({"SADD", "s", "m"}), test::Int(1));
+  EXPECT_EQ(h.Run({"PEXPIRE", "h", "10"}), test::Int(1));
+  EXPECT_EQ(h.Run({"PEXPIRE", "s", "10"}), test::Int(1));
+  h.clock().Advance(10);
+  auto n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok());
+  EXPECT_EQ(*n, 2u);
+  EXPECT_TRUE(h.Cf(ColumnFamily::kMeta).empty());
+  EXPECT_TRUE(h.Cf(ColumnFamily::kExpire).empty());
+  EXPECT_TRUE(h.Cf(ColumnFamily::kSubkey).empty());
+}
+
+TEST_F(ReaperTest, RecreatedCollectionWithANewDeadlineIsNotReaped) {
+  EXPECT_EQ(h.Run({"SADD", "s", "old"}), test::Int(1));
+  EXPECT_EQ(h.Run({"PEXPIRE", "s", "10"}), test::Int(1));
+  h.clock().Advance(10);
+  EXPECT_EQ(h.Run({"SADD", "s", "new"}), test::Int(1));  // drops the expired set, new oid
+  EXPECT_EQ(h.Run({"PEXPIRE", "s", "100000"}), test::Int(1));
+  ASSERT_TRUE(reaper.RunOnce().ok());
+  EXPECT_EQ(h.Run({"SMEMBERS", "s"}), test::Arr({test::Bulk("new")}));
+}
+
 }  // namespace
 }  // namespace tideskv
