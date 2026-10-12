@@ -60,7 +60,8 @@ TEST(ExpireArgs, ExpireCommandOverflow) {  // Review Focus #3
 ArgList Args(std::initializer_list<const char*> a) { return ArgList(a.begin(), a.end()); }
 
 TEST(ExtendedArgs, SetOptionsAreCaseInsensitiveAndCombine) {
-  auto a = ParseExtendedArgs(Args({"set", "k", "v", "nx", "Get", "PX", "100"}), 3, ExtendedArgsKind::kSet);
+  const ArgList argv = Args({"set", "k", "v", "nx", "Get", "PX", "100"});  // expire_arg views into argv
+  auto a = ParseExtendedArgs(argv, 3, ExtendedArgsKind::kSet);
   ASSERT_TRUE(a.ok());
   EXPECT_EQ(a->condition, SetOptions::Condition::kIfMissing);
   EXPECT_TRUE(a->get);
@@ -69,11 +70,13 @@ TEST(ExtendedArgs, SetOptionsAreCaseInsensitiveAndCombine) {
 }
 
 TEST(ExtendedArgs, SameExpireOptionRepeatedLastWins) {
-  auto a =
-      ParseExtendedArgs(Args({"set", "k", "v", "ex", "1", "ex", "2", "EX", "10"}), 3, ExtendedArgsKind::kSet);
+  const ArgList argv =
+      Args({"set", "k", "v", "ex", "1", "ex", "2", "EX", "10"});  // expire_arg views into argv
+  auto a = ParseExtendedArgs(argv, 3, ExtendedArgsKind::kSet);
   ASSERT_TRUE(a.ok());
   EXPECT_EQ(a->expire_arg, "10");
-  auto b = ParseExtendedArgs(Args({"set", "k", "v", "nx", "nx"}), 3, ExtendedArgsKind::kSet);
+  const ArgList argv_b = Args({"set", "k", "v", "nx", "nx"});
+  auto b = ParseExtendedArgs(argv_b, 3, ExtendedArgsKind::kSet);
   EXPECT_TRUE(b.ok());
 }
 
@@ -91,7 +94,8 @@ TEST(ExtendedArgs, SyntaxErrors) {
 }
 
 TEST(ExtendedArgs, GetExAcceptsPersistButNotSetOptions) {
-  auto a = ParseExtendedArgs(Args({"getex", "k", "persist"}), 2, ExtendedArgsKind::kGetEx);
+  const ArgList persist_argv = Args({"getex", "k", "persist"});
+  auto a = ParseExtendedArgs(persist_argv, 2, ExtendedArgsKind::kGetEx);
   ASSERT_TRUE(a.ok());
   EXPECT_TRUE(a->persist);
   for (auto argv :
