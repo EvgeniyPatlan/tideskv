@@ -2,34 +2,17 @@
 
 #include <spdlog/spdlog.h>
 
-#include <cassert>
 #include <mutex>
 #include <shared_mutex>
 
+#include "exec/engine_internal.h"
 #include "exec/recording_txn.h"
 
 namespace tideskv {
-namespace {
 
-#ifndef NDEBUG
-thread_local bool t_in_engine = false;
-
-// A nested Engine call from inside a fn would self-deadlock on the non-reentrant Gate.
-class ReentryCheck {
- public:
-  ReentryCheck() {
-    assert(!t_in_engine && "an Engine fn called back into the Engine");
-    t_in_engine = true;
-  }
-  ~ReentryCheck() { t_in_engine = false; }
-  ReentryCheck(const ReentryCheck&) = delete;
-  ReentryCheck& operator=(const ReentryCheck&) = delete;
-};
-#else
-struct ReentryCheck {};
-#endif
-
-}  // namespace
+using engine_internal::ModifiedBy;
+using engine_internal::ReentryCheck;
+using engine_internal::WriteScope;
 
 Status Engine::Read(const ReadFn& fn) {
   [[maybe_unused]] const ReentryCheck reentry;
@@ -47,31 +30,52 @@ Status Engine::Snapshot(const ReadFn& fn) {
   return fn(**view, clock_.NowMs());
 }
 
-Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, const WriteFn& fn) {
+Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, const WriteFn& fn,
+                     std::vector<std::string>* also_modified) {
   [[maybe_unused]] const ReentryCheck reentry;
   std::shared_lock gate(gate_);
   const LockManager::Guard guard = locks_.Lock(db, keys);
-  return RunTxn(fn);
+  return RunTxn(fn, WriteScope{db, &keys, also_modified, nullptr});
 }
 
-Status Engine::WriteExclusive(const WriteFn& fn) {
+Status Engine::WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flushed_dbs) {
   [[maybe_unused]] const ReentryCheck reentry;
   std::unique_lock gate(gate_);
-  return RunTxn(fn);
+  return RunTxn(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
 }
 
-Status Engine::RunTxn(const WriteFn& fn) {
+Status Engine::CollectFlushed(ReadView& view, const WriteScope& scope, std::vector<DbKey>* out) {
+  out->clear();
+  if (scope.flushed_dbs == nullptr || observer_ == nullptr || observer_->Idle()) return Status::Ok();
+  for (uint8_t db : *scope.flushed_dbs) {
+    for (std::string& k : observer_->ExistingWatched(db, view)) out->push_back({db, std::move(k)});
+  }
+  return Status::Ok();
+}
+
+void Engine::Report(const std::vector<DbKey>& keys) {
+  if (observer_ == nullptr || keys.empty() || observer_->Idle()) return;
+  auto view = storage_.BeginRead();
+  if (!view.ok()) spdlog::warn("watch report without a committed view: {}", view.status().ToString());
+  observer_->OnModified(keys, view.ok() ? view->get() : nullptr);
+}
+
+Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
   Status st;
   for (int attempt = 1; attempt <= kMaxCommitAttempts; ++attempt) {
     auto txn = storage_.BeginWrite();
     if (!txn.ok()) return txn.status();
     RecordingTxn recorder(**txn);
-    WriteTxn& target = listener_ != nullptr ? static_cast<WriteTxn&>(recorder) : **txn;
-    st = fn(target, clock_.NowMs());  // read under the locks, fresh on every attempt
-    if (!st.ok()) return st;          // destroying the unfinished txn rolls it back
-    st = target.Commit();
-    if (st.ok() && listener_ != nullptr && !recorder.deletes().empty())
-      listener_->OnCommitted(recorder.deletes());
+    if (scope.also_modified != nullptr) scope.also_modified->clear();
+    std::vector<DbKey> flushed;
+    if (st = CollectFlushed(recorder, scope, &flushed); !st.ok()) return st;
+    st = fn(recorder, clock_.NowMs());  // read under the locks, fresh on every attempt
+    if (!st.ok()) return st;            // destroying the unfinished txn rolls it back
+    st = recorder.Commit();
+    if (st.ok()) {
+      if (listener_ != nullptr && !recorder.deletes().empty()) listener_->OnCommitted(recorder.deletes());
+      Report(ModifiedBy(recorder.writes() > 0, recorder.meta_keys(), scope, std::move(flushed)));
+    }
     if (st.code() != StatusCode::kConflict) return st;
     // Key locks make conflicts impossible (invariant I1), so one indicates a bug.
     spdlog::warn("commit conflict, attempt {}/{}: {}", attempt, kMaxCommitAttempts, st.message());

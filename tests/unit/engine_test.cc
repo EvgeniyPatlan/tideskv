@@ -7,7 +7,9 @@
 #include <thread>
 #include <vector>
 
+#include "encoding/key_codec.h"
 #include "exec/commit_listener.h"
+#include "exec/write_observer.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 
@@ -295,6 +297,143 @@ TEST(EngineListener, ReportsCommittedRangeDeletesOnly) {
                  return t.DeletePrefix(ColumnFamily::kMeta, "\x01");
                }).ok());
   EXPECT_EQ(listener.batches.size(), 2u);
+}
+
+// Records what the Engine reports; `watched` makes it non-idle.
+class RecordingObserver final : public WriteObserver {
+ public:
+  bool Idle() const override { return !watching; }
+  void OnModified(const std::vector<DbKey>& keys, ReadView* committed) override {
+    reports.push_back(keys);
+    had_view = committed != nullptr;
+  }
+  std::vector<std::string> ExistingWatched(uint8_t db, ReadView& view) override {
+    std::vector<std::string> out;
+    for (const auto& k : flush_candidates) {
+      if (view.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(db, k)).ok()) out.push_back(k);
+    }
+    return out;
+  }
+  bool watching = true;
+  bool had_view = false;
+  std::vector<std::string> flush_candidates;
+  std::vector<std::vector<DbKey>> reports;
+};
+
+struct ObservedEngine : ::testing::Test {
+  InMemoryStorage storage;
+  LockManager locks;
+  FakeClock clock;
+  RecordingObserver observer;
+  Engine engine{storage, locks, clock, nullptr, &observer};
+
+  Status PutMeta(uint8_t db, const std::string& key) {
+    return engine.Write(db, {key}, [&](WriteTxn& t, int64_t) {
+      return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key), "v");
+    });
+  }
+};
+
+TEST_F(ObservedEngine, OneKeyWriteReportsItsKeyAfterCommit) {
+  ASSERT_TRUE(engine.Write(2, {"k"}, [](WriteTxn& t, int64_t) {
+                return t.Put(ColumnFamily::kSubkey, "x", "v");  // no meta write: rule (b)
+              }).ok());
+  ASSERT_EQ(observer.reports.size(), 1u);
+  EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{2, "k"}}));
+  EXPECT_TRUE(observer.had_view);
+}
+
+TEST_F(ObservedEngine, WriteThatWritesNothingReportsNothing) {
+  ASSERT_TRUE(engine.Write(0, {"k"}, [](WriteTxn&, int64_t) { return Status::Ok(); }).ok());
+  EXPECT_TRUE(observer.reports.empty());
+}
+
+TEST_F(ObservedEngine, FailedWriteReportsNothing) {
+  EXPECT_FALSE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
+                 EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v").ok());
+                 return Status::UserError("ERR nope");
+               }).ok());
+  EXPECT_TRUE(observer.reports.empty());
+}
+
+TEST_F(ObservedEngine, MultiKeyWriteReportsOnlyKeysWhoseMetaChanged) {
+  ASSERT_TRUE(engine.Write(0, {"src", "dst"}, [](WriteTxn& t, int64_t) {
+                return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "dst"), "v");
+              }).ok());
+  ASSERT_EQ(observer.reports.size(), 1u);
+  EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{0, "dst"}}));
+}
+
+TEST_F(ObservedEngine, AlsoModifiedIsReportedEvenWithoutWrites) {
+  std::vector<std::string> also;
+  ASSERT_TRUE(engine.Write(0, {"a", "b"}, [&](WriteTxn&, int64_t) {
+                also.push_back("b");
+                return Status::Ok();
+              }, &also).ok());
+  ASSERT_EQ(observer.reports.size(), 1u);
+  EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{0, "b"}}));
+}
+
+TEST_F(ObservedEngine, AlsoModifiedIsClearedBeforeEachAttempt) {
+  std::vector<std::string> also = {"stale"};
+  ASSERT_TRUE(engine.Write(0, {"a"}, [&](WriteTxn&, int64_t) { return Status::Ok(); }, &also).ok());
+  EXPECT_TRUE(also.empty());
+  EXPECT_TRUE(observer.reports.empty());
+}
+
+TEST_F(ObservedEngine, DuplicatesAreReportedOnce) {
+  ASSERT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
+                EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "1").ok());
+                return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "2");
+              }).ok());
+  EXPECT_EQ(observer.reports.at(0), (std::vector<DbKey>{{0, "k"}}));
+}
+
+TEST_F(ObservedEngine, IdleObserverIsNotCalled) {
+  observer.watching = false;
+  ASSERT_TRUE(PutMeta(0, "k").ok());
+  EXPECT_TRUE(observer.reports.empty());
+}
+
+TEST_F(ObservedEngine, FlushReportsWatchedKeysThatExistedBeforeIt) {
+  ASSERT_TRUE(PutMeta(4, "here").ok());
+  observer.reports.clear();
+  observer.flush_candidates = {"here", "absent"};
+  ASSERT_TRUE(engine.WriteExclusive([](WriteTxn& t, int64_t) {
+                return t.DeletePrefix(ColumnFamily::kMeta, encoding::DbPrefix(4));
+              }, {4}).ok());
+  ASSERT_EQ(observer.reports.size(), 1u);
+  EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{4, "here"}}));
+}
+
+// Review Focus #1: the report happens before the gate is released, so an exclusive gate
+// holder (EXEC) can never run between a commit and its report.
+TEST(Engine, ReportHappensBeforeTheGateIsReleased) {
+  InMemoryStorage storage;
+  LockManager locks;
+  FakeClock clock;
+  struct SlowObserver final : WriteObserver {
+    bool Idle() const override { return false; }
+    void OnModified(const std::vector<DbKey>&, ReadView*) override {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      reported = true;
+    }
+    std::vector<std::string> ExistingWatched(uint8_t, ReadView&) override { return {}; }
+    std::atomic<bool> reported{false};
+  } observer;
+  Engine engine(storage, locks, clock, nullptr, &observer);
+  std::thread writer([&] {
+    EXPECT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
+                  return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v");
+                }).ok());
+  });
+  // Spin until the commit is visible, then take the gate exclusively: the report must be done.
+  while (ReadMeta(engine, encoding::MetaKeyFor(0, "k")) == "<missing>") std::this_thread::yield();
+  ASSERT_TRUE(engine.WriteExclusive([&](WriteTxn&, int64_t) {
+                EXPECT_TRUE(observer.reported.load());
+                return Status::Ok();
+              }).ok());
+  writer.join();
 }
 
 }  // namespace

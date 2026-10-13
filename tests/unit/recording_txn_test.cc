@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "encoding/key_codec.h"
 #include "storage/memory_storage.h"
 
 namespace tideskv {
@@ -37,6 +38,32 @@ TEST(RecordingTxn, SavepointRollbackForgetsLaterDeletes) {
   EXPECT_EQ(txn.deletes()[0].lo, "one");
   ASSERT_TRUE(txn.Rollback().ok());
   EXPECT_TRUE(txn.deletes().empty());
+}
+
+TEST(RecordingTxn, CountsWritesAndDecodesMetaKeys) {
+  InMemoryStorage s;
+  auto inner = s.BeginWrite();
+  RecordingTxn txn(**inner);
+  EXPECT_EQ(txn.writes(), 0u);
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(3, "user"), "v").ok());
+  ASSERT_TRUE(txn.Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "gone")).ok());
+  ASSERT_TRUE(txn.Put(ColumnFamily::kSubkey, "opaque", "v").ok());  // counted, not decoded
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, "\x01", "v").ok());      // too short to decode: counted only
+  EXPECT_EQ(txn.writes(), 4u);
+  EXPECT_EQ(txn.meta_keys(), (std::vector<DbKey>{{3, "user"}, {0, "gone"}}));
+}
+
+TEST(RecordingTxn, SavepointRollbackForgetsLaterWritesAndKeys) {
+  InMemoryStorage s;
+  auto inner = s.BeginWrite();
+  RecordingTxn txn(**inner);
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "a"), "v").ok());
+  ASSERT_TRUE(txn.Savepoint("sp").ok());
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "v").ok());
+  ASSERT_TRUE(txn.DeletePrefix(ColumnFamily::kSubkey, "p").ok());
+  ASSERT_TRUE(txn.RollbackToSavepoint("sp").ok());
+  EXPECT_EQ(txn.writes(), 1u);
+  EXPECT_EQ(txn.meta_keys(), (std::vector<DbKey>{{0, "a"}}));
 }
 
 }  // namespace
