@@ -1,6 +1,9 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -9,6 +12,7 @@
 #include "exec/commit_listener.h"
 #include "exec/gate.h"
 #include "exec/lock_manager.h"
+#include "exec/recording_txn.h"
 #include "exec/write_observer.h"
 #include "storage/storage.h"
 
@@ -42,7 +46,7 @@ class Engine {
 
   // For parse-time work only (turning a relative EX/PX into a deadline, as Redis does at
   // command start); never for an expiry decision, which uses the fn's now_ms.
-  int64_t NowMs() const { return clock_.NowMs(); }
+  int64_t NowMs() const;
   // Latest committed data; no key locks.
   Status Read(const ReadFn& fn);
   // One point-in-time view for commands that read many keys (MGET, DBSIZE, SCAN, KEYS).
@@ -59,7 +63,43 @@ class Engine {
   // `flushed_dbs`: the dbs fn empties; their watched keys that exist before fn runs are reported.
   Status WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flushed_dbs = {});
 
+  // An atomic batch (EXEC; M5a plan G1). Holds the gate exclusively and one transaction; the
+  // clock is frozen. Until it is destroyed or committed, every Engine call on the creating
+  // thread runs inside that transaction without locking, each Write under its own savepoint
+  // (rolled back if fn fails). Destroying it without Commit rolls everything back.
+  class Batch {
+   public:
+    ~Batch();
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+    int64_t now_ms() const { return now_ms_; }
+    // Commits, then tells the listener and the observer, still under the gate. At most once;
+    // routing stops either way. On failure nothing was applied.
+    Status Commit();
+
+   private:
+    friend class Engine;
+    Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn, int64_t now_ms);
+    Status RunRead(const ReadFn& fn);
+    Status RunWrite(const WriteFn& fn, const engine_internal::WriteScope& scope);
+    void Unroute();
+
+    Engine& engine_;
+    std::unique_lock<Gate> gate_;    // first: released last, after the txn is gone
+    std::unique_ptr<WriteTxn> txn_;  // before recorder_, which refers to it
+    RecordingTxn recorder_;
+    int64_t now_ms_;
+    uint64_t next_savepoint_ = 0;
+    std::vector<DbKey> modified_;
+    Status broken_;  // a savepoint rollback failed: the txn may hold half a command
+    bool done_ = false;
+  };
+  // Fails with kInternal if this thread already has a batch (G1).
+  Result<std::unique_ptr<Batch>> BeginBatch();
+  bool InBatch() const { return ActiveBatch() != nullptr; }
+
  private:
+  Batch* ActiveBatch() const;
   Status RunTxn(const WriteFn& fn, const engine_internal::WriteScope& scope);
   // Flushed-db keys to report (G2); empty unless scope.flushed_dbs and a non-idle observer.
   Status CollectFlushed(ReadView& view, const engine_internal::WriteScope& scope, std::vector<DbKey>* out);

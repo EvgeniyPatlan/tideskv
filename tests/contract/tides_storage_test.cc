@@ -3,6 +3,9 @@
 #include <chrono>
 #include <thread>
 
+#include "encoding/key_codec.h"
+#include "exec/engine.h"
+#include "exec/lock_manager.h"
 #include "storage/tides_storage.h"
 #include "support/temp_dir.h"
 
@@ -218,6 +221,41 @@ TEST(TidesStorageMaint, CompactKeepsLiveDataAndDropsDeletedData) {
   auto view = s->BeginRead();
   EXPECT_TRUE((*view)->Get(ColumnFamily::kSubkey, "a1").status().IsNotFound());
   EXPECT_EQ(*(*view)->Get(ColumnFamily::kSubkey, "b1"), "y");
+}
+
+// A TidesDB transaction must hold 1000 savepoints and roll back to arbitrary ones (M5a G1).
+TEST(TidesStorage, BatchOfThousandSavepoints) {
+  TempDir dir;
+  auto s = MustOpen(OptionsFor(dir));
+  ASSERT_NE(s, nullptr);
+  LockManager locks;
+  SystemClock clock;
+  Engine engine(*s, locks, clock);
+  auto get = [&](const std::string& k) {
+    std::string out = "<missing>";
+    EXPECT_TRUE(engine.Read([&](ReadView& v, int64_t) {
+                  auto r = v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, k));
+                  if (r.ok()) out = *r;
+                  return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
+                }).ok());
+    return out;
+  };
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  for (int i = 0; i < 1000; ++i) {
+    const std::string k = "k" + std::to_string(i);
+    const Status st = engine.Write(0, {k}, [&](WriteTxn& t, int64_t) {
+      EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, k), "v").ok());
+      return i % 3 == 0 ? Status::UserError("ERR x") : Status::Ok();
+    });
+    EXPECT_EQ(st.ok(), i % 3 != 0);
+  }
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(get("k0"), "<missing>");
+  EXPECT_EQ(get("k1"), "v");
+  EXPECT_EQ(get("k999"), "<missing>");
+  EXPECT_EQ(get("k998"), "v");
 }
 
 }  // namespace

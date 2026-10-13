@@ -3,12 +3,15 @@
 #include <cassert>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "exec/engine.h"
 #include "exec/recording_txn.h"
 
 namespace tideskv::engine_internal {
+
+inline thread_local Engine::Batch* t_batch = nullptr;  // the active batch of this thread (G1)
 
 #ifndef NDEBUG
 inline thread_local bool t_in_engine = false;

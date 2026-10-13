@@ -14,7 +14,18 @@ using engine_internal::ModifiedBy;
 using engine_internal::ReentryCheck;
 using engine_internal::WriteScope;
 
+Engine::Batch* Engine::ActiveBatch() const {
+  return engine_internal::t_batch != nullptr && &engine_internal::t_batch->engine_ == this ? engine_internal::t_batch
+                                                                                          : nullptr;
+}
+
+int64_t Engine::NowMs() const {
+  if (const Batch* b = ActiveBatch()) return b->now_ms();
+  return clock_.NowMs();
+}
+
 Status Engine::Read(const ReadFn& fn) {
+  if (Batch* b = ActiveBatch()) return b->RunRead(fn);
   [[maybe_unused]] const ReentryCheck reentry;
   std::shared_lock gate(gate_);
   auto view = storage_.BeginRead();
@@ -23,6 +34,7 @@ Status Engine::Read(const ReadFn& fn) {
 }
 
 Status Engine::Snapshot(const ReadFn& fn) {
+  if (Batch* b = ActiveBatch()) return b->RunRead(fn);  // a batch reads its own transaction
   [[maybe_unused]] const ReentryCheck reentry;
   std::shared_lock gate(gate_);
   auto view = storage_.BeginSnapshot();
@@ -32,6 +44,7 @@ Status Engine::Snapshot(const ReadFn& fn) {
 
 Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, const WriteFn& fn,
                      std::vector<std::string>* also_modified) {
+  if (Batch* b = ActiveBatch()) return b->RunWrite(fn, WriteScope{db, &keys, also_modified, nullptr});
   [[maybe_unused]] const ReentryCheck reentry;
   std::shared_lock gate(gate_);
   const LockManager::Guard guard = locks_.Lock(db, keys);
@@ -39,6 +52,7 @@ Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, cons
 }
 
 Status Engine::WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flushed_dbs) {
+  if (Batch* b = ActiveBatch()) return b->RunWrite(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
   [[maybe_unused]] const ReentryCheck reentry;
   std::unique_lock gate(gate_);
   return RunTxn(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
@@ -81,6 +95,17 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
     spdlog::warn("commit conflict, attempt {}/{}: {}", attempt, kMaxCommitAttempts, st.message());
   }
   return st;
+}
+
+Result<std::unique_ptr<Engine::Batch>> Engine::BeginBatch() {
+  if (engine_internal::t_batch != nullptr) return Status::Internal("nested batch");
+  [[maybe_unused]] const ReentryCheck reentry;
+  std::unique_lock gate(gate_);
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  std::unique_ptr<Batch> batch(new Batch(*this, std::move(gate), std::move(txn).value(), clock_.NowMs()));
+  engine_internal::t_batch = batch.get();
+  return batch;
 }
 
 }  // namespace tideskv
