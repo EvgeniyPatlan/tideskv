@@ -189,11 +189,11 @@ TEST_F(BatchTest, ThrowingWriteIsUndoneButTheBatchGoesOn) {
   auto batch = engine.BeginBatch();
   ASSERT_TRUE(batch.ok());
   EXPECT_THROW(
-      engine.Write(0, {"b"},
-                   [](WriteTxn& t, int64_t) -> Status {
-                     EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "half").ok());
-                     throw std::runtime_error("boom");
-                   }),
+      (void)engine.Write(0, {"b"},
+                         [](WriteTxn& t, int64_t) -> Status {
+                           EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "half").ok());
+                           throw std::runtime_error("boom");
+                         }),
       std::runtime_error);
   ASSERT_TRUE(Put(0, "c", "3").ok());
   ASSERT_TRUE((*batch)->Commit().ok());
