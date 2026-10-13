@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <memory>
 #include <string>
 
 #include "encoding/object_codec.h"
