@@ -132,25 +132,6 @@ void LMPop(ExecContext& ctx, const ArgList& argv) {
 
 }  // namespace
 
-Status ParseListEndArg(std::string_view arg, ListEnd* out) {
-  if (EqualsIgnoreCase(arg, "left")) {
-    *out = ListEnd::kLeft;
-  } else if (EqualsIgnoreCase(arg, "right")) {
-    *out = ListEnd::kRight;
-  } else {
-    return Status::UserError(std::string(kErrSyntax));
-  }
-  return Status::Ok();
-}
-
-void ReplyPopped(ExecContext& ctx, const std::optional<PoppedFrom>& popped) {
-  if (!popped) return ctx.reply.NullArray();
-  ctx.reply.ArrayHeader(2);
-  ctx.reply.Bulk(popped->key);
-  ctx.reply.ArrayHeader(popped->values.size());
-  for (const std::string& v : popped->values) ctx.reply.Bulk(v);
-}
-
 void RegisterListEditCommands(CommandRegistry& r) {
   r.Register({"linsert", 5, kCmdWrite, 1, 1, 1, &LInsert});
   r.Register({"lrem", 4, kCmdWrite, 1, 1, 1, &LRem});
