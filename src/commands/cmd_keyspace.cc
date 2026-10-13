@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "commands/all_commands.h"
+#include "commands/cmd_util.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
@@ -99,6 +100,7 @@ void RenameGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
     return MoveInto(RenameKey(txn, ctx.session.db, argv[1], argv[2], nx, now_ms), &result);
   });
   if (!st.ok()) return ReplyError(ctx, st);
+  if (result == 1) SignalReady(ctx, argv[2]);
   nx ? ctx.reply.Integer(result) : ctx.reply.SimpleString("OK");
 }
 

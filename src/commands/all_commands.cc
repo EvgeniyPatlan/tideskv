@@ -17,6 +17,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterSetAlgebraCommands(registry);
   RegisterListCommands(registry);
   RegisterListEditCommands(registry);
+  RegisterBlockingListCommands(registry);
   RegisterElementScanCommands(registry);
 }
 

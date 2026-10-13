@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "support/command_harness.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -123,6 +124,30 @@ TEST(Client, IdNamesAndInfo) {
   EXPECT_EQ(h.Run({"CLIENT", "SETINFO", "COLOR", "x"}), "-ERR Unrecognized option 'COLOR'\r\n");
   EXPECT_EQ(h.Run({"CLIENT", "FOO"}),
             "-ERR unknown subcommand or wrong number of arguments for 'FOO'. Try CLIENT HELP.\r\n");
+}
+
+TEST(ClientUnblock, TimeoutAndErrorReasons) {  // Review Focus #4
+  test::CommandHarness h;
+  test::SecondClient other(h);  // session id 8
+  EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8", "BOGUS"}), test::Err(kErrUnblockReason));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "x"}), test::Err(kErrNotInteger));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "999"}), test::Int(0));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8"}), test::Int(1));  // TIMEOUT is the default
+  EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{"*-1\r\n"}));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8"}), test::Int(0));
+  EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
+  EXPECT_EQ(h.Run({"CLIENT", "unblock", "8", "error"}), test::Int(1));
+  EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{test::Err(kErrUnblockedByClient)}));
+}
+
+TEST(ClientUnblock, TimeoutReplyUsesTheTargetsProtocol) {
+  test::CommandHarness h;
+  test::SecondClient other(h);
+  other.session.protocol = 3;
+  EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8", "TIMEOUT"}), test::Int(1));
+  EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{"_\r\n"}));
 }
 
 }  // namespace

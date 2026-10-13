@@ -39,7 +39,9 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
   }
   if (name == "clients") {
     return Section("Clients", {{"connected_clients", std::to_string(s.connected_clients)},
-                               {"maxclients", std::to_string(s.maxclients)}});
+                               {"maxclients", std::to_string(s.maxclients)},
+                               {"blocked_clients", std::to_string(s.blocked_clients)},
+                               {"total_blocking_keys", std::to_string(s.blocking_keys)}});
   }
   if (name == "stats") {
     return Section("Stats", {{"total_connections_received", std::to_string(s.total_connections)},

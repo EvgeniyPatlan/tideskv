@@ -58,4 +58,7 @@ inline constexpr std::string_view kErrTimeoutNotFloat = "ERR timeout is not a fl
 inline constexpr std::string_view kErrTimeoutNegative = "ERR timeout is negative";
 inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of range";
 
+inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
+inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";
+
 }  // namespace tideskv

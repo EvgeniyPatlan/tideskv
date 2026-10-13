@@ -4,6 +4,8 @@
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "server/blocking.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -159,6 +161,29 @@ void ClientSetInfo(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.SimpleString("OK");
 }
 
+// CLIENT UNBLOCK id [TIMEOUT|ERROR] (networking.c:3221): the reason is checked before the id.
+void ClientUnblock(ExecContext& ctx, const ArgList& argv) {
+  bool error = false;
+  if (argv.size() == 4) {
+    if (EqualsIgnoreCase(argv[3], "error")) {
+      error = true;
+    } else if (!EqualsIgnoreCase(argv[3], "timeout")) {
+      return ctx.reply.Error(kErrUnblockReason);
+    }
+  }
+  int64_t id = 0;
+  if (!ParseInt64(argv[2], &id)) return ctx.reply.Error(kErrNotInteger);
+  const auto target = ctx.server.blocking().Find(static_cast<uint64_t>(id));
+  if (target == nullptr) return ctx.reply.Integer(0);
+  resp::ReplyBuilder r(target->session().protocol);
+  if (error) {
+    r.Error(kErrUnblockedByClient);
+  } else {
+    r.NullArray();
+  }
+  ctx.reply.Integer(target->Unblock(r.Take()) ? 1 : 0);
+}
+
 void Client(ExecContext& ctx, const ArgList& argv) {
   const std::string sub = ToLower(argv[1]);
   if (sub == "id" && argv.size() == 2) return ctx.reply.Integer(static_cast<int64_t>(ctx.session.id));
@@ -171,6 +196,7 @@ void Client(ExecContext& ctx, const ArgList& argv) {
     return ctx.reply.SimpleString("OK");
   }
   if (sub == "setinfo" && argv.size() == 4) return ClientSetInfo(ctx, argv);
+  if (sub == "unblock" && (argv.size() == 3 || argv.size() == 4)) return ClientUnblock(ctx, argv);
   ctx.reply.Error("ERR unknown subcommand or wrong number of arguments for '" + argv[1] +
                   "'. Try CLIENT HELP.");
 }

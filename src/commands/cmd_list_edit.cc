@@ -100,6 +100,7 @@ void MoveCommand(ExecContext& ctx, const ArgList& argv, ListEnd from, ListEnd to
                         &moved);
       });
   if (!st.ok()) return ReplyError(ctx, st);
+  if (moved) SignalReady(ctx, argv[2]);
   ReplyOptional(ctx, moved);
 }
 

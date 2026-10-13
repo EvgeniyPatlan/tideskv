@@ -25,7 +25,9 @@ void PushCommand(ExecContext& ctx, const ArgList& argv, ListEnd end, bool only_i
     return MoveInto(
         ListPush(txn, ctx.server.oids(), ctx.session.db, argv[1], end, values, only_if_exists, now_ms), &len);
   });
-  if (ok) ctx.reply.Integer(len);
+  if (!ok) return;
+  if (len > 0 && !only_if_exists) SignalReady(ctx, argv[1]);
+  ctx.reply.Integer(len);
 }
 
 void LPush(ExecContext& ctx, const ArgList& argv) { PushCommand(ctx, argv, ListEnd::kLeft, false); }

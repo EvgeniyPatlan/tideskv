@@ -171,5 +171,14 @@ TEST(Shutdown, AbortAndBadOption) {
   EXPECT_FALSE(h.services.shutdown_requested_);
 }
 
+TEST(InfoBlocking, ClientsSectionHasBlockedFields) {
+  test::CommandHarness h;
+  h.services.stats_.blocked_clients = 2;
+  h.services.stats_.blocking_keys = 3;
+  const std::string info = h.Run({"INFO", "clients"});
+  EXPECT_NE(info.find("blocked_clients:2\r\n"), std::string::npos);
+  EXPECT_NE(info.find("total_blocking_keys:3\r\n"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace tideskv
