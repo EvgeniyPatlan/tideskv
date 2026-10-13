@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <utility>
+#include <vector>
+
 #include "commands/blocking_serve.h"
 #include "support/command_harness.h"
 #include "types/errors.h"
@@ -123,6 +126,24 @@ TEST_F(BlockingListCmds, RenameIntoAWaitedKeyServes) {
   EXPECT_EQ(other.Run({"RPUSH", "tmp", "v"}), Int(1));
   EXPECT_EQ(other.Run({"RENAME", "tmp", "k"}), kOk);
   EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("k"), Bulk("v")})}));
+}
+
+// Each command that creates (or pushes to) the destination list wakes the client blocked on it.
+TEST_F(BlockingListCmds, CommandsWritingTheDestinationServeItsWaiter) {
+  const std::vector<std::pair<ArgList, std::string>> writers = {
+      {{"LMOVE", "src", "k", "LEFT", "RIGHT"}, Bulk("v")},
+      {{"RPOPLPUSH", "src", "k"}, Bulk("v")},
+      {{"RENAMENX", "src", "k"}, Int(1)},
+  };
+  for (const auto& [argv, reply] : writers) {
+    SCOPED_TRACE(argv.front());
+    EXPECT_EQ(h.Run({"BLPOP", "k", "0"}), "");
+    SecondClient other(h);
+    EXPECT_EQ(other.Run({"RPUSH", "src", "v"}), Int(1));
+    EXPECT_EQ(other.Run(argv), reply);
+    EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("k"), Bulk("v")})}));
+    EXPECT_EQ(other.Run({"EXISTS", "src", "k"}), Int(0));
+  }
 }
 
 TEST_F(BlockingListCmds, BlmpopServedTakesUpToCount) {

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <vector>
+
 #include "support/command_harness.h"
 #include "types/errors.h"
 
@@ -43,6 +45,26 @@ TEST_F(BlockingZsetCmds, ServedByAStoreCreatingTheKey) {
   EXPECT_EQ(other.Run({"ZADD", "{t}src", "1", "m"}), Int(1));
   EXPECT_EQ(other.Run({"ZUNIONSTORE", "{t}dst", "1", "{t}src"}), Int(1));
   EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("{t}dst"), Arr({Arr({Bulk("m"), Bulk("1")})})})}));
+}
+
+// Every *STORE that creates the destination wakes the client blocked on it.
+TEST_F(BlockingZsetCmds, EachStoreCreatingTheKeyServes) {
+  const std::vector<ArgList> stores = {
+      {"ZUNIONSTORE", "{t}dst", "1", "{t}src"},
+      {"ZINTERSTORE", "{t}dst", "1", "{t}src"},
+      {"ZDIFFSTORE", "{t}dst", "1", "{t}src"},
+      {"ZRANGESTORE", "{t}dst", "{t}src", "0", "-1"},
+  };
+  for (const ArgList& store : stores) {
+    SCOPED_TRACE(store.front());
+    EXPECT_EQ(h.Run({"BZPOPMIN", "{t}dst", "0"}), "");
+    SecondClient other(h);
+    EXPECT_EQ(other.Run({"ZADD", "{t}src", "1", "m"}), Int(1));
+    EXPECT_EQ(other.Run(store), Int(1));
+    EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("{t}dst"), Bulk("m"), Bulk("1")})}));
+    EXPECT_EQ(other.Run({"DEL", "{t}src"}), Int(1));
+    EXPECT_EQ(other.Run({"EXISTS", "{t}dst"}), Int(0));
+  }
 }
 
 TEST_F(BlockingZsetCmds, ListAndZsetWaitersOnOneKey) {  // Review Focus #3
