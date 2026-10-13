@@ -109,7 +109,6 @@ func setTests(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("SMISMEMBER against non set", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH, M4")
 		require.ErrorContains(t, rdb.LPush(ctx, "myset", "foo").Err(), "WRONGTYPE")
 	})
 
@@ -119,7 +118,6 @@ func setTests(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("SMISMEMBER requires one or more members", func(t *testing.T) {
-		t.Skip("tideskv: needs ZADD, M4")
 		require.NoError(t, rdb.Del(ctx, "zmscoretest").Err())
 		require.NoError(t, rdb.ZAdd(ctx, "zmscoretest", redis.Z{Score: 10, Member: "x"}).Err())
 		require.NoError(t, rdb.ZAdd(ctx, "zmscoretest", redis.Z{Score: 20, Member: "y"}).Err())
@@ -127,7 +125,6 @@ func setTests(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("SADD against non set", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH, M4")
 		require.NoError(t, rdb.LPush(ctx, "mylist", "foo").Err())
 		util.ErrorRegexp(t, rdb.SAdd(ctx, "mylist", "bar").Err(), ".*WRONGTYPE.*")
 	})

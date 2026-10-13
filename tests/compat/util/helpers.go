@@ -16,17 +16,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-// Ported to TidesKV from apache/kvrocks v2.17.0 tests/gocase/util/random.go and util/assertions.go; changes are marked "tideskv:".
+// Ported to TidesKV from apache/kvrocks v2.17.0 tests/gocase/util/random.go, util/assertions.go and util/client.go; changes are marked "tideskv:".
 
 package util
 
 import (
 	"cmp" // tideskv: standard cmp.Ordered replaces golang.org/x/exp/constraints
+	"context"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
@@ -185,4 +188,15 @@ func RetryEventually(t testing.TB, condition func() bool, maxAttempts int, msgAn
 		}
 	}
 	require.Fail(t, "Condition never satisfied", msgAndArgs...)
+}
+
+// tideskv: ported for the BZMPOP test (Kvrocks tests/gocase/util/client.go)
+func FindInfoEntry(rdb *redis.Client, key string, section ...string) string {
+	r := rdb.Info(context.Background(), section...)
+	p := regexp.MustCompile(fmt.Sprintf("%s:(.+)", key))
+	ms := p.FindStringSubmatch(r.Val())
+	if len(ms) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(ms[1])
 }

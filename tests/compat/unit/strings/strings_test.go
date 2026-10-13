@@ -252,7 +252,6 @@ func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("GETEX against wrong type", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH, M4")
 		rdb.Del(ctx, "foo")
 		rdb.LPush(ctx, "foo", "bar")
 		util.ErrorRegexp(t, rdb.Do(ctx, "getex", "foo").Err(), ".*WRONGTYPE.*")
@@ -705,7 +704,6 @@ func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("SETRANGE against key with wrong type", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH, M4")
 		require.NoError(t, rdb.Del(ctx, "mykey").Err())
 		require.NoError(t, rdb.LPush(ctx, "mykey", "foo").Err())
 		require.ErrorContains(t, rdb.SetRange(ctx, "mykey", 0, "bar").Err(), "WRONGTYPE")
@@ -1322,7 +1320,7 @@ func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("WRONGTYPE error when key is not a string", func(t *testing.T) {
-		t.Skip("tideskv: IFEQ is Redis 8.x; RPUSH is M4")
+		t.Skip("tideskv: IFEQ is Redis 8.x")
 		require.NoError(t, rdb.Del(ctx, "listkey").Err())
 		require.NoError(t, rdb.RPush(ctx, "listkey", "a").Err())
 		err := rdb.Do(ctx, "SET", "listkey", "v", "IFEQ", "a").Err()
@@ -1689,7 +1687,6 @@ func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	})
 
 	t.Run("Extended SET GET and NX option on wrong type", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH, M4")
 		require.NoError(t, rdb.Del(ctx, "listkey").Err())
 		require.NoError(t, rdb.LPush(ctx, "listkey", "v1").Err())
 		require.ErrorContains(t, rdb.Do(ctx, "SET", "listkey", "v", "NX", "GET").Err(), "WRONGTYPE")

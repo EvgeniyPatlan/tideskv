@@ -58,7 +58,6 @@ func TestExpire(t *testing.T) {
 	})
 
 	t.Run("EXPIRE - write on expire should work", func(t *testing.T) {
-		t.Skip("tideskv: needs LPUSH/LRANGE, M4")
 		require.NoError(t, rdb.Del(ctx, "x").Err())
 		require.NoError(t, rdb.LPush(ctx, "x", "foo").Err())
 		require.NoError(t, rdb.Expire(ctx, "x", 1000*time.Second).Err())
