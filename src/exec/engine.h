@@ -94,8 +94,12 @@ class Engine {
     int64_t now_ms_;
     uint64_t next_savepoint_ = 0;
     std::vector<DbKey> modified_;
-    std::vector<size_t> marks_;  // modified_.size() at each Mark()
-    Status broken_;              // a savepoint rollback failed: the txn may hold half a command
+    struct MarkPoint {
+      uint64_t savepoint;  // unique savepoint number: a mark id is reused after RollbackTo
+      size_t modified;     // modified_.size() at Mark()
+    };
+    std::vector<MarkPoint> marks_;  // index = mark id; RollbackTo(m) forgets the marks after m
+    Status broken_;                 // a savepoint rollback failed: the txn may hold half a command
     bool done_ = false;
   };
   // Fails with kInternal if this thread already has a batch (G1).
@@ -106,7 +110,16 @@ class Engine {
   Result<uint64_t> BatchMark();
   Status BatchRollbackTo(uint64_t mark);
 
+  // M5b H6: while busy() holds, a call that would wait for the gate returns UserError(busy_reply)
+  // instead. busy must be cheap and must not touch the Engine; whoever makes it true then calls
+  // WakeWaiters() so calls already waiting re-check it. Set before the Engine is shared.
+  void SetBusyGuard(std::function<bool()> busy, std::string busy_reply);
+  void WakeWaiters() { gate_.Wake(); }  // takes only the gate's internal mutex, never the gate
+
  private:
+  bool AcquireShared();     // false: gave up because busy_
+  bool AcquireExclusive();  // false: gave up because busy_
+  Status BusyStatus() const { return Status::UserError(busy_reply_); }
   Batch* ActiveBatch() const;
   Status RunTxn(const WriteFn& fn, const engine_internal::WriteScope& scope);
   // Flushed-db keys to report (G2); empty unless scope.flushed_dbs and a non-idle observer.
@@ -120,6 +133,8 @@ class Engine {
   CommitListener* listener_;  // may be null; told about committed range deletes
   WriteObserver* observer_;   // may be null; told which keys each commit modified
   Gate gate_;
+  std::function<bool()> busy_;  // empty: plain gate waits
+  std::string busy_reply_;
 };
 
 }  // namespace tideskv

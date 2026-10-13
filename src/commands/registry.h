@@ -52,7 +52,8 @@ enum CommandFlag : uint32_t {
   kCmdFast = 1u << 3,
   kCmdNoAuth = 1u << 4,  // allowed before AUTH
   kCmdNoScript = 1u << 5,
-  kCmdNoMulti = 1u << 6,  // refused inside MULTI (Redis CMD_NO_MULTI)
+  kCmdNoMulti = 1u << 6,    // refused inside MULTI (Redis CMD_NO_MULTI)
+  kCmdAllowBusy = 1u << 7,  // runs while a script is busy (Redis CMD_ALLOW_BUSY)
 };
 
 using ArgList = std::vector<std::string>;
@@ -82,7 +83,8 @@ class CommandRegistry {
 std::vector<std::string_view> FlagNames(uint32_t flags);
 bool ArityOk(int arity, size_t argc);
 
-// Validates (unknown → arity → auth, Redis 7 order), queues inside MULTI (M5a G3), and runs one command.
+// Validates (unknown → arity → auth → busy script, Redis 7 order), queues inside MULTI (M5a G3), and runs one
+// command.
 void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv);
 
 }  // namespace tideskv

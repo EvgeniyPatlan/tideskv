@@ -160,7 +160,7 @@ void RegisterScriptCommands(CommandRegistry& r) {
   r.Register({"evalsha", -3, kCmdNoScript, 0, 0, 0, &EvalSha});
   r.Register({"eval_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalRo});
   r.Register({"evalsha_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalShaRo});
-  r.Register({"script", -2, kCmdNoScript, 0, 0, 0, &Script});
+  r.Register({"script", -2, kCmdNoScript | kCmdAllowBusy, 0, 0, 0, &Script});
 }
 
 }  // namespace tideskv

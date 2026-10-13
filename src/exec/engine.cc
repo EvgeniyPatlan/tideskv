@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 
 #include "exec/engine_internal.h"
 #include "exec/recording_txn.h"
@@ -20,6 +21,27 @@ Engine::Batch* Engine::ActiveBatch() const {
              : nullptr;
 }
 
+void Engine::SetBusyGuard(std::function<bool()> busy, std::string busy_reply) {
+  busy_ = std::move(busy);
+  busy_reply_ = std::move(busy_reply);
+}
+
+bool Engine::AcquireShared() {
+  if (!busy_) {
+    gate_.lock_shared();
+    return true;
+  }
+  return gate_.lock_shared_unless(busy_);
+}
+
+bool Engine::AcquireExclusive() {
+  if (!busy_) {
+    gate_.lock();
+    return true;
+  }
+  return gate_.lock_unless(busy_);
+}
+
 int64_t Engine::NowMs() const {
   if (const Batch* b = ActiveBatch()) return b->now_ms();
   return clock_.NowMs();
@@ -28,7 +50,8 @@ int64_t Engine::NowMs() const {
 Status Engine::Read(const ReadFn& fn) {
   if (Batch* b = ActiveBatch()) return b->RunRead(fn);
   [[maybe_unused]] const ReentryCheck reentry;
-  std::shared_lock gate(gate_);
+  if (!AcquireShared()) return BusyStatus();
+  std::shared_lock gate(gate_, std::adopt_lock);
   auto view = storage_.BeginRead();
   if (!view.ok()) return view.status();
   return fn(**view, clock_.NowMs());
@@ -37,7 +60,8 @@ Status Engine::Read(const ReadFn& fn) {
 Status Engine::Snapshot(const ReadFn& fn) {
   if (Batch* b = ActiveBatch()) return b->RunRead(fn);  // a batch reads its own transaction
   [[maybe_unused]] const ReentryCheck reentry;
-  std::shared_lock gate(gate_);
+  if (!AcquireShared()) return BusyStatus();
+  std::shared_lock gate(gate_, std::adopt_lock);
   auto view = storage_.BeginSnapshot();
   if (!view.ok()) return view.status();
   return fn(**view, clock_.NowMs());
@@ -47,7 +71,8 @@ Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, cons
                      std::vector<std::string>* also_modified) {
   if (Batch* b = ActiveBatch()) return b->RunWrite(fn, WriteScope{db, &keys, also_modified, nullptr});
   [[maybe_unused]] const ReentryCheck reentry;
-  std::shared_lock gate(gate_);
+  if (!AcquireShared()) return BusyStatus();
+  std::shared_lock gate(gate_, std::adopt_lock);
   const LockManager::Guard guard = locks_.Lock(db, keys);
   return RunTxn(fn, WriteScope{db, &keys, also_modified, nullptr});
 }
@@ -55,7 +80,8 @@ Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, cons
 Status Engine::WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flushed_dbs) {
   if (Batch* b = ActiveBatch()) return b->RunWrite(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
   [[maybe_unused]] const ReentryCheck reentry;
-  std::unique_lock gate(gate_);
+  if (!AcquireExclusive()) return BusyStatus();
+  std::unique_lock gate(gate_, std::adopt_lock);
   return RunTxn(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
 }
 
@@ -123,7 +149,8 @@ Status Engine::BatchRollbackTo(uint64_t mark) {
 Result<std::unique_ptr<Engine::Batch>> Engine::BeginBatch() {
   if (engine_internal::t_batch != nullptr) return Status::Internal("nested batch");
   [[maybe_unused]] const ReentryCheck reentry;
-  std::unique_lock gate(gate_);
+  if (!AcquireExclusive()) return BusyStatus();
+  std::unique_lock gate(gate_, std::adopt_lock);
   auto txn = storage_.BeginWrite();
   if (!txn.ok()) return txn.status();
   std::unique_ptr<Batch> batch(new Batch(*this, std::move(gate), std::move(txn).value(), clock_.NowMs()));

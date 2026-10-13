@@ -14,6 +14,7 @@
 #include "commands/blocking_serve.h"
 #include "common/version.h"
 #include "server/connection_block_handler.h"
+#include "types/errors.h"
 #include "types/format_version.h"
 
 namespace tideskv {
@@ -79,6 +80,8 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
   scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
   engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_);
+  engine_->SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));  // H6
+  scripts_.SetOnTimeout([this] { engine_->WakeWaiters(); });  // the script thread holds the gate: no lock
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(

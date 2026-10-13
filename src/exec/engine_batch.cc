@@ -63,20 +63,21 @@ Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
 
 Result<uint64_t> Engine::Batch::Mark() {
   if (!broken_.ok()) return broken_;
-  const uint64_t id = marks_.size();
-  if (Status st = recorder_.Savepoint("mark" + std::to_string(id)); !st.ok()) return st;
-  marks_.push_back(modified_.size());
-  return id;
+  const uint64_t savepoint = next_savepoint_++;
+  if (Status st = recorder_.Savepoint("mark" + std::to_string(savepoint)); !st.ok()) return st;
+  marks_.push_back({savepoint, modified_.size()});
+  return marks_.size() - 1;
 }
 
 Status Engine::Batch::RollbackTo(uint64_t mark) {
   if (mark >= marks_.size()) return Status::Internal("unknown batch mark");
   if (!broken_.ok()) return broken_;
-  if (Status st = recorder_.RollbackToSavepoint("mark" + std::to_string(mark)); !st.ok()) {
+  if (Status st = recorder_.RollbackToSavepoint("mark" + std::to_string(marks_[mark].savepoint)); !st.ok()) {
     broken_ = st;
     return st;
   }
-  modified_.resize(marks_[mark]);
+  modified_.resize(marks_[mark].modified);
+  marks_.resize(mark + 1);  // later marks were undone with their writes: never roll back to them
   return Status::Ok();
 }
 

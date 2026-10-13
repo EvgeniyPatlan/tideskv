@@ -64,13 +64,10 @@ class ScriptEngine::Host final : public SandboxHost {
     int expected = kRunning;
     if (ElapsedMs() >= threshold_ms_ &&  // script.c:80-109
         engine_.phase_.compare_exchange_strong(expected, kTimedOut)) {
+      WarnSlow();
       try {
-        spdlog::warn(
-            "Slow script detected: still in execution after {} milliseconds. You can try killing the "
-            "script using the SCRIPT KILL command. Script name is: {}.",
-            ElapsedMs(), sha_);
-        if (engine_.on_timeout_) engine_.on_timeout_();
-      } catch (...) {  // the warning is best-effort; the timeout flag is already set
+        if (engine_.on_timeout_) engine_.on_timeout_();  // even if the warning failed: waiters must wake
+      } catch (...) {  // cannot unwind through Lua (nor log safely); waiters still wake when it ends
         return false;
       }
     }
@@ -78,6 +75,17 @@ class ScriptEngine::Host final : public SandboxHost {
   }
 
  private:
+  void WarnSlow() const noexcept {
+    try {
+      spdlog::warn(
+          "Slow script detected: still in execution after {} milliseconds. You can try killing the "
+          "script using the SCRIPT KILL command. Script name is: {}.",
+          ElapsedMs(), sha_);
+    } catch (...) {  // the warning is best-effort; the timeout flag is already set
+      return;
+    }
+  }
+
   int64_t ElapsedMs() const {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_)
         .count();

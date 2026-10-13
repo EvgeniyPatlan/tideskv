@@ -7,7 +7,9 @@
 #include "commands/info.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "script/script_engine.h"
 #include "spdlog/spdlog.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -172,11 +174,17 @@ void CommandCmd(ExecContext& ctx, const ArgList& argv) {
 }
 
 void Shutdown(ExecContext& ctx, const ArgList& argv) {
+  bool nosave = false;
   for (size_t i = 1; i < argv.size(); ++i) {
     const std::string opt = ToLower(argv[i]);
     if (opt == "abort") return ctx.reply.Error("ERR No shutdown in progress.");
     if (opt != "nosave" && opt != "save" && opt != "now" && opt != "force")
       return ctx.reply.Error("ERR syntax error");
+    nosave = nosave || opt == "nosave";
+  }
+  if (ctx.server.scripts().TimedOut()) {
+    if (!nosave) return ctx.reply.Error(kErrBusyScript);  // only SHUTDOWN NOSAVE (db.c:1222)
+    ctx.server.scripts().KillForShutdown();               // the script dies at its next hook
   }
   ctx.server.RequestShutdown();
   ctx.session.close_after_reply = true;  // like Redis: no reply, the connection just closes
@@ -209,7 +217,7 @@ void RegisterServerCommands(CommandRegistry& r) {
   r.Register({"info", -1, 0, 0, 0, 0, &Info});
   r.Register({"config", -2, kCmdAdmin | kCmdNoScript, 0, 0, 0, &ConfigCmd});
   r.Register({"command", -1, 0, 0, 0, 0, &CommandCmd});
-  r.Register({"shutdown", -1, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Shutdown});
+  r.Register({"shutdown", -1, kCmdAdmin | kCmdNoScript | kCmdNoMulti | kCmdAllowBusy, 0, 0, 0, &Shutdown});
 }
 
 }  // namespace tideskv

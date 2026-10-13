@@ -236,5 +236,29 @@ TEST_F(BatchTest, MarkAndRollbackUndoTheWritesAfterTheMark) {
   EXPECT_EQ(engine.BatchMark().status().code(), StatusCode::kInternal);
 }
 
+TEST_F(BatchTest, RollingBackForgetsTheLaterMarks) {
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  auto outer = engine.BatchMark();
+  ASSERT_TRUE(outer.ok());
+  ASSERT_TRUE(Put(0, "a", "1").ok());
+  auto inner = engine.BatchMark();
+  ASSERT_TRUE(inner.ok());
+  ASSERT_TRUE(engine.BatchRollbackTo(*outer).ok());
+  EXPECT_EQ(engine.BatchRollbackTo(*inner).code(), StatusCode::kInternal);  // stale: undone with "a"
+  auto again = engine.BatchMark();  // the id is reused, with a fresh savepoint
+  ASSERT_TRUE(again.ok());
+  EXPECT_EQ(*again, *inner);
+  ASSERT_TRUE(Put(0, "b", "2").ok());
+  ASSERT_TRUE(engine.BatchRollbackTo(*again).ok());
+  ASSERT_TRUE(Put(0, "c", "3").ok());
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(Get(0, "a"), "<missing>");
+  EXPECT_EQ(Get(0, "b"), "<missing>");
+  EXPECT_EQ(Get(0, "c"), "3");
+  EXPECT_EQ(observer.reported, (std::vector<DbKey>{{0, "c"}}));
+}
+
 }  // namespace
 }  // namespace tideskv

@@ -126,10 +126,27 @@ TEST(ScriptCmd, LoadExistsFlushHelpDebugKill) {
   EXPECT_EQ(h.Run({"SCRIPT", "LOAD"}), Err("ERR wrong number of arguments for 'script|load' command"));
   EXPECT_EQ(h.Run({"SCRIPT", "LOAD", "#!lua flags=bad\nreturn 1"}),
             Err("ERR Unexpected flag in script shebang: bad"));
-  const std::string help = h.Run({"SCRIPT", "HELP"});
-  EXPECT_EQ(help.substr(0, 5), "*17\r\n");
-  EXPECT_NE(help.find("+SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"),
-            std::string::npos);
+  // redis72-lua.md §1 (ev:580-598): 1 header, 14 body lines, 2 footer lines, all status replies.
+  const std::string expected_help =
+      "*17\r\n"
+      "+SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"
+      "+DEBUG (YES|SYNC|NO)\r\n"
+      "+    Set the debug mode for subsequent scripts executed.\r\n"
+      "+EXISTS <sha1> [<sha1> ...]\r\n"
+      "+    Return information about the existence of the scripts in the script cache.\r\n"
+      "+FLUSH [ASYNC|SYNC]\r\n"
+      "+    Flush the Lua scripts cache. Very dangerous on replicas.\r\n"
+      "+    When called without the optional mode argument, the behavior is determined by the\r\n"
+      "+    lazyfree-lazy-user-flush configuration directive. Valid modes are:\r\n"
+      "+    * ASYNC: Asynchronously flush the scripts cache.\r\n"
+      "+    * SYNC: Synchronously flush the scripts cache.\r\n"
+      "+KILL\r\n"
+      "+    Kill the currently executing Lua script.\r\n"
+      "+LOAD <script>\r\n"
+      "+    Load a script into the scripts cache without executing it.\r\n"
+      "+HELP\r\n"
+      "+    Print this help.\r\n";
+  EXPECT_EQ(h.Run({"SCRIPT", "HELP"}), expected_help);
 }
 
 TEST(ScriptCmd, InfoMemoryAndConfig) {

@@ -35,6 +35,36 @@ bool Gate::try_lock_shared() {
   return true;
 }
 
+bool Gate::lock_shared_unless(const std::function<bool()>& give_up) {
+  std::unique_lock l(mu_);
+  while (writer_ || writers_waiting_ != 0) {
+    if (give_up()) return false;
+    cv_.wait(l);
+  }
+  ++readers_;
+  return true;
+}
+
+bool Gate::lock_unless(const std::function<bool()>& give_up) {
+  std::unique_lock l(mu_);
+  ++writers_waiting_;
+  while (writer_ || readers_ != 0) {
+    if (give_up()) {
+      if (--writers_waiting_ == 0) cv_.notify_all();  // readers queued behind us may proceed
+      return false;
+    }
+    cv_.wait(l);
+  }
+  --writers_waiting_;
+  writer_ = true;
+  return true;
+}
+
+void Gate::Wake() {
+  std::lock_guard l(mu_);
+  cv_.notify_all();
+}
+
 void Gate::unlock() {
   std::lock_guard l(mu_);
   writer_ = false;

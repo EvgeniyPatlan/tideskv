@@ -8,7 +8,9 @@
 
 #include "commands/multi_state.h"
 #include "commands/reply_util.h"
+#include "commands/server_services.h"
 #include "common/string_util.h"
+#include "script/script_engine.h"
 #include "server/watch.h"
 #include "types/errors.h"
 
@@ -79,8 +81,9 @@ const CommandSpec* CommandRegistry::Find(std::string_view name) const {
 
 std::vector<std::string_view> FlagNames(uint32_t flags) {
   static constexpr std::pair<CommandFlag, std::string_view> kNames[] = {
-      {kCmdWrite, "write"},    {kCmdReadOnly, "readonly"}, {kCmdAdmin, "admin"},     {kCmdFast, "fast"},
-      {kCmdNoAuth, "no-auth"}, {kCmdNoScript, "noscript"}, {kCmdNoMulti, "no_multi"}};
+      {kCmdWrite, "write"},      {kCmdReadOnly, "readonly"},   {kCmdAdmin, "admin"},
+      {kCmdFast, "fast"},        {kCmdNoAuth, "no-auth"},      {kCmdNoScript, "noscript"},
+      {kCmdNoMulti, "no_multi"}, {kCmdAllowBusy, "allow_busy"}};
   std::vector<std::string_view> out;
   for (const auto& [flag, name] : kNames) {
     if ((flags & flag) != 0) out.push_back(name);
@@ -101,6 +104,9 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, ArityError(spec->name));
   }
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
+  if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
+    return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
+  }
   if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv);
   spec->handler(ctx, argv);
 }
