@@ -6,7 +6,10 @@ import (
 )
 
 // Gen produces a deterministic command stream for one seed.
-type Gen struct{ r *rand.Rand }
+type Gen struct {
+	r       *rand.Rand
+	inMulti bool
+}
 
 func NewGen(seed int64) *Gen { return &Gen{r: rand.New(rand.NewSource(seed))} }
 
@@ -63,8 +66,59 @@ const (
 	NormScanElems      // SSCAN page: cursor exact, elements order-free
 )
 
-// Next returns the next command and how its reply is normalised before comparing.
+// Next returns the next command and how its reply is normalised before comparing. About one
+// command in 12 is a transaction command; inside MULTI every command replies +QUEUED and EXEC's
+// array is compared byte for byte, so only NormNone commands are queued.
 func (g *Gen) Next() ([]string, Norm) {
+	if g.r.Intn(12) == 0 {
+		return g.txnCmd(), NormNone
+	}
+	for {
+		cmd, norm := g.dataCmd()
+		if !g.inMulti || norm == NormNone {
+			return cmd, norm
+		}
+	}
+}
+
+func (g *Gen) txnCmd() []string {
+	k := g.key()
+	switch g.r.Intn(10) {
+	case 0, 1:
+		g.inMulti = true // MULTI nested inside MULTI is an error that keeps the transaction
+		return []string{"MULTI"}
+	case 2, 3, 4:
+		g.inMulti = false
+		if g.r.Intn(20) == 0 {
+			return []string{"EXEC", "x"} // EXECABORT ... because of: (discards)
+		}
+		return []string{"EXEC"}
+	case 5:
+		g.inMulti = false
+		return []string{"DISCARD"}
+	case 6:
+		return []string{"WATCH", k, g.key()}
+	case 7:
+		return []string{"UNWATCH"}
+	case 8:
+		if g.inMulti { // blocking commands are queued and answer null at EXEC; outside they would wait
+			return []string{g.pick("BLPOP", "BRPOP", "BZPOPMIN"), k, "0"}
+		}
+		return []string{"WATCH", k}
+	default:
+		if g.r.Intn(4) == 0 {
+			g.inMulti = false
+			return []string{"RESET"} // back to RESP2 and db 0 on both sides
+		}
+		if !g.inMulti {
+			return []string{"NOSUCHCMD", k} // SHUTDOWN outside MULTI would stop both servers
+		}
+		return []string{g.pick("NOSUCHCMD", "SHUTDOWN"), k} // queue-time errors; SHUTDOWN is NO_MULTI
+	}
+}
+
+// dataCmd is the data-command family picker (the former body of Next).
+func (g *Gen) dataCmd() ([]string, Norm) {
 	switch g.r.Intn(4) { // a quarter of the stream goes to each family
 	case 0:
 		return g.collection(g.key())
