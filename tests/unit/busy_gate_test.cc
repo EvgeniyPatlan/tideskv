@@ -4,6 +4,8 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "exec/engine.h"
 #include "exec/gate.h"
@@ -155,36 +157,119 @@ TEST(BusyDispatch, AllowBusyCommandsStillRun) {
   EXPECT_TRUE(h.services.shutdown_requested_);
 }
 
-// End to end, as App wires it: a call already waiting for the gate when the script times out is
-// woken by the timeout callback and answers BUSY; SCRIPT KILL then ends the script.
+// End to end, as App wires it: a script that loops forever, run by `h` on its own thread. Every exit
+// path (including a failed ASSERT) ends the script and joins the thread.
+class LoopingScript {
+ public:
+  static constexpr int kThresholdMs = 1000;
+
+  explicit LoopingScript(test::CommandHarness& h) : h_(h), scripts_(h.services.scripts_) {
+    h.services.engine_.SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));
+    scripts_.SetOnTimeout([this] { h_.services.engine_.WakeWaiters(); });
+    EXPECT_EQ(h.Run({"CONFIG", "SET", "busy-reply-threshold", std::to_string(kThresholdMs)}), test::kOk);
+    thread_ = std::thread([this] { reply_ = h_.Run({"EVAL", "while true do end", "0"}); });
+  }
+  ~LoopingScript() {
+    if (!thread_.joinable()) return;
+    scripts_.KillForShutdown();
+    thread_.join();
+  }
+  LoopingScript(const LoopingScript&) = delete;
+  LoopingScript& operator=(const LoopingScript&) = delete;
+
+  // Runs each command on its own client and thread, all at once. A command still running after 10 s
+  // means a lost wake-up: the script is ended so the waiters return and the test fails.
+  std::vector<std::string> RunAll(std::vector<std::pair<test::SecondClient*, ArgList>> calls) {
+    std::vector<std::string> replies(calls.size());
+    std::atomic<size_t> done{0};
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < calls.size(); ++i) {
+      threads.emplace_back([&, i] {
+        replies[i] = calls[i].first->Run(calls[i].second);
+        ++done;
+      });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (done.load() < calls.size() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(5ms);
+    if (done.load() < calls.size()) scripts_.KillForShutdown();
+    for (std::thread& t : threads) t.join();
+    return replies;
+  }
+  std::string Join() {
+    thread_.join();
+    return reply_;
+  }
+
+ private:
+  test::CommandHarness& h_;
+  ScriptEngine& scripts_;
+  std::string reply_;
+  std::thread thread_;
+};
+
+// A call already waiting for the gate when the script times out is woken by the timeout callback and
+// answers BUSY; SCRIPT KILL then ends the script.
 TEST(BusyDispatch, AWaitingCallIsWokenByTheTimeoutAndScriptKillEndsIt) {
   test::CommandHarness h;
   test::SecondClient other(h);
+  LoopingScript script(h);
+  std::this_thread::sleep_for(200ms);  // the script holds the gate but has not timed out yet
+  ASSERT_FALSE(h.services.scripts_.TimedOut());
+  const auto replies = script.RunAll({{&other, {"GET", "k"}}});  // passes Dispatch, waits for the gate
+  EXPECT_TRUE(h.services.scripts_.TimedOut());
+  EXPECT_EQ(replies[0], kBusy);
+  EXPECT_EQ(other.Run({"SCRIPT", "KILL"}), test::kOk);
+  const std::string eval_reply = script.Join();
+  EXPECT_NE(eval_reply.find("Script killed by user with SCRIPT KILL..."), std::string::npos) << eval_reply;
+  EXPECT_FALSE(h.services.scripts_.TimedOut());
+  EXPECT_EQ(other.Run({"GET", "k"}), test::kNil);
+}
+
+// SCRIPT LOAD and EXISTS need ScriptEngine's mutex, which the script holds for its whole run. Sent
+// before the timeout, they must wait on the gate (and be woken with BUSY), not on that mutex.
+TEST(BusyDispatch, ScriptLoadAndExistsSentBeforeTheTimeoutAnswerBusy) {
+  test::CommandHarness h;
+  test::SecondClient loader(h);
+  test::SecondClient checker(h);
+  LoopingScript script(h);
+  std::this_thread::sleep_for(200ms);
+  ASSERT_FALSE(h.services.scripts_.TimedOut());
+  const auto replies =
+      script.RunAll({{&loader, {"SCRIPT", "LOAD", "return 1"}}, {&checker, {"SCRIPT", "EXISTS", "abc"}}});
+  EXPECT_EQ(replies[0], kBusy);
+  EXPECT_EQ(replies[1], kBusy);
+  EXPECT_EQ(checker.Run({"SCRIPT", "KILL"}), test::kOk);
+  script.Join();
+  EXPECT_EQ(checker.Run({"SCRIPT", "EXISTS", "abc"}), test::Arr({test::Int(0)}));
+}
+
+// Review fix: a WATCH whose key read fails (BUSY: a timed-out script holds the gate) keeps none of the
+// watches it registered.
+TEST(BusyDispatch, WatchThatAnswersBusyLeavesNoWatches) {
+  test::CommandHarness h;
   ScriptEngine& scripts = h.services.scripts_;
   h.services.engine_.SetBusyGuard([&] { return scripts.TimedOut(); }, std::string(kErrBusyScript));
-  scripts.SetOnTimeout([&] { h.services.engine_.WakeWaiters(); });
-  ASSERT_EQ(h.Run({"CONFIG", "SET", "busy-reply-threshold", "300"}), test::kOk);
-  std::string eval_reply;
-  std::thread script([&] { eval_reply = h.Run({"EVAL", "while true do end", "0"}); });
-  std::this_thread::sleep_for(100ms);  // the script holds the gate but has not timed out yet
-  ASSERT_FALSE(scripts.TimedOut());
-  std::atomic<bool> done{false};
-  std::string get_reply;
-  std::thread waiter([&] {
-    get_reply = other.Run({"GET", "k"});  // passes Dispatch, then waits for the gate
-    done = true;
+  std::atomic<int> state{0};  // 0 = starting, 1 = holds the gate, 2 = BeginBatch failed
+  std::atomic<bool> release{false};
+  std::thread holder([&] {  // stands in for the script's batch
+    auto batch = h.services.engine_.BeginBatch();
+    state = batch.ok() ? 1 : 2;
+    while (!release.load()) std::this_thread::sleep_for(1ms);
   });
-  const auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (!done.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
-  if (!done.load()) scripts.KillForShutdown();  // lost wake-up: end the script so the test can fail
-  waiter.join();
-  EXPECT_TRUE(scripts.TimedOut());
-  EXPECT_EQ(get_reply, kBusy);
-  EXPECT_EQ(other.Run({"SCRIPT", "KILL"}), test::kOk);
-  script.join();
-  EXPECT_NE(eval_reply.find("Script killed by user with SCRIPT KILL..."), std::string::npos) << eval_reply;
-  EXPECT_FALSE(scripts.TimedOut());
-  EXPECT_EQ(other.Run({"GET", "k"}), test::kNil);
+  while (state.load() == 0) std::this_thread::sleep_for(1ms);
+  scripts.ForceTimedOutForTests(true);
+  const std::string reply = state.load() == 1 ? h.Run({"WATCH", "a", "b"}) : "no batch";
+  const size_t registered = h.services.watches_.size();
+  release = true;
+  holder.join();  // before any ASSERT can return
+  scripts.ForceTimedOutForTests(false);
+  EXPECT_EQ(reply, kBusy);
+  ASSERT_NE(h.session.watch, nullptr);
+  EXPECT_TRUE(h.session.watch->keys().empty());
+  EXPECT_EQ(registered, 0u);
+  EXPECT_EQ(h.Run({"WATCH", "a"}), test::kOk);
+  EXPECT_EQ(h.services.watches_.size(), 1u);
 }
 
 // Task 8 review: SCRIPT subcommands while a script is busy.

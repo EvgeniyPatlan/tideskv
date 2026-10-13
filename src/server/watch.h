@@ -38,6 +38,8 @@ class WatchRegistry final : public WriteObserver {
   // Owner thread, after Watch() returned true and the key was read: records that it was already
   // expired at WATCH. No-op if the entry is gone or the client is dirty (a write landed in between).
   void MarkExpiredAtWatch(const WatchClient& client, uint8_t db, std::string_view key);
+  // Owner thread. Drops one watch (a WATCH that failed after registering it); the dirty flag is kept.
+  void Unwatch(WatchClient& client, uint8_t db, std::string_view key);
   // Owner thread. Drops every watch and clears the dirty flag (UNWATCH, EXEC, DISCARD, RESET, disconnect).
   void UnwatchAll(WatchClient& client);
   // Owner thread. The watched keys whose expired-at-watch flag is clear: EXEC checks them for expiry.
@@ -61,6 +63,7 @@ class WatchRegistry final : public WriteObserver {
   static std::string MapKey(uint8_t db, std::string_view key);
   Shard& ShardFor(const std::string& map_key);
   const Shard& ShardFor(const std::string& map_key) const;
+  void RemoveEntries(const WatchClient& client, uint8_t db, std::string_view key);  // the registry side
 
   std::array<Shard, kShards> shards_;
   std::atomic<size_t> entries_{0};  // seq_cst: see Idle() and Watch()

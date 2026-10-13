@@ -39,7 +39,12 @@ void Watch(ExecContext& ctx, const ArgList& argv) {
     }
     return Status::Ok();
   });
-  if (!st.ok()) return ReplyError(ctx, st);
+  if (!st.ok()) {  // e.g. BUSY: undo this call's registrations, so an error reply leaves no new watches
+    for (size_t i = 1; i < argv.size(); ++i) {
+      if (fresh[i]) ctx.server.watches().Unwatch(*s.watch, s.db, argv[i]);
+    }
+    return ReplyError(ctx, st);
+  }
   for (size_t i = 1; i < argv.size(); ++i) {
     if (expired[i]) ctx.server.watches().MarkExpiredAtWatch(*s.watch, s.db, argv[i]);
   }

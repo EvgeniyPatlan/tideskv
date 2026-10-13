@@ -117,7 +117,10 @@ void ExpireReaper::Loop() {
   while (!stop_) {
     lock.unlock();
     try {  // an exception escaping this thread would std::terminate the server
-      if (auto n = RunOnce(); !n.ok()) spdlog::error("expire reaper: {}", n.status().ToString());
+      auto n = RunOnce();
+      // kUserError is only the Engine's BUSY answer while a script is timed out: retry next cycle, quietly.
+      if (!n.ok() && n.status().code() != StatusCode::kUserError)
+        spdlog::error("expire reaper: {}", n.status().ToString());
     } catch (const std::exception& e) {
       spdlog::error("expire reaper: {}", e.what());
     }

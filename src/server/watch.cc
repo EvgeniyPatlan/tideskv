@@ -57,17 +57,24 @@ void WatchRegistry::MarkExpiredAtWatch(const WatchClient& client, uint8_t db, st
   }
 }
 
+void WatchRegistry::RemoveEntries(const WatchClient& client, uint8_t db, std::string_view key) {
+  const std::string mk = MapKey(db, key);
+  Shard& s = ShardFor(mk);
+  std::lock_guard lock(s.mu);
+  auto it = s.by_key.find(mk);
+  if (it == s.by_key.end()) return;
+  const auto removed = std::erase_if(it->second, [&](const Entry& e) { return e.client.get() == &client; });
+  entries_.fetch_sub(removed);
+  if (it->second.empty()) s.by_key.erase(it);
+}
+
+void WatchRegistry::Unwatch(WatchClient& client, uint8_t db, std::string_view key) {
+  RemoveEntries(client, db, key);
+  std::erase_if(client.keys_, [&](const DbKey& k) { return k.db == db && k.key == key; });
+}
+
 void WatchRegistry::UnwatchAll(WatchClient& client) {
-  for (const DbKey& k : client.keys_) {
-    const std::string mk = MapKey(k.db, k.key);
-    Shard& s = ShardFor(mk);
-    std::lock_guard lock(s.mu);
-    auto it = s.by_key.find(mk);
-    if (it == s.by_key.end()) continue;
-    const auto removed = std::erase_if(it->second, [&](const Entry& e) { return e.client.get() == &client; });
-    entries_.fetch_sub(removed);
-    if (it->second.empty()) s.by_key.erase(it);
-  }
+  for (const DbKey& k : client.keys_) RemoveEntries(client, k.db, k.key);
   client.keys_.clear();
   client.dirty_.store(false, std::memory_order_release);
 }

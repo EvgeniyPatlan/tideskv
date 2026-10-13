@@ -120,15 +120,29 @@ void ScriptDebug(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.Error(kErrScriptDebugOption);
 }
 
+// LOAD and EXISTS take ScriptEngine's mutex, which a running script holds. Taking the gate first
+// (lock order gate -> mutex) means a call that arrives before the script times out waits on the
+// gate, where the timeout wakes it with BUSY, never on the mutex (H6). Inside EXEC the Read runs in
+// the batch, and the mutex is free.
 void ScriptExists(ExecContext& ctx, const ArgList& argv) {
   const std::vector<std::string> shas(argv.begin() + 2, argv.end());
-  const std::vector<bool> found = ctx.server.scripts().Exists(shas);
+  std::vector<bool> found;
+  const Status st = ctx.server.engine().Read([&](ReadView&, int64_t) {
+    found = ctx.server.scripts().Exists(shas);
+    return Status::Ok();
+  });
+  if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.ArrayHeader(found.size());
   for (bool f : found) ctx.reply.Integer(f ? 1 : 0);
 }
 
 void ScriptLoad(ExecContext& ctx, const ArgList& argv) {
-  auto sha = ctx.server.scripts().Load(argv[2]);
+  Result<std::string> sha = Status::Internal("script not loaded");
+  const Status st = ctx.server.engine().Read([&](ReadView&, int64_t) {
+    sha = ctx.server.scripts().Load(argv[2]);
+    return Status::Ok();
+  });
+  if (!st.ok()) return ReplyError(ctx, st);
   if (!sha.ok()) return ReplyError(ctx, sha.status());
   ctx.reply.Bulk(*sha);
 }
@@ -142,7 +156,7 @@ void Script(ExecContext& ctx, const ArgList& argv) {
   if (spec == nullptr) return ctx.reply.Error("ERR unknown subcommand '" + argv[1] + "'. Try SCRIPT HELP.");
   if (!ArityOk(spec->arity, argv.size()))
     return ctx.reply.Error("ERR wrong number of arguments for 'script|" + sub + "' command");
-  // Before anything that takes the engine's mutex: a running script holds it (Task 9).
+  // A timed-out script holds the gate and the engine's mutex: answer at once (Task 9).
   if (sub != "kill" && ctx.server.scripts().TimedOut()) return ctx.reply.Error(kErrBusyScript);
   if (sub == "load") return ScriptLoad(ctx, argv);
   if (sub == "exists") return ScriptExists(ctx, argv);

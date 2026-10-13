@@ -18,7 +18,8 @@ class Gate {
   bool try_lock_shared();  // succeeds iff no writer holds or waits for the gate
   // lock_shared()/lock() that give up and return false once give_up() is true. give_up is checked
   // when waiting starts and after every wake-up (Wake(), an unlock); it must be cheap and must not
-  // touch the gate (M5b H6). Whoever makes it true must call Wake() afterwards.
+  // touch the gate (M5b H6), and must not throw (a throw from lock_unless would leak writers_waiting_
+  // and stall every reader). Whoever makes it true must call Wake() afterwards.
   bool lock_shared_unless(const std::function<bool()>& give_up);
   bool lock_unless(const std::function<bool()>& give_up);
   void Wake();  // waiters re-check give_up
