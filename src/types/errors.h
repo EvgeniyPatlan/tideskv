@@ -73,4 +73,9 @@ inline constexpr std::string_view kErrZaddGtLtNx =
 inline constexpr std::string_view kErrZaddIncrPair =
     "ERR INCR option supports a single increment-element pair";
 
+inline constexpr std::string_view kErrZrangeLimit =
+    "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX";
+inline constexpr std::string_view kErrZrangeWithscoresLex =
+    "ERR syntax error, WITHSCORES not supported in combination with BYLEX";
+
 }  // namespace tideskv
