@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <string_view>
 
 #include "commands/registry.h"
@@ -29,6 +30,9 @@ void RegisterZsetAlgebraCommands(CommandRegistry& registry);   // cmd_zset_algeb
 void RegisterBlockingZsetCommands(CommandRegistry& registry);  // cmd_blocking_zset.cc
 void RegisterMultiCommands(CommandRegistry& registry);         // cmd_multi.cc
 void RegisterScriptCommands(CommandRegistry& registry);        // cmd_script.cc (M5b)
+// Redis rejects an unknown or mis-sized SCRIPT subcommand at lookup time, before MULTI queues it.
+// Returns the error text, or empty when `argv` (size >= 2) names a valid subcommand.
+std::string ScriptSubcommandError(const ArgList& argv);
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv

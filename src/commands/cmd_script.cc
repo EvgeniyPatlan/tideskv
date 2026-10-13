@@ -151,14 +151,8 @@ void ScriptLoad(ExecContext& ctx, const ArgList& argv) {
 }
 
 void Script(ExecContext& ctx, const ArgList& argv) {
+  if (std::string err = ScriptSubcommandError(argv); !err.empty()) return ctx.reply.Error(err);
   const std::string sub = ToLower(argv[1]);
-  const ScriptSub* spec = nullptr;
-  for (const ScriptSub& s : kScriptSubs) {
-    if (s.name == sub) spec = &s;
-  }
-  if (spec == nullptr) return ctx.reply.Error("ERR unknown subcommand '" + argv[1] + "'. Try SCRIPT HELP.");
-  if (!ArityOk(spec->arity, argv.size()))
-    return ctx.reply.Error("ERR wrong number of arguments for 'script|" + sub + "' command");
   // A timed-out script holds the gate and the engine's mutex: answer at once (Task 9).
   if (sub != "kill" && ctx.server.scripts().TimedOut()) return ctx.reply.Error(kErrBusyScript);
   if (sub == "load") return ScriptLoad(ctx, argv);
@@ -171,6 +165,16 @@ void Script(ExecContext& ctx, const ArgList& argv) {
 }
 
 }  // namespace
+
+std::string ScriptSubcommandError(const ArgList& argv) {
+  const std::string sub = ToLower(argv[1]);
+  for (const ScriptSub& s : kScriptSubs) {
+    if (s.name != sub) continue;
+    if (ArityOk(s.arity, argv.size())) return {};
+    return "ERR wrong number of arguments for 'script|" + sub + "' command";
+  }
+  return "ERR unknown subcommand '" + argv[1] + "'. Try SCRIPT HELP.";
+}
 
 void RegisterScriptCommands(CommandRegistry& r) {
   r.Register({"eval", -3, kCmdNoScript, 0, 0, 0, &Eval});

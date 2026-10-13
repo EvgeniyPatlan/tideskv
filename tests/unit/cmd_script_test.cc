@@ -94,6 +94,18 @@ TEST(EvalCmd, InsideMultiAndWatch) {
   EXPECT_EQ(h.Run({"EXEC"}), "*-1\r\n");
 }
 
+// Redis refuses an unknown or mis-sized SCRIPT subcommand at lookup time, so inside MULTI it is not
+// queued and it dooms the transaction (differential seed 59, Redis 7.2.5: `SCRIPT FOO` in MULTI
+// answers -ERR unknown subcommand 'FOO'. Try SCRIPT HELP.).
+TEST(ScriptCmd, BadSubcommandInsideMultiIsRejectedAtQueueTime) {
+  CommandHarness h;
+  h.Run({"MULTI"});
+  EXPECT_EQ(h.Run({"SCRIPT", "FOO"}), Err("ERR unknown subcommand 'FOO'. Try SCRIPT HELP."));
+  EXPECT_EQ(h.Run({"SCRIPT", "LOAD"}), Err("ERR wrong number of arguments for 'script|load' command"));
+  EXPECT_EQ(h.Run({"SCRIPT", "FLUSH"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"EXEC"}), Err("EXECABORT Transaction discarded because of previous errors."));
+}
+
 TEST(EvalCmd, FailedCommitRepliesTheErrorAndAppliesNothing) {
   CommandHarness h;
   h.services.storage_.fail_commit_in = 1;

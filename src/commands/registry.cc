@@ -6,6 +6,7 @@
 #include <string_view>
 #include <utility>
 
+#include "commands/all_commands.h"
 #include "commands/multi_state.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
@@ -58,6 +59,9 @@ void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
 
 void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
+  if (spec.name == "script") {  // subcommand lookup precedes queueing in Redis processCommand
+    if (std::string err = ScriptSubcommandError(argv); !err.empty()) return Reject(ctx, &spec, err);
+  }
   const auto& w = ctx.session.watch;
   const bool doomed = ctx.session.multi.dirty_exec || (w != nullptr && w->dirty());
   if (!doomed) ctx.session.multi.queued.push_back(argv);  // multi.c:67
