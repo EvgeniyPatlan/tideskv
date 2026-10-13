@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <map>
 #include <set>
 
 #include "support/command_harness.h"
@@ -159,6 +160,22 @@ TEST(ZScan, LargeZsetPagesWithLongDoubleText) {
     }
   } while (cursor != "0");
   EXPECT_EQ(seen.size(), 130u);
+}
+
+// <= 128 members but one longer than 64 bytes: Redis keeps it as a skiplist, so ZSCAN takes the large path.
+TEST(ZScan, LongMemberTakesTheLargePath) {
+  test::CommandHarness h;
+  const std::string long_member(65, 'x');
+  ASSERT_EQ(h.Run({"ZADD", "z", "0.1", "a", "0.1", long_member, "1.5", "b"}), test::Int(3));
+  std::map<std::string, std::string> seen;
+  std::string cursor = "0";
+  do {
+    const test::ScanReply page = test::ParseScan(h.Run({"ZSCAN", "z", cursor}));
+    cursor = page.cursor;
+    for (size_t i = 0; i + 1 < page.keys.size(); i += 2) seen[page.keys[i]] = page.keys[i + 1];
+  } while (cursor != "0");
+  EXPECT_EQ(seen, (std::map<std::string, std::string>{
+                      {"a", "0.10000000000000001"}, {long_member, "0.10000000000000001"}, {"b", "1.5"}}));
 }
 
 }  // namespace
