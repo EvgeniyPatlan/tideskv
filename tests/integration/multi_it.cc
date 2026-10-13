@@ -138,6 +138,10 @@ TEST(MultiIT, KillDuringExecIsAllOrNothing) {  // Review Focus #2; spec §12 "ki
       std::atomic<bool> stop{false};
       std::vector<std::thread> threads;
       const ThreadGuard guard{stop, threads};
+      auto probe = s.Connect();
+      ASSERT_NE(probe, nullptr);
+      // The data dir is shared across rounds, so progress is measured from this round's start.
+      const int64_t baseline = IntValue(*probe, "a");
       threads.emplace_back([&] {
         auto c = s.Connect();
         for (int i = 0; c && !stop; ++i) {
@@ -151,9 +155,7 @@ TEST(MultiIT, KillDuringExecIsAllOrNothing) {  // Review Focus #2; spec §12 "ki
           }
         }
       });
-      auto probe = s.Connect();
-      ASSERT_NE(probe, nullptr);
-      ASSERT_TRUE(WaitFor([&] { return IntValue(*probe, "a") >= 5; })) << "round " << round;
+      ASSERT_TRUE(WaitFor([&] { return IntValue(*probe, "a") >= baseline + 5; })) << "round " << round;
       std::this_thread::sleep_for(std::chrono::milliseconds(rng() % 200));
       s.Kill9();
       stop = true;

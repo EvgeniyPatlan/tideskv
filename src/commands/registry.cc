@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "commands/multi_state.h"
+#include "commands/reply_util.h"
 #include "common/string_util.h"
 #include "server/watch.h"
 #include "types/errors.h"
@@ -97,7 +98,7 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
   const CommandSpec* spec = registry.Find(argv[0]);
   if (spec == nullptr) return Reject(ctx, nullptr, UnknownCommandMessage(argv));
   if (!ArityOk(spec->arity, argv.size())) {
-    return Reject(ctx, spec, "ERR wrong number of arguments for '" + spec->name + "' command");
+    return Reject(ctx, spec, ArityError(spec->name));
   }
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
   if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv);
