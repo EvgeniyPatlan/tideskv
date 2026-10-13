@@ -12,6 +12,10 @@ std::string ArityError(std::string_view command) {
   return "ERR wrong number of arguments for '" + std::string(command) + "' command";
 }
 
+std::string AtLeastOneKeyError(std::string_view command) {
+  return "ERR at least 1 input key is needed for '" + std::string(command) + "' command";
+}
+
 std::string UnsupportedOptionError(std::string_view opt) {
   return "ERR Unsupported option " + std::string(opt);
 }
