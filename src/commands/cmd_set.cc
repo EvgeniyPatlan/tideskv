@@ -13,10 +13,6 @@
 namespace tideskv {
 namespace {
 
-std::vector<std::string_view> ArgsFrom(const ArgList& argv, size_t first) {
-  return std::vector<std::string_view>(argv.begin() + static_cast<std::ptrdiff_t>(first), argv.end());
-}
-
 void ReplySet(ExecContext& ctx, const std::vector<std::string>& members) {
   ctx.reply.SetHeader(members.size());  // RESP3 '~', RESP2 array
   for (const std::string& m : members) ctx.reply.Bulk(m);

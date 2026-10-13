@@ -12,11 +12,6 @@
 namespace tideskv {
 namespace {
 
-std::vector<std::string_view> ArgsFrom(const ArgList& argv, size_t first, size_t last) {
-  return std::vector<std::string_view>(argv.begin() + static_cast<std::ptrdiff_t>(first),
-                                       argv.begin() + static_cast<std::ptrdiff_t>(last));
-}
-
 void Combine(ExecContext& ctx, const ArgList& argv, SetOp op) {
   const auto keys = ArgsFrom(argv, 1, argv.size());
   std::vector<std::string> members;

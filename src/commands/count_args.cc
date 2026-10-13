@@ -19,4 +19,10 @@ Status ParsePositiveCount(std::string_view arg, std::string_view error, int64_t*
   return Status::Ok();
 }
 
+Status ParseNonNegativeCount(std::string_view arg, int64_t* out) {
+  if (!ParseInt64(arg, out)) return Status::UserError(std::string(kErrNotInteger));
+  if (*out < 0) return Status::UserError(std::string(kErrMustBePositive));
+  return Status::Ok();
+}
+
 }  // namespace tideskv

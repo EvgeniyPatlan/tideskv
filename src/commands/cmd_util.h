@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "commands/registry.h"
 #include "commands/reply_util.h"
@@ -37,6 +38,15 @@ bool WriteOneKey(ExecContext& ctx, std::string_view key, Fn&& fn) {
 // Replies a bulk string, or nil for nullopt.
 inline void ReplyOptional(ExecContext& ctx, const std::optional<std::string>& v) {
   v ? ctx.reply.Bulk(*v) : ctx.reply.Null();
+}
+
+// argv[first, last) as views (keys, members, values ...).
+inline std::vector<std::string_view> ArgsFrom(const ArgList& argv, size_t first, size_t last) {
+  return std::vector<std::string_view>(argv.begin() + static_cast<std::ptrdiff_t>(first),
+                                       argv.begin() + static_cast<std::ptrdiff_t>(last));
+}
+inline std::vector<std::string_view> ArgsFrom(const ArgList& argv, size_t first) {
+  return ArgsFrom(argv, first, argv.size());
 }
 
 // Runs fn(ReadView&, int64_t now_ms) -> Status through Engine::Read (Engine::Snapshot for

@@ -18,10 +18,6 @@
 namespace tideskv {
 namespace {
 
-std::vector<std::string_view> ArgsFrom(const ArgList& argv, size_t first) {
-  return std::vector<std::string_view>(argv.begin() + static_cast<std::ptrdiff_t>(first), argv.end());
-}
-
 void HSetGeneric(ExecContext& ctx, const ArgList& argv, bool hmset) {
   if (argv.size() % 2 == 1) return ctx.reply.Error(ArityError(hmset ? "hmset" : "hset"));
   std::vector<FieldValue> pairs;

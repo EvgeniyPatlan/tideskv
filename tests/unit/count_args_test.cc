@@ -25,5 +25,13 @@ TEST(CountArgs, PositiveCountUsesTheGivenMessageForEveryFailure) {
   EXPECT_EQ(ParsePositiveCount("-1", kErrLimitNegative, &n).message(), kErrLimitNegative);
 }
 
+TEST(CountArgs, NonNegativeCount) {
+  int64_t n = -1;
+  EXPECT_TRUE(ParseNonNegativeCount("0", &n).ok());
+  EXPECT_EQ(n, 0);
+  EXPECT_EQ(ParseNonNegativeCount("x", &n).message(), kErrNotInteger);
+  EXPECT_EQ(ParseNonNegativeCount("-1", &n).message(), kErrMustBePositive);
+}
+
 }  // namespace
 }  // namespace tideskv

@@ -42,6 +42,8 @@ inline constexpr std::string_view kErrNumkeysNotPositive = "ERR numkeys should b
 inline constexpr std::string_view kErrNumkeysTooMany =
     "ERR Number of keys can't be greater than number of args";
 inline constexpr std::string_view kErrLimitNegative = "ERR LIMIT can't be negative";
+// M4 (Redis 7.2.5 t_list.c, t_zset.c, blocked.c, timeout.c; see notes/m4-research).
+inline constexpr std::string_view kErrIndexOutOfRange = "ERR index out of range";
 inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
 }  // namespace tideskv

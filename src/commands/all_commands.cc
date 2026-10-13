@@ -15,6 +15,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterHashCommands(registry);
   RegisterSetCommands(registry);
   RegisterSetAlgebraCommands(registry);
+  RegisterListCommands(registry);
   RegisterElementScanCommands(registry);
 }
 
