@@ -11,7 +11,6 @@
 namespace tideskv {
 namespace {
 
-using test::Arr;
 using test::Bulk;
 using test::CommandHarness;
 using test::Err;
@@ -114,6 +113,27 @@ TEST_F(BlockingServe, WaiterOfAnotherTypeIsSkipped) {
   ServeBlockedClients(h.services.registry(), h.services, ready);  // as if SADD had signalled
   EXPECT_TRUE(h.TakeUnblocked().empty());
   EXPECT_EQ(h.services.blocking_.blocked_clients(), 1u);
+}
+
+TEST_F(BlockingServe, WrongTypeWaiterIsSkippedAndTheNextOneServed) {
+  EXPECT_EQ(h.Run({"BZPOPMIN", "k", "0"}), "");  // waits for a zset
+  SecondClient b(h), pusher(h);
+  EXPECT_EQ(b.Run({"TBPOP", "k"}), "");  // waits for a list, behind the zset waiter
+  EXPECT_EQ(pusher.Run({"TPUSH", "k", "x"}), Int(1));
+  EXPECT_EQ(b.TakeUnblocked(), (std::vector<std::string>{Bulk("x")}));
+  EXPECT_TRUE(h.TakeUnblocked().empty());
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 1u);  // the zset waiter still waits
+}
+
+TEST_F(BlockingServe, ServedCommandCascadesToItsDestinationsWaiters) {
+  EXPECT_EQ(h.Run({"BLMOVE", "src", "dst", "LEFT", "RIGHT", "0"}), "");
+  SecondClient b(h), pusher(h);
+  EXPECT_EQ(b.Run({"TBPOP", "dst"}), "");
+  EXPECT_EQ(pusher.Run({"TPUSH", "src", "v"}), Int(1));
+  EXPECT_EQ(h.TakeUnblocked(), (std::vector<std::string>{Bulk("v")}));  // moved src -> dst
+  EXPECT_EQ(b.TakeUnblocked(), (std::vector<std::string>{Bulk("v")}));  // dst became ready in the same call
+  EXPECT_EQ(pusher.Run({"EXISTS", "src", "dst"}), Int(0));
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
 }
 
 TEST_F(BlockingServe, ReRunThatThrowsEndsThatWaitWithAnErrorNotThePusher) {
