@@ -265,8 +265,10 @@ static int LuaMathRandom(lua_State* L) noexcept {
       lua_pushnumber(L, std::floor(r * static_cast<lua_Number>(int64_t{u} - l + 1)) + l);
       break;
     }
-    default:  // luaL_error from a C function adds no position prefix
+    default:  // luaL_error: prefixed with luaL_where(L, 1)
+      luaL_where(L, 1);
       lua_pushlstring(L, kScriptErrWrongArgs.data(), kScriptErrWrongArgs.size());
+      lua_concat(L, 2);
       return lua_error(L);
   }
   return 1;

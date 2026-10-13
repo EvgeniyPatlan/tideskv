@@ -83,9 +83,12 @@ constexpr char kErrHandler[] =
 
 constexpr int kGcCyclePeriod = 50;  // LUA_GC_CYCLE_PERIOD (sl:1680)
 
-// luaL_error from a C function: the message has no position prefix.
+// luaL_error from a C function: the message is prefixed with luaL_where(L, 1), i.e. "user_script:N: " when
+// the caller is Lua code. Only the position string (a Lua stack value) is alive when lua_error is called.
 int RaiseMessage(lua_State* L, std::string_view msg) {
+  luaL_where(L, 1);
   lua_pushlstring(L, msg.data(), msg.size());
+  lua_concat(L, 2);
   return lua_error(L);
 }
 
@@ -127,10 +130,11 @@ static int ProtectedTableError(lua_State* L) noexcept {
   }
   if (!lua_isstring(L, -1) && !lua_isnumber(L, -1)) return RaiseMessage(L, kScriptErrProtectedTableKey);
   const char* name = lua_tostring(L, -1);
+  luaL_where(L, 1);
   lua_pushlstring(L, kScriptErrNonexistentGlobal.data(), kScriptErrNonexistentGlobal.size());
   lua_pushstring(L, name);
   lua_pushliteral(L, "'");
-  lua_concat(L, 3);
+  lua_concat(L, 4);
   return lua_error(L);
 }
 

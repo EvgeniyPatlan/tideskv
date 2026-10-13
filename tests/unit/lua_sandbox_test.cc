@@ -73,7 +73,8 @@ TEST_F(SandboxTest, ErrorRepliesMatchRedis) {  // redis72-lua.md §5
   std::string c = "x = 1";
   EXPECT_EQ(Eval(c), ScriptErr(c, "ERR user_script:1: Attempt to modify a readonly table"));
   c = "return a";
-  EXPECT_EQ(Eval(c), ScriptErr(c, "ERR Script attempted to access nonexistent global variable 'a'"));
+  EXPECT_EQ(Eval(c),
+            ScriptErr(c, "ERR user_script:1: Script attempted to access nonexistent global variable 'a'"));
   c = "error('x')";
   EXPECT_EQ(Eval(c), ScriptErr(c, "ERR user_script:1: x"));
   c = "error('x', 0)";
@@ -119,7 +120,9 @@ TEST_F(SandboxTest, SandboxAbsencesAndPresences) {  // redis72-lua.md §3
     const std::string c = std::string("return ") + g;
     EXPECT_EQ(
         Eval(c),
-        ScriptErr(c, std::string("ERR Script attempted to access nonexistent global variable '") + g + "'"))
+        ScriptErr(c,
+                  std::string("ERR user_script:1: Script attempted to access nonexistent global variable '") +
+                      g + "'"))
         << g;
   }
   EXPECT_EQ(
@@ -148,8 +151,16 @@ TEST_F(SandboxTest, MathRandomIsRedisRand48) {  // lua-integration.md §3.4
   RedisRand48ResetForTests();
   EXPECT_EQ(Eval("return {math.random(1000), math.random(1000)}"), "*2\r\n:397\r\n:841\r\n");
   EXPECT_EQ(Eval("math.randomseed(1) return math.random(1000)"), ":42\r\n");
+  // Live redis:7.2.5 replies for luaL_error / luaL_argcheck / luaL_checkint raisers (all carry luaL_where).
   std::string c = "return math.random(1, 2, 3)";
-  EXPECT_EQ(Eval(c), ScriptErr(c, "ERR wrong number of arguments"));
+  EXPECT_EQ(Eval(c), ScriptErr(c, "ERR user_script:1: wrong number of arguments"));
+  c = "return math.random(0)";
+  EXPECT_EQ(Eval(c), ScriptErr(c, "ERR user_script:1: bad argument #1 to 'random' (interval is empty)"));
+  c = "return math.random(2, 1)";
+  EXPECT_EQ(Eval(c), ScriptErr(c, "ERR user_script:1: bad argument #2 to 'random' (interval is empty)"));
+  c = "math.randomseed('x')";
+  EXPECT_EQ(Eval(c),
+            ScriptErr(c, "ERR user_script:1: bad argument #1 to 'randomseed' (number expected, got string)"));
 }
 
 TEST_F(SandboxTest, RedisHelpers) {  // redis72-lua.md §3 table
