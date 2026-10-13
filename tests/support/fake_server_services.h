@@ -10,6 +10,7 @@
 #include "server/watch.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
+#include "support/faulty_storage.h"
 #include "types/cursor_store.h"
 #include "types/oid_allocator.h"
 
@@ -39,7 +40,7 @@ class FakeServerServices final : public ServerServices {
   int reset_calls_ = 0;
   bool shutdown_requested_ = false;
   CursorStore cursors_;
-  InMemoryStorage storage_;
+  FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;
   BlockingRegistry blocking_;                                    // before engine_
