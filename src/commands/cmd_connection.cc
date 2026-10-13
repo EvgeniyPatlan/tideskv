@@ -213,7 +213,7 @@ void Client(ExecContext& ctx, const ArgList& argv) {
 void RegisterConnectionCommands(CommandRegistry& r) {
   r.Register({"ping", -1, kCmdFast, 0, 0, 0, &Ping});
   r.Register({"echo", 2, kCmdFast, 0, 0, 0, &Echo});
-  r.Register({"quit", -1, kCmdNoAuth | kCmdFast, 0, 0, 0, &Quit});
+  r.Register({"quit", -1, kCmdNoAuth | kCmdFast | kCmdNoScript, 0, 0, 0, &Quit});
   r.Register({"auth", -2, kCmdNoAuth | kCmdFast | kCmdNoScript, 0, 0, 0, &Auth});
   r.Register({"hello", -1, kCmdNoAuth | kCmdFast | kCmdNoScript, 0, 0, 0, &Hello});
   r.Register({"client", -2, kCmdNoScript, 0, 0, 0, &Client});

@@ -11,6 +11,7 @@
 #include "exec/lock_manager.h"
 #include "expire/reaper.h"
 #include "net/server.h"
+#include "script/script_engine.h"
 #include "server/blocking.h"
 #include "server/compaction_scheduler.h"
 #include "server/config.h"
@@ -44,6 +45,7 @@ class App final : public ServerServices {
   OidAllocator& oids() override { return *oids_; }
   BlockingRegistry& blocking() override { return blocking_; }
   WatchRegistry& watches() override { return watches_; }
+  ScriptEngine& scripts() override { return scripts_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -54,6 +56,7 @@ class App final : public ServerServices {
   std::unique_ptr<OidAllocator> oids_;
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;
+  ScriptEngine scripts_;                            // before engine_: its busy guard refers to it
   WatchRegistry watches_;                           // before engine_ and the reaper: it must outlive them
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;

@@ -6,6 +6,7 @@
 #include "commands/server_services.h"
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
+#include "script/script_engine.h"
 #include "server/blocking.h"
 #include "server/watch.h"
 #include "storage/memory_storage.h"
@@ -33,6 +34,7 @@ class FakeServerServices final : public ServerServices {
   OidAllocator& oids() override { return oids_; }
   BlockingRegistry& blocking() override { return blocking_; }
   WatchRegistry& watches() override { return watches_; }
+  ScriptEngine& scripts() override { return scripts_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -40,6 +42,7 @@ class FakeServerServices final : public ServerServices {
   int reset_calls_ = 0;
   bool shutdown_requested_ = false;
   CursorStore cursors_;
+  ScriptEngine scripts_;
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

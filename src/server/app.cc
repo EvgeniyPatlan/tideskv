@@ -141,12 +141,13 @@ void App::RequestShutdown() {
 void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
-  server_->Stop();     // no command can touch storage after this
-  reaper_.reset();     // joins the reaper thread; it writes through engine_
-  engine_.reset();     // references storage_, so it goes first
-  scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
-  oids_.reset();       // likewise (its persist hook checkpoints storage_)
-  storage_.reset();    // flushes and closes TidesDB
+  scripts_.KillForShutdown();  // a running script must not hold up the worker threads
+  server_->Stop();             // no command can touch storage after this
+  reaper_.reset();             // joins the reaper thread; it writes through engine_
+  engine_.reset();             // references storage_, so it goes first
+  scheduler_.reset();          // compacts storage_; nothing commits (feeds it) once the engine is gone
+  oids_.reset();               // likewise (its persist hook checkpoints storage_)
+  storage_.reset();            // flushes and closes TidesDB
 }
 
 ServerStats App::Stats() const {

@@ -11,6 +11,7 @@ class CommandRegistry;
 class CursorStore;
 class Engine;
 class OidAllocator;
+class ScriptEngine;
 class WatchRegistry;
 
 struct ServerStats {
@@ -52,6 +53,7 @@ class ServerServices {
   virtual CursorStore& cursors() = 0;        // SCAN cursor table (Task 14)
   virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
   virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
+  virtual ScriptEngine& scripts() = 0;       // EVAL / SCRIPT (M5b)
 };
 
 }  // namespace tideskv
