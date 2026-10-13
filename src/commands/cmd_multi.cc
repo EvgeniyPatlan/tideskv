@@ -9,6 +9,7 @@
 #include "commands/server_services.h"
 #include "exec/engine.h"
 #include "resp/reply_builder.h"
+#include "server/config.h"
 #include "server/watch.h"
 #include "types/errors.h"
 #include "types/object_store.h"
@@ -63,11 +64,24 @@ void Discard(ExecContext& ctx, const ArgList&) {
   ctx.reply.SimpleString("OK");
 }
 
-// EXEC's CAS check, run while the batch holds the gate exclusively, so every committed write has
-// already reported its keys (Review Focus #1). Task 6 adds the expiry half.
+// EXEC's CAS check (G2), under the batch's exclusive gate and frozen clock: a watched key was
+// modified, or a key that was live when watched has expired since (isWatchedKeyExpired, multi.c:360).
 Result<bool> WatchFailed(ExecContext& ctx) {
   const auto& w = ctx.session.watch;
-  return w != nullptr && w->dirty();
+  if (w == nullptr) return false;
+  if (w->dirty()) return true;
+  for (const DbKey& k : ctx.server.watches().KeysWatchedLive(*w)) {
+    bool expired = false;
+    const Status st = ctx.server.engine().Read([&](ReadView& view, int64_t now_ms) {  // routed into the batch
+      auto obj = LoadObject(view, k.db, k.key, now_ms);
+      if (!obj.ok()) return obj.status();
+      expired = obj->state == ObjectState::kExpired;
+      return Status::Ok();
+    });
+    if (!st.ok()) return st;
+    if (expired) return true;
+  }
+  return false;
 }
 
 // Runs the queue in one batch (G1, G3). Replies go to a scratch builder that is sent only if the
@@ -115,6 +129,18 @@ void Exec(ExecContext& ctx, const ArgList&) {
   RunQueued(ctx, queued, std::move(batch).value());
 }
 
+// RESET (networking.c:1501 clearClientConnectionState): runs at once even inside MULTI.
+void Reset(ExecContext& ctx, const ArgList&) {
+  DiscardTransaction(ctx);  // leaves MULTI and unwatches
+  Session& s = ctx.session;
+  s.db = 0;
+  s.protocol = 2;
+  ctx.reply.SetProtocol(2);
+  s.authenticated = ctx.server.config().Snapshot().requirepass.empty();
+  s.name.clear();  // lib_name / lib_ver stay: they describe the client library
+  ctx.reply.SimpleString("RESET");
+}
+
 }  // namespace
 
 void RegisterMultiCommands(CommandRegistry& r) {
@@ -123,6 +149,7 @@ void RegisterMultiCommands(CommandRegistry& r) {
   r.Register({"exec", 1, kCmdNoScript, 0, 0, 0, &Exec});
   r.Register({"discard", 1, kCmdNoScript | kCmdFast, 0, 0, 0, &Discard});
   r.Register({"unwatch", 1, kCmdNoScript | kCmdFast, 0, 0, 0, &Unwatch});
+  r.Register({"reset", 1, kCmdNoAuth | kCmdNoScript | kCmdFast, 0, 0, 0, &Reset});
 }
 
 }  // namespace tideskv

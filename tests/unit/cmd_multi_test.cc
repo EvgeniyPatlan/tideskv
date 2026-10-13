@@ -303,5 +303,97 @@ TEST(ConnectionState, RestoreUndoesQueuedChanges) {
   EXPECT_EQ(h.reply.protocol(), 2);
 }
 
+TEST(MultiExpiry, LiveWatchedKeyThatExpiresBeforeExecAborts) {  // multi.c:360, Review Focus #4
+  CommandHarness h;
+  h.clock().Set(1000);
+  h.Run({"SET", "k", "v", "PX", "100"});
+  h.Run({"WATCH", "k"});
+  h.clock().Set(2000);  // expired, but nobody deleted it
+  h.Run({"MULTI"});
+  h.Run({"PING"});
+  EXPECT_EQ(h.Run({"EXEC"}), "*-1\r\n");
+}
+
+TEST(MultiExpiry, KeyAlreadyExpiredAtWatchDoesNotAbort) {
+  CommandHarness h;
+  h.clock().Set(1000);
+  h.Run({"SET", "k", "v", "PX", "100"});
+  h.clock().Set(2000);
+  h.Run({"WATCH", "k"});
+  h.Run({"MULTI"});
+  h.Run({"PING"});
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({"+PONG\r\n"}));
+}
+
+TEST(MultiExpiry, FlushdbOfAStaleWatchedKeyDoesNotAbort) {  // Redis multi.tcl
+  CommandHarness h;
+  h.clock().Set(1000);
+  h.Run({"SET", "k", "v", "PX", "100"});
+  h.clock().Set(2000);
+  h.Run({"WATCH", "k"});
+  h.Run({"FLUSHDB"});
+  h.Run({"MULTI"});
+  h.Run({"PING"});
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({"+PONG\r\n"}));
+}
+
+TEST(Reset, DiscardsUnwatchesAndRestoresDefaults) {  // networking.c:1501
+  CommandHarness h;
+  SecondClient other(h);
+  h.Run({"HELLO", "3"});
+  h.Run({"SELECT", "4"});
+  h.Run({"CLIENT", "SETNAME", "me"});
+  h.Run({"WATCH", "x"});
+  h.Run({"MULTI"});
+  h.Run({"SET", "x", "40"});
+  EXPECT_EQ(h.Run({"RESET"}), "+RESET\r\n");
+  EXPECT_FALSE(h.session.multi.active);
+  EXPECT_EQ(h.session.db, 0);
+  EXPECT_EQ(h.session.protocol, 2);
+  EXPECT_EQ(h.reply.protocol(), 2);
+  EXPECT_TRUE(h.session.name.empty());
+  EXPECT_TRUE(h.session.watch->keys().empty());
+  other.Run({"SET", "x", "1"});  // would have dirtied the old watch
+  h.Run({"MULTI"});
+  h.Run({"PING"});
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({"+PONG\r\n"}));
+}
+
+TEST(Reset, DeauthenticatesWhenAPasswordIsSet) {
+  CommandHarness h;
+  h.RequirePassword("pw");
+  EXPECT_EQ(h.Run({"AUTH", "pw"}), kOk);
+  EXPECT_EQ(h.Run({"RESET"}), "+RESET\r\n");
+  EXPECT_EQ(h.Run({"PING"}), Err("NOAUTH Authentication required."));
+  EXPECT_EQ(h.Run({"RESET"}), "+RESET\r\n");  // allowed before AUTH
+}
+
+TEST(Reset, KeepsLibNameAndVersion) {
+  CommandHarness h;
+  h.Run({"CLIENT", "SETINFO", "LIB-NAME", "go-redis"});
+  h.Run({"RESET"});
+  EXPECT_EQ(h.session.lib_name, "go-redis");
+}
+
+// G4: the unblock takes effect after EXEC, before waiters are served, so the push stays in q.
+TEST(MultiUnblock, ClientUnblockInsideExecIsDeferredButOrderedBeforeServing) {
+  CommandHarness h;
+  SecondClient w(h);
+  EXPECT_EQ(w.Run({"BLPOP", "q", "0"}), "");
+  h.Run({"MULTI"});
+  h.Run({"LPUSH", "q", "x"});
+  h.Run({"CLIENT", "UNBLOCK", std::to_string(w.session.id)});
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({Int(1), Int(1)}));
+  EXPECT_EQ(w.TakeUnblocked(), (std::vector<std::string>{"*-1\r\n"}));
+  EXPECT_EQ(h.Run({"LLEN", "q"}), Int(1));
+}
+
+TEST(MultiUnblock, UnknownClientIsZero) {
+  CommandHarness h;
+  h.Run({"MULTI"});
+  h.Run({"CLIENT", "UNBLOCK", "999999"});
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({Int(0)}));
+}
+
 }  // namespace
 }  // namespace tideskv::test

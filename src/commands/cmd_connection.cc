@@ -181,6 +181,13 @@ void ClientUnblock(ExecContext& ctx, const ArgList& argv) {
   } else {
     r.NullArray();
   }
+  // Inside EXEC the batch holds the gate, and a waiter being served holds its own lock while it
+  // waits for that gate: calling Unblock here could deadlock (lock order, M5a G4). EXEC runs the
+  // action after releasing the gate and before serving waiters.
+  if (ctx.after_batch != nullptr) {
+    ctx.after_batch->push_back([target, r = r.Take()]() mutable { target->Unblock(std::move(r)); });
+    return ctx.reply.Integer(1);
+  }
   ctx.reply.Integer(target->Unblock(r.Take()) ? 1 : 0);
 }
 
