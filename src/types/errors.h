@@ -121,5 +121,29 @@ inline constexpr std::string_view kScriptErrNoArgs =
 inline constexpr std::string_view kScriptErrArgType =
     "Lua redis lib command arguments must be strings or integers";
 inline constexpr std::string_view kScriptErrKilled = "Script killed by user with SCRIPT KILL...";
+inline constexpr std::string_view kScriptErrWrongArgs = "wrong number of arguments";
+inline constexpr std::string_view kScriptErrWrongArgsOrType = "wrong number or type of arguments";
+inline constexpr std::string_view kScriptErrNonexistentGlobal =
+    "Script attempted to access nonexistent global variable '";
+inline constexpr std::string_view kScriptErrLogArgs = "redis.log() requires two arguments or more.";
+inline constexpr std::string_view kScriptErrLogLevelType = "First argument must be a number (log level).";
+inline constexpr std::string_view kScriptErrLogLevel = "Invalid debug level.";
+inline constexpr std::string_view kScriptErrSetRespArgs = "redis.setresp() requires one argument.";
+inline constexpr std::string_view kScriptErrSetRespVersion = "RESP version must be 2 or 3.";
+inline constexpr std::string_view kScriptErrSetReplArgs = "redis.set_repl() requires one argument.";
+inline constexpr std::string_view kScriptErrSetReplFlags =
+    "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE.";
+inline constexpr std::string_view kScriptErrAclCheckCmd = "Invalid command passed to redis.acl_check_cmd()";
+// Raised by the protection metamethods when called directly (sl:1267-1350).
+inline constexpr std::string_view kScriptErrProtectedTableArgs =
+    "Wrong number of arguments to luaProtectedTableError";
+inline constexpr std::string_view kScriptErrProtectedTableKey =
+    "Second argument to luaProtectedTableError must be a string or number";
+inline constexpr std::string_view kScriptErrAllowListArgs =
+    "Wrong number of arguments to luaNewIndexAllowList";
+inline constexpr std::string_view kScriptErrAllowListTable =
+    "first argument to luaNewIndexAllowList must be a table";
+inline constexpr std::string_view kScriptErrAllowListKey =
+    "Second argument to luaNewIndexAllowList must be a string or number";
 
 }  // namespace tideskv

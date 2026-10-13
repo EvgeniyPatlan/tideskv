@@ -10,5 +10,7 @@ namespace tideskv {
 inline constexpr int32_t kRedisLrand48Max = std::numeric_limits<int32_t>::max();
 int32_t RedisLrand48();
 void RedisSrand48(int32_t seed);
+// Restores drand48's initial state, as in a fresh process (tests only).
+void RedisRand48ResetForTests();
 
 }  // namespace tideskv
