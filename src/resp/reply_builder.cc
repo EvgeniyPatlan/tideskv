@@ -1,21 +1,10 @@
 #include "resp/reply_builder.h"
 
-#include <charconv>
-#include <cmath>
 #include <utility>
 
+#include "common/score_format.h"
+
 namespace tideskv::resp {
-namespace {
-
-std::string FormatDouble(double d) {
-  if (std::isnan(d)) return "nan";
-  if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
-  char buf[64];
-  const auto res = std::to_chars(buf, buf + sizeof(buf), d);  // shortest round-trip form
-  return std::string(buf, res.ptr);
-}
-
-}  // namespace
 
 void ReplyBuilder::Line(char prefix, std::string_view s) {
   buf_.push_back(prefix);
@@ -47,9 +36,9 @@ void ReplyBuilder::SetHeader(size_t n) { Count(protocol_ >= 3 ? '~' : '*', n); }
 
 void ReplyBuilder::Double(double d) {
   if (protocol_ >= 3) {
-    Line(',', FormatDouble(d));
+    Line(',', FormatScore(d));
   } else {
-    Bulk(FormatDouble(d));
+    Bulk(FormatScore(d));
   }
 }
 

@@ -16,3 +16,7 @@ Copyright 2022-2026 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
+
+third_party/fpconv/ is copied unmodified from Redis 7.2.5 deps/fpconv (https://github.com/redis/redis,
+tag 7.2.5), which is based on night-shift/fpconv and Florian Loitsch's Grisu algorithm. It is licensed
+under the Boost Software License 1.0; see third_party/fpconv/LICENSE.txt.

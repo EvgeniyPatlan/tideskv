@@ -61,4 +61,10 @@ inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of
 inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
 inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";
 
+// M4 sorted sets (zslParseRange, zslParseLexRange, ZADD/ZINCRBY NaN, ZUNION WEIGHTS).
+inline constexpr std::string_view kErrMinMaxNotFloat = "ERR min or max is not a float";
+inline constexpr std::string_view kErrMinMaxNotString = "ERR min or max not valid string range item";
+inline constexpr std::string_view kErrScoreNan = "ERR resulting score is not a number (NaN)";
+inline constexpr std::string_view kErrWeightNotFloat = "ERR weight value is not a float";
+
 }  // namespace tideskv

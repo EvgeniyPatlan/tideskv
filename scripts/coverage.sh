@@ -15,7 +15,7 @@ for b in tests/unit_tests tests/contract_tests tests/integration_tests src/tides
 done
 args=("${bins[0]}")
 for b in "${bins[@]:1}"; do args+=(-object "$b"); done
-ignore='(_deps/|/tests/|src/app/main\.cc)'
+ignore='(_deps/|/tests/|/third_party/|src/app/main\.cc)'
 
 llvm-cov-18 report "${args[@]}" -instr-profile="$BUILD/merged.profdata" --ignore-filename-regex="$ignore"
 llvm-cov-18 export "${args[@]}" -instr-profile="$BUILD/merged.profdata" --ignore-filename-regex="$ignore" \

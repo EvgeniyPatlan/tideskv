@@ -98,5 +98,14 @@ TEST(ReplyBuilder, RawAppendsEncodedBytes) {
   EXPECT_EQ(r.Take(), ":1\r\n*-1\r\n");
 }
 
+TEST(ReplyBuilder, DoubleUsesRedisFormatting) {
+  ReplyBuilder r2(2), r3(3);
+  r2.Double(1e20);
+  r3.Double(1.5);
+  r3.Double(-std::numeric_limits<double>::infinity());
+  EXPECT_EQ(r2.Take(), "$5\r\n1e+20\r\n");
+  EXPECT_EQ(r3.Take(), ",1.5\r\n,-inf\r\n");
+}
+
 }  // namespace
 }  // namespace tideskv::resp
