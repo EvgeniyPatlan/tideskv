@@ -130,5 +130,36 @@ TEST_F(ElementScan, SscanReturnsMembersOnly) {
   EXPECT_EQ(h.Run({"SSCAN", "h", "0"}), Err(kErrWrongType));
 }
 
+TEST(ZScan, SmallZsetIsOneReplyInScoreOrder) {
+  test::CommandHarness h;
+  EXPECT_EQ(h.Run({"ZADD", "z", "2", "b", "1", "a", "0.1", "c"}), test::Int(3));
+  EXPECT_EQ(h.Run({"ZSCAN", "z", "0", "COUNT", "1"}),
+            test::Arr({test::Bulk("0"), test::Arr({test::Bulk("c"), test::Bulk("0.1"), test::Bulk("a"),
+                                                   test::Bulk("1"), test::Bulk("b"), test::Bulk("2")})}));
+  EXPECT_EQ(h.Run({"ZSCAN", "z", "0", "MATCH", "a*"}),
+            test::Arr({test::Bulk("0"), test::Arr({test::Bulk("a"), test::Bulk("1")})}));
+  EXPECT_EQ(h.Run({"ZSCAN", "nokey", "0", "BOGUS"}),
+            test::Arr({test::Bulk("0"), "*0\r\n"}));  // options unchecked
+  EXPECT_EQ(h.Run({"ZSCAN", "z", "0", "BOGUS"}), test::Err(kErrSyntax));
+}
+
+TEST(ZScan, LargeZsetPagesWithLongDoubleText) {
+  test::CommandHarness h;
+  for (int i = 0; i < 130; ++i) {
+    ASSERT_EQ(h.Run({"ZADD", "z", "0.1", "m" + std::to_string(1000 + i)}), test::Int(1));
+  }
+  std::set<std::string> seen;
+  std::string cursor = "0";
+  do {
+    const test::ScanReply page = test::ParseScan(h.Run({"ZSCAN", "z", cursor, "COUNT", "50"}));
+    cursor = page.cursor;
+    for (size_t i = 0; i + 1 < page.keys.size(); i += 2) {  // flat [member, score, ...]
+      seen.insert(page.keys[i]);
+      EXPECT_EQ(page.keys[i + 1], "0.10000000000000001");  // %.17Lg on a large zset
+    }
+  } while (cursor != "0");
+  EXPECT_EQ(seen.size(), 130u);
+}
+
 }  // namespace
 }  // namespace tideskv

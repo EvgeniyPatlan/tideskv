@@ -24,4 +24,16 @@ void ReplyScored(ExecContext& ctx, const std::vector<ScoreMember>& items, bool w
   }
 }
 
+void ReplyZPopped(ExecContext& ctx, const std::optional<ZPoppedFrom>& popped) {
+  if (!popped) return ctx.reply.NullArray();
+  ctx.reply.ArrayHeader(2);
+  ctx.reply.Bulk(popped->key);
+  ctx.reply.ArrayHeader(popped->items.size());
+  for (const ScoreMember& p : popped->items) {
+    ctx.reply.ArrayHeader(2);
+    ctx.reply.Bulk(p.member);
+    ctx.reply.Double(p.score);
+  }
+}
+
 }  // namespace tideskv

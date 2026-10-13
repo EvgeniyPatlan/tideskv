@@ -20,6 +20,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterBlockingListCommands(registry);
   RegisterZsetCommands(registry);
   RegisterZsetRangeCommands(registry);
+  RegisterZsetPopCommands(registry);
   RegisterElementScanCommands(registry);
 }
 
