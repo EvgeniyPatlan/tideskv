@@ -94,5 +94,25 @@ TEST_F(ListMoveTest, PopFirstScansKeysInOrder) {
             kErrWrongType);  // a wrong-typed key before the first list aborts
 }
 
+TEST_F(ListMoveTest, PopFirstPopsALargeCountInOrder) {
+  std::vector<std::string> values;
+  for (int i = 0; i < 2000; ++i) values.push_back("v" + std::to_string(i));
+  Fill("b", std::vector<std::string_view>(values.begin(), values.end()));
+  std::optional<PoppedFrom> got;
+  ASSERT_TRUE(Write([&](WriteTxn& t) {
+                return MoveInto(ListPopFirst(t, 0, {"b"}, ListEnd::kRight, 1500, 0), &got);
+              }).ok());
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->values, Strings(values.rbegin(), values.rbegin() + 1500));
+  EXPECT_EQ(All("b"), Strings(values.begin(), values.begin() + 500));
+  ASSERT_TRUE(Write([&](WriteTxn& t) {
+                return MoveInto(ListPopFirst(t, 0, {"b"}, ListEnd::kLeft, 9999, 0), &got);
+              }).ok());
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->values, Strings(values.begin(), values.begin() + 500));
+  EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kMeta)].empty());  // the key went with it
+  EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].empty());
+}
+
 }  // namespace
 }  // namespace tideskv

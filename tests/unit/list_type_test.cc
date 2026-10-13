@@ -42,6 +42,13 @@ struct ListTypeTest : ::testing::Test {
     return r.ok() ? *r : Strings{};
   }
 
+  encoding::Metadata Meta() {
+    auto view = storage.BeginRead();
+    auto c = LoadCollection(**view, 0, "l", encoding::ValueType::kList, 0);
+    EXPECT_TRUE(c.ok() && c->exists());
+    return c.ok() ? c->obj.meta : encoding::Metadata{};
+  }
+
   InMemoryStorage storage;
   OidAllocator oids{storage};
 };
@@ -71,6 +78,34 @@ TEST_F(ListTypeTest, PopFromBothEndsAndDeleteWhenEmpty) {
   const auto tables = storage.Current();
   EXPECT_TRUE((*tables)[CfIndex(ColumnFamily::kMeta)].empty());
   EXPECT_TRUE((*tables)[CfIndex(ColumnFamily::kSubkey)].empty());
+}
+
+TEST_F(ListTypeTest, PopsALargeCountFromEitherEndInOneRun) {
+  std::vector<std::string> values;
+  for (int i = 0; i < 6000; ++i) values.push_back("v" + std::to_string(i));
+  const std::vector<std::string_view> views(values.begin(), values.end());
+  ASSERT_EQ(Push(ListEnd::kRight, views), 6000);
+  const encoding::Metadata before = Meta();
+
+  const auto left = Pop(ListEnd::kLeft, 5000);
+  ASSERT_TRUE(left.has_value());
+  EXPECT_EQ(*left, Strings(values.begin(), values.begin() + 5000));
+  EXPECT_EQ(Range(0, -1), Strings(values.begin() + 5000, values.end()));
+  encoding::Metadata m = Meta();
+  EXPECT_EQ(m.head, before.head + 5000);
+  EXPECT_EQ(m.tail, before.tail);
+  EXPECT_EQ(m.size, 1000u);
+  EXPECT_EQ((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].size(), 1000u);
+
+  const auto right = Pop(ListEnd::kRight, 600);  // tail first
+  ASSERT_TRUE(right.has_value());
+  EXPECT_EQ(*right, Strings(values.rbegin(), values.rbegin() + 600));
+  EXPECT_EQ(Range(0, -1), Strings(values.begin() + 5000, values.end() - 600));
+  m = Meta();
+  EXPECT_EQ(m.head, before.head + 5000);
+  EXPECT_EQ(m.tail, before.tail - 600);
+  EXPECT_EQ(m.size, 400u);
+  EXPECT_EQ((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].size(), 400u);
 }
 
 TEST_F(ListTypeTest, RangeFollowsRedisIndexRules) {

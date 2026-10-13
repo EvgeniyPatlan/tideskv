@@ -48,12 +48,7 @@ Result<std::optional<PoppedFrom>> ListPopFirst(WriteTxn& txn, uint8_t db,
     if (!c->exists()) continue;
     PoppedFrom out{std::string(key), {}};
     const uint64_t n = std::min<uint64_t>(count, c->size());
-    out.values.reserve(n);
-    for (uint64_t i = 0; i < n; ++i) {
-      auto v = PopElement(txn, *c, end);
-      if (!v.ok()) return v.status();
-      out.values.push_back(std::move(v).value());
-    }
+    if (Status st = PopRun(txn, *c, end, n, &out.values); !st.ok()) return st;
     if (Status st = SaveCollection(txn, *c); !st.ok()) return st;
     return Out(std::move(out));
   }

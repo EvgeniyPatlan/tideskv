@@ -44,6 +44,10 @@ Result<std::string> ListElementAt(ReadView& view, const Collection& c, uint64_t 
 // Removes and returns the element at `end` of the non-empty list c, updating c.obj.meta (the caller
 // saves the collection).
 Result<std::string> PopElement(WriteTxn& txn, Collection& c, ListEnd end);
+// Removes the n (<= size) elements at `end` of c and appends them to *out in pop order (RIGHT: tail
+// first). One range read before any write, then blind subkey deletes; updates c.obj.meta once (the
+// caller saves the collection).
+Status PopRun(WriteTxn& txn, Collection& c, ListEnd end, uint64_t n, std::vector<std::string>* out);
 // Writes value at `end` of c, updating c.obj.meta (the caller saves the collection).
 Status PushElement(WriteTxn& txn, Collection& c, ListEnd end, std::string_view value);
 // Appends the values at positions [from, to] (inclusive, from <= to < size) to *out, left to right.

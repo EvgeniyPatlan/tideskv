@@ -1,6 +1,7 @@
 #include "types/list_type.h"
 
 #include <algorithm>
+#include <iterator>
 
 #include "common/string_util.h"
 #include "encoding/object_codec.h"
@@ -46,6 +47,28 @@ Result<std::string> PopElement(WriteTxn& txn, Collection& c, ListEnd end) {
   }
   --m.size;
   return v;
+}
+
+Status PopRun(WriteTxn& txn, Collection& c, ListEnd end, uint64_t n, std::vector<std::string>* out) {
+  encoding::Metadata& m = c.obj.meta;
+  if (n == 0) return Status::Ok();
+  const uint64_t from = end == ListEnd::kLeft ? 0 : m.size - n;
+  const uint64_t to = from + n - 1;
+  std::vector<std::string> run;
+  run.reserve(n);
+  if (Status st = ReadListRange(txn, c, from, to, &run); !st.ok()) return st;
+  for (uint64_t p = from; p <= to; ++p) {  // blind deletes: the run was just read
+    if (Status st = txn.Delete(ColumnFamily::kSubkey, ListElementKey(c, p)); !st.ok()) return st;
+  }
+  if (end == ListEnd::kRight) std::reverse(run.begin(), run.end());  // RIGHT pops come out tail first
+  out->insert(out->end(), std::make_move_iterator(run.begin()), std::make_move_iterator(run.end()));
+  if (end == ListEnd::kLeft) {
+    m.head += n;
+  } else {
+    m.tail -= n;
+  }
+  m.size -= n;
+  return Status::Ok();
 }
 
 Status PushElement(WriteTxn& txn, Collection& c, ListEnd end, std::string_view value) {
@@ -106,12 +129,7 @@ Result<std::optional<std::vector<std::string>>> ListPop(WriteTxn& txn, uint8_t d
   if (!c->exists()) return Out();
   const uint64_t n = std::min<uint64_t>(count, c->obj.meta.size);
   std::vector<std::string> out;
-  out.reserve(n);
-  for (uint64_t i = 0; i < n; ++i) {
-    auto v = PopElement(txn, *c, end);
-    if (!v.ok()) return v.status();
-    out.push_back(std::move(v).value());
-  }
+  if (Status st = PopRun(txn, *c, end, n, &out); !st.ok()) return st;
   if (n > 0) {
     if (Status st = SaveCollection(txn, *c); !st.ok()) return st;
   }
