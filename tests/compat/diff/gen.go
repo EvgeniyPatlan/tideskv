@@ -296,8 +296,10 @@ func (g *Gen) scoreBound() string {
 
 func (g *Gen) lexBound() string { return g.pick("-", "+", "[f1", "(f1", "[f3", "(", "[", "f2", "+x") }
 
+// idx: list indexes. 2147483648 and 4294967296 pin LSET's int32 truncation (both wrap to 0 in Redis 7.2).
 func (g *Gen) idx() string {
-	return g.pick("0", "1", "-1", "2", "-2", "5", "-100", "100", "x", "9223372036854775807", "-9223372036854775808")
+	return g.pick("0", "1", "-1", "2", "-2", "5", "-100", "100", "x", "9223372036854775807", "-9223372036854775808",
+		"2147483648", "4294967296")
 }
 
 // listCmd: lists stay short (pushes of 1-3 elements, frequent pops), so Redis keeps listpacks.

@@ -81,9 +81,13 @@ func runSeed(t *testing.T, seed int64, ours, ref string) {
 		}
 	}
 	if seed%2 == 1 { // odd seeds run the whole stream in RESP3
-		for _, c := range []*Conn{a, b} {
-			if _, err := c.Do("HELLO", "3"); err != nil { // its reply (server info) differs by design
+		for name, c := range map[string]*Conn{"tideskv": a, "redis": b} {
+			r, err := c.Do("HELLO", "3") // its contents (server info) differ by design; its kind must not
+			if err != nil {
 				t.Fatal(err)
+			}
+			if r.Kind != '%' {
+				t.Fatalf("seed %d: %s: HELLO 3 replied %s, want a RESP3 map", seed, name, r)
 			}
 		}
 	}
