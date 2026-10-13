@@ -30,7 +30,7 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
  public:
   Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
              std::shared_ptr<ConnStats> stats, size_t query_buffer_limit);
-  ~Connection();
+  ~Connection() override;
   Connection(const Connection&) = delete;
   Connection& operator=(const Connection&) = delete;
 
@@ -45,7 +45,7 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   void StartWrite();
   void OnWrite(std::error_code ec);
   void ArmBlockTimer();
-  void OnUnblocked(std::string reply);
+  void OnUnblocked(const std::string& reply);
   void ResumeAfterBlock();  // the blocked command ended: run the pipeline again
   void Close();
 

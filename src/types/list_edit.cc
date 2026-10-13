@@ -104,9 +104,10 @@ Result<int64_t> ListInsert(WriteTxn& txn, uint8_t db, std::string_view key, Inse
   if (!c->exists()) return int64_t{0};
   auto found = FindPivot(txn, *c, pivot);
   if (!found.ok()) return found.status();
-  if (!*found) return int64_t{-1};
+  const auto& pivot_pos = *found;
+  if (!pivot_pos) return int64_t{-1};
   encoding::Metadata& m = c->obj.meta;
-  const uint64_t q = **found + (where == InsertWhere::kAfter ? 1 : 0);  // logical slot of the new element
+  const uint64_t q = *pivot_pos + (where == InsertWhere::kAfter ? 1 : 0);  // logical slot of the new element
   uint64_t slot = 0;
   if (q <= m.size - q) {  // fewer elements on the left: move [0, q) one step left
     if (q > 0) {

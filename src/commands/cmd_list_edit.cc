@@ -83,13 +83,14 @@ void LPos(ExecContext& ctx, const ArgList& argv) {
     return MoveInto(ListPos(view, ctx.session.db, argv[1], argv[2], opts, now_ms), &found);
   });
   if (!ok) return;
+  static const std::vector<int64_t> kNone;
+  const std::vector<int64_t>& positions = found.has_value() ? *found : kNone;
   if (!opts.count) {
-    if (!found || found->empty()) return ctx.reply.Null();
-    return ctx.reply.Integer(found->front());
+    if (positions.empty()) return ctx.reply.Null();
+    return ctx.reply.Integer(positions.front());
   }
-  const size_t n = found ? found->size() : 0;
-  ctx.reply.ArrayHeader(n);
-  for (size_t i = 0; i < n; ++i) ctx.reply.Integer((*found)[i]);
+  ctx.reply.ArrayHeader(positions.size());
+  for (const int64_t p : positions) ctx.reply.Integer(p);
 }
 
 void MoveCommand(ExecContext& ctx, const ArgList& argv, ListEnd from, ListEnd to) {

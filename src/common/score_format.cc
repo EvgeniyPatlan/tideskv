@@ -19,7 +19,9 @@ std::string FormatScore(double v) {
   if (std::isinf(v)) return v < 0 ? "-inf" : "inf";
   if (v == 0) return std::signbit(v) ? "-0" : "0";
   // double2ll (util.c:590): |v| <= LLONG_MAX/2 and integral.
-  constexpr auto kHalf = static_cast<double>(std::numeric_limits<int64_t>::max() / 2);
+  // The division is deliberately done in integer arithmetic (as Redis does) before converting.
+  constexpr int64_t kHalfLl = std::numeric_limits<int64_t>::max() / 2;
+  constexpr auto kHalf = static_cast<double>(kHalfLl);
   if (v >= -kHalf && v <= kHalf) {
     const auto ll = static_cast<int64_t>(v);
     if (static_cast<double>(ll) == v) return std::to_string(ll);

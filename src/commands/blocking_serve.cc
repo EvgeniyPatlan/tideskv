@@ -71,8 +71,9 @@ void ServeKey(const CommandRegistry& registry, ServerServices& server, const Rea
       spdlog::error("serving blocked clients: {}", type.status().ToString());
       return;
     }
-    if (!*type) return;                      // the key is gone: nobody can be served from it
-    if (**type != waiter->type()) continue;  // e.g. a BLPOP waiter on a key that became a zset
+    const auto& live = *type;
+    if (!live) return;                      // the key is gone: nobody can be served from it
+    if (*live != waiter->type()) continue;  // e.g. a BLPOP waiter on a key that became a zset
     const auto result = ServeOne(registry, server, *waiter, ready);
     if (result == BlockedClient::ServeResult::kStillBlocked) return;  // the key is empty again
   }

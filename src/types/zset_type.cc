@@ -51,9 +51,10 @@ double DecodeRawScore(std::string_view in) {
 Result<std::optional<double>> MemberScore(ReadView& view, const Collection& c, std::string_view member) {
   auto v = GetElement(view, c, member);
   if (!v.ok()) return v.status();
-  if (!*v) return std::optional<double>();
-  if ((*v)->size() != 8) return Status::Corruption("bad zset score");
-  return std::optional<double>(DecodeRawScore(**v));
+  const auto& raw = *v;
+  if (!raw) return std::optional<double>();
+  if (raw->size() != 8) return Status::Corruption("bad zset score");
+  return std::optional<double>(DecodeRawScore(*raw));
 }
 
 Status PutMember(WriteTxn& txn, Collection& c, std::string_view member, double score,
@@ -121,17 +122,18 @@ Result<ZAddResult> ZsetAdd(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::s
   for (const ScoreMember& p : pairs) {
     auto old = MemberScore(txn, *c, p.member);
     if (!old.ok()) return old.status();
+    const auto& prior = *old;
     double score = p.score;
-    if (*old) {
+    if (prior) {
       if (f.nx) continue;
       if (f.incr) {
-        score += **old;
+        score += *prior;
         if (std::isnan(score)) return Status::UserError(std::string(kErrScoreNan));
       }
-      if ((f.lt && score >= **old) || (f.gt && score <= **old)) continue;
+      if ((f.lt && score >= *prior) || (f.gt && score <= *prior)) continue;
       if (f.incr) r.incr_score = score;
-      if (NormalizeScore(score) == **old) continue;
-      if (Status st = PutMember(txn, *c, p.member, score, *old); !st.ok()) return st;
+      if (NormalizeScore(score) == *prior) continue;
+      if (Status st = PutMember(txn, *c, p.member, score, prior); !st.ok()) return st;
       ++r.updated;
     } else {
       if (f.xx) continue;
@@ -154,8 +156,9 @@ Result<int64_t> ZsetRemove(WriteTxn& txn, uint8_t db, std::string_view key,
   for (std::string_view m : members) {
     auto old = MemberScore(txn, *c, m);  // sees this txn's deletes: a repeated member counts once
     if (!old.ok()) return old.status();
-    if (!*old) continue;
-    if (Status st = DeleteMember(txn, *c, m, **old); !st.ok()) return st;
+    const auto& prior = *old;
+    if (!prior) continue;
+    if (Status st = DeleteMember(txn, *c, m, *prior); !st.ok()) return st;
     ++removed;
   }
   if (removed == 0) return removed;

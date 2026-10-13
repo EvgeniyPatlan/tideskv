@@ -88,9 +88,11 @@ Result<std::optional<RankResult>> ZsetRank(ReadView& view, uint8_t db, std::stri
   if (!c.ok()) return c.status();
   auto score = MemberScore(view, *c, member);
   if (!score.ok()) return score.status();
-  if (!*score) return Out();
+  const auto& member_score = *score;
+  if (!member_score) return Out();
   // O(rank): count the members ordered before (score, member).
-  const std::string target = encoding::EncodeZScoreKey(c->db, c->slot, c->obj.meta.oid, **score, member);
+  const std::string target =
+      encoding::EncodeZScoreKey(c->db, c->slot, c->obj.meta.oid, *member_score, member);
   auto it = view.NewIterator(ColumnFamily::kZScore,
                              {encoding::ZScorePrefix(c->db, c->slot, c->obj.meta.oid), target});
   if (!it.ok()) return it.status();
@@ -99,7 +101,7 @@ Result<std::optional<RankResult>> ZsetRank(ReadView& view, uint8_t db, std::stri
   for (; st.ok() && (*it)->Valid(); st = (*it)->Next()) ++before;
   if (!st.ok()) return st;
   const int64_t rank = reverse ? static_cast<int64_t>(c->size()) - 1 - before : before;
-  return Out(RankResult{rank, **score});
+  return Out(RankResult{rank, *member_score});
 }
 
 }  // namespace tideskv
