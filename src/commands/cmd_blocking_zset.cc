@@ -1,5 +1,7 @@
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "commands/all_commands.h"
@@ -33,6 +35,8 @@ void BlockingZPop(ExecContext& ctx, const std::vector<std::string_view>& keys, b
       {encoding::ValueType::kZSet, std::vector<std::string>(keys.begin(), keys.end()), timeout_ms});
 }
 
+// Parse order (Redis 7.2.5 blockingGenericZpopCommand): the timeout is the only argument parsed, before
+// any key is read.
 void BZPopCommand(ExecContext& ctx, const ArgList& argv, bool max) {
   int64_t timeout_ms = 0;
   if (Status st = ParseBlockTimeout(argv.back(), ctx.server.engine().NowMs(), &timeout_ms); !st.ok())
@@ -43,6 +47,8 @@ void BZPopCommand(ExecContext& ctx, const ArgList& argv, bool max) {
 void BZPopMin(ExecContext& ctx, const ArgList& argv) { BZPopCommand(ctx, argv, false); }
 void BZPopMax(ExecContext& ctx, const ArgList& argv) { BZPopCommand(ctx, argv, true); }
 
+// Parse order (Redis 7.2.5 zmpopGenericCommand): numkeys, MIN|MAX and COUNT first, then the timeout
+// (argv[1]), so an argument error wins over a bad timeout; keys are read last.
 void BZMPop(ExecContext& ctx, const ArgList& argv) {
   MultiPopArgs a;
   if (Status st = ParseMultiPop(argv, 2, "MIN", "MAX", &a); !st.ok()) return ReplyError(ctx, st);
