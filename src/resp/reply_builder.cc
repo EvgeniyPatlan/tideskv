@@ -50,15 +50,28 @@ void ReplyBuilder::Boolean(bool b) {
   }
 }
 
-void ReplyBuilder::Verbatim(std::string_view text) {
+void ReplyBuilder::Verbatim(std::string_view text) { Verbatim(text, "txt"); }
+
+void ReplyBuilder::Verbatim(std::string_view text, std::string_view format) {
   if (protocol_ < 3) {
     Bulk(text);
     return;
   }
+  std::string fmt(3, ' ');  // padded with spaces or truncated to 3 characters
+  for (size_t i = 0; i < 3 && i < format.size(); ++i) fmt[i] = format[i];
   Count('=', text.size() + 4);
-  buf_.append("txt:");
+  buf_.append(fmt);
+  buf_.push_back(':');
   buf_.append(text);
   buf_.append("\r\n");
+}
+
+void ReplyBuilder::BigNumber(std::string_view digits) {
+  if (protocol_ < 3) {
+    Bulk(digits);
+    return;
+  }
+  Line('(', digits);
 }
 
 std::string ReplyBuilder::Take() { return std::exchange(buf_, std::string()); }

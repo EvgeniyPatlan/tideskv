@@ -107,5 +107,20 @@ TEST(ReplyBuilder, DoubleUsesRedisFormatting) {
   EXPECT_EQ(r3.Take(), ",1.5\r\n,-inf\r\n");
 }
 
+TEST(ReplyBuilder, BigNumberAndVerbatimWithFormat) {
+  ReplyBuilder r2(2), r3(3);
+  r2.BigNumber("123");
+  r3.BigNumber("123");
+  EXPECT_EQ(r2.buffer(), "$3\r\n123\r\n");
+  EXPECT_EQ(r3.buffer(), "(123\r\n");
+  ReplyBuilder v2(2), v3(3), pad(3);
+  v2.Verbatim("hello", "markdown");
+  v3.Verbatim("hello", "markdown");
+  pad.Verbatim("x", "md");
+  EXPECT_EQ(v2.buffer(), "$5\r\nhello\r\n");
+  EXPECT_EQ(v3.buffer(), "=9\r\nmar:hello\r\n");
+  EXPECT_EQ(pad.buffer(), "=5\r\nmd :x\r\n");
+}
+
 }  // namespace
 }  // namespace tideskv::resp

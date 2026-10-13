@@ -27,6 +27,9 @@ class ReplyBuilder {
   void Double(double d);                 // RESP2: bulk string
   void Boolean(bool b);                  // RESP2: integer 0/1
   void Verbatim(std::string_view text);  // RESP3 "=…txt:"; RESP2 bulk
+  // RESP3 "=<len+4>\r\n<fmt3>:<text>", format padded/truncated to 3 chars; RESP2 bulk.
+  void Verbatim(std::string_view text, std::string_view format);
+  void BigNumber(std::string_view digits);  // RESP2: bulk; RESP3 "("
   // Already-encoded reply bytes (the reply of an unblocked command).
   void Raw(std::string_view bytes) { buf_.append(bytes); }
 
