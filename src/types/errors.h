@@ -53,5 +53,9 @@ inline constexpr std::string_view kErrMaxlenNegative = "ERR MAXLEN can't be nega
 inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
 inline constexpr std::string_view kErrCountGreaterThanZero = "ERR count should be greater than 0";
+// getTimeoutFromObjectOrReply(UNIT_SECONDS) (timeout.c:165).
+inline constexpr std::string_view kErrTimeoutNotFloat = "ERR timeout is not a float or out of range";
+inline constexpr std::string_view kErrTimeoutNegative = "ERR timeout is negative";
+inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of range";
 
 }  // namespace tideskv

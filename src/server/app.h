@@ -11,6 +11,7 @@
 #include "exec/lock_manager.h"
 #include "expire/reaper.h"
 #include "net/server.h"
+#include "server/blocking.h"
 #include "server/compaction_scheduler.h"
 #include "server/config.h"
 #include "storage/tides_storage.h"
@@ -40,6 +41,7 @@ class App final : public ServerServices {
   Engine& engine() override { return *engine_; }
   CursorStore& cursors() override { return cursors_; }
   OidAllocator& oids() override { return *oids_; }
+  BlockingRegistry& blocking() override { return blocking_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -55,6 +57,7 @@ class App final : public ServerServices {
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it
   CommandRegistry registry_;
   CursorStore cursors_;
+  BlockingRegistry blocking_;  // before server_: connections cancel their waiters when destroyed
   std::unique_ptr<net::Server> server_;
   asio::io_context main_ctx_;
   std::optional<asio::signal_set> signals_;  // registered in Start(), before accepting

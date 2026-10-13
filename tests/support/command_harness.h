@@ -6,13 +6,17 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "commands/all_commands.h"
+#include "commands/blocking_serve.h"
 #include "common/coding.h"
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "encoding/meta_codec.h"
 #include "encoding/object_codec.h"
+#include "server/connection_block_handler.h"
+#include "support/fake_link.h"
 #include "support/fake_server_services.h"
 #include "types/object_store.h"
 
@@ -38,11 +42,14 @@ struct CommandHarness {
     RegisterAllCommands(services.registry_);
     session.id = 7;
     session.authenticated = true;
+    session.link = link;
   }
 
   std::string Run(const ArgList& argv) {
-    ExecContext ctx{session, reply, services};
+    ConnectionBlockHandler block(services.blocking_, session, argv, ready);
+    ExecContext ctx{session, reply, services, &block, &ready};
     Dispatch(services.registry(), ctx, argv);
+    ServeBlockedClients(services.registry(), services, ready);
     return reply.Take();
   }
   // Binary-safe: each element keeps its length (std::string arguments may hold NULs).
@@ -78,7 +85,18 @@ struct CommandHarness {
   }
 
   // Switches the harness connection to RESP3 (as HELLO 3 would).
-  void Resp3() { reply.SetProtocol(3); }
+  void Resp3() {
+    reply.SetProtocol(3);
+    session.protocol = 3;  // a blocked command's reply is built later from the session copy
+  }
+
+  // Replies delivered to this harness's session while it was blocked; clears session.blocked as the
+  // connection does when it receives them.
+  std::vector<std::string> TakeUnblocked() {
+    auto replies = link->Take();
+    if (!replies.empty()) session.blocked.reset();
+    return replies;
+  }
 
   // A hash metadata record with object id `oid`; with_field also stores one subkey field, so
   // tests can assert that overwriting/deleting the key drops its collection data.
@@ -119,7 +137,39 @@ struct CommandHarness {
   FakeServerServices services;
   Session session;
   resp::ReplyBuilder reply;
+  std::shared_ptr<FakeLink> link = std::make_shared<FakeLink>();
+  ReadyKeys ready;
   std::shared_ptr<const InMemoryStorage::Tables> snapshot_;
+};
+
+// Another connection on the same server as `main` (shares storage, registry and clock).
+struct SecondClient {
+  explicit SecondClient(CommandHarness& main) : h(main) {
+    session.id = 8;
+    session.authenticated = true;
+    session.link = link;
+  }
+  std::string Run(const ArgList& argv) {
+    ConnectionBlockHandler block(h.services.blocking_, session, argv, ready);
+    ExecContext ctx{session, reply, h.services, &block, &ready};
+    Dispatch(h.services.registry(), ctx, argv);
+    ServeBlockedClients(h.services.registry(), h.services, ready);
+    return reply.Take();
+  }
+  std::string Run(std::initializer_list<std::string_view> argv) {
+    return Run(ArgList(argv.begin(), argv.end()));
+  }
+  std::vector<std::string> TakeUnblocked() {
+    auto replies = link->Take();
+    if (!replies.empty()) session.blocked.reset();
+    return replies;
+  }
+
+  CommandHarness& h;
+  Session session;
+  resp::ReplyBuilder reply;
+  std::shared_ptr<FakeLink> link = std::make_shared<FakeLink>();
+  ReadyKeys ready;
 };
 
 }  // namespace tideskv::test

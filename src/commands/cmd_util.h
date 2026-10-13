@@ -10,6 +10,7 @@
 #include "commands/server_services.h"
 #include "common/status.h"
 #include "exec/engine.h"
+#include "server/blocking.h"
 #include "types/string_type.h"
 
 // Engine boilerplate shared by the data-command handlers. All helpers act on the session's db.
@@ -21,6 +22,12 @@ inline Status ReadStringValue(ExecContext& ctx, std::string_view key, std::optio
   return ctx.server.engine().Read([&](ReadView& view, int64_t now_ms) {
     return MoveInto(StringGet(view, ctx.session.db, key, now_ms), out);
   });
+}
+
+// After a successful write that may have created a list or zset at `key` (M4 plan F6).
+inline void SignalReady(ExecContext& ctx, std::string_view key) {
+  if (ctx.ready == nullptr || !ctx.server.blocking().HasWaiters(ctx.session.db, key)) return;
+  ctx.ready->push_back({ctx.session.db, std::string(key)});
 }
 
 // Runs fn(WriteTxn&, int64_t now_ms) -> Status in one Engine::Write that locks `key`;

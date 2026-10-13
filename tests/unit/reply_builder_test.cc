@@ -91,5 +91,12 @@ TEST(ReplyBuilder, ProtocolSwitchAndTake) {
   EXPECT_TRUE(r.empty());
 }
 
+TEST(ReplyBuilder, RawAppendsEncodedBytes) {
+  resp::ReplyBuilder r;
+  r.Integer(1);
+  r.Raw("*-1\r\n");
+  EXPECT_EQ(r.Take(), ":1\r\n*-1\r\n");
+}
+
 }  // namespace
 }  // namespace tideskv::resp

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "encoding/meta_codec.h"
 #include "resp/reply_builder.h"
 #include "server/session.h"
 
@@ -13,10 +14,33 @@ namespace tideskv {
 
 class ServerServices;
 
+// What a blocking command asks for when every key is empty (M4 plan F6).
+struct BlockRequest {
+  encoding::ValueType type = encoding::ValueType::kList;  // kList or kZSet
+  std::vector<std::string> keys;                          // in argument order (duplicates allowed)
+  int64_t timeout_ms = 0;                                 // relative; 0 = forever
+};
+
+class BlockHandler {
+ public:
+  virtual ~BlockHandler() = default;
+  // Parks the command. The handler writes no reply; it comes later (served, timeout, CLIENT UNBLOCK).
+  virtual void Block(const BlockRequest& request) = 0;
+};
+
+// A key a write may have made non-empty for blocked clients.
+struct ReadyKey {
+  uint8_t db = 0;
+  std::string key;
+};
+using ReadyKeys = std::vector<ReadyKey>;
+
 struct ExecContext {
   Session& session;
   resp::ReplyBuilder& reply;
   ServerServices& server;
+  BlockHandler* block = nullptr;  // null: this context cannot block (answer as timed out; M5 MULTI/Lua)
+  ReadyKeys* ready = nullptr;     // where SignalReady records keys; null: nobody serves waiters
 };
 
 enum CommandFlag : uint32_t {

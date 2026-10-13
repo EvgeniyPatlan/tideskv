@@ -11,7 +11,9 @@
 #include <thread>
 
 #include "commands/all_commands.h"
+#include "commands/blocking_serve.h"
 #include "common/version.h"
+#include "server/connection_block_handler.h"
 #include "types/format_version.h"
 
 namespace tideskv {
@@ -82,8 +84,11 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   server_ = std::make_unique<net::Server>(
       MakeServerOptions(),
       [this](Session& session, const std::vector<std::string>& argv, resp::ReplyBuilder& reply) {
-        ExecContext ctx{session, reply, *this};
+        ReadyKeys ready;
+        ConnectionBlockHandler block(blocking_, session, argv, ready);
+        ExecContext ctx{session, reply, *this, &block, &ready};
         Dispatch(registry_, ctx, argv);
+        ServeBlockedClients(registry_, *this, ready);  // before this command's reply leaves (F6)
       });
 }
 
@@ -169,6 +174,8 @@ ServerStats App::Stats() const {
   s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
   s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
   s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
+  s.blocked_clients = blocking_.blocked_clients();
+  s.blocking_keys = blocking_.blocking_keys();
   return s;
 }
 

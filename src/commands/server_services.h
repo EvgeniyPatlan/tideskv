@@ -6,6 +6,7 @@
 
 namespace tideskv {
 
+class BlockingRegistry;
 class CommandRegistry;
 class CursorStore;
 class Engine;
@@ -31,6 +32,8 @@ struct ServerStats {
   uint64_t background_compactions = 0;          // CompactionScheduler jobs completed
   uint64_t background_compaction_failures = 0;  // jobs given up after retries
   uint64_t expired_keys = 0;                    // removed by the active-expiry reaper
+  uint64_t blocked_clients = 0;                 // clients waiting in a blocking command
+  uint64_t blocking_keys = 0;                   // distinct keys with at least one blocked client
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and
@@ -42,10 +45,11 @@ class ServerServices {
   virtual const CommandRegistry& registry() const = 0;
   virtual ServerStats Stats() const = 0;
   virtual void ResetStats() = 0;
-  virtual void RequestShutdown() = 0;  // must not block; the main thread performs the shutdown
-  virtual Engine& engine() = 0;        // data access for commands (Task 5)
-  virtual OidAllocator& oids() = 0;    // collection object ids (M3 E1)
-  virtual CursorStore& cursors() = 0;  // SCAN cursor table (Task 14)
+  virtual void RequestShutdown() = 0;        // must not block; the main thread performs the shutdown
+  virtual Engine& engine() = 0;              // data access for commands (Task 5)
+  virtual OidAllocator& oids() = 0;          // collection object ids (M3 E1)
+  virtual CursorStore& cursors() = 0;        // SCAN cursor table (Task 14)
+  virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
 };
 
 }  // namespace tideskv

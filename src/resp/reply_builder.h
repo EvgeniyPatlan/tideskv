@@ -27,6 +27,8 @@ class ReplyBuilder {
   void Double(double d);                 // RESP2: bulk string
   void Boolean(bool b);                  // RESP2: integer 0/1
   void Verbatim(std::string_view text);  // RESP3 "=…txt:"; RESP2 bulk
+  // Already-encoded reply bytes (the reply of an unblocked command).
+  void Raw(std::string_view bytes) { buf_.append(bytes); }
 
   const std::string& buffer() const { return buf_; }
   std::string Take();
