@@ -39,8 +39,10 @@ struct ExecContext {
   Session& session;
   resp::ReplyBuilder& reply;
   ServerServices& server;
-  BlockHandler* block = nullptr;  // null: this context cannot block (answer as timed out; M5 MULTI/Lua)
+  BlockHandler* block = nullptr;  // null: this context cannot block (answer as timed out; MULTI, Lua)
   ReadyKeys* ready = nullptr;     // where SignalReady records keys; null: nobody serves waiters
+  // Inside EXEC (M5a G4): actions to run once the batch has committed and released the gate.
+  std::vector<std::function<void()>>* after_batch = nullptr;
 };
 
 enum CommandFlag : uint32_t {
@@ -50,6 +52,7 @@ enum CommandFlag : uint32_t {
   kCmdFast = 1u << 3,
   kCmdNoAuth = 1u << 4,  // allowed before AUTH
   kCmdNoScript = 1u << 5,
+  kCmdNoMulti = 1u << 6,  // refused inside MULTI (Redis CMD_NO_MULTI)
 };
 
 using ArgList = std::vector<std::string>;
@@ -79,7 +82,7 @@ class CommandRegistry {
 std::vector<std::string_view> FlagNames(uint32_t flags);
 bool ArityOk(int arity, size_t argc);
 
-// Validates (unknown → arity → auth, Redis 7 order) and runs one command.
+// Validates (unknown → arity → auth, Redis 7 order), queues inside MULTI (M5a G3), and runs one command.
 void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv);
 
 }  // namespace tideskv

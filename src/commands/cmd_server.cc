@@ -204,7 +204,7 @@ void RegisterServerCommands(CommandRegistry& r) {
   r.Register({"info", -1, 0, 0, 0, 0, &Info});
   r.Register({"config", -2, kCmdAdmin | kCmdNoScript, 0, 0, 0, &ConfigCmd});
   r.Register({"command", -1, 0, 0, 0, 0, &CommandCmd});
-  r.Register({"shutdown", -1, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Shutdown});
+  r.Register({"shutdown", -1, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Shutdown});
 }
 
 }  // namespace tideskv

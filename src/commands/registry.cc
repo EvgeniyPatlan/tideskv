@@ -3,7 +3,9 @@
 #include <stdexcept>
 #include <utility>
 
+#include "commands/multi_state.h"
 #include "common/string_util.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -18,6 +20,31 @@ std::string UnknownCommandMessage(const ArgList& argv) {
     msg += "'" + argv[i].substr(0, kMaxEchoedArgLen) + "' ";
   }
   return msg;
+}
+
+// Run at once even inside MULTI (server.c:4155-4161).
+bool RunsImmediately(std::string_view name) {
+  return name == "exec" || name == "discard" || name == "multi" || name == "watch" || name == "quit" ||
+         name == "reset";
+}
+
+// A command refused before it runs: replies `error` and, inside MULTI, dooms the transaction (Redis
+// flagTransaction). A refused EXEC discards the transaction instead and names the reason, without
+// "ERR " (execCommandAbort, multi.c:136).
+void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
+  if (spec != nullptr && spec->name == "exec") {
+    DiscardTransaction(ctx);
+    if (error.starts_with("ERR ")) error.remove_prefix(4);
+    return ctx.reply.Error(std::string(kErrExecAbortBecause).append(error));
+  }
+  if (ctx.session.multi.active) ctx.session.multi.dirty_exec = true;
+  ctx.reply.Error(error);
+}
+
+void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
+  if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
+  if (!ctx.session.multi.dirty_exec) ctx.session.multi.queued.push_back(argv);  // multi.c:67
+  ctx.reply.SimpleString("QUEUED");
 }
 
 }  // namespace
@@ -37,8 +64,8 @@ const CommandSpec* CommandRegistry::Find(std::string_view name) const {
 
 std::vector<std::string_view> FlagNames(uint32_t flags) {
   static constexpr std::pair<CommandFlag, std::string_view> kNames[] = {
-      {kCmdWrite, "write"}, {kCmdReadOnly, "readonly"}, {kCmdAdmin, "admin"},
-      {kCmdFast, "fast"},   {kCmdNoAuth, "no-auth"},    {kCmdNoScript, "noscript"}};
+      {kCmdWrite, "write"},    {kCmdReadOnly, "readonly"}, {kCmdAdmin, "admin"},     {kCmdFast, "fast"},
+      {kCmdNoAuth, "no-auth"}, {kCmdNoScript, "noscript"}, {kCmdNoMulti, "no_multi"}};
   std::vector<std::string_view> out;
   for (const auto& [flag, name] : kNames) {
     if ((flags & flag) != 0) out.push_back(name);
@@ -54,18 +81,12 @@ bool ArityOk(int arity, size_t argc) {
 void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
   if (argv.empty()) return;
   const CommandSpec* spec = registry.Find(argv[0]);
-  if (spec == nullptr) {
-    ctx.reply.Error(UnknownCommandMessage(argv));
-    return;
-  }
+  if (spec == nullptr) return Reject(ctx, nullptr, UnknownCommandMessage(argv));
   if (!ArityOk(spec->arity, argv.size())) {
-    ctx.reply.Error("ERR wrong number of arguments for '" + spec->name + "' command");
-    return;
+    return Reject(ctx, spec, "ERR wrong number of arguments for '" + spec->name + "' command");
   }
-  if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) {
-    ctx.reply.Error("NOAUTH Authentication required.");
-    return;
-  }
+  if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
+  if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv);
   spec->handler(ctx, argv);
 }
 

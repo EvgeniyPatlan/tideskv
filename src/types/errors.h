@@ -82,5 +82,13 @@ inline constexpr std::string_view kErrZrangeWithscoresLex =
 
 // Transactions (M5a; multi.c, server.c 7.2.5).
 inline constexpr std::string_view kErrWatchInMulti = "ERR WATCH inside MULTI is not allowed";
+inline constexpr std::string_view kErrMultiNested = "ERR MULTI calls can not be nested";
+inline constexpr std::string_view kErrExecNoMulti = "ERR EXEC without MULTI";
+inline constexpr std::string_view kErrDiscardNoMulti = "ERR DISCARD without MULTI";
+inline constexpr std::string_view kErrNotAllowedInMulti = "ERR Command not allowed inside a transaction";
+inline constexpr std::string_view kErrExecAbort =
+    "EXECABORT Transaction discarded because of previous errors.";
+inline constexpr std::string_view kErrExecAbortBecause = "EXECABORT Transaction discarded because of: ";
+inline constexpr std::string_view kErrNoAuth = "NOAUTH Authentication required.";
 
 }  // namespace tideskv
