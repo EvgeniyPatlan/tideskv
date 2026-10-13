@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "encoding/meta_codec.h"
 #include "storage/memory_storage.h"
+#include "types/collection.h"
 #include "types/errors.h"
 #include "types/list_type.h"
 #include "types/oid_allocator.h"
@@ -51,6 +53,19 @@ struct ListEditTest : ::testing::Test {
     return r.ok() ? *r : std::nullopt;
   }
 
+  encoding::Metadata Meta() {
+    auto view = storage.BeginRead();
+    auto c = LoadCollection(**view, 0, "l", encoding::ValueType::kList, 0);
+    EXPECT_TRUE(c.ok() && c->exists());
+    return c.ok() ? c->obj.meta : encoding::Metadata{};
+  }
+  void ExpectMetaMatches(const Strings& expected) {
+    const encoding::Metadata m = Meta();
+    EXPECT_EQ(m.size, expected.size());
+    EXPECT_EQ(m.tail - m.head + 1, m.size);
+    EXPECT_EQ(All(), expected);
+  }
+
   InMemoryStorage storage;
   OidAllocator oids{storage};
 };
@@ -94,6 +109,52 @@ TEST_F(ListEditTest, RemoveFromHeadTailAndAll) {
   EXPECT_EQ(Remove(0, "a") + Remove(0, "b") + Remove(0, "c"), 3);
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kMeta)].empty());
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].empty());
+}
+
+// 2500 elements: every scan crosses the 1024-element batch boundaries.
+TEST_F(ListEditTest, RemoveAndPosAcrossBatchBoundaries) {
+  Strings expected;
+  for (int i = 0; i < 2500; ++i) expected.push_back(i % 3 == 0 ? "x" : std::to_string(i));
+  Fill(std::vector<std::string_view>(expected.begin(), expected.end()));
+  Positions all_x;  // LPOS x RANK -1 COUNT 0: every match, tail first
+  for (int64_t i = 2499; i >= 0; --i) {
+    if (i % 3 == 0) all_x.push_back(i);
+  }
+  EXPECT_EQ(Pos("x", {.rank = -1, .count = 0}), all_x);
+
+  const auto remove_x = [&](int64_t count) {  // the expected effect of LREM count x
+    int64_t left = count == 0 ? INT64_MAX : (count < 0 ? -count : count);
+    Strings next;
+    if (count >= 0) {
+      for (const std::string& v : expected) {
+        if (v == "x" && left > 0) {
+          --left;
+        } else {
+          next.push_back(v);
+        }
+      }
+    } else {
+      for (auto it = expected.rbegin(); it != expected.rend(); ++it) {
+        if (*it == "x" && left > 0) {
+          --left;
+        } else {
+          next.insert(next.begin(), *it);
+        }
+      }
+    }
+    expected = std::move(next);
+  };
+  EXPECT_EQ(Remove(400, "x"), 400);
+  remove_x(400);
+  ExpectMetaMatches(expected);
+  EXPECT_EQ(Remove(-300, "x"), 300);
+  remove_x(-300);
+  ExpectMetaMatches(expected);
+  EXPECT_EQ(Remove(0, "x"), 834 - 700);
+  remove_x(0);
+  ExpectMetaMatches(expected);
+  EXPECT_EQ(expected.size(), 2500u - 834);
+  EXPECT_EQ(Pos("x", {.rank = -1, .count = 0}), Positions{});
 }
 
 TEST_F(ListEditTest, TrimKeepsTheRangeAndDeletesWhenEmpty) {
