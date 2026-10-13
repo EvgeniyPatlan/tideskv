@@ -142,10 +142,17 @@ struct CommandHarness {
   std::shared_ptr<const InMemoryStorage::Tables> snapshot_;
 };
 
+// Client ids for SecondClient: unique per test process and clear of the ids tests assign by hand (< 100)
+// and of CommandHarness's 7, so two waiters never share an id in the BlockingRegistry.
+inline uint64_t NextSecondClientId() {
+  static uint64_t next = 100;
+  return next++;
+}
+
 // Another connection on the same server as `main` (shares storage, registry and clock).
 struct SecondClient {
   explicit SecondClient(CommandHarness& main) : h(main) {
-    session.id = 8;
+    session.id = NextSecondClientId();
     session.authenticated = true;
     session.link = link;
   }

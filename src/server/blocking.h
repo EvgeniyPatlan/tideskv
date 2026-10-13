@@ -70,6 +70,10 @@ class BlockedClient {
 
 class BlockingRegistry {
  public:
+  // A client id is registered at most once. Adding an id that is already registered (a caller bug: a
+  // connection blocks once at a time) replaces the old entry in every index, so the registry stays
+  // consistent and the connection's current wait is the one that can be served; the old wait is
+  // orphaned (its later Remove is a no-op) and ends only by its own timeout or disconnect.
   void Add(const std::shared_ptr<BlockedClient>& client);
   void Remove(const BlockedClient& client);  // idempotent
   // Cheap when nobody is blocked anywhere (one atomic load).
@@ -81,6 +85,8 @@ class BlockingRegistry {
   size_t blocking_keys() const;  // distinct (db, key) with at least one waiter
 
  private:
+  void EraseKeysLocked(const BlockedClient& client);  // drops client from by_key_ (mu_ held)
+
   mutable std::mutex mu_;
   std::map<std::string, std::list<std::shared_ptr<BlockedClient>>> by_key_;  // [db byte][key] -> FIFO
   std::unordered_map<uint64_t, std::shared_ptr<BlockedClient>> by_client_;

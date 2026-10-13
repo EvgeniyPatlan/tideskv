@@ -44,6 +44,24 @@ TEST(BlockingRegistry, AddFindRemoveAndCounters) {
   EXPECT_EQ(r.blocking_keys(), 0u);
 }
 
+TEST(BlockingRegistry, AddingADuplicateClientIdReplacesTheOldEntry) {
+  BlockingRegistry r;
+  auto link = std::make_shared<test::FakeLink>();
+  auto old_wait = MakeClient(r, 1, {"k1", "k2"}, link), new_wait = MakeClient(r, 1, {"k2", "k3"}, link);
+  r.Add(old_wait);
+  r.Add(new_wait);
+  EXPECT_EQ(r.Find(1), new_wait);
+  EXPECT_EQ(r.blocked_clients(), 1u);
+  EXPECT_FALSE(r.HasWaiters(0, "k1"));  // nothing of the old entry is left behind
+  EXPECT_EQ(r.WaitersOn(0, "k2"), (std::vector<std::shared_ptr<BlockedClient>>{new_wait}));
+  EXPECT_EQ(r.blocking_keys(), 2u);
+  r.Remove(*old_wait);  // no longer registered: a no-op
+  EXPECT_EQ(r.Find(1), new_wait);
+  r.Remove(*new_wait);
+  EXPECT_EQ(r.blocked_clients(), 0u);
+  EXPECT_EQ(r.blocking_keys(), 0u);
+}
+
 TEST(BlockingRegistry, WaitersAreFifoPerKey) {
   BlockingRegistry r;
   auto link = std::make_shared<test::FakeLink>();

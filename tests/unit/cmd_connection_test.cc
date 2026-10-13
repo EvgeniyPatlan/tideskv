@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "support/command_harness.h"
 #include "types/errors.h"
 
@@ -128,16 +130,17 @@ TEST(Client, IdNamesAndInfo) {
 
 TEST(ClientUnblock, TimeoutAndErrorReasons) {  // Review Focus #4
   test::CommandHarness h;
-  test::SecondClient other(h);  // session id 8
+  test::SecondClient other(h);
+  const std::string id = std::to_string(other.session.id);
   EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
-  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8", "BOGUS"}), test::Err(kErrUnblockReason));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", id, "BOGUS"}), test::Err(kErrUnblockReason));
   EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "x"}), test::Err(kErrNotInteger));
   EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "999"}), test::Int(0));
-  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8"}), test::Int(1));  // TIMEOUT is the default
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", id}), test::Int(1));  // TIMEOUT is the default
   EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{"*-1\r\n"}));
-  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8"}), test::Int(0));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", id}), test::Int(0));
   EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
-  EXPECT_EQ(h.Run({"CLIENT", "unblock", "8", "error"}), test::Int(1));
+  EXPECT_EQ(h.Run({"CLIENT", "unblock", id, "error"}), test::Int(1));
   EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{test::Err(kErrUnblockedByClient)}));
 }
 
@@ -145,8 +148,9 @@ TEST(ClientUnblock, TimeoutReplyUsesTheTargetsProtocol) {
   test::CommandHarness h;
   test::SecondClient other(h);
   other.session.protocol = 3;
+  const std::string id = std::to_string(other.session.id);
   EXPECT_EQ(other.Run({"BLPOP", "k", "0"}), "");
-  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", "8", "TIMEOUT"}), test::Int(1));
+  EXPECT_EQ(h.Run({"CLIENT", "UNBLOCK", id, "TIMEOUT"}), test::Int(1));
   EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{"_\r\n"}));
 }
 

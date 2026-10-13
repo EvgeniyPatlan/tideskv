@@ -68,9 +68,14 @@ void BlockedClient::Deliver(std::string reply) {
 
 void BlockingRegistry::Add(const std::shared_ptr<BlockedClient>& client) {
   std::lock_guard lock(mu_);
+  auto& slot = by_client_[client->client_id()];
+  if (slot) {
+    EraseKeysLocked(*slot);  // a duplicate id replaces the old entry (see the header)
+  } else {
+    count_.fetch_add(1);
+  }
+  slot = client;
   for (const std::string& k : client->keys()) by_key_[KeyOf(client->db(), k)].push_back(client);
-  by_client_[client->client_id()] = client;
-  count_.fetch_add(1);
 }
 
 void BlockingRegistry::Remove(const BlockedClient& client) {
@@ -78,13 +83,17 @@ void BlockingRegistry::Remove(const BlockedClient& client) {
   const auto it = by_client_.find(client.client_id());
   if (it == by_client_.end() || it->second.get() != &client) return;
   by_client_.erase(it);
+  EraseKeysLocked(client);
+  count_.fetch_sub(1);
+}
+
+void BlockingRegistry::EraseKeysLocked(const BlockedClient& client) {
   for (const std::string& k : client.keys()) {
     const auto kit = by_key_.find(KeyOf(client.db(), k));
     if (kit == by_key_.end()) continue;
     kit->second.remove_if([&](const std::shared_ptr<BlockedClient>& p) { return p.get() == &client; });
     if (kit->second.empty()) by_key_.erase(kit);
   }
-  count_.fetch_sub(1);
 }
 
 bool BlockingRegistry::HasWaiters(uint8_t db, std::string_view key) const {
