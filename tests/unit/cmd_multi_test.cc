@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include "commands/multi_state.h"
 #include "support/command_harness.h"
+#include "types/errors.h"
 
 namespace tideskv::test {
 namespace {
@@ -56,11 +58,19 @@ TEST(Multi, ErrorsThatDoNotDoomTheTransaction) {
 }
 
 TEST(Multi, QueueTimeErrorsAbortExec) {  // multi.c:170, server.c:3708
-  for (const ArgList& bad : std::vector<ArgList>{{"NOSUCH", "a"}, {"SET", "k"}, {"SHUTDOWN"}}) {
+  struct Case {
+    ArgList argv;
+    std::string reply;
+  };
+  const std::vector<Case> cases = {
+      {{"NOSUCH", "a"}, Err("ERR unknown command 'NOSUCH', with args beginning with: 'a' ")},
+      {{"SET", "k"}, Err("ERR wrong number of arguments for 'set' command")},
+      {{"SHUTDOWN"}, Err(std::string(kErrNotAllowedInMulti))}};
+  for (const auto& [bad, expected] : cases) {
     CommandHarness h;
     h.Run({"MULTI"});
     h.Run({"SET", "a", "1"});
-    EXPECT_EQ(h.Run(bad).substr(0, 5), "-ERR ") << bad[0];
+    EXPECT_EQ(h.Run(bad), expected) << bad[0];
     EXPECT_EQ(h.Run({"SET", "b", "2"}), kQueued);  // still +QUEUED, though dropped
     EXPECT_EQ(h.Run({"EXEC"}), kExecAbort);
     EXPECT_FALSE(h.session.multi.active);
@@ -272,6 +282,25 @@ TEST(Multi, QueuedCommandsAreCopiedNotReparsed) {
   h.Run({"SET", std::string("k\0z", 3), std::string("v\r\n", 3)});
   h.Run({"GET", std::string("k\0z", 3)});
   EXPECT_EQ(h.Run({"EXEC"}), Arr({kOk, Bulk(std::string("v\r\n", 3))}));
+}
+
+TEST(ConnectionState, RestoreUndoesQueuedChanges) {
+  CommandHarness h;
+  h.session.db = 2;
+  h.session.name = "orig";
+  h.session.authenticated = true;
+  const ConnectionState saved = ConnectionState::Capture(h.session);
+  h.session.db = 5;
+  h.session.protocol = 3;
+  h.session.authenticated = false;
+  h.session.name = "changed";
+  h.reply.SetProtocol(3);
+  saved.Restore(h.session, h.reply);
+  EXPECT_EQ(h.session.db, 2);
+  EXPECT_EQ(h.session.protocol, 2);
+  EXPECT_TRUE(h.session.authenticated);
+  EXPECT_EQ(h.session.name, "orig");
+  EXPECT_EQ(h.reply.protocol(), 2);
 }
 
 }  // namespace

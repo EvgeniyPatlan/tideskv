@@ -5,6 +5,7 @@
 
 #include "commands/multi_state.h"
 #include "common/string_util.h"
+#include "server/watch.h"
 #include "types/errors.h"
 
 namespace tideskv {
@@ -43,7 +44,9 @@ void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
 
 void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
-  if (!ctx.session.multi.dirty_exec) ctx.session.multi.queued.push_back(argv);  // multi.c:67
+  const auto& w = ctx.session.watch;
+  const bool doomed = ctx.session.multi.dirty_exec || (w != nullptr && w->dirty());
+  if (!doomed) ctx.session.multi.queued.push_back(argv);  // multi.c:67
   ctx.reply.SimpleString("QUEUED");
 }
 

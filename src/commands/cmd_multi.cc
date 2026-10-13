@@ -78,10 +78,14 @@ void RunQueued(ExecContext& ctx, const std::vector<ArgList>& queued, std::unique
   std::vector<std::function<void()>> after;
   ExecContext inner{ctx.session, replies, ctx.server, nullptr, ctx.ready, &after};
   const CommandRegistry& registry = ctx.server.registry();
+  const ConnectionState before = ConnectionState::Capture(ctx.session);
   for (const ArgList& argv : queued) registry.Find(argv[0])->handler(inner, argv);  // validated when queued
   const Status st = batch->Commit();
   batch.reset();  // releases the gate before the deferred actions run
-  if (!st.ok()) return ReplyError(ctx, st);
+  if (!st.ok()) {
+    before.Restore(ctx.session, ctx.reply);  // a failed EXEC applies nothing, session state included
+    return ReplyError(ctx, st);
+  }
   ctx.reply.ArrayHeader(queued.size());
   ctx.reply.Raw(replies.buffer());
   ctx.reply.SetProtocol(replies.protocol());  // HELLO inside the transaction switched it
