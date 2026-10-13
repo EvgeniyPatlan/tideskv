@@ -115,6 +115,10 @@ void Connection::Unblock(std::string reply) {
   });
 }
 
+// Relies on at-most-once delivery: BlockedClient ends a wait exactly once (TryServe, Cancel and Unblock
+// all check and set done_ under its lock), so at most one Unblock is posted per wait, and never after
+// the block timer's Cancel won. A non-null session_.blocked therefore means this reply belongs to the
+// current wait; nothing here has to tell a stale reply from a fresh one.
 void Connection::OnUnblocked(std::string reply) {
   if (closed_ || !session_.blocked) return;
   reply_.Raw(reply);

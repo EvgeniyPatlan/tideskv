@@ -337,6 +337,8 @@ TEST(NetServerBlocking, PipelinedBlocksRunOneAfterTheOther) {  // Review Focus #
   auto server = StartBlockingServer(registry);
   auto a = RespClient::Connect(server->port());
   auto b = RespClient::Connect(server->port());
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
   const int64_t id = a->Command({"ID"}).integer;
   ASSERT_TRUE(a->SendRaw(test::EncodeCommand({"BLOCK", "0"}) + test::EncodeCommand({"BLOCK", "0"})));
   ASSERT_TRUE(WaitFor([&] { return b->Command({"WAITERS"}).integer == 1; }));
@@ -355,6 +357,7 @@ TEST(NetServerBlocking, DisconnectWhileBlockedCancelsTheWait) {  // Review Focus
   BlockingRegistry registry;
   auto server = StartBlockingServer(registry);
   auto a = RespClient::Connect(server->port());
+  ASSERT_NE(a, nullptr);
   ASSERT_TRUE(a->Send({"BLOCK", "0"}));
   ASSERT_TRUE(WaitFor([&] { return registry.blocked_clients() == 1; }));
   a->Close();
@@ -365,6 +368,7 @@ TEST(NetServerBlocking, StopWithABlockedClientIsPrompt) {
   BlockingRegistry registry;
   auto server = StartBlockingServer(registry);
   auto a = RespClient::Connect(server->port());
+  ASSERT_NE(a, nullptr);
   ASSERT_TRUE(a->Send({"BLOCK", "0"}));
   ASSERT_TRUE(WaitFor([&] { return registry.blocked_clients() == 1; }));
   const auto start = std::chrono::steady_clock::now();
@@ -377,6 +381,7 @@ TEST(NetServerBlocking, ManyRepliesWhileReadingStayOrdered) {
   BlockingRegistry registry;
   auto server = StartBlockingServer(registry);
   auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
   std::string batch;
   for (int i = 0; i < 2000; ++i) batch += test::EncodeCommand({"x" + std::to_string(i)});
   ASSERT_TRUE(c->SendRaw(batch));
