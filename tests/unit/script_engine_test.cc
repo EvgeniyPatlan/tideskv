@@ -23,20 +23,33 @@ class StubCaller final : public ScriptCaller {
   std::vector<std::vector<std::string>> calls;
 };
 
+// Polls `pred` for up to 5 s so a regression fails instead of hanging the suite.
+template <typename Pred>
+bool WaitFor(Pred pred) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!pred()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::yield();
+  }
+  return true;
+}
+
 struct ScriptEngineFixture : ::testing::Test {
   ScriptEngine se;
   StubCaller caller;
   std::vector<std::string> keys, args;
+  bool killed = false;
 
   std::string Eval(std::string_view script, bool by_sha = false, bool ro = false, int64_t threshold = 5000) {
     resp::ReplyBuilder out(2);
-    se.Eval({script, by_sha, ro, &keys, &args, 2, threshold}, caller, out);
+    killed = se.Eval({script, by_sha, ro, &keys, &args, 2, threshold}, caller, out).killed;
     return out.Take();
   }
 };
 
 TEST_F(ScriptEngineFixture, EvalCachesAndEvalshaFindsItCaseInsensitively) {
   EXPECT_EQ(Eval("return 1+1"), ":2\r\n");
+  EXPECT_FALSE(killed);
   EXPECT_EQ(se.cached_scripts(), 1u);
   EXPECT_EQ(Eval("a27e7e8a43702b7046d4f6a7ccf5b60cef6b9bd9", true), ":2\r\n");
   EXPECT_EQ(Eval("A27E7E8A43702B7046D4F6A7CCF5B60CEF6B9BD9", true), ":2\r\n");
@@ -85,13 +98,26 @@ TEST_F(ScriptEngineFixture, TimesOutThenKillOrShutdownStopsIt) {
   EXPECT_FALSE(se.Kill());  // nothing running: NOTBUSY
   std::string reply;
   std::thread runner([&] { reply = Eval("while true do end", false, false, 20); });
-  while (!se.TimedOut()) std::this_thread::yield();
-  while (!woke.load()) std::this_thread::yield();  // timed_out_ is set just before the callback runs
+  ASSERT_TRUE(WaitFor([&] { return se.TimedOut(); }));
+  ASSERT_TRUE(WaitFor([&] { return woke.load(); }));  // the phase flips just before the callback runs
   EXPECT_TRUE(se.Kill());
   runner.join();
+  EXPECT_TRUE(killed);
   EXPECT_NE(reply.find("Script killed by user with SCRIPT KILL..."), std::string::npos);
   EXPECT_FALSE(se.TimedOut());
+  EXPECT_FALSE(se.Kill());  // the run is over: NOTBUSY, so a late SCRIPT KILL cannot hit the next script
   EXPECT_EQ(Eval("return 1"), ":1\r\n");  // the kill flag does not leak into the next run
+  EXPECT_FALSE(killed);
+}
+
+TEST_F(ScriptEngineFixture, KillAfterATimedOutRunEndedDoesNotHitTheNextRun) {
+  std::thread runner([&] { Eval("while true do end", false, false, 20); });
+  ASSERT_TRUE(WaitFor([&] { return se.TimedOut(); }));
+  EXPECT_TRUE(se.Kill());
+  runner.join();
+  EXPECT_FALSE(se.Kill());
+  EXPECT_EQ(Eval("for i=1,300000 do end return 2", false, false, 1), ":2\r\n");
+  EXPECT_FALSE(killed);
 }
 
 TEST_F(ScriptEngineFixture, ShutdownKillsAHookedScriptEvenBeforeItTimesOut) {
@@ -101,6 +127,7 @@ TEST_F(ScriptEngineFixture, ShutdownKillsAHookedScriptEvenBeforeItTimesOut) {
   EXPECT_FALSE(se.TimedOut());
   se.KillForShutdown();
   runner.join();
+  EXPECT_TRUE(killed);
   EXPECT_NE(reply.find("Script killed by user with SCRIPT KILL..."), std::string::npos);
 }
 

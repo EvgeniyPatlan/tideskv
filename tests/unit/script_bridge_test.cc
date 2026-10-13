@@ -25,6 +25,14 @@ TEST(ScriptBridge, RunsCommandsInTheCallersDbWithoutChangingIt) {
   EXPECT_EQ(h.Run({"GET", "k"}), Bulk("v"));
 }
 
+TEST(ScriptBridge, TheScriptsProtocolNeverLeaksToTheCaller) {
+  CommandHarness h;
+  ExecContext ctx{h.session, h.reply, h.services, nullptr, &h.ready};
+  ScriptBridge b(ctx);
+  EXPECT_EQ(Call(b, {"HSET", "h", "f", "v"}, 3), ":1\r\n");
+  EXPECT_EQ(h.session.protocol, 2);
+}
+
 TEST(ScriptBridge, RejectsLikeRedis) {  // scriptCall, script.c:513-573
   CommandHarness h;
   ExecContext ctx{h.session, h.reply, h.services, nullptr, &h.ready};

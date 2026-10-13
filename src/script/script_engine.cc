@@ -60,9 +60,10 @@ class ScriptEngine::Host final : public SandboxHost {
   }
 
   bool ShouldKill() noexcept override {
-    if (engine_.kill_.load() || engine_.shutdown_.load()) return true;
-    if (!engine_.timed_out_.load() && ElapsedMs() >= threshold_ms_) {  // script.c:80-109
-      engine_.timed_out_ = true;
+    if (engine_.phase_.load() == kKilled || engine_.shutdown_.load()) return true;
+    int expected = kRunning;
+    if (ElapsedMs() >= threshold_ms_ &&  // script.c:80-109
+        engine_.phase_.compare_exchange_strong(expected, kTimedOut)) {
       try {
         spdlog::warn(
             "Slow script detected: still in execution after {} milliseconds. You can try killing the "
@@ -122,16 +123,19 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
     return {};
   }
   caller.SetReadOnly(req.read_only_command || flags.no_writes);
-  running_ = true;
-  timed_out_ = false;
-  kill_ = false;
+  static const std::vector<std::string> kNone;
+  struct RunGuard {  // also runs when Run throws, so BUSY cannot stick
+    ScriptEngine& e;
+    ~RunGuard() {
+      e.phase_ = kIdle;
+      e.lua_memory_ = e.sandbox_->memory_bytes();
+    }
+  } guard{*this};
+  phase_ = kRunning;
   Host host(*this, caller, *sha, req.busy_threshold_ms);
   const auto r =
-      sandbox_->Run(*sha, *req.keys, *req.args, host, {req.caller_resp, req.busy_threshold_ms > 0}, out);
-  running_ = false;
-  timed_out_ = false;
-  kill_ = false;
-  lua_memory_ = sandbox_->memory_bytes();
+      sandbox_->Run(*sha, req.keys != nullptr ? *req.keys : kNone, req.args != nullptr ? *req.args : kNone,
+                    host, {req.caller_resp, req.busy_threshold_ms > 0}, out);
   return {r.killed};
 }
 
@@ -156,12 +160,13 @@ void ScriptEngine::Flush() {
   lua_memory_ = sandbox_->memory_bytes();
 }
 
-bool ScriptEngine::TimedOut() const noexcept { return timed_out_.load() || forced_timed_out_.load(); }
+bool ScriptEngine::TimedOut() const noexcept {
+  return phase_.load() >= kTimedOut || forced_timed_out_.load();
+}
 
 bool ScriptEngine::Kill() noexcept {
-  if (!timed_out_.load()) return false;
-  kill_ = true;
-  return true;
+  int expected = kTimedOut;
+  return phase_.compare_exchange_strong(expected, kKilled);
 }
 
 void ScriptEngine::KillForShutdown() noexcept { shutdown_ = true; }

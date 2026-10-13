@@ -71,9 +71,9 @@ class ScriptEngine {
   mutable std::mutex mu_;  // the Lua state and the cache (lock order: after the Engine gate)
   std::unique_ptr<LuaSandbox> sandbox_;
   std::unordered_map<std::string, Script> scripts_;  // key: lowercase sha
-  std::atomic<bool> running_{false};
-  std::atomic<bool> timed_out_{false};
-  std::atomic<bool> kill_{false};
+  // One state word, so Kill() can only ever hit the run that timed out (never a later one).
+  enum Phase : int { kIdle, kRunning, kTimedOut, kKilled };
+  std::atomic<int> phase_{kIdle};
   std::atomic<bool> shutdown_{false};
   std::atomic<bool> forced_timed_out_{false};
   std::atomic<size_t> cached_{0};
