@@ -5,6 +5,7 @@
 #include <atomic>
 #include <thread>
 
+#include "server/connection_block_handler.h"
 #include "support/fake_link.h"
 
 namespace tideskv {
@@ -119,6 +120,30 @@ TEST(BlockedClient, ServeRacingCancelHasOneWinner) {
     EXPECT_EQ(link->Take().size(), won_serve ? 1u : 0u);
     EXPECT_EQ(r.blocked_clients(), 0u);
   }
+}
+
+// A timeout beyond what steady_clock can represent (BLPOP k 10000000000) blocks forever, as in Redis.
+TEST(ConnectionBlockHandler, HugeTimeoutBlocksForeverAndNormalOneHasADeadline) {
+  BlockingRegistry r;
+  Session s;
+  s.id = 1;
+  ReadyKeys ready;
+  const std::vector<std::string> argv{"blpop", "k", "10000000000"};
+  ConnectionBlockHandler handler(r, s, argv, ready);
+  handler.Block({ValueType::kList, {"k"}, 10'000'000'000'000});
+  ASSERT_NE(s.blocked, nullptr);
+  EXPECT_EQ(s.blocked->deadline(), std::nullopt);
+  EXPECT_TRUE(s.blocked->Cancel());
+
+  Session s2;
+  s2.id = 2;
+  ConnectionBlockHandler handler2(r, s2, argv, ready);
+  const auto before = BlockedClient::Clock::now();
+  handler2.Block({ValueType::kList, {"k"}, 200});
+  ASSERT_NE(s2.blocked, nullptr);
+  ASSERT_TRUE(s2.blocked->deadline().has_value());
+  EXPECT_GE(*s2.blocked->deadline(), before + std::chrono::milliseconds(200));
+  EXPECT_TRUE(s2.blocked->Cancel());
 }
 
 }  // namespace

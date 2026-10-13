@@ -7,9 +7,16 @@
 namespace tideskv {
 
 void ConnectionBlockHandler::Block(const BlockRequest& request) {
-  std::optional<BlockedClient::Clock::time_point> deadline;
-  if (request.timeout_ms > 0)
-    deadline = BlockedClient::Clock::now() + std::chrono::milliseconds(request.timeout_ms);
+  using Clock = BlockedClient::Clock;
+  std::optional<Clock::time_point> deadline;
+  if (request.timeout_ms > 0) {
+    const auto now = Clock::now();
+    // A timeout steady_clock cannot represent (e.g. 1e10 s; ParseBlockTimeout allows up to INT64_MAX ms)
+    // would overflow; it blocks forever instead, as Redis effectively does.
+    const auto headroom =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now);
+    if (request.timeout_ms < headroom.count()) deadline = now + std::chrono::milliseconds(request.timeout_ms);
+  }
   Session copy = session_;
   copy.blocked.reset();
   auto client = std::make_shared<BlockedClient>(registry_, std::move(copy), argv_, request.type, request.keys,
