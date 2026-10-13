@@ -1,5 +1,7 @@
 #include "exec/recording_txn.h"
 
+#include <cstddef>
+
 #include "encoding/key_codec.h"
 
 namespace tideskv {
@@ -55,6 +57,17 @@ Status RecordingTxn::RollbackToSavepoint(std::string_view name) {
     writes_ = savepoints_[i].writes;
     meta_keys_.resize(savepoints_[i].meta_keys);
     savepoints_.resize(i + 1);
+    break;
+  }
+  return st;
+}
+
+Status RecordingTxn::ReleaseSavepoint(std::string_view name) {
+  Status st = inner_.ReleaseSavepoint(name);
+  if (!st.ok()) return st;
+  for (size_t i = savepoints_.size(); i-- > 0;) {  // newest first: in a batch it is the last one
+    if (savepoints_[i].name != name) continue;
+    savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(i));
     break;
   }
   return st;

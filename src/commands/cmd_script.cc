@@ -35,9 +35,12 @@ void RunScript(ExecContext& ctx, const ScriptEngine::EvalRequest& req) {
   resp::ReplyBuilder scratch(ctx.reply.protocol());
   ScriptBridge bridge(ctx);
   const ScriptEngine::EvalResult result = ctx.server.scripts().Eval(req, bridge, scratch);
-  if (result.killed) {
-    if (Status st = engine.BatchRollbackTo(*mark); !st.ok())
-      spdlog::error("rolling back a killed script: {}", st.ToString());
+  // Then drop the mark: a live one slows every later write of the batch (an EXEC may run many scripts).
+  const Status undone = result.killed ? engine.BatchRollbackTo(*mark) : Status::Ok();
+  if (!undone.ok()) {
+    spdlog::error("rolling back a killed script: {}", undone.ToString());
+  } else if (Status st = engine.BatchReleaseMark(*mark); !st.ok()) {
+    spdlog::warn("releasing a script's batch mark: {}", st.ToString());
   }
   if (own) {
     const Status st = own->Commit();

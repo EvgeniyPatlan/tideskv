@@ -236,6 +236,50 @@ TEST_F(BatchTest, MarkAndRollbackUndoTheWritesAfterTheMark) {
   EXPECT_EQ(engine.BatchMark().status().code(), StatusCode::kInternal);
 }
 
+TEST_F(BatchTest, ReleasedMarkKeepsItsWritesAndCannotBeRolledBackTo) {
+  EXPECT_EQ(engine.BatchReleaseMark(0).code(), StatusCode::kInternal);  // no batch
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  auto outer = engine.BatchMark();
+  ASSERT_TRUE(outer.ok());
+  ASSERT_TRUE(Put(0, "a", "1").ok());
+  auto inner = engine.BatchMark();
+  ASSERT_TRUE(inner.ok());
+  ASSERT_TRUE(Put(0, "b", "2").ok());
+  EXPECT_EQ(engine.BatchReleaseMark(*outer).code(), StatusCode::kInternal);  // only the newest mark
+  ASSERT_TRUE(engine.BatchReleaseMark(*inner).ok());
+  EXPECT_EQ(engine.BatchRollbackTo(*inner).code(), StatusCode::kInternal);  // released
+  EXPECT_EQ(engine.BatchReleaseMark(*inner).code(), StatusCode::kInternal);
+  auto again = engine.BatchMark();  // the id is reused, with a fresh savepoint
+  ASSERT_TRUE(again.ok());
+  EXPECT_EQ(*again, *inner);
+  ASSERT_TRUE(Put(0, "c", "3").ok());
+  ASSERT_TRUE(engine.BatchRollbackTo(*again).ok());
+  ASSERT_TRUE(engine.BatchReleaseMark(*again).ok());  // rolled back to, then released (a killed script)
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(Get(0, "a"), "1");
+  EXPECT_EQ(Get(0, "b"), "2");
+  EXPECT_EQ(Get(0, "c"), "<missing>");
+  EXPECT_EQ(observer.reported, (std::vector<DbKey>{{0, "a"}, {0, "b"}}));
+}
+
+TEST_F(BatchTest, RollbackToOuterMarkUndoesAReleasedInnerMarksWrites) {
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  auto outer = engine.BatchMark();
+  ASSERT_TRUE(outer.ok());
+  auto inner = engine.BatchMark();
+  ASSERT_TRUE(inner.ok());
+  ASSERT_TRUE(Put(0, "a", "1").ok());
+  ASSERT_TRUE(engine.BatchReleaseMark(*inner).ok());
+  ASSERT_TRUE(engine.BatchRollbackTo(*outer).ok());
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(Get(0, "a"), "<missing>");
+  EXPECT_TRUE(observer.reported.empty());
+}
+
 TEST_F(BatchTest, RollingBackForgetsTheLaterMarks) {
   auto batch = engine.BeginBatch();
   ASSERT_TRUE(batch.ok());

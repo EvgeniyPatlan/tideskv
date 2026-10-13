@@ -37,6 +37,7 @@ class ConflictingTxn final : public WriteTxn {
   }
   Status Savepoint(std::string_view n) override { return inner_->Savepoint(n); }
   Status RollbackToSavepoint(std::string_view n) override { return inner_->RollbackToSavepoint(n); }
+  Status ReleaseSavepoint(std::string_view n) override { return inner_->ReleaseSavepoint(n); }
   Status Commit() override {
     if (failures_->fetch_sub(1) > 0) return Status::Conflict("injected");
     return inner_->Commit();

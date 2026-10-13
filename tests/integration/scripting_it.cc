@@ -42,17 +42,41 @@ int64_t IntValue(RespClient& c, const std::string& key) {
   return std::stoll(v.str);
 }
 
+// Task 13: batch writes are linear now, so the script can be long: about 0.6 s on a release server.
+// Debug and sanitizer servers are 10x or more slower, so they run fewer iterations.
+#ifdef NDEBUG
+constexpr int kKillIterations = 300000;
+#else
+constexpr int kKillIterations = 30000;
+#endif
+
 TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
   TempDir dir("tideskv-it-eval-kill");
   std::mt19937 rng(std::random_device{}());
-  const std::string script = "for i = 1, 4000 do redis.call('incr','a') redis.call('incr','b') end return 1";
+  const std::string script = "for i = 1, " + std::to_string(kKillIterations) +
+                             " do redis.call('incr','a') redis.call('incr','b') end return 1";
+  // One uninterrupted run times the script on this build. Kills then land anywhere from just after the
+  // start to 1.5x its run time, so across rounds some land mid-script and some after its commit.
+  int64_t run_ms = 0;
+  {
+    TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
+    auto c = RespClient::Connect(s.port(), 60s);
+    ASSERT_NE(c, nullptr);
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(c->Command({"EVAL", script, "0"}).integer, 1);
+    run_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                 .count();
+    ASSERT_EQ(IntValue(*c, "a"), kKillIterations);
+  }
+  RecordProperty("script_ms", std::to_string(run_ms));
   for (int round = 0; round < 5; ++round) {
+    const int64_t delay_ms = 10 + static_cast<int64_t>(rng() % static_cast<uint64_t>(run_ms * 3 / 2 + 1));
     {
       TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
       auto c = s.Connect();
       ASSERT_NE(c, nullptr);
       ASSERT_TRUE(c->Send({"EVAL", script, "0"}));  // no reply awaited: we kill mid-script
-      std::this_thread::sleep_for(std::chrono::milliseconds(10 + rng() % 200));
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
       s.Kill9();
     }
     TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
@@ -60,8 +84,10 @@ TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
     ASSERT_NE(c, nullptr);
     const int64_t a = IntValue(*c, "a");
     SCOPED_TRACE("round " + std::to_string(round) + ", a = " + std::to_string(a));
+    RecordProperty("round" + std::to_string(round),
+                   std::to_string(delay_ms) + " ms: a = " + std::to_string(a));
     EXPECT_EQ(IntValue(*c, "b"), a) << "round " << round;
-    EXPECT_EQ(a % 4000, 0) << "round " << round << ": a script is never partly applied";
+    EXPECT_EQ(a % kKillIterations, 0) << "round " << round << ": a script is never partly applied";
   }
 }
 

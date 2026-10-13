@@ -292,12 +292,65 @@ TEST_P(StorageContractTest, SavepointRollbackDiscardsLaterWritesOnly) {
   EXPECT_FALSE(ReadCommitted(storage(), kMeta, "b").has_value());
 }
 
+TEST_P(StorageContractTest, ReleasedSavepointKeepsItsWritesAndCannotBeRolledBackTo) {
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  WriteTxn& t = **txn;
+  ASSERT_TRUE(t.Savepoint("s1").ok());
+  ASSERT_TRUE(t.Put(kMeta, "a", "1").ok());
+  ASSERT_TRUE(t.ReleaseSavepoint("s1").ok());
+  EXPECT_EQ(*t.Get(kMeta, "a"), "1");
+  EXPECT_TRUE(t.RollbackToSavepoint("s1").IsNotFound());
+  EXPECT_TRUE(t.ReleaseSavepoint("s1").IsNotFound());
+  EXPECT_TRUE(t.ReleaseSavepoint("missing").IsNotFound());
+  EXPECT_EQ(t.ReleaseSavepoint("").code(), StatusCode::kInvalidArgument);
+  ASSERT_TRUE(t.Commit().ok());
+  EXPECT_EQ(ReadCommitted(storage(), kMeta, "a"), "1");
+}
+
+TEST_P(StorageContractTest, ReleasingASavepointKeepsTheOthersUsable) {
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  WriteTxn& t = **txn;
+  ASSERT_TRUE(t.Savepoint("s1").ok());
+  ASSERT_TRUE(t.Put(kMeta, "a", "1").ok());
+  ASSERT_TRUE(t.Savepoint("s2").ok());
+  ASSERT_TRUE(t.Put(kMeta, "b", "2").ok());
+  ASSERT_TRUE(t.Savepoint("s3").ok());
+  ASSERT_TRUE(t.Put(kMeta, "c", "3").ok());
+  ASSERT_TRUE(t.ReleaseSavepoint("s2").ok());  // a middle one: the earlier and the later ones stay
+  ASSERT_TRUE(t.RollbackToSavepoint("s3").ok());
+  EXPECT_TRUE(t.Get(kMeta, "c").status().IsNotFound());
+  EXPECT_EQ(*t.Get(kMeta, "b"), "2");  // s2's writes were kept by the release
+  ASSERT_TRUE(t.RollbackToSavepoint("s1").ok());
+  EXPECT_TRUE(t.Get(kMeta, "a").status().IsNotFound());
+  EXPECT_TRUE(t.Get(kMeta, "b").status().IsNotFound());
+  ASSERT_TRUE(t.Put(kMeta, "d", "4").ok());
+  ASSERT_TRUE(t.Commit().ok());
+  EXPECT_FALSE(ReadCommitted(storage(), kMeta, "a").has_value());
+  EXPECT_EQ(ReadCommitted(storage(), kMeta, "d"), "4");
+}
+
+TEST_P(StorageContractTest, RolledBackToSavepointCanBeReleased) {
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  WriteTxn& t = **txn;
+  ASSERT_TRUE(t.Savepoint("s1").ok());
+  ASSERT_TRUE(t.Put(kMeta, "a", "1").ok());
+  ASSERT_TRUE(t.RollbackToSavepoint("s1").ok());
+  ASSERT_TRUE(t.ReleaseSavepoint("s1").ok());
+  EXPECT_TRUE(t.RollbackToSavepoint("s1").IsNotFound());
+  ASSERT_TRUE(t.Commit().ok());
+  EXPECT_FALSE(ReadCommitted(storage(), kMeta, "a").has_value());
+}
+
 TEST_P(StorageContractTest, FinishedTxnRejectsFurtherUse) {
   auto txn = storage().BeginWrite();
   ASSERT_TRUE(txn.ok());
   ASSERT_TRUE((*txn)->Commit().ok());
   EXPECT_EQ((*txn)->Commit().code(), StatusCode::kInvalidArgument);
   EXPECT_EQ((*txn)->Put(kMeta, "k", "v").code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ((*txn)->ReleaseSavepoint("s").code(), StatusCode::kInvalidArgument);
 }
 
 TEST_P(StorageContractTest, LargeBatchCommitsAtomically) {

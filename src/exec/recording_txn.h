@@ -26,6 +26,7 @@ class RecordingTxn final : public WriteTxn {
   Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override;
   Status Savepoint(std::string_view name) override;
   Status RollbackToSavepoint(std::string_view name) override;
+  Status ReleaseSavepoint(std::string_view name) override;  // keeps the counts; forgets the savepoint
   Status Commit() override { return inner_.Commit(); }
   Status Rollback() override;
 

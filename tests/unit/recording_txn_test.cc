@@ -66,5 +66,26 @@ TEST(RecordingTxn, SavepointRollbackForgetsLaterWritesAndKeys) {
   EXPECT_EQ(txn.meta_keys(), (std::vector<DbKey>{{0, "a"}}));
 }
 
+TEST(RecordingTxn, ReleaseKeepsTheCountsAndForgetsTheSavepoint) {
+  InMemoryStorage s;
+  auto inner = s.BeginWrite();
+  RecordingTxn txn(**inner);
+  ASSERT_TRUE(txn.Savepoint("outer").ok());
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "a"), "v").ok());
+  ASSERT_TRUE(txn.Savepoint("sp").ok());
+  ASSERT_TRUE(txn.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "v").ok());
+  ASSERT_TRUE(txn.DeletePrefix(ColumnFamily::kSubkey, "p").ok());
+  ASSERT_TRUE(txn.ReleaseSavepoint("sp").ok());
+  EXPECT_EQ(txn.writes(), 3u);
+  EXPECT_EQ(txn.meta_keys(), (std::vector<DbKey>{{0, "a"}, {0, "b"}}));
+  EXPECT_EQ(txn.deletes().size(), 1u);
+  EXPECT_TRUE(txn.RollbackToSavepoint("sp").IsNotFound());
+  EXPECT_TRUE(txn.ReleaseSavepoint("missing").IsNotFound());
+  ASSERT_TRUE(txn.RollbackToSavepoint("outer").ok());  // the earlier savepoint still undoes everything
+  EXPECT_EQ(txn.writes(), 0u);
+  EXPECT_TRUE(txn.meta_keys().empty());
+  EXPECT_TRUE(txn.deletes().empty());
+}
+
 }  // namespace
 }  // namespace tideskv

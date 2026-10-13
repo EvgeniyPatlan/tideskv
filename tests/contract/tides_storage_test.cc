@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <string>
 #include <thread>
 
 #include "encoding/key_codec.h"
@@ -258,6 +260,43 @@ TEST(TidesStorage, BatchOfThousandSavepoints) {
   EXPECT_EQ(get("k1"), "v");
   EXPECT_EQ(get("k999"), "<missing>");
   EXPECT_EQ(get("k998"), "v");
+}
+
+// Seconds for `writes` single-put writes (INCR-like, two alternating keys) in one batch, which is then
+// rolled back. Best of three runs, to damp scheduler noise.
+double BatchWriteSeconds(Engine& engine, int writes) {
+  double best = 1e9;
+  for (int run = 0; run < 3; ++run) {
+    auto batch = engine.BeginBatch();
+    EXPECT_TRUE(batch.ok());
+    if (!batch.ok()) return best;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < writes; ++i) {
+      const std::string k = i % 2 == 0 ? "a" : "b";
+      const Status st = engine.Write(0, {k}, [&](WriteTxn& t, int64_t) {
+        return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, k), std::to_string(i));
+      });
+      EXPECT_TRUE(st.ok()) << st.ToString();
+    }
+    best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  }  // each batch is destroyed uncommitted: rolled back
+  return best;
+}
+
+// Task 13: every write in a batch takes a savepoint, and TidesDB finds savepoints by name with a linear
+// scan, so unreleased savepoints made a batch O(N^2) in its writes (~16x for 4x the writes). The batch
+// must release them: 4x the writes must cost well under 8x the time. A ratio is build-independent, so the
+// same bound holds under debug and the sanitizers; best-of-3 keeps scheduler noise out of it.
+TEST(TidesStorage, BatchWriteCostIsLinear) {
+  TempDir dir;
+  auto s = MustOpen(OptionsFor(dir));
+  ASSERT_NE(s, nullptr);
+  LockManager locks;
+  SystemClock clock;
+  Engine engine(*s, locks, clock);
+  const double small = BatchWriteSeconds(engine, 4000);
+  const double large = BatchWriteSeconds(engine, 16000);
+  EXPECT_LT(large, 8 * small) << "4000 writes: " << small << " s, 16000 writes: " << large << " s";
 }
 
 }  // namespace

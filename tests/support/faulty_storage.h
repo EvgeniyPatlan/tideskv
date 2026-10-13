@@ -17,6 +17,9 @@ class FaultyStorage final : public Storage {
   std::atomic<int> fail_commit_in{-1};
   std::atomic<int> fail_savepoint_in{-1};
   std::atomic<int> fail_rollback_to_savepoint_in{-1};
+  std::atomic<int> fail_release_savepoint_in{-1};
+  // Successful Savepoint calls minus successful ReleaseSavepoint calls, over every transaction.
+  std::atomic<int> unreleased_savepoints{0};
 
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override {
     auto txn = inner_.BeginWrite();
@@ -56,11 +59,19 @@ class FaultyStorage final : public Storage {
     }
     Status Savepoint(std::string_view n) override {
       if (Trip(owner_.fail_savepoint_in)) return Status::IOError("injected savepoint failure");
-      return inner_->Savepoint(n);
+      Status st = inner_->Savepoint(n);
+      if (st.ok()) ++owner_.unreleased_savepoints;
+      return st;
     }
     Status RollbackToSavepoint(std::string_view n) override {
       if (Trip(owner_.fail_rollback_to_savepoint_in)) return Status::IOError("injected rollback failure");
       return inner_->RollbackToSavepoint(n);
+    }
+    Status ReleaseSavepoint(std::string_view n) override {
+      if (Trip(owner_.fail_release_savepoint_in)) return Status::IOError("injected release failure");
+      Status st = inner_->ReleaseSavepoint(n);
+      if (st.ok()) --owner_.unreleased_savepoints;
+      return st;
     }
     Status Commit() override {
       if (Trip(owner_.fail_commit_in)) return Status::IOError("injected commit failure");

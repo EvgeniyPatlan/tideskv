@@ -227,6 +227,12 @@ class TidesWriteTxn final : public WriteTxn {
     if (rc == TDB_ERR_NOT_FOUND) return Status::NotFound("no savepoint named " + std::string(name));
     return FromTdb(rc, "rollback_to_savepoint");
   }
+  Status ReleaseSavepoint(std::string_view name) override {
+    if (Status st = Check(ValidateSavepointName(name)); !st.ok()) return st;
+    const int rc = tidesdb_txn_release_savepoint(txn_, std::string(name).c_str());
+    if (rc == TDB_ERR_NOT_FOUND) return Status::NotFound("no savepoint named " + std::string(name));
+    return FromTdb(rc, "release_savepoint");
+  }
 
   Status Commit() override {
     if (Status st = Check(Status::Ok()); !st.ok()) return st;

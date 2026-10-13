@@ -56,7 +56,13 @@ class ReadView {
 // BeginRead views and WriteTxn reads observe commits made after the view/transaction
 // was created (read-committed); BeginSnapshot views never do. An Iterator reflects the
 // data as of its creation or newer - callers must not rely on either.
-// Whether a savepoint still exists after RollbackToSavepoint is unspecified; use unique names.
+// Savepoints: use unique names (re-using a live name is unspecified). RollbackToSavepoint(s) undoes the
+// writes made after s and drops the savepoints taken after s; s itself stays (standard SQL), so it can be
+// rolled back to again and must still be released.
+// ReleaseSavepoint(s) forgets s without undoing anything: the writes made since s stay, and the savepoints
+// taken before or after s remain usable. Release savepoints that are no longer needed: TidesDB finds a
+// savepoint by name with a linear scan, so every Savepoint/RollbackToSavepoint/ReleaseSavepoint call is
+// O(live savepoints) there.
 // Reads observe this transaction's own buffered writes. Destroying an unfinished
 // transaction rolls it back. After Commit/Rollback every call returns InvalidArgument.
 class WriteTxn : public ReadView {
@@ -70,6 +76,7 @@ class WriteTxn : public ReadView {
   virtual Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) = 0;
   virtual Status Savepoint(std::string_view name) = 0;
   virtual Status RollbackToSavepoint(std::string_view name) = 0;  // NotFound if unknown
+  virtual Status ReleaseSavepoint(std::string_view name) = 0;     // NotFound if unknown
   virtual Status Commit() = 0;
   virtual Status Rollback() = 0;
 };

@@ -80,11 +80,14 @@ class Engine {
 
    private:
     friend class Engine;
-    Result<uint64_t> Mark();           // savepoint at the current write position; the mark id
-    Status RollbackTo(uint64_t mark);  // undoes the writes (and their modified keys) after the mark
+    Result<uint64_t> Mark();            // savepoint at the current write position; the mark id
+    Status RollbackTo(uint64_t mark);   // undoes the writes (and their modified keys) after the mark
+    Status ReleaseMark(uint64_t mark);  // forgets the newest mark; its writes stay
     Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn, int64_t now_ms);
     Status RunRead(const ReadFn& fn);
     Status RunWrite(const WriteFn& fn, const engine_internal::WriteScope& scope);
+    void UndoWrite(const std::string& savepoint);  // rolls back to and releases a write's savepoint
+    void Release(const std::string& savepoint);    // a failure only warns: a leftover costs speed
     void Unroute();
 
     Engine& engine_;
@@ -106,9 +109,13 @@ class Engine {
   Result<std::unique_ptr<Batch>> BeginBatch();
   bool InBatch() const { return ActiveBatch() != nullptr; }
   // Script-level undo inside the active batch (M5b H3): BatchRollbackTo(mark) undoes every write
-  // made after BatchMark() and forgets their modified keys. kInternal outside a batch.
+  // made after BatchMark() and forgets their modified keys. BatchReleaseMark(mark) drops the newest
+  // mark once it is no longer needed (after a rollback to it too), keeping its writes; release every
+  // mark, since each live one slows down later writes of the batch. kInternal outside a batch, and
+  // for an unknown, released, undone or not-newest mark.
   Result<uint64_t> BatchMark();
   Status BatchRollbackTo(uint64_t mark);
+  Status BatchReleaseMark(uint64_t mark);
 
   // M5b H6: while busy() holds, a call that would wait for the gate returns UserError(busy_reply)
   // instead. busy must be cheap and must not touch the Engine; whoever makes it true then calls

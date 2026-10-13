@@ -1,6 +1,7 @@
 #include "storage/memory_storage.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <utility>
 
@@ -192,6 +193,16 @@ class MemoryWriteTxn final : public WriteTxn {
       if (savepoints_[i].first != name) continue;
       ops_.resize(savepoints_[i].second);
       savepoints_.resize(i + 1);  // keep this savepoint, drop later ones
+      return Status::Ok();
+    }
+    return Status::NotFound("no savepoint named " + std::string(name));
+  }
+
+  Status ReleaseSavepoint(std::string_view name) override {
+    if (Status st = Check(ValidateSavepointName(name)); !st.ok()) return st;
+    for (size_t i = savepoints_.size(); i-- > 0;) {
+      if (savepoints_[i].first != name) continue;
+      savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(i));  // the ops stay
       return Status::Ok();
     }
     return Status::NotFound("no savepoint named " + std::string(name));

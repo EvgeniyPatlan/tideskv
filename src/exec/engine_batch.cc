@@ -46,19 +46,36 @@ Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
     try {
       st = fn(recorder_, now_ms_);
     } catch (...) {
-      if (Status rb = recorder_.RollbackToSavepoint(savepoint); !rb.ok()) broken_ = rb;
+      UndoWrite(savepoint);
       throw;
     }
   }
   if (!st.ok()) {
-    if (Status rb = recorder_.RollbackToSavepoint(savepoint); !rb.ok()) broken_ = rb;
+    UndoWrite(savepoint);
     return st;
   }
+  Release(savepoint);  // keeps TidesDB's savepoint list at (live marks + 1): see storage.h
   const std::span<const DbKey> meta(recorder_.meta_keys());
   std::vector<DbKey> keys =
       ModifiedBy(recorder_.writes() > writes_before, meta.subspan(keys_before), scope, std::move(flushed));
   modified_.insert(modified_.end(), keys.begin(), keys.end());
   return Status::Ok();
+}
+
+// Known TidesDB cost: a rollback that discards ops rebuilds the write set's key index
+// (tidesdb_writeset_truncate), O(batch size) per rollback. Only a command that wrote and then failed pays
+// it; one that failed before writing has nothing to discard.
+void Engine::Batch::UndoWrite(const std::string& savepoint) {
+  if (Status rb = recorder_.RollbackToSavepoint(savepoint); !rb.ok()) {
+    broken_ = rb;
+    return;
+  }
+  Release(savepoint);  // the rollback keeps the target savepoint
+}
+
+void Engine::Batch::Release(const std::string& savepoint) {
+  if (Status st = recorder_.ReleaseSavepoint(savepoint); !st.ok())
+    spdlog::warn("batch savepoint release: {}", st.ToString());
 }
 
 Result<uint64_t> Engine::Batch::Mark() {
@@ -79,6 +96,15 @@ Status Engine::Batch::RollbackTo(uint64_t mark) {
   modified_.resize(marks_[mark].modified);
   marks_.resize(mark + 1);  // later marks were undone with their writes: never roll back to them
   return Status::Ok();
+}
+
+Status Engine::Batch::ReleaseMark(uint64_t mark) {
+  if (mark + 1 != marks_.size()) return Status::Internal("not the newest batch mark");
+  if (!broken_.ok()) return broken_;
+  const Status st = recorder_.ReleaseSavepoint("mark" + std::to_string(marks_[mark].savepoint));
+  if (!st.ok()) return st;
+  marks_.pop_back();  // its writes and modified keys now belong to the mark before it, if any
+  return st;
 }
 
 Status Engine::Batch::Commit() {
