@@ -52,4 +52,6 @@ inline constexpr std::string_view kErrCountNegative = "ERR COUNT can't be negati
 inline constexpr std::string_view kErrMaxlenNegative = "ERR MAXLEN can't be negative";
 inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
+inline constexpr std::string_view kErrCountGreaterThanZero = "ERR count should be greater than 0";
+
 }  // namespace tideskv

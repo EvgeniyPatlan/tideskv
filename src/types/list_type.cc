@@ -33,6 +33,31 @@ Result<std::string> ListElementAt(ReadView& view, const Collection& c, uint64_t 
   return v;
 }
 
+Result<std::string> PopElement(WriteTxn& txn, Collection& c, ListEnd end) {
+  encoding::Metadata& m = c.obj.meta;
+  const uint64_t position = end == ListEnd::kLeft ? 0 : m.size - 1;
+  auto v = ListElementAt(txn, c, position);
+  if (!v.ok()) return v.status();
+  if (Status st = txn.Delete(ColumnFamily::kSubkey, ListElementKey(c, position)); !st.ok()) return st;
+  if (end == ListEnd::kLeft) {
+    ++m.head;
+  } else {
+    --m.tail;
+  }
+  --m.size;
+  return v;
+}
+
+Status PushElement(WriteTxn& txn, Collection& c, ListEnd end, std::string_view value) {
+  encoding::Metadata& m = c.obj.meta;
+  const uint64_t index = end == ListEnd::kLeft ? --m.head : ++m.tail;
+  if (Status st = txn.Put(ColumnFamily::kSubkey, c.SubkeyFor(encoding::EncodeListIndex(index)), value);
+      !st.ok())
+    return st;
+  ++m.size;
+  return Status::Ok();
+}
+
 Status ReadListRange(ReadView& view, const Collection& c, uint64_t from, uint64_t to,
                      std::vector<std::string>* out) {
   auto it = view.NewIterator(ColumnFamily::kSubkey, {ListElementKey(c, from), ListElementKey(c, to + 1)});
@@ -66,16 +91,11 @@ Result<int64_t> ListPush(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::str
                           : OpenCollectionForWrite(txn, oids, db, key, kList, now_ms);
   if (!c.ok()) return c.status();
   if (!c->exists()) return int64_t{0};
-  encoding::Metadata& m = c->obj.meta;
   for (std::string_view v : values) {
-    const uint64_t index = end == ListEnd::kLeft ? --m.head : ++m.tail;
-    if (Status st = txn.Put(ColumnFamily::kSubkey, c->SubkeyFor(encoding::EncodeListIndex(index)), v);
-        !st.ok())
-      return st;
-    ++m.size;
+    if (Status st = PushElement(txn, *c, end, v); !st.ok()) return st;
   }
   if (Status st = SaveCollection(txn, *c); !st.ok()) return st;
-  return static_cast<int64_t>(m.size);
+  return static_cast<int64_t>(c->obj.meta.size);
 }
 
 Result<std::optional<std::vector<std::string>>> ListPop(WriteTxn& txn, uint8_t db, std::string_view key,
@@ -84,22 +104,13 @@ Result<std::optional<std::vector<std::string>>> ListPop(WriteTxn& txn, uint8_t d
   auto c = LoadCollectionForWrite(txn, db, key, kList, now_ms);
   if (!c.ok()) return c.status();
   if (!c->exists()) return Out();
-  encoding::Metadata& m = c->obj.meta;
-  const uint64_t n = std::min<uint64_t>(count, m.size);
+  const uint64_t n = std::min<uint64_t>(count, c->obj.meta.size);
   std::vector<std::string> out;
   out.reserve(n);
   for (uint64_t i = 0; i < n; ++i) {
-    const uint64_t position = end == ListEnd::kLeft ? 0 : m.size - 1;
-    auto v = ListElementAt(txn, *c, position);
+    auto v = PopElement(txn, *c, end);
     if (!v.ok()) return v.status();
-    if (Status st = txn.Delete(ColumnFamily::kSubkey, ListElementKey(*c, position)); !st.ok()) return st;
     out.push_back(std::move(v).value());
-    if (end == ListEnd::kLeft) {
-      ++m.head;
-    } else {
-      --m.tail;
-    }
-    --m.size;
   }
   if (n > 0) {
     if (Status st = SaveCollection(txn, *c); !st.ok()) return st;

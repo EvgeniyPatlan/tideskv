@@ -5,10 +5,14 @@
 #include "commands/all_commands.h"
 #include "commands/cmd_util.h"
 #include "commands/count_args.h"
+#include "commands/list_reply.h"
+#include "commands/numkeys_args.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "types/errors.h"
 #include "types/list_edit.h"
+#include "types/list_move.h"
 
 namespace tideskv {
 namespace {
@@ -88,13 +92,72 @@ void LPos(ExecContext& ctx, const ArgList& argv) {
   for (size_t i = 0; i < n; ++i) ctx.reply.Integer((*found)[i]);
 }
 
+void MoveCommand(ExecContext& ctx, const ArgList& argv, ListEnd from, ListEnd to) {
+  std::optional<std::string> moved;
+  const Status st =
+      ctx.server.engine().Write(ctx.session.db, {argv[1], argv[2]}, [&](WriteTxn& txn, int64_t now_ms) {
+        return MoveInto(ListMove(txn, ctx.server.oids(), ctx.session.db, argv[1], argv[2], from, to, now_ms),
+                        &moved);
+      });
+  if (!st.ok()) return ReplyError(ctx, st);
+  ReplyOptional(ctx, moved);
+}
+
+// LMOVE: both position tokens are checked before any key (redis72-list.md section 2.11).
+void LMove(ExecContext& ctx, const ArgList& argv) {
+  ListEnd from{}, to{};
+  if (Status st = ParseListEndArg(argv[3], &from); !st.ok()) return ReplyError(ctx, st);
+  if (Status st = ParseListEndArg(argv[4], &to); !st.ok()) return ReplyError(ctx, st);
+  MoveCommand(ctx, argv, from, to);
+}
+
+void RPopLPush(ExecContext& ctx, const ArgList& argv) {
+  MoveCommand(ctx, argv, ListEnd::kRight, ListEnd::kLeft);
+}
+
+void LMPop(ExecContext& ctx, const ArgList& argv) {
+  MultiPopArgs a;
+  if (Status st = ParseMultiPop(argv, 1, "LEFT", "RIGHT", &a); !st.ok()) return ReplyError(ctx, st);
+  const auto keys = ArgsFrom(argv, a.first_key, a.first_key + a.num_keys);
+  const ListEnd end = a.second ? ListEnd::kRight : ListEnd::kLeft;
+  std::optional<PoppedFrom> popped;
+  const Status st = ctx.server.engine().Write(ctx.session.db, keys, [&](WriteTxn& txn, int64_t now_ms) {
+    return MoveInto(ListPopFirst(txn, ctx.session.db, keys, end, static_cast<uint64_t>(a.count), now_ms),
+                    &popped);
+  });
+  if (!st.ok()) return ReplyError(ctx, st);
+  ReplyPopped(ctx, popped);
+}
+
 }  // namespace
+
+Status ParseListEndArg(std::string_view arg, ListEnd* out) {
+  if (EqualsIgnoreCase(arg, "left")) {
+    *out = ListEnd::kLeft;
+  } else if (EqualsIgnoreCase(arg, "right")) {
+    *out = ListEnd::kRight;
+  } else {
+    return Status::UserError(std::string(kErrSyntax));
+  }
+  return Status::Ok();
+}
+
+void ReplyPopped(ExecContext& ctx, const std::optional<PoppedFrom>& popped) {
+  if (!popped) return ctx.reply.NullArray();
+  ctx.reply.ArrayHeader(2);
+  ctx.reply.Bulk(popped->key);
+  ctx.reply.ArrayHeader(popped->values.size());
+  for (const std::string& v : popped->values) ctx.reply.Bulk(v);
+}
 
 void RegisterListEditCommands(CommandRegistry& r) {
   r.Register({"linsert", 5, kCmdWrite, 1, 1, 1, &LInsert});
   r.Register({"lrem", 4, kCmdWrite, 1, 1, 1, &LRem});
   r.Register({"ltrim", 4, kCmdWrite, 1, 1, 1, &LTrim});
   r.Register({"lpos", -3, kCmdReadOnly, 1, 1, 1, &LPos});
+  r.Register({"lmove", 5, kCmdWrite, 1, 2, 1, &LMove});
+  r.Register({"rpoplpush", 3, kCmdWrite, 1, 2, 1, &RPopLPush});
+  r.Register({"lmpop", -4, kCmdWrite, 0, 0, 0, &LMPop});  // keynum-based key spec
 }
 
 }  // namespace tideskv

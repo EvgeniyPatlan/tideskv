@@ -41,6 +41,11 @@ Result<std::vector<std::string>> ListRange(ReadView& view, uint8_t db, std::stri
 std::string ListElementKey(const Collection& c, uint64_t position);  // position 0 = leftmost
 // Corruption if the element is missing (meta.size promised it).
 Result<std::string> ListElementAt(ReadView& view, const Collection& c, uint64_t position);
+// Removes and returns the element at `end` of the non-empty list c, updating c.obj.meta (the caller
+// saves the collection).
+Result<std::string> PopElement(WriteTxn& txn, Collection& c, ListEnd end);
+// Writes value at `end` of c, updating c.obj.meta (the caller saves the collection).
+Status PushElement(WriteTxn& txn, Collection& c, ListEnd end, std::string_view value);
 // Appends the values at positions [from, to] (inclusive, from <= to < size) to *out, left to right.
 Status ReadListRange(ReadView& view, const Collection& c, uint64_t from, uint64_t to,
                      std::vector<std::string>* out);
