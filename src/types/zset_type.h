@@ -15,6 +15,13 @@
 // Sorted-set logic (spec §4.4, M4 plan F2) on the collection layer:
 //   subkey [prefix][member] -> raw score (8 bytes BE), zscore [prefix][EncodeScore(score)][member] -> "".
 // Stored scores are normalised (-0 -> 0). WRONGTYPE for a live key of another type.
+//
+// Known cost, deferred to M8 (M4 final review): pops and removals leave point tombstones in the
+// zscore CF; scans that start at the low end (ZPOPMIN, BZPOPMIN, ZRANGE 0 n, ZRANK) step over them
+// until TidesDB compacts, so head operations slow down roughly linearly with prior pops (~10 ms/op
+// after 55k pops on a 60k zset). M8: tombstone-aware zscore compaction or an order-statistics
+// structure. Bulk ZPOPMIN n / ZREM of many members in one command is also superlinear in n (M8, with
+// E7).
 namespace tideskv {
 
 struct ZAddFlags {
@@ -61,7 +68,8 @@ Status PutMember(WriteTxn& txn, Collection& c, std::string_view member, double s
 Status DeleteMember(WriteTxn& txn, Collection& c, std::string_view member, double score);
 
 using ScoredFn = std::function<Result<bool>(double score, std::string_view member)>;  // false: stop
-// Every member in (score, member) order, or the reverse.
+// Every member in (score, member) order, or the reverse. From the low end this steps over the zscore
+// tombstones left by earlier pops/removals (see the file header: known cost, deferred to M8).
 Status ForEachByScore(ReadView& view, const Collection& c, bool reverse, const ScoredFn& fn);
 // Members whose score is in `range`, ascending (or descending with reverse); an empty range visits nothing.
 Status ForEachInScoreRange(ReadView& view, const Collection& c, const ScoreRange& range, bool reverse,
