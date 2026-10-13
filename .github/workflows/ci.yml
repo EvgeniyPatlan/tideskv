@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   schedule:
     - cron: "0 2 * * *"
@@ -21,7 +21,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
+          sudo apt-get install -y ninja-build clang-18 llvm-18 libclang-rt-18-dev liblz4-dev libzstd-dev
       - name: Allow TSan memory mappings (Ubuntu 24.04 kernels)
         if: matrix.preset == 'tsan'
         run: sudo sysctl vm.mmap_rnd_bits=28
@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
+          sudo apt-get install -y ninja-build clang-18 llvm-18 libclang-rt-18-dev liblz4-dev libzstd-dev
       - run: scripts/coverage.sh
         env:
           TIDESKV_CMAKE_ARGS: -DTIDESKV_WERROR=ON
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang-18 llvm-18 liblz4-dev libzstd-dev
+          sudo apt-get install -y ninja-build clang-18 llvm-18 libclang-rt-18-dev liblz4-dev libzstd-dev
       - run: cmake --preset fuzz -DTIDESKV_WERROR=ON && cmake --build --preset fuzz -j --target resp_parser_fuzz
       - run: mkdir -p corpus && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=1800 -max_len=65536
 
