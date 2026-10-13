@@ -21,7 +21,8 @@ struct WatchRegistryTest : ::testing::Test {
   }
   void Touch(uint8_t db, const std::string& key) {
     auto v = storage.BeginRead();
-    reg.OnModified({{db, key}}, v->get());
+    ReadView* view = v->get();
+    reg.OnModified({{db, key}}, [view] { return view; });
   }
 };
 
@@ -113,7 +114,7 @@ TEST_F(WatchRegistryTest, ExpiredFlagSetAfterRegistrationKeepsStaleKeySemantics)
 
 TEST_F(WatchRegistryTest, NullViewCountsAsExisting) {
   reg.Watch(a, 0, "k", true);
-  reg.OnModified({{0, "k"}}, nullptr);
+  reg.OnModified({{0, "k"}}, [] { return static_cast<ReadView*>(nullptr); });
   EXPECT_TRUE(a->dirty());
 }
 

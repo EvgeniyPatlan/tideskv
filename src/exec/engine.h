@@ -22,8 +22,8 @@ namespace engine_internal {
 struct WriteScope;
 }
 
-// The only path from commands to storage (spec §5.1). M5 swaps in the per-worker
-// ExclusiveGate and M6 adds the Sequencer and replog here; command code never changes.
+// The only path from commands to storage (spec §5.1). M6 adds the Sequencer and replog here; command code
+// never changes.
 //
 // Lock order: the Gate is always taken before any key stripe. The Gate is not re-entrant,
 // so a ReadFn/WriteFn must never call back into the Engine (debug builds assert this).
@@ -104,6 +104,7 @@ class Engine {
   Status RunTxn(const WriteFn& fn, const engine_internal::WriteScope& scope);
   // Flushed-db keys to report (G2); empty unless scope.flushed_dbs and a non-idle observer.
   Status CollectFlushed(ReadView& view, const engine_internal::WriteScope& scope, std::vector<DbKey>* out);
+  bool Observing() const { return observer_ != nullptr && !observer_->Idle(); }
   void Report(const std::vector<DbKey>& keys);  // under the gate, after commit
 
   Storage& storage_;

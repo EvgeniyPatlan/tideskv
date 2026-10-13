@@ -70,9 +70,17 @@ Status Engine::CollectFlushed(ReadView& view, const WriteScope& scope, std::vect
 
 void Engine::Report(const std::vector<DbKey>& keys) {
   if (observer_ == nullptr || keys.empty() || observer_->Idle()) return;
-  auto view = storage_.BeginRead();
-  if (!view.ok()) spdlog::warn("watch report without a committed view: {}", view.status().ToString());
-  observer_->OnModified(keys, view.ok() ? view->get() : nullptr);
+  Result<std::unique_ptr<ReadView>> view = Status::Internal("committed view not opened");
+  bool opened = false;
+  const CommittedViewFn committed = [&]() -> ReadView* {  // opened only if the observer must probe a key
+    if (!opened) {
+      opened = true;
+      view = storage_.BeginRead();
+      if (!view.ok()) spdlog::warn("watch report without a committed view: {}", view.status().ToString());
+    }
+    return view.ok() ? view->get() : nullptr;
+  };
+  observer_->OnModified(keys, committed);
 }
 
 Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
@@ -89,7 +97,9 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
     st = recorder.Commit();
     if (st.ok()) {
       if (listener_ != nullptr && !recorder.deletes().empty()) listener_->OnCommitted(recorder.deletes());
-      Report(ModifiedBy(recorder.writes() > 0, recorder.meta_keys(), scope, std::move(flushed)));
+      if (Observing()) {
+        Report(ModifiedBy(recorder.writes() > 0, recorder.meta_keys(), scope, std::move(flushed)));
+      }
     }
     if (st.code() != StatusCode::kConflict) return st;
     // Key locks make conflicts impossible (invariant I1), so one indicates a bug.

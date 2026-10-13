@@ -76,9 +76,11 @@ Status Engine::Batch::Commit() {
   }
   if (engine_.listener_ != nullptr && !recorder_.deletes().empty())
     engine_.listener_->OnCommitted(recorder_.deletes());
-  std::sort(modified_.begin(), modified_.end());
-  modified_.erase(std::unique(modified_.begin(), modified_.end()), modified_.end());
-  engine_.Report(modified_);
+  if (engine_.Observing()) {
+    std::sort(modified_.begin(), modified_.end());
+    modified_.erase(std::unique(modified_.begin(), modified_.end()), modified_.end());
+    engine_.Report(modified_);
+  }
   return st;
 }
 

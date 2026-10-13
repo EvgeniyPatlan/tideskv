@@ -19,7 +19,7 @@ using test::FakeClock;
 class Observer final : public WriteObserver {
  public:
   bool Idle() const override { return false; }
-  void OnModified(const std::vector<DbKey>& keys, ReadView*) override {
+  void OnModified(const std::vector<DbKey>& keys, const CommittedViewFn&) override {
     reported.insert(reported.end(), keys.begin(), keys.end());
   }
   std::vector<std::string> ExistingWatched(uint8_t, ReadView&) override { return {}; }

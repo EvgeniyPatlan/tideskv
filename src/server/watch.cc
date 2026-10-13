@@ -87,7 +87,7 @@ std::vector<DbKey> WatchRegistry::KeysWatchedLive(const WatchClient& client) con
   return out;
 }
 
-void WatchRegistry::OnModified(const std::vector<DbKey>& keys, ReadView* committed) {
+void WatchRegistry::OnModified(const std::vector<DbKey>& keys, const CommittedViewFn& committed) {
   for (const DbKey& k : keys) {
     const std::string mk = MapKey(k.db, k.key);
     Shard& s = ShardFor(mk);
@@ -99,7 +99,8 @@ void WatchRegistry::OnModified(const std::vector<DbKey>& keys, ReadView* committ
     for (Entry& e : it->second) {
       if (e.expired) {
         if (!probed) {
-          exists = committed == nullptr || MetaExists(*committed, k.db, k.key);
+          ReadView* view = committed();
+          exists = view == nullptr || MetaExists(*view, k.db, k.key);
           probed = true;
         }
         if (!exists) {  // the stale key was deleted: no logical change (multi.c:393-402)

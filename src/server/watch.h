@@ -45,7 +45,7 @@ class WatchRegistry final : public WriteObserver {
   size_t size() const { return entries_.load(); }  // registered (client, key) pairs
 
   bool Idle() const override { return entries_.load() == 0; }
-  void OnModified(const std::vector<DbKey>& keys, ReadView* committed) override;
+  void OnModified(const std::vector<DbKey>& keys, const CommittedViewFn& committed) override;
   std::vector<std::string> ExistingWatched(uint8_t db, ReadView& view) override;
 
  private:

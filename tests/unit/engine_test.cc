@@ -303,9 +303,9 @@ TEST(EngineListener, ReportsCommittedRangeDeletesOnly) {
 class RecordingObserver final : public WriteObserver {
  public:
   bool Idle() const override { return !watching; }
-  void OnModified(const std::vector<DbKey>& keys, ReadView* committed) override {
+  void OnModified(const std::vector<DbKey>& keys, const CommittedViewFn& committed) override {
     reports.push_back(keys);
-    had_view = committed != nullptr;
+    had_view = committed() != nullptr;
   }
   std::vector<std::string> ExistingWatched(uint8_t db, ReadView& view) override {
     std::vector<std::string> out;
@@ -434,7 +434,7 @@ TEST(Engine, ReportHappensBeforeTheGateIsReleased) {
   FakeClock clock;
   struct SlowObserver final : WriteObserver {
     bool Idle() const override { return false; }
-    void OnModified(const std::vector<DbKey>&, ReadView*) override {
+    void OnModified(const std::vector<DbKey>&, const CommittedViewFn&) override {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       reported = true;
     }
