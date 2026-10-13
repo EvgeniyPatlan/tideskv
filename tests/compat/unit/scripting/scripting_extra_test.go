@@ -56,7 +56,7 @@ func TestScriptingWireFormat(t *testing.T) {
 
 	t.Run("Nil stops a table reply, false does not; large numbers keep their precision", func(t *testing.T) {
 		require.Equal(t, "*1", send(t, `return {1,nil,3}`))
-		require.Equal(t, ":1", func() string { l, _ := c.ReadLine(); return l }())
+		c.MustRead(t, ":1")
 		require.Equal(t, "*3", send(t, `return {1,false,3}`))
 		c.MustRead(t, ":1")
 		c.MustRead(t, "$-1")
@@ -130,14 +130,14 @@ func TestScriptingErrors(t *testing.T) {
 
 		compile := evalErr(ctx, rdb, `local a b`)
 		require.Regexp(t, `^ERR Error compiling script \(new function\): user_script:1: .*near`, compile)
-		sha := rdb.Do(ctx, "SCRIPT", "LOAD", `return 'ok'`).Val().(string)
-		require.Len(t, sha, 40)
 		loadErr := rdb.Do(ctx, "SCRIPT", "LOAD", `local a b`).Err()
 		require.Regexp(t, `^ERR Error compiling script \(new function\): user_script:1: `, loadErr.Error())
-		// the failed compile is not cached
-		exists, err := rdb.ScriptExists(ctx, "5a1f3b8ef2dc5a7a1b2c3d4e5f60718293a4b5c6").Result()
+		// neither the failed EVAL nor the failed SCRIPT LOAD cached the body
+		failedSha := sha1hex(ctx, t, rdb, `local a b`)
+		exists, err := rdb.ScriptExists(ctx, failedSha).Result()
 		require.NoError(t, err)
 		require.Equal(t, []bool{false}, exists)
+		require.EqualError(t, rdb.EvalSha(ctx, failedSha, nil).Err(), noscript)
 	})
 
 	t.Run("numkeys and arity errors", func(t *testing.T) {
@@ -150,6 +150,25 @@ func TestScriptingErrors(t *testing.T) {
 		require.EqualError(t, rdb.Do(ctx, "EVAL", "", "0").Err(), redis.Nil.Error())
 		// the EVALSHA length check wins over the numkeys check
 		require.EqualError(t, rdb.Do(ctx, "EVALSHA", "short", "bogus").Err(), "NOSCRIPT No matching script. Please use EVAL.")
+	})
+
+	t.Run("luaL_error style errors carry the user_script:N: position prefix", func(t *testing.T) {
+		const suffix = ` script: [0-9a-f]{40}, on @user_script:1\.$`
+		require.Regexp(t, `^ERR user_script:1: Script attempted to access nonexistent global variable 'x'`+suffix,
+			evalErr(ctx, rdb, `return x`))
+		require.Regexp(t, `^ERR user_script:1: Script attempted to access nonexistent global variable 'print'`+suffix,
+			evalErr(ctx, rdb, `return print`))
+		require.Regexp(t, `^ERR user_script:1: wrong number of arguments`+suffix, evalErr(ctx, rdb, `return math.random(1,2,3)`))
+		require.Regexp(t, `^ERR user_script:1: bad argument #1 to 'random' \(interval is empty\)`+suffix,
+			evalErr(ctx, rdb, `return math.random(0)`))
+		require.Regexp(t, `^ERR user_script:1: bad argument #2 to 'random' \(interval is empty\)`+suffix,
+			evalErr(ctx, rdb, `return math.random(2,1)`))
+		require.Regexp(t, `^ERR user_script:1: bad argument #1 to 'randomseed' \(number expected, got string\)`+suffix,
+			evalErr(ctx, rdb, `math.randomseed('x')`))
+		// helpers that push an error table (luaPushError) have no position prefix
+		require.Regexp(t, `^ERR wrong number of arguments`+suffix, evalErr(ctx, rdb, `return redis.sha1hex()`))
+		// the readonly-table error comes from the VM and has the prefix
+		require.Regexp(t, `^ERR user_script:1: Attempt to modify a readonly table`+suffix, evalErr(ctx, rdb, `x=1`))
 	})
 
 	t.Run("Lua library argument errors", func(t *testing.T) {
@@ -294,8 +313,8 @@ func TestScriptingSandbox(t *testing.T) {
 	})
 
 	t.Run("redis.REDIS_VERSION, replicate_commands and set_repl", func(t *testing.T) {
-		// tideskv: only the major.minor family is asserted; TidesKV reports 7.2.0, Redis 7.2.x higher
-		require.Regexp(t, `^7\.2\.[0-9]+$`, rdb.Eval(ctx, `return redis.REDIS_VERSION`, nil).Val())
+		// tideskv: TidesKV reports exactly "7.2.0" (ruled value); live Redis 7.2.5 reports "7.2.5"
+		require.Equal(t, "7.2.0", rdb.Eval(ctx, `return redis.REDIS_VERSION`, nil).Val())
 		num := rdb.Eval(ctx, `return redis.REDIS_VERSION_NUM`, nil).Val().(int64)
 		require.GreaterOrEqual(t, num, int64(0x070200))
 		require.Less(t, num, int64(0x070300))
