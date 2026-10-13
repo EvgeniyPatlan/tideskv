@@ -20,3 +20,12 @@ The Apache Software Foundation (http://www.apache.org/).
 third_party/fpconv/ is copied unmodified from Redis 7.2.5 deps/fpconv (https://github.com/redis/redis,
 tag 7.2.5), which is based on night-shift/fpconv and Florian Loitsch's Grisu algorithm. It is licensed
 under the Boost Software License 1.0; see third_party/fpconv/LICENSE.txt.
+
+third_party/lua/ is copied from Redis 7.2.16 deps/lua (https://github.com/redis/redis, tag 7.2.16, BSD-3-Clause,
+see third_party/lua/LICENSE.redis). It contains PUC-Rio Lua 5.1.5 (MIT, see third_party/lua/COPYRIGHT) with
+Redis's modifications, lua-cjson 2.1.0 with its strbuf and fpconv helpers (MIT, Mark Pulford), lua-cmsgpack 0.4.0
+(Salvatore Sanfilippo), LuaBitOp 1.0.2 (MIT, Mike Pall) and lua-struct (MIT, Lua.org); their licence notices are in
+the source files. Modifications are marked with "tideskv:" comments.
+
+third_party/sha1/ is copied from Redis 7.2.16 src/sha1.c and src/sha1.h (SHA-1 in C by Steve Reid, public
+domain). Modifications are marked with "tideskv:" comments.
