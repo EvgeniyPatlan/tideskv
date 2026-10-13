@@ -72,6 +72,17 @@ TEST_F(ScanCmds, MatchAndType) {
   EXPECT_EQ(FullScan({"MATCH", "*"}).size(), 4u);
 }
 
+TEST_F(ScanCmds, TypeListAndZset) {
+  h.Run({"RPUSH", "l1", "a"});
+  h.Run({"LPUSH", "l2", "b"});
+  h.Run({"ZADD", "z", "1", "m"});
+  h.Run({"SADD", "s", "m"});
+  h.Run({"SET", "str", "v"});
+  EXPECT_EQ(FullScan({"TYPE", "list"}), (std::multiset<std::string>{"l1", "l2"}));
+  EXPECT_EQ(FullScan({"TYPE", "zset"}), std::multiset<std::string>{"z"});
+  EXPECT_EQ(FullScan({"TYPE", "ZSET", "MATCH", "l*"}), std::multiset<std::string>{});
+}
+
 TEST_F(ScanCmds, SkipsExpiredAndStaysInItsDb) {  // Review Focus #1
   EXPECT_EQ(Run({"SET", "live", "v"}), kOk);
   EXPECT_EQ(Run({"SET", "dead", "v", "PX", "1"}), kOk);

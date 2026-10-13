@@ -146,6 +146,22 @@ TEST_F(BlockingListCmds, CommandsWritingTheDestinationServeItsWaiter) {
   }
 }
 
+// FLUSHALL, FLUSHDB and DEL drop the key, not the wait: the client stays blocked until a later push.
+TEST_F(BlockingListCmds, StaysBlockedAcrossFlushAndDelThenServedByALaterPush) {
+  EXPECT_EQ(h.Run({"BLPOP", "k", "0"}), "");
+  SecondClient other(h);
+  for (const ArgList& wipe : std::vector<ArgList>{{"FLUSHALL"}, {"FLUSHDB"}, {"DEL", "k"}}) {
+    SCOPED_TRACE(wipe.front());
+    EXPECT_EQ(other.Run({"SET", "k", "v"}), kOk);  // something for the wipe to remove
+    EXPECT_EQ(other.Run(wipe), wipe.front() == "DEL" ? Int(1) : kOk);
+    EXPECT_TRUE(h.TakeUnblocked().empty());
+    EXPECT_EQ(h.services.blocking_.blocked_clients(), 1u);
+  }
+  EXPECT_EQ(other.Run({"RPUSH", "k", "late"}), Int(1));
+  EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("k"), Bulk("late")})}));
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
+}
+
 TEST_F(BlockingListCmds, BlmpopServedTakesUpToCount) {
   EXPECT_EQ(h.Run({"BLMPOP", "0", "2", "a", "b", "LEFT", "COUNT", "5"}), "");
   SecondClient other(h);
