@@ -22,8 +22,8 @@ void PushCommand(ExecContext& ctx, const ArgList& argv, ListEnd end, bool only_i
   const auto values = ArgsFrom(argv, 2);
   int64_t len = 0;
   const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
-    return MoveInto(ListPush(txn, ctx.server.oids(), ctx.session.db, argv[1], end, values, only_if_exists, now_ms),
-                    &len);
+    return MoveInto(
+        ListPush(txn, ctx.server.oids(), ctx.session.db, argv[1], end, values, only_if_exists, now_ms), &len);
   });
   if (ok) ctx.reply.Integer(len);
 }
@@ -44,7 +44,8 @@ void PopCommand(ExecContext& ctx, const ArgList& argv, ListEnd end, std::string_
   }
   std::optional<std::vector<std::string>> popped;
   const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
-    return MoveInto(ListPop(txn, ctx.session.db, argv[1], end, static_cast<uint64_t>(count), now_ms), &popped);
+    return MoveInto(ListPop(txn, ctx.session.db, argv[1], end, static_cast<uint64_t>(count), now_ms),
+                    &popped);
   });
   if (!ok) return;
   if (!popped) return has_count ? ctx.reply.NullArray() : ctx.reply.Null();

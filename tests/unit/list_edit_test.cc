@@ -34,12 +34,14 @@ struct ListEditTest : ::testing::Test {
   }
   int64_t Insert(InsertWhere where, std::string_view pivot, std::string_view value) {
     int64_t n = 0;
-    EXPECT_TRUE(Write([&](WriteTxn& t) { return MoveInto(ListInsert(t, 0, "l", where, pivot, value, 0), &n); }).ok());
+    EXPECT_TRUE(
+        Write([&](WriteTxn& t) { return MoveInto(ListInsert(t, 0, "l", where, pivot, value, 0), &n); }).ok());
     return n;
   }
   int64_t Remove(int64_t count, std::string_view value) {
     int64_t n = 0;
-    EXPECT_TRUE(Write([&](WriteTxn& t) { return MoveInto(ListRemove(t, 0, "l", count, value, 0), &n); }).ok());
+    EXPECT_TRUE(
+        Write([&](WriteTxn& t) { return MoveInto(ListRemove(t, 0, "l", count, value, 0), &n); }).ok());
     return n;
   }
   std::optional<Positions> Pos(std::string_view value, ListPosOptions o) {

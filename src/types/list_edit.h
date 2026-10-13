@@ -25,9 +25,9 @@ Result<int64_t> ListRemove(WriteTxn& txn, uint8_t db, std::string_view key, int6
 Status ListTrim(WriteTxn& txn, uint8_t db, std::string_view key, int64_t start, int64_t stop, int64_t now_ms);
 
 struct ListPosOptions {
-  int64_t rank = 1;             // != 0; negative scans from the right
+  int64_t rank = 1;                             // != 0; negative scans from the right
   std::optional<int64_t> count = std::nullopt;  // absent: one match; 0: every match
-  int64_t maxlen = 0;           // elements to examine; 0 = all
+  int64_t maxlen = 0;                           // elements to examine; 0 = all
 };
 // LPOS: nullopt for a missing key; otherwise the matching positions (counted from the left) in scan
 // order, starting at the rank-th match: at most one without COUNT.

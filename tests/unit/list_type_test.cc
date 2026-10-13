@@ -26,9 +26,8 @@ struct ListTypeTest : ::testing::Test {
 
   int64_t Push(ListEnd end, std::vector<std::string_view> values, bool xx = false) {
     int64_t n = -1;
-    EXPECT_TRUE(Write([&](WriteTxn& t) {
-                  return MoveInto(ListPush(t, oids, 0, "l", end, values, xx, 0), &n);
-                }).ok());
+    EXPECT_TRUE(
+        Write([&](WriteTxn& t) { return MoveInto(ListPush(t, oids, 0, "l", end, values, xx, 0), &n); }).ok());
     return n;
   }
   std::optional<Strings> Pop(ListEnd end, uint64_t count) {
@@ -96,7 +95,8 @@ TEST_F(ListTypeTest, IndexAndSet) {
   EXPECT_EQ(*ListIndex(**view, 0, "nokey", "x", 0), std::nullopt);  // the key is looked up first
   EXPECT_TRUE(Write([](WriteTxn& t) { return ListSet(t, 0, "l", "-2", "B", 0); }).ok());
   EXPECT_EQ(Range(0, -1), (Strings{"a", "B", "c"}));
-  EXPECT_EQ(Write([](WriteTxn& t) { return ListSet(t, 0, "l", "3", "x", 0); }).message(), kErrIndexOutOfRange);
+  EXPECT_EQ(Write([](WriteTxn& t) { return ListSet(t, 0, "l", "3", "x", 0); }).message(),
+            kErrIndexOutOfRange);
   EXPECT_EQ(Write([](WriteTxn& t) { return ListSet(t, 0, "nokey", "x", "v", 0); }).message(), kErrNoSuchKey);
 }
 
@@ -119,8 +119,9 @@ TEST_F(ListTypeTest, WrongType) {
               }).ok());
   auto view = storage.BeginRead();
   EXPECT_EQ(ListLen(**view, 0, "l", 0).status().message(), kErrWrongType);
-  EXPECT_EQ(Write([&](WriteTxn& t) { return ListPush(t, oids, 0, "l", ListEnd::kLeft, {"a"}, false, 0).status(); })
-                .message(),
+  EXPECT_EQ(Write([&](WriteTxn& t) {
+              return ListPush(t, oids, 0, "l", ListEnd::kLeft, {"a"}, false, 0).status();
+            }).message(),
             kErrWrongType);
 }
 

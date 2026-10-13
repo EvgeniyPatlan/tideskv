@@ -69,7 +69,8 @@ Result<int64_t> ListPush(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::str
   encoding::Metadata& m = c->obj.meta;
   for (std::string_view v : values) {
     const uint64_t index = end == ListEnd::kLeft ? --m.head : ++m.tail;
-    if (Status st = txn.Put(ColumnFamily::kSubkey, c->SubkeyFor(encoding::EncodeListIndex(index)), v); !st.ok())
+    if (Status st = txn.Put(ColumnFamily::kSubkey, c->SubkeyFor(encoding::EncodeListIndex(index)), v);
+        !st.ok())
       return st;
     ++m.size;
   }

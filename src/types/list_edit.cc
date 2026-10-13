@@ -15,10 +15,13 @@ namespace {
 constexpr auto kList = encoding::ValueType::kList;
 constexpr uint64_t kBatch = 1024;  // elements per iterator pass (as M3 RehomeEntries)
 
-std::string KeyAt(const Collection& c, uint64_t index) { return c.SubkeyFor(encoding::EncodeListIndex(index)); }
+std::string KeyAt(const Collection& c, uint64_t index) {
+  return c.SubkeyFor(encoding::EncodeListIndex(index));
+}
 
 // Reads the values at absolute indexes [lo, hi] (ascending), closing the iterator before returning.
-Status ReadIndexes(ReadView& view, const Collection& c, uint64_t lo, uint64_t hi, std::vector<std::string>* out) {
+Status ReadIndexes(ReadView& view, const Collection& c, uint64_t lo, uint64_t hi,
+                   std::vector<std::string>* out) {
   out->clear();
   auto it = view.NewIterator(ColumnFamily::kSubkey, {KeyAt(c, lo), KeyAt(c, hi + 1)});
   if (!it.ok()) return it.status();
@@ -158,7 +161,8 @@ Result<int64_t> ListRemove(WriteTxn& txn, uint8_t db, std::string_view key, int6
   return static_cast<int64_t>(removed);
 }
 
-Status ListTrim(WriteTxn& txn, uint8_t db, std::string_view key, int64_t start, int64_t stop, int64_t now_ms) {
+Status ListTrim(WriteTxn& txn, uint8_t db, std::string_view key, int64_t start, int64_t stop,
+                int64_t now_ms) {
   auto c = LoadCollectionForWrite(txn, db, key, kList, now_ms);
   if (!c.ok()) return c.status();
   if (!c->exists()) return Status::Ok();
@@ -191,7 +195,8 @@ Result<std::optional<std::vector<int64_t>>> ListPos(ReadView& view, uint8_t db, 
   if (!c->exists()) return Out();
   const bool from_right = opts.rank < 0;
   const uint64_t skip = (from_right ? 0 - static_cast<uint64_t>(opts.rank) : opts.rank) - 1;
-  const uint64_t want = !opts.count ? 1 : (*opts.count == 0 ? UINT64_MAX : static_cast<uint64_t>(*opts.count));
+  const uint64_t want =
+      !opts.count ? 1 : (*opts.count == 0 ? UINT64_MAX : static_cast<uint64_t>(*opts.count));
   std::vector<int64_t> out;
   uint64_t seen = 0, matches = 0;
   Status st = Walk(view, *c, from_right, [&](uint64_t pos, const std::string& v) -> Result<bool> {
