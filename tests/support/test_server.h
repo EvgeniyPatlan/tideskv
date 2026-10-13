@@ -17,7 +17,9 @@ namespace tideskv::test {
 class TestServer {
  public:
   struct Options {
-    std::vector<std::string> extra_args;                   // appended last, so they override defaults
+    // appended last, so they override defaults; must not redirect or silence the log: readiness reads
+    // "ready to accept connections" from it
+    std::vector<std::string> extra_args;
     std::string dir;                                       // data dir; empty = a private temp dir
     uint16_t port = 0;                                     // 0 = a free port
     bool wait_ready = true;                                // wait until the server answers
@@ -44,6 +46,7 @@ class TestServer {
 
  private:
   static int DecodeStatus(int status);
+  void Spawn(const std::string& binary, const Options& options);
   bool WaitReady(std::chrono::milliseconds timeout);
   static uint16_t FreePort();
 
