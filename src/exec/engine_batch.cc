@@ -13,7 +13,8 @@ using engine_internal::ModifiedBy;
 using engine_internal::ReentryCheck;
 using engine_internal::WriteScope;
 
-Engine::Batch::Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn, int64_t now_ms)
+Engine::Batch::Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn,
+                     int64_t now_ms)
     : engine_(engine), gate_(std::move(gate)), txn_(std::move(txn)), recorder_(*txn_), now_ms_(now_ms) {}
 
 Engine::Batch::~Batch() {
@@ -41,7 +42,14 @@ Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
   if (scope.also_modified != nullptr) scope.also_modified->clear();
   std::vector<DbKey> flushed;
   Status st = engine_.CollectFlushed(recorder_, scope, &flushed);
-  if (st.ok()) st = fn(recorder_, now_ms_);
+  if (st.ok()) {
+    try {
+      st = fn(recorder_, now_ms_);
+    } catch (...) {
+      if (Status rb = recorder_.RollbackToSavepoint(savepoint); !rb.ok()) broken_ = rb;
+      throw;
+    }
+  }
   if (!st.ok()) {
     if (Status rb = recorder_.RollbackToSavepoint(savepoint); !rb.ok()) broken_ = rb;
     return st;
@@ -58,12 +66,16 @@ Status Engine::Batch::Commit() {
   done_ = true;
   Unroute();
   if (!broken_.ok()) {
-    (void)recorder_.Rollback();
+    if (Status rb = recorder_.Rollback(); !rb.ok()) spdlog::warn("batch rollback: {}", rb.ToString());
     return broken_;
   }
   Status st = recorder_.Commit();  // no retry: the queued commands' replies are already written
-  if (!st.ok()) return st;
-  if (engine_.listener_ != nullptr && !recorder_.deletes().empty()) engine_.listener_->OnCommitted(recorder_.deletes());
+  if (!st.ok()) {
+    if (Status rb = recorder_.Rollback(); !rb.ok()) spdlog::warn("batch rollback: {}", rb.ToString());
+    return st;
+  }
+  if (engine_.listener_ != nullptr && !recorder_.deletes().empty())
+    engine_.listener_->OnCommitted(recorder_.deletes());
   std::sort(modified_.begin(), modified_.end());
   modified_.erase(std::unique(modified_.begin(), modified_.end()), modified_.end());
   engine_.Report(modified_);

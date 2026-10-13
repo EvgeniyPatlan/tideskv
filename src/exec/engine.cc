@@ -15,8 +15,9 @@ using engine_internal::ReentryCheck;
 using engine_internal::WriteScope;
 
 Engine::Batch* Engine::ActiveBatch() const {
-  return engine_internal::t_batch != nullptr && &engine_internal::t_batch->engine_ == this ? engine_internal::t_batch
-                                                                                          : nullptr;
+  return engine_internal::t_batch != nullptr && &engine_internal::t_batch->engine_ == this
+             ? engine_internal::t_batch
+             : nullptr;
 }
 
 int64_t Engine::NowMs() const {

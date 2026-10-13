@@ -335,9 +335,12 @@ struct ObservedEngine : ::testing::Test {
 };
 
 TEST_F(ObservedEngine, OneKeyWriteReportsItsKeyAfterCommit) {
-  ASSERT_TRUE(engine.Write(2, {"k"}, [](WriteTxn& t, int64_t) {
-                return t.Put(ColumnFamily::kSubkey, "x", "v");  // no meta write: rule (b)
-              }).ok());
+  ASSERT_TRUE(engine
+                  .Write(2, {"k"},
+                         [](WriteTxn& t, int64_t) {
+                           return t.Put(ColumnFamily::kSubkey, "x", "v");  // no meta write: rule (b)
+                         })
+                  .ok());
   ASSERT_EQ(observer.reports.size(), 1u);
   EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{2, "k"}}));
   EXPECT_TRUE(observer.had_view);
@@ -349,27 +352,38 @@ TEST_F(ObservedEngine, WriteThatWritesNothingReportsNothing) {
 }
 
 TEST_F(ObservedEngine, FailedWriteReportsNothing) {
-  EXPECT_FALSE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
-                 EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v").ok());
-                 return Status::UserError("ERR nope");
-               }).ok());
+  EXPECT_FALSE(engine
+                   .Write(0, {"k"},
+                          [](WriteTxn& t, int64_t) {
+                            EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v").ok());
+                            return Status::UserError("ERR nope");
+                          })
+                   .ok());
   EXPECT_TRUE(observer.reports.empty());
 }
 
 TEST_F(ObservedEngine, MultiKeyWriteReportsOnlyKeysWhoseMetaChanged) {
-  ASSERT_TRUE(engine.Write(0, {"src", "dst"}, [](WriteTxn& t, int64_t) {
-                return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "dst"), "v");
-              }).ok());
+  ASSERT_TRUE(engine
+                  .Write(0, {"src", "dst"},
+                         [](WriteTxn& t, int64_t) {
+                           return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "dst"), "v");
+                         })
+                  .ok());
   ASSERT_EQ(observer.reports.size(), 1u);
   EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{0, "dst"}}));
 }
 
 TEST_F(ObservedEngine, AlsoModifiedIsReportedEvenWithoutWrites) {
   std::vector<std::string> also;
-  ASSERT_TRUE(engine.Write(0, {"a", "b"}, [&](WriteTxn&, int64_t) {
-                also.push_back("b");
-                return Status::Ok();
-              }, &also).ok());
+  ASSERT_TRUE(engine
+                  .Write(
+                      0, {"a", "b"},
+                      [&](WriteTxn&, int64_t) {
+                        also.push_back("b");
+                        return Status::Ok();
+                      },
+                      &also)
+                  .ok());
   ASSERT_EQ(observer.reports.size(), 1u);
   EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{0, "b"}}));
 }
@@ -382,10 +396,13 @@ TEST_F(ObservedEngine, AlsoModifiedIsClearedBeforeEachAttempt) {
 }
 
 TEST_F(ObservedEngine, DuplicatesAreReportedOnce) {
-  ASSERT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
-                EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "1").ok());
-                return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "2");
-              }).ok());
+  ASSERT_TRUE(engine
+                  .Write(0, {"k"},
+                         [](WriteTxn& t, int64_t) {
+                           EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "1").ok());
+                           return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "2");
+                         })
+                  .ok());
   EXPECT_EQ(observer.reports.at(0), (std::vector<DbKey>{{0, "k"}}));
 }
 
@@ -399,9 +416,12 @@ TEST_F(ObservedEngine, FlushReportsWatchedKeysThatExistedBeforeIt) {
   ASSERT_TRUE(PutMeta(4, "here").ok());
   observer.reports.clear();
   observer.flush_candidates = {"here", "absent"};
-  ASSERT_TRUE(engine.WriteExclusive([](WriteTxn& t, int64_t) {
-                return t.DeletePrefix(ColumnFamily::kMeta, encoding::DbPrefix(4));
-              }, {4}).ok());
+  ASSERT_TRUE(
+      engine
+          .WriteExclusive(
+              [](WriteTxn& t, int64_t) { return t.DeletePrefix(ColumnFamily::kMeta, encoding::DbPrefix(4)); },
+              {4})
+          .ok());
   ASSERT_EQ(observer.reports.size(), 1u);
   EXPECT_EQ(observer.reports[0], (std::vector<DbKey>{{4, "here"}}));
 }
@@ -423,16 +443,21 @@ TEST(Engine, ReportHappensBeforeTheGateIsReleased) {
   } observer;
   Engine engine(storage, locks, clock, nullptr, &observer);
   std::thread writer([&] {
-    EXPECT_TRUE(engine.Write(0, {"k"}, [](WriteTxn& t, int64_t) {
-                  return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v");
-                }).ok());
+    EXPECT_TRUE(engine
+                    .Write(0, {"k"},
+                           [](WriteTxn& t, int64_t) {
+                             return t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k"), "v");
+                           })
+                    .ok());
   });
   // Spin until the commit is visible, then take the gate exclusively: the report must be done.
   while (ReadMeta(engine, encoding::MetaKeyFor(0, "k")) == "<missing>") std::this_thread::yield();
-  ASSERT_TRUE(engine.WriteExclusive([&](WriteTxn&, int64_t) {
-                EXPECT_TRUE(observer.reported.load());
-                return Status::Ok();
-              }).ok());
+  ASSERT_TRUE(engine
+                  .WriteExclusive([&](WriteTxn&, int64_t) {
+                    EXPECT_TRUE(observer.reported.load());
+                    return Status::Ok();
+                  })
+                  .ok());
   writer.join();
 }
 

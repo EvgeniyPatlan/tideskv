@@ -45,7 +45,8 @@ inline std::vector<DbKey> ModifiedBy(bool wrote, std::span<const DbKey> meta_key
                                      std::vector<DbKey> out) {
   if (wrote) {
     out.insert(out.end(), meta_keys.begin(), meta_keys.end());
-    if (scope.keys != nullptr && scope.keys->size() == 1) out.push_back({scope.db, std::string((*scope.keys)[0])});
+    if (scope.keys != nullptr && scope.keys->size() == 1)
+      out.push_back({scope.db, std::string((*scope.keys)[0])});
   }
   if (scope.also_modified != nullptr) {
     for (const std::string& k : *scope.also_modified) out.push_back({scope.db, k});

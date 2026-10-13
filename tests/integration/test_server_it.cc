@@ -42,8 +42,9 @@ TEST(TestServerIT, ParallelStartsGetDistinctPorts) {
     ports.insert(s->port());
     auto c = s->Connect();
     ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->Command({"INFO", "server"}).str.find("tcp_port:" + std::to_string(s->port())) != std::string::npos,
-              true);
+    EXPECT_EQ(
+        c->Command({"INFO", "server"}).str.find("tcp_port:" + std::to_string(s->port())) != std::string::npos,
+        true);
   }
   EXPECT_EQ(ports.size(), static_cast<size_t>(kServers));
 }

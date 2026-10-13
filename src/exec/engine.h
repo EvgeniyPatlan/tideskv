@@ -74,7 +74,8 @@ class Engine {
     Batch& operator=(const Batch&) = delete;
     int64_t now_ms() const { return now_ms_; }
     // Commits, then tells the listener and the observer, still under the gate. At most once;
-    // routing stops either way. On failure nothing was applied.
+    // routing stops either way. On failure nothing was applied. The thread still holds the gate
+    // until the Batch is destroyed, so make no Engine call on it in between (it would deadlock).
     Status Commit();
 
    private:

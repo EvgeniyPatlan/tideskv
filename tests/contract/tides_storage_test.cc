@@ -233,11 +233,13 @@ TEST(TidesStorage, BatchOfThousandSavepoints) {
   Engine engine(*s, locks, clock);
   auto get = [&](const std::string& k) {
     std::string out = "<missing>";
-    EXPECT_TRUE(engine.Read([&](ReadView& v, int64_t) {
-                  auto r = v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, k));
-                  if (r.ok()) out = *r;
-                  return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
-                }).ok());
+    EXPECT_TRUE(engine
+                    .Read([&](ReadView& v, int64_t) {
+                      auto r = v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, k));
+                      if (r.ok()) out = *r;
+                      return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
+                    })
+                    .ok());
     return out;
   };
   auto batch = engine.BeginBatch();

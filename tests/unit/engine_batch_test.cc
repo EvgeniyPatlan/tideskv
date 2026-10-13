@@ -40,11 +40,13 @@ struct BatchTest : ::testing::Test {
   }
   std::string Get(uint8_t db, const std::string& key) {
     std::string out = "<missing>";
-    EXPECT_TRUE(engine.Read([&](ReadView& v, int64_t) {
-                  auto r = v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key));
-                  if (r.ok()) out = *r;
-                  return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
-                }).ok());
+    EXPECT_TRUE(engine
+                    .Read([&](ReadView& v, int64_t) {
+                      auto r = v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key));
+                      if (r.ok()) out = *r;
+                      return r.ok() || r.status().IsNotFound() ? Status::Ok() : r.status();
+                    })
+                    .ok());
     return out;
   }
 };
@@ -56,7 +58,7 @@ TEST_F(BatchTest, WritesAreInvisibleToOthersUntilCommit) {
   ASSERT_TRUE(Put(0, "k", "v").ok());
   EXPECT_EQ(Get(0, "k"), "v");  // read-your-writes inside the batch
   std::string outside;
-  std::thread other([&] {      // another thread waits for the gate, then sees the committed value
+  std::thread other([&] {  // another thread waits for the gate, then sees the committed value
     outside = Get(0, "k");
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -82,10 +84,13 @@ TEST_F(BatchTest, FailedWriteIsUndoneButTheBatchGoesOn) {
   auto batch = engine.BeginBatch();
   ASSERT_TRUE(batch.ok());
   ASSERT_TRUE(Put(0, "a", "1").ok());
-  EXPECT_EQ(engine.Write(0, {"b"}, [](WriteTxn& t, int64_t) {
-              EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "half").ok());
-              return Status::UserError("WRONGTYPE x");
-            }).code(),
+  EXPECT_EQ(engine
+                .Write(0, {"b"},
+                       [](WriteTxn& t, int64_t) {
+                         EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "half").ok());
+                         return Status::UserError("WRONGTYPE x");
+                       })
+                .code(),
             StatusCode::kUserError);
   ASSERT_TRUE(Put(0, "c", "3").ok());
   ASSERT_TRUE((*batch)->Commit().ok());
@@ -103,10 +108,13 @@ TEST_F(BatchTest, ClockIsFrozen) {
   EXPECT_EQ((*batch)->now_ms(), 1000);
   EXPECT_EQ(engine.NowMs(), 1000);
   int64_t seen = 0;
-  ASSERT_TRUE(engine.Write(0, {"k"}, [&](WriteTxn&, int64_t now) {
-                seen = now;
-                return Status::Ok();
-              }).ok());
+  ASSERT_TRUE(engine
+                  .Write(0, {"k"},
+                         [&](WriteTxn&, int64_t now) {
+                           seen = now;
+                           return Status::Ok();
+                         })
+                  .ok());
   EXPECT_EQ(seen, 1000);
   batch->reset();
   EXPECT_EQ(engine.NowMs(), 1500);
@@ -116,15 +124,20 @@ TEST_F(BatchTest, ExclusiveWriteAndSnapshotRunInsideTheBatch) {
   ASSERT_TRUE(Put(0, "old", "x").ok());
   auto batch = engine.BeginBatch();
   ASSERT_TRUE(batch.ok());
-  ASSERT_TRUE(engine.WriteExclusive([](WriteTxn& t, int64_t) {
-                return t.DeletePrefix(ColumnFamily::kMeta, encoding::DbPrefix(0));
-              }, {0}).ok());
+  ASSERT_TRUE(
+      engine
+          .WriteExclusive(
+              [](WriteTxn& t, int64_t) { return t.DeletePrefix(ColumnFamily::kMeta, encoding::DbPrefix(0)); },
+              {0})
+          .ok());
   ASSERT_TRUE(Put(0, "new", "y").ok());
-  ASSERT_TRUE(engine.Snapshot([&](ReadView& v, int64_t) {
-                EXPECT_FALSE(v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "old")).ok());
-                EXPECT_TRUE(v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "new")).ok());
-                return Status::Ok();
-              }).ok());
+  ASSERT_TRUE(engine
+                  .Snapshot([&](ReadView& v, int64_t) {
+                    EXPECT_FALSE(v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "old")).ok());
+                    EXPECT_TRUE(v.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "new")).ok());
+                    return Status::Ok();
+                  })
+                  .ok());
   ASSERT_TRUE((*batch)->Commit().ok());
 }
 
@@ -170,6 +183,23 @@ TEST_F(BatchTest, ExceptionRollsBackUnroutesAndReleasesTheGate) {
   EXPECT_FALSE(engine.InBatch());
   EXPECT_EQ(Get(0, "k"), "<missing>");
   EXPECT_TRUE(Put(0, "k", "w").ok());  // the gate is free again
+}
+
+TEST_F(BatchTest, ThrowingWriteIsUndoneButTheBatchGoesOn) {
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  EXPECT_THROW(
+      engine.Write(0, {"b"},
+                   [](WriteTxn& t, int64_t) -> Status {
+                     EXPECT_TRUE(t.Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"), "half").ok());
+                     throw std::runtime_error("boom");
+                   }),
+      std::runtime_error);
+  ASSERT_TRUE(Put(0, "c", "3").ok());
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(Get(0, "b"), "<missing>");
+  EXPECT_EQ(Get(0, "c"), "3");
 }
 
 TEST_F(BatchTest, ThousandCommandsWithFailuresInterleaved) {
