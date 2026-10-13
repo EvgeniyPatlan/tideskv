@@ -34,7 +34,12 @@ struct WriterGuard {
 
 int64_t IntValue(RespClient& c, const std::string& key) {
   const RespValue v = c.Command({"GET", key});
-  return v.type == RespValue::Type::kBulk ? std::stoll(v.str) : 0;
+  if (v.type == RespValue::Type::kNull) return 0;  // only a missing key counts as 0
+  if (v.type != RespValue::Type::kBulk) {
+    ADD_FAILURE() << "GET " << key << " answered " << ToDebugString(v);
+    return -1;
+  }
+  return std::stoll(v.str);
 }
 
 TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
@@ -54,17 +59,21 @@ TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
     auto c = s.Connect();
     ASSERT_NE(c, nullptr);
     const int64_t a = IntValue(*c, "a");
+    SCOPED_TRACE("round " + std::to_string(round) + ", a = " + std::to_string(a));
     EXPECT_EQ(IntValue(*c, "b"), a) << "round " << round;
     EXPECT_EQ(a % 4000, 0) << "round " << round << ": a script is never partly applied";
   }
 }
+
+// 50 incr pairs in one script: a non-atomic implementation would let a reader see a != b.
+constexpr char kPairs[] = "for i = 1, 50 do redis.call('incr','a') redis.call('incr','b') end return 1";
 
 TEST(ScriptingIT, ReadersNeverSeeHalfAScript) {  // Review Focus #1
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<bool> stop{false};
   std::thread writer([&] {
     auto c = s.Connect();
-    while (c && !stop) c->Command({"EVAL", "redis.call('incr','a') redis.call('incr','b') return 1", "0"});
+    while (c && !stop) c->Command({"EVAL", kPairs, "0"});
   });
   const WriterGuard guard{stop, writer};
   auto c = s.Connect();
@@ -102,33 +111,37 @@ TEST(ScriptingIT, BusyScriptAnswersBusyAndIsKilledWithItsWritesUndone) {  // Rev
 
 TEST(ScriptingIT, ClientsWaitingOnTheGateAreReleasedWithBusy) {  // Review Focus #3
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "2", "--lua-time-limit", "200"}});
+  // Placement: connections are accepted round-robin, so connection n+1 is on the other worker than
+  // connection n (2 workers). Order: runner (conn 0), probe (conn 1, other worker), waiter i (conn i + 2).
+  // Waiter i therefore shares the runner's worker iff i is even; odd waiters and the probe do not.
   auto runner = s.Connect();
-  ASSERT_NE(runner, nullptr);
+  auto probe = s.Connect();
+  ASSERT_TRUE(runner && probe);
   ASSERT_TRUE(runner->Send({"EVAL", kSpin, "0"}));
-  std::this_thread::sleep_for(20ms);  // the script holds the gate, not yet timed out
+  // Prove the script is inside the gate: a GET answered BUSY (after the 200 ms limit) can only come from
+  // a running script; a null reply means the EVAL was not started yet, so ask again.
+  ASSERT_TRUE(WaitFor([&] { return probe->Command({"GET", "k"}).str == kBusyText; }, 5s));
   std::vector<std::unique_ptr<RespClient>> waiters;
   for (int i = 0; i < 8; ++i) {
     waiters.push_back(s.Connect());
     ASSERT_NE(waiters.back(), nullptr);
-    ASSERT_TRUE(waiters.back()->Send({"GET", "k"}));  // these wait on the gate (both workers stall)
+    ASSERT_TRUE(waiters.back()->Send({"GET", "k"}));  // the gate is held: these must be answered BUSY
   }
-  // Placement: connections go round-robin, so waiter i is on the runner's worker iff i is odd (the
-  // runner is connection 0 of the sequence, waiter i is connection i + 1). Those waiters' commands are
-  // not even read until the script ends. Even-indexed waiters are on the other worker: they must be
-  // answered BUSY while the script still runs.
-  for (size_t i = 0; i < waiters.size(); i += 2) {
+  // Waiters on the runner's worker (even i) are not read by the server until the script ends. Odd ones are
+  // on the other worker: they must be answered BUSY while the script still runs.
+  for (size_t i = 1; i < waiters.size(); i += 2) {
     const auto r = waiters[i]->Read();  // RespClient times out after 5 s: a hang fails here
     ASSERT_TRUE(r.has_value()) << "waiter " << i;
     EXPECT_EQ(r->str, kBusyText) << "waiter " << i;
   }
-  // 9 connections after the runner: the killer is on the other worker too (odd offset).
-  auto killer = s.Connect();
-  ASSERT_NE(killer, nullptr);
-  EXPECT_EQ(killer->Command({"SCRIPT", "KILL"}).str, "OK");
-  ASSERT_TRUE(runner->Read().has_value());
+  // The probe is on the other worker, so it can still be served: it is the killer.
+  EXPECT_EQ(probe->Command({"SCRIPT", "KILL"}).str, "OK");
+  const auto killed = runner->Read();
+  ASSERT_TRUE(killed.has_value());
+  EXPECT_NE(killed->str.find("Script killed by user with SCRIPT KILL..."), std::string::npos) << killed->str;
   // Waiters on the runner's worker run after the script ended: BUSY if already queued as busy, else the
   // normal reply (GET of a missing key is null).
-  for (size_t i = 1; i < waiters.size(); i += 2) {
+  for (size_t i = 0; i < waiters.size(); i += 2) {
     const auto r = waiters[i]->Read();
     ASSERT_TRUE(r.has_value()) << "waiter " << i;
     EXPECT_TRUE(r->type == RespValue::Type::kNull || r->str == kBusyText) << ToDebugString(*r);
@@ -136,7 +149,7 @@ TEST(ScriptingIT, ClientsWaitingOnTheGateAreReleasedWithBusy) {  // Review Focus
 }
 
 TEST(ScriptingIT, ShutdownNosaveStopsABusyServer) {  // Review Focus #3
-  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--lua-time-limit", "50"}});
+  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "2", "--lua-time-limit", "50"}});
   // Round-robin placement (see the busy test above): `other` is on the other worker than `runner`.
   auto runner = s.Connect();
   auto other = s.Connect();
@@ -151,7 +164,10 @@ TEST(ScriptingIT, ShutdownNosaveStopsABusyServer) {  // Review Focus #3
 TEST(ScriptingIT, ScriptCacheIsSharedByEveryWorker) {  // Review Focus #5
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::vector<std::unique_ptr<RespClient>> cs;
-  for (int i = 0; i < 8; ++i) cs.push_back(s.Connect());
+  for (int i = 0; i < 8; ++i) {
+    cs.push_back(s.Connect());
+    ASSERT_NE(cs.back(), nullptr);
+  }
   const std::string sha = cs[0]->Command({"SCRIPT", "LOAD", "return 'hi'"}).str;
   for (auto& c : cs) EXPECT_EQ(c->Command({"EVALSHA", sha, "0"}).str, "hi");
   cs[3]->Command({"EVAL", "return 'eval'", "0"});
@@ -168,12 +184,13 @@ TEST(ScriptingIT, ScriptWritesDirtyOtherClientsWatches) {  // Review Focus #5
   auto a = s.Connect();
   auto b = s.Connect();
   ASSERT_TRUE(a && b);
-  b->Command({"WATCH", "w"});
-  a->Command({"EVAL", "return redis.call('set','w','1')", "0"});
+  EXPECT_EQ(b->Command({"WATCH", "w"}).str, "OK");
+  EXPECT_EQ(a->Command({"EVAL", "return redis.call('set','w','1')", "0"}).str, "OK");
   b->Command({"MULTI"});
   EXPECT_EQ(b->Command({"EXEC"}).type, RespValue::Type::kNull);
-  b->Command({"WATCH", "w"});
-  a->Command({"EVAL", "return redis.call('set','w','1', 'NX')", "0"});  // no-op: not a change
+  EXPECT_EQ(b->Command({"WATCH", "w"}).str, "OK");
+  // no-op: not a change, so NX does not set and the reply is nil
+  EXPECT_EQ(a->Command({"EVAL", "return redis.call('set','w','1', 'NX')", "0"}).type, RespValue::Type::kNull);
   b->Command({"MULTI"});
   EXPECT_EQ(b->Command({"EXEC"}).type, RespValue::Type::kArray);
 }
