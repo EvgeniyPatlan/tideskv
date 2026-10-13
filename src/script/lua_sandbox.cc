@@ -379,8 +379,10 @@ LuaSandbox::~LuaSandbox() {
 Status LuaSandbox::Compile(const std::string& sha, std::string_view code) {
   CompileJob job{"f_" + sha, code, {}, 0};
   if (lua_cpcall(L_, CompileInLua, &job) != 0) {
+    const char* msg = lua_tostring(L_, -1);
+    spdlog::error("Lua: {}: {}", kErrLuaStoreScript, msg != nullptr ? msg : "?");
     lua_pop(L_, 1);
-    return Status::Internal("cannot store the compiled script");
+    return Status::Internal(std::string(kErrLuaStoreScript));
   }
   if (job.rc != 0) return Status::UserError(std::string(kErrCompilingScript) + job.error);
   return Status::Ok();
@@ -401,7 +403,8 @@ LuaSandbox::RunResult LuaSandbox::Run(const std::string& sha, const std::vector<
   if (err == 0) {
     err = lua_pcall(L, 0, 1, -2);
   } else {
-    lua_remove(L, -2);  // f: the cpcall error takes its place
+    lua_enablereadonlytable(L, LUA_GLOBALSINDEX, 1);  // it may have failed while _G was writable
+    lua_remove(L, -2);                                // f: the cpcall error takes its place
   }
   if (++gc_runs_ == kGcCyclePeriod) {
     lua_gc(L, LUA_GCSTEP, kGcCyclePeriod);

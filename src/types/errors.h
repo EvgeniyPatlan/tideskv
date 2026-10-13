@@ -120,6 +120,8 @@ inline constexpr std::string_view kScriptErrNoArgs =
     "Please specify at least one argument for this redis lib call";
 inline constexpr std::string_view kScriptErrArgType =
     "Lua redis lib command arguments must be strings or integers";
+// Internal (not a reply text): the compiled script could not be stored in the Lua registry.
+inline constexpr std::string_view kErrLuaStoreScript = "cannot store the compiled script";
 inline constexpr std::string_view kScriptErrKilled = "Script killed by user with SCRIPT KILL...";
 inline constexpr std::string_view kScriptErrWrongArgs = "wrong number of arguments";
 inline constexpr std::string_view kScriptErrWrongArgsOrType = "wrong number or type of arguments";

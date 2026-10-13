@@ -218,5 +218,41 @@ TEST_F(SandboxTest, AnErrorTableWhoseFieldsRaiseDoesNotCrash) {
   EXPECT_EQ(Eval("return 1"), ":1\r\n");
 }
 
+// A host that asks for the kill only once: the kill must still be sticky for the run.
+class OneShotKillHost final : public SandboxHost {
+ public:
+  std::optional<std::string> Call(const std::vector<std::string>& /*argv*/, int /*resp*/,
+                                  std::string* /*error*/) noexcept override {
+    return std::string("+OK\r\n");
+  }
+  bool CommandExists(std::string_view /*name*/) const noexcept override { return false; }
+  void Log(int /*level*/, std::string_view /*msg*/) noexcept override {}
+  bool ShouldKill() noexcept override { return ++polls == 1; }
+  int polls = 0;
+};
+
+TEST_F(SandboxTest, KillIsStickyWhenTheHostAsksOnlyOnce) {
+  OneShotKillHost once;
+  const std::string c = "while true do pcall(function() while true do end end) end";
+  const std::string sha = Sha1Hex(c);
+  ASSERT_TRUE(sb->Compile(sha, c).ok());
+  resp::ReplyBuilder out(2);
+  EXPECT_TRUE(sb->Run(sha, {}, {}, once, {2, true}, out).killed);
+  EXPECT_NE(out.Take().find("Script killed by user with SCRIPT KILL..."), std::string::npos);
+  EXPECT_EQ(once.polls, 1);
+}
+
+// Regression guard against the NULL dereference Redis 7.2.16 has here, not a parity claim.
+TEST_F(SandboxTest, AnErrorTableWithoutErrRepliesWithTheSuffixOnly) {
+  const std::string c = "error({})";
+  EXPECT_EQ(Eval(c), "- script: " + Sha1Hex(c) + ", on @user_script:1.\r\n");
+}
+
+TEST_F(SandboxTest, MathRandomFullIntRangeHasNoOverflow) {
+  const std::string r = Eval("return math.random(-2147483647, 2147483647)");
+  ASSERT_FALSE(r.empty());
+  EXPECT_EQ(r.front(), ':') << r;
+}
+
 }  // namespace
 }  // namespace tideskv

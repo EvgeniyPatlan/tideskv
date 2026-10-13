@@ -261,7 +261,8 @@ static int LuaMathRandom(lua_State* L) noexcept {
       const int l = luaL_checkint(L, 1);
       const int u = luaL_checkint(L, 2);
       luaL_argcheck(L, l <= u, 2, "interval is empty");
-      lua_pushnumber(L, std::floor(r * (u - l + 1)) + l);
+      // In int64_t: Redis's int `u - l + 1` overflows (UB) for ranges wider than INT_MAX.
+      lua_pushnumber(L, std::floor(r * static_cast<lua_Number>(int64_t{u} - l + 1)) + l);
       break;
     }
     default:  // luaL_error from a C function adds no position prefix
@@ -357,7 +358,7 @@ void SetCurrentRun(lua_State* L, ScriptRun* run) {
 // luaMaskCountHook (sl:1610-1628). No C++ object is alive at lua_error.
 extern "C" void ScriptCountHook(lua_State* L, lua_Debug* /*ar*/) noexcept {
   tideskv::ScriptRun* run = tideskv::CurrentRun(L);
-  if (run == nullptr || !run->host->ShouldKill()) return;
+  if (run == nullptr || (!run->killed && !run->host->ShouldKill())) return;  // sticky once killed
   run->killed = true;
   spdlog::info("Lua script killed by user with SCRIPT KILL.");
   // Fire on every line from now on, so the script cannot catch the error with pcall and loop.

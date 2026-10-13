@@ -18,7 +18,9 @@ class SandboxHost {
                                           std::string* error) noexcept = 0;
   virtual bool CommandExists(std::string_view name) const noexcept = 0;  // redis.acl_check_cmd
   virtual void Log(int level, std::string_view msg) noexcept = 0;        // redis.log, level 0..3
-  virtual bool ShouldKill() noexcept = 0;  // count hook, every 100000 instructions
+  // Polled by the count hook every 100000 instructions until it first returns true; the kill is
+  // then sticky for the rest of the run (raised again on every line, so pcall cannot swallow it).
+  virtual bool ShouldKill() noexcept = 0;
 };
 
 // The state of the script being run (Redis's scriptRunCtx, as far as the Lua API needs it).
