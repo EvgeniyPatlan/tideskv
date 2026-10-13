@@ -1492,7 +1492,6 @@ func TestRPOPLPUSH(t *testing.T) {
 //
 // For more information, please refer to: https://github.com/apache/kvrocks/issues/2900
 func TestPotentialDataRaceInBlockingCommand(t *testing.T) {
-	t.Skip("tideskv: needs MULTI/EXEC, M5")
 	srv := util.StartServer(t, map[string]string{})
 	defer srv.Close()
 
