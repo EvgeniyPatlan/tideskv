@@ -30,10 +30,32 @@ RespValue Transaction(RespClient& c, const std::vector<std::vector<std::string>>
   return r.value_or(RespValue{});
 }
 
+// Stops and joins the test's threads on every exit path, so a failed ASSERT cannot reach
+// std::terminate through a joinable std::thread.
+struct ThreadGuard {
+  std::atomic<bool>& stop;
+  std::vector<std::thread>& threads;
+  ~ThreadGuard() {
+    stop = true;
+    for (auto& t : threads) {
+      if (t.joinable()) t.join();
+    }
+  }
+};
+
+int64_t Pttl(RespClient& c, const std::string& key) { return c.Command({"PTTL", key}).integer; }
+
+// The integer stored at `key` (0 when missing).
+int64_t IntValue(RespClient& c, const std::string& key) {
+  const RespValue v = c.Command({"GET", key});
+  return v.type == RespValue::Type::kBulk ? std::stoll(v.str) : 0;
+}
+
 TEST(MultiIT, ExecIsIsolatedFromConcurrentWriters) {  // Review Focus #2
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<bool> stop{false};
   std::vector<std::thread> writers;
+  const ThreadGuard guard{stop, writers};
   for (int t = 0; t < 4; ++t) {
     writers.emplace_back([&] {
       auto c = s.Connect();
@@ -48,14 +70,14 @@ TEST(MultiIT, ExecIsIsolatedFromConcurrentWriters) {  // Review Focus #2
     ASSERT_EQ(r.elements.size(), 2u);
     EXPECT_EQ(r.elements[0].str, r.elements[1].str) << "iteration " << i;
   }
-  stop = true;
-  for (auto& t : writers) t.join();
 }
 
 TEST(MultiIT, ReadersNeverSeeHalfAnExec) {  // Review Focus #2
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<bool> stop{false};
-  std::thread writer([&] {
+  std::vector<std::thread> threads;
+  const ThreadGuard guard{stop, threads};
+  threads.emplace_back([&] {
     auto c = s.Connect();
     while (c && !stop) Transaction(*c, {{"INCR", "a"}, {"INCR", "b"}});
   });
@@ -67,7 +89,8 @@ TEST(MultiIT, ReadersNeverSeeHalfAnExec) {  // Review Focus #2
     EXPECT_EQ(r.elements[0].str, r.elements[1].str);
   }
   stop = true;
-  writer.join();
+  threads.front().join();
+  EXPECT_GT(IntValue(*c, "a"), 0) << "the writer made no progress";
 }
 
 TEST(MultiIT, WatchCasLoopIsExact) {  // Review Focus #1
@@ -75,14 +98,19 @@ TEST(MultiIT, WatchCasLoopIsExact) {  // Review Focus #1
   constexpr int kClients = 8;
   constexpr int kIncrements = 50;
   std::atomic<int> errors{0};
+  std::atomic<bool> stop{false};
   std::vector<std::thread> threads;
+  const ThreadGuard guard{stop, threads};
+  const auto deadline = std::chrono::steady_clock::now() + 60s;
   for (int t = 0; t < kClients; ++t) {
     threads.emplace_back([&] {
       auto c = s.Connect();
       if (!c) return void(++errors);
       for (int done = 0; done < kIncrements;) {
+        if (std::chrono::steady_clock::now() > deadline) return void(++errors);
         c->Command({"WATCH", "ctr"});
         const RespValue v = c->Command({"GET", "ctr"});
+        if (v.type != RespValue::Type::kNull && v.type != RespValue::Type::kBulk) return void(++errors);
         const int64_t n = v.type == RespValue::Type::kNull ? 0 : std::stoll(v.str);
         const RespValue r = Transaction(*c, {{"SET", "ctr", std::to_string(n + 1)}});
         if (r.type == RespValue::Type::kArray) {
@@ -108,7 +136,9 @@ TEST(MultiIT, KillDuringExecIsAllOrNothing) {  // Review Focus #2; spec §12 "ki
     {
       TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
       std::atomic<bool> stop{false};
-      std::thread client([&] {
+      std::vector<std::thread> threads;
+      const ThreadGuard guard{stop, threads};
+      threads.emplace_back([&] {
         auto c = s.Connect();
         for (int i = 0; c && !stop; ++i) {
           const std::string id = std::to_string(round) + ":" + std::to_string(i);
@@ -121,10 +151,13 @@ TEST(MultiIT, KillDuringExecIsAllOrNothing) {  // Review Focus #2; spec §12 "ki
           }
         }
       });
-      std::this_thread::sleep_for(std::chrono::milliseconds(50 + rng() % 200));
+      auto probe = s.Connect();
+      ASSERT_NE(probe, nullptr);
+      ASSERT_TRUE(WaitFor([&] { return IntValue(*probe, "a") >= 5; })) << "round " << round;
+      std::this_thread::sleep_for(std::chrono::milliseconds(rng() % 200));
       s.Kill9();
       stop = true;
-      client.join();
+      threads.front().join();
     }
     TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
     auto c = s.Connect();
@@ -169,33 +202,66 @@ TEST(MultiIT, ClientUnblockInsideExecRace) {  // Review Focus #5, G4
     const RespValue r = Transaction(*execer, {{"CLIENT", "UNBLOCK", wid}, {"SET", "z", "1"}});
     p.join();
     EXPECT_EQ(r.type, RespValue::Type::kArray);
-    ASSERT_TRUE(w->Read().has_value()) << "iteration " << i;  // the element or a null, never a hang
+    const auto reply = w->Read();  // the element or a null, never a hang
+    ASSERT_TRUE(reply.has_value()) << "iteration " << i;
+    const int64_t left = pusher->Command({"LLEN", "q"}).integer;
+    if (reply->type == RespValue::Type::kArray) {
+      ASSERT_EQ(reply->elements.size(), 2u) << "iteration " << i;
+      EXPECT_EQ(reply->elements[1].str, "v") << "iteration " << i;
+      EXPECT_EQ(left, 0) << "iteration " << i;  // the pushed element was consumed
+    } else {
+      EXPECT_EQ(reply->type, RespValue::Type::kNull) << "iteration " << i;
+      EXPECT_EQ(left, 1) << "iteration " << i;  // unblocked first: the element stays
+    }
     pusher->Command({"DEL", "q"});
   }
 }
 
+// The lazy, not-yet-reaped path is covered by the unit test
+// MultiExpiry.LiveWatchedKeyThatExpiresBeforeExecAborts; here the key may also be reaped.
 TEST(MultiIT, WatchedKeyExpiringBeforeExecAborts) {  // Review Focus #4
   TestServer s(TIDESKV_SERVER_BIN);
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
-  c->Command({"SET", "k", "v", "PX", "100"});
-  c->Command({"WATCH", "k"});
-  std::this_thread::sleep_for(300ms);  // expired; the reaper may or may not have deleted it
-  EXPECT_EQ(Transaction(*c, {{"PING"}}).type, RespValue::Type::kNull);
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    const std::string key = "k" + std::to_string(attempt);
+    c->Command({"SET", key, "v", "PX", "300"});
+    c->Command({"WATCH", key});
+    if (Pttl(*c, key) <= 0) {  // already stale at WATCH (loaded machine): EXEC would rightly succeed
+      c->Command({"UNWATCH"});
+      continue;
+    }
+    ASSERT_TRUE(WaitFor([&] { return Pttl(*c, key) <= 0; }));
+    EXPECT_EQ(Transaction(*c, {{"PING"}}).type, RespValue::Type::kNull);
+    return;
+  }
+  FAIL() << "the key was never live at WATCH";
 }
 
 TEST(MultiIT, ReaperDeletingAStaleWatchedKeyDoesNotAbort) {  // Review Focus #4
   TestServer s(TIDESKV_SERVER_BIN);
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
-  c->Command({"SET", "k", "v", "PX", "50"});
-  std::this_thread::sleep_for(100ms);
-  c->Command({"WATCH", "k"});  // stale, or already reaped (then simply missing)
-  ASSERT_TRUE(WaitFor([&] { return InfoField(*c, "stats", "expired_keys") >= 1; }));
-  EXPECT_EQ(Transaction(*c, {{"PING"}}).type, RespValue::Type::kArray);
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    const std::string key = "k" + std::to_string(attempt);
+    const int64_t baseline = InfoField(*c, "stats", "expired_keys");
+    c->Command({"SET", key, "v", "PX", "50"});
+    ASSERT_TRUE(WaitFor([&] { return Pttl(*c, key) <= 0; }));
+    c->Command({"WATCH", key});                               // stale, not yet reaped, if we won the race
+    if (InfoField(*c, "stats", "expired_keys") > baseline) {  // the reaper won: try again
+      c->Command({"UNWATCH"});
+      continue;
+    }
+    ASSERT_TRUE(WaitFor([&] { return InfoField(*c, "stats", "expired_keys") > baseline; }));
+    EXPECT_EQ(Transaction(*c, {{"PING"}}).type, RespValue::Type::kArray);
+    return;
+  }
+  FAIL() << "never observed WATCH on a stale key before the reaper deleted it";
 }
 
-TEST(MultiIT, DisconnectInMultiLeavesNothingBehind) {  // Review Focus #5
+// Proves a disconnected client's queued commands never run and that a fresh client's WATCH/EXEC on
+// the same key works. It cannot observe a server-side watch-registry leak (no counter exists).
+TEST(MultiIT, DisconnectedClientsQueueNeverRuns) {  // Review Focus #5
   TestServer s(TIDESKV_SERVER_BIN);
   for (int i = 0; i < 50; ++i) {
     auto c = s.Connect();
