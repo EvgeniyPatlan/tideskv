@@ -71,6 +71,10 @@ TEST(WriteLuaValue, TablesMatchRedis) {
   EXPECT_EQ(b.Reply("{err='ERR this is an error'}"), "-ERR this is an error\r\n");
   EXPECT_EQ(b.Reply("{err='oops'}"), "-oops\r\n");  // no code added
   EXPECT_EQ(b.Reply("{ok='fine'}"), "+fine\r\n");
+  EXPECT_EQ(b.Reply("{err='oops\\r\\n'}"), "-oops\r\n");
+  EXPECT_EQ(b.Reply("{err='a\\r\\nb'}"), "-a  b\r\n");
+  EXPECT_EQ(b.Reply("{ok='a\\0b'}"), "+a\r\n");
+  EXPECT_EQ(b.Reply("{err='E x\\0y'}"), "-E x\r\n");
   EXPECT_EQ(b.Reply("{ok='a\\r\\nb'}"), "+a  b\r\n");
   EXPECT_EQ(b.Reply("{double=3.141}"), "$5\r\n3.141\r\n");
   EXPECT_EQ(b.Reply("{double=3.141}", 2, 3), ",3.141\r\n");

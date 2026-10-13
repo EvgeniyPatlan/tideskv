@@ -16,6 +16,8 @@ namespace tideskv {
 int64_t LuaNumberToInteger(double d);
 
 // redisProtocolToLuaType: pushes `node` as a Lua value. False when the Lua stack cannot grow.
+// As in Redis, a RESP3 map or set with a null key raises "table index is nil" (unreachable: no command
+// emits null keys).
 bool PushReply(lua_State* L, const resp::ReplyNode& node);
 
 // luaPushErrorBuff: pushes {err = "<CODE> <message>"} built from `error` (optionally "-CODE msg").

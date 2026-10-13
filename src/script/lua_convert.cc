@@ -65,6 +65,16 @@ int RawField(lua_State* L, int t, const char* name) {
   return lua_type(L, -1);
 }
 
+// Redis reads ok/err with lua_tostring: an embedded NUL truncates.
+std::string_view ToCString(lua_State* L, int idx) { return std::string_view(lua_tostring(L, idx)); }
+
+// sdstrim(s, "\r\n") as in addReplyErrorFormatEx.
+std::string_view TrimCrLf(std::string_view s) {
+  while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
+  while (!s.empty() && (s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
+  return s;
+}
+
 std::string_view ToView(lua_State* L, int idx) {
   size_t n = 0;
   const char* s = lua_tolstring(L, idx, &n);
@@ -88,13 +98,13 @@ bool WriteVerbatim(lua_State* L, int v, resp::ReplyBuilder& out) {
 // err / ok / double / big_number / verbatim_string. Leaves the stack as it found it.
 bool WriteScalarField(lua_State* L, int t, resp::ReplyBuilder& out) {
   if (RawField(L, t, "err") == LUA_TSTRING) {
-    out.Error(ToView(L, -1));
+    out.Error(TrimCrLf(ToCString(L, -1)));
     lua_pop(L, 1);
     return true;
   }
   lua_pop(L, 1);
   if (RawField(L, t, "ok") == LUA_TSTRING) {
-    out.SimpleString(ToView(L, -1));
+    out.SimpleString(ToCString(L, -1));
     lua_pop(L, 1);
     return true;
   }
