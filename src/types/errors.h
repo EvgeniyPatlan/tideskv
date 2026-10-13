@@ -91,4 +91,35 @@ inline constexpr std::string_view kErrExecAbort =
 inline constexpr std::string_view kErrExecAbortBecause = "EXECABORT Transaction discarded because of: ";
 inline constexpr std::string_view kErrNoAuth = "NOAUTH Authentication required.";
 
+// Scripting (M5b; eval.c, script_lua.c, script.c 7.2).
+inline constexpr std::string_view kErrNoScript = "NOSCRIPT No matching script. Please use EVAL.";
+inline constexpr std::string_view kErrNumkeysNegative = "ERR Number of keys can't be negative";
+inline constexpr std::string_view kErrNumkeysTooBig =
+    "ERR Number of keys can't be greater than number of args";
+inline constexpr std::string_view kErrRoScriptWithWriteFlag =
+    "ERR Can not execute a script with write flag using *_ro command.";
+inline constexpr std::string_view kErrBusyScript =
+    "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
+inline constexpr std::string_view kErrNotBusy = "NOTBUSY No scripts in execution right now.";
+inline constexpr std::string_view kErrScriptFlushOption = "ERR SCRIPT FLUSH only support SYNC|ASYNC option";
+inline constexpr std::string_view kErrScriptDebugOption = "ERR Use SCRIPT DEBUG YES/SYNC/NO";
+inline constexpr std::string_view kErrScriptDebugUnsupported = "ERR SCRIPT DEBUG YES/SYNC is not supported";
+inline constexpr std::string_view kErrInvalidShebang = "ERR Invalid script shebang";
+inline constexpr std::string_view kErrInvalidShebangEngine = "ERR Invalid engine in script shebang";
+inline constexpr std::string_view kErrUnexpectedShebangEngine = "ERR Unexpected engine in script shebang: ";
+inline constexpr std::string_view kErrUnknownShebangOption = "ERR Unknown lua shebang option: ";
+inline constexpr std::string_view kErrUnexpectedShebangFlag = "ERR Unexpected flag in script shebang: ";
+inline constexpr std::string_view kErrCompilingScript = "ERR Error compiling script (new function): ";
+// Raised inside scripts (no code: luaPushErrorBuff prefixes "ERR ").
+inline constexpr std::string_view kScriptErrUnknownCommand = "Unknown Redis command called from script";
+inline constexpr std::string_view kScriptErrArity = "Wrong number of args calling Redis command from script";
+inline constexpr std::string_view kScriptErrNoScript = "This Redis command is not allowed from script";
+inline constexpr std::string_view kScriptErrWriteInRo =
+    "Write commands are not allowed from read-only scripts.";
+inline constexpr std::string_view kScriptErrNoArgs =
+    "Please specify at least one argument for this redis lib call";
+inline constexpr std::string_view kScriptErrArgType =
+    "Lua redis lib command arguments must be strings or integers";
+inline constexpr std::string_view kScriptErrKilled = "Script killed by user with SCRIPT KILL...";
+
 }  // namespace tideskv
