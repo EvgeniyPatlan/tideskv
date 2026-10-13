@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include "server/blocking.h"
+#include "server/connection_block_handler.h"
 #include "support/resp_client.h"
 
 namespace tideskv::net {
@@ -265,6 +267,124 @@ TEST(NetServer, StartTwiceFails) {
   auto c = RespClient::Connect(server->port());
   ASSERT_NE(c, nullptr);
   EXPECT_EQ(c->Command({"ok"}).str, "ok");
+}
+
+// Executor for the blocking tests: BLOCK <ms> parks the command (0 = forever); WAKE <id> <text> unblocks
+// client <id> with +<text>; WAITERS counts blocked clients; anything else echoes.
+std::unique_ptr<Server> StartBlockingServer(BlockingRegistry& registry) {
+  ServerOptions o;
+  o.port = 0;
+  o.workers = 2;
+  auto exec = [&registry](Session& s, const std::vector<std::string>& argv, resp::ReplyBuilder& r) {
+    if (argv[0] == "BLOCK") {
+      ReadyKeys ready;
+      ConnectionBlockHandler block(registry, s, argv, ready);
+      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1])});
+    } else if (argv[0] == "WAKE") {
+      auto c = registry.Find(std::stoull(argv[1]));
+      r.Integer(c != nullptr && c->Unblock("+" + argv[2] + "\r\n") ? 1 : 0);
+    } else if (argv[0] == "WAITERS") {
+      r.Integer(static_cast<int64_t>(registry.blocked_clients()));
+    } else if (argv[0] == "ID") {
+      r.Integer(static_cast<int64_t>(s.id));
+    } else {
+      r.Bulk(argv[0]);
+    }
+  };
+  auto server = std::make_unique<Server>(std::move(o), exec);
+  EXPECT_TRUE(server->Start().ok());
+  return server;
+}
+
+TEST(NetServerBlocking, TimeoutRepliesNullArrayThenRunsThePipeline) {  // Review Focus #4
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"BLOCK", "150"}) + test::EncodeCommand({"AFTER"})));
+  auto first = c->Read();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->type, RespValue::Type::kNull);  // *-1
+  EXPECT_GE(std::chrono::steady_clock::now() - start, 140ms);
+  auto second = c->Read();
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->str, "AFTER");  // the pipelined command ran only after the timeout
+  EXPECT_EQ(registry.blocked_clients(), 0u);
+}
+
+TEST(NetServerBlocking, UnblockFromAnotherConnectionDeliversInOrder) {
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto a = RespClient::Connect(server->port());
+  auto b = RespClient::Connect(server->port());
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  const int64_t id = a->Command({"ID"}).integer;
+  ASSERT_TRUE(a->SendRaw(test::EncodeCommand({"BLOCK", "0"}) + test::EncodeCommand({"NEXT"})));
+  ASSERT_TRUE(WaitFor([&] { return b->Command({"WAITERS"}).integer == 1; }));
+  EXPECT_EQ(b->Command({"WAKE", std::to_string(id), "served"}).integer, 1);
+  auto r1 = a->Read();
+  auto r2 = a->Read();
+  ASSERT_TRUE(r1 && r2);
+  EXPECT_EQ(r1->str, "served");
+  EXPECT_EQ(r2->str, "NEXT");
+  EXPECT_EQ(b->Command({"WAKE", std::to_string(id), "again"}).integer, 0);  // no longer blocked
+}
+
+TEST(NetServerBlocking, PipelinedBlocksRunOneAfterTheOther) {  // Review Focus #2
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto a = RespClient::Connect(server->port());
+  auto b = RespClient::Connect(server->port());
+  const int64_t id = a->Command({"ID"}).integer;
+  ASSERT_TRUE(a->SendRaw(test::EncodeCommand({"BLOCK", "0"}) + test::EncodeCommand({"BLOCK", "0"})));
+  ASSERT_TRUE(WaitFor([&] { return b->Command({"WAITERS"}).integer == 1; }));
+  EXPECT_EQ(b->Command({"WAKE", std::to_string(id), "one"}).integer, 1);
+  auto r1 = a->Read();
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(r1->str, "one");
+  ASSERT_TRUE(WaitFor([&] { return b->Command({"WAITERS"}).integer == 1; }));  // the second one now waits
+  EXPECT_EQ(b->Command({"WAKE", std::to_string(id), "two"}).integer, 1);
+  auto r2 = a->Read();
+  ASSERT_TRUE(r2.has_value());
+  EXPECT_EQ(r2->str, "two");
+}
+
+TEST(NetServerBlocking, DisconnectWhileBlockedCancelsTheWait) {  // Review Focus #4
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto a = RespClient::Connect(server->port());
+  ASSERT_TRUE(a->Send({"BLOCK", "0"}));
+  ASSERT_TRUE(WaitFor([&] { return registry.blocked_clients() == 1; }));
+  a->Close();
+  EXPECT_TRUE(WaitFor([&] { return registry.blocked_clients() == 0; }));
+}
+
+TEST(NetServerBlocking, StopWithABlockedClientIsPrompt) {
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto a = RespClient::Connect(server->port());
+  ASSERT_TRUE(a->Send({"BLOCK", "0"}));
+  ASSERT_TRUE(WaitFor([&] { return registry.blocked_clients() == 1; }));
+  const auto start = std::chrono::steady_clock::now();
+  server->Stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 2s);
+  EXPECT_EQ(registry.blocked_clients(), 0u);  // destroying the connection cancelled the wait
+}
+
+TEST(NetServerBlocking, ManyRepliesWhileReadingStayOrdered) {
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto c = RespClient::Connect(server->port());
+  std::string batch;
+  for (int i = 0; i < 2000; ++i) batch += test::EncodeCommand({"x" + std::to_string(i)});
+  ASSERT_TRUE(c->SendRaw(batch));
+  for (int i = 0; i < 2000; ++i) {
+    auto r = c->Read();
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->str, "x" + std::to_string(i));
+  }
 }
 
 }  // namespace

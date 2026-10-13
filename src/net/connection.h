@@ -9,6 +9,7 @@
 
 #include "resp/reply_builder.h"
 #include "resp/request_parser.h"
+#include "server/blocking.h"
 #include "server/session.h"
 
 namespace tideskv::net {
@@ -23,8 +24,9 @@ struct ConnStats {
 };
 
 // One client. Lives on exactly one worker io_context; kept alive by the
-// shared_ptr captured in its pending async handler.
-class Connection : public std::enable_shared_from_this<Connection> {
+// shared_ptr captured in its pending async handler. While a command is blocked (session_.blocked set) it
+// executes nothing more but keeps reading, so pipelined input is buffered and EOF is detected (M4 F5).
+class Connection : public std::enable_shared_from_this<Connection>, public ClientLink {
  public:
   Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
              std::shared_ptr<ConnStats> stats, size_t query_buffer_limit);
@@ -33,15 +35,22 @@ class Connection : public std::enable_shared_from_this<Connection> {
   Connection& operator=(const Connection&) = delete;
 
   void Start();
+  void Unblock(std::string reply) override;  // ClientLink: any thread
 
  private:
   void DoRead();
   void OnRead(std::error_code ec, size_t n);
   void ProcessInput();
-  void Flush();
+  void AfterInput();
+  void StartWrite();
+  void OnWrite(std::error_code ec);
+  void ArmBlockTimer();
+  void OnUnblocked(std::string reply);
+  void ResumeAfterBlock();  // the blocked command ended: run the pipeline again
   void Close();
 
   asio::ip::tcp::socket socket_;
+  asio::steady_timer block_timer_;
   Session session_;
   CommandExecutor executor_;
   std::shared_ptr<ConnStats> stats_;
@@ -52,6 +61,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
   std::string out_;
   std::array<char, size_t{16} * 1024> read_buf_{};
   bool closed_ = false;
+  bool reading_ = false;  // at most one read in flight
+  bool writing_ = false;  // at most one write in flight
 };
 
 }  // namespace tideskv::net
