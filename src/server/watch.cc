@@ -30,11 +30,11 @@ const WatchRegistry::Shard& WatchRegistry::ShardFor(const std::string& map_key) 
   return shards_[std::hash<std::string>{}(map_key) % kShards];
 }
 
-void WatchRegistry::Watch(const std::shared_ptr<WatchClient>& client, uint8_t db, std::string_view key,
+bool WatchRegistry::Watch(const std::shared_ptr<WatchClient>& client, uint8_t db, std::string_view key,
                           bool expired) {
-  if (client->dirty()) return;
+  if (client->dirty()) return false;
   const DbKey dk{db, std::string(key)};
-  if (std::find(client->keys_.begin(), client->keys_.end(), dk) != client->keys_.end()) return;
+  if (std::find(client->keys_.begin(), client->keys_.end(), dk) != client->keys_.end()) return false;
   const std::string mk = MapKey(db, key);
   Shard& s = ShardFor(mk);
   {
@@ -43,6 +43,19 @@ void WatchRegistry::Watch(const std::shared_ptr<WatchClient>& client, uint8_t db
     entries_.fetch_add(1);  // before the client reads the key: a writer that then sees 0 committed earlier
   }
   client->keys_.push_back(dk);
+  return true;
+}
+
+void WatchRegistry::MarkExpiredAtWatch(const WatchClient& client, uint8_t db, std::string_view key) {
+  const std::string mk = MapKey(db, key);
+  Shard& s = ShardFor(mk);
+  std::lock_guard lock(s.mu);
+  if (client.dirty()) return;
+  auto it = s.by_key.find(mk);
+  if (it == s.by_key.end()) return;
+  for (Entry& e : it->second) {
+    if (e.client.get() == &client) e.expired = true;
+  }
 }
 
 void WatchRegistry::UnwatchAll(WatchClient& client) {

@@ -84,9 +84,15 @@ class WatchRules : public ::testing::TestWithParam<size_t> {};
 TEST_P(WatchRules, MatchRedis72) {  // Review Focus #3
   const Rule& r = Rules()[GetParam()];
   CommandHarness h;
-  for (const ArgList& c : r.setup) h.Run(c);
+  for (const ArgList& c : r.setup) EXPECT_NE(h.Run(c)[0], '-') << r.name << ": setup failed";
   ASSERT_EQ(h.Run({"WATCH", r.watched}), kOk);
-  for (const ArgList& c : r.write) h.Run(c);
+  const bool expect_error = std::string_view(r.name) == "wrongtype error";
+  for (const ArgList& c : r.write) {
+    const std::string reply = h.Run(c);
+    if (!expect_error) {
+      EXPECT_NE(reply[0], '-') << r.name << ": write failed: " << reply;
+    }
+  }
   ASSERT_NE(h.session.watch, nullptr);
   EXPECT_EQ(h.session.watch->dirty(), r.dirty) << r.name;
 }

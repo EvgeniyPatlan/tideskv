@@ -33,7 +33,11 @@ class WatchRegistry final : public WriteObserver {
  public:
   // Owner thread. Watches (db, key) unless the client already does or is dirty (Redis then
   // registers nothing). expired: the key exists but is logically expired now (wk->expired).
-  void Watch(const std::shared_ptr<WatchClient>& client, uint8_t db, std::string_view key, bool expired);
+  // Returns true if this call registered the key (false: already watched, or the client is dirty).
+  bool Watch(const std::shared_ptr<WatchClient>& client, uint8_t db, std::string_view key, bool expired);
+  // Owner thread, after Watch() returned true and the key was read: records that it was already
+  // expired at WATCH. No-op if the entry is gone or the client is dirty (a write landed in between).
+  void MarkExpiredAtWatch(const WatchClient& client, uint8_t db, std::string_view key);
   // Owner thread. Drops every watch and clears the dirty flag (UNWATCH, EXEC, DISCARD, RESET, disconnect).
   void UnwatchAll(WatchClient& client);
   // Owner thread. The watched keys whose expired-at-watch flag is clear: EXEC checks them for expiry.

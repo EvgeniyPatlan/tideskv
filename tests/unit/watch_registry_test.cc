@@ -89,6 +89,28 @@ TEST_F(WatchRegistryTest, ExpiredAtWatchAndStillThereIsDirty) {
   EXPECT_TRUE(a->dirty());
 }
 
+// A recreate landing between registration and the expired flag must dirty the client.
+TEST_F(WatchRegistryTest, WriteBetweenRegistrationAndExpiredFlagDirties) {
+  reg.Watch(a, 0, "k", false);
+  Create(0, "k");
+  Touch(0, "k");
+  reg.MarkExpiredAtWatch(*a, 0, "k");
+  EXPECT_TRUE(a->dirty());
+}
+
+TEST_F(WatchRegistryTest, ExpiredFlagSetAfterRegistrationKeepsStaleKeySemantics) {
+  Create(0, "k");
+  reg.Watch(a, 0, "k", false);
+  reg.MarkExpiredAtWatch(*a, 0, "k");
+  EXPECT_TRUE(reg.KeysWatchedLive(*a).empty());
+  auto t = storage.BeginWrite();
+  ASSERT_TRUE((*t)->Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k")).ok());
+  ASSERT_TRUE((*t)->Commit().ok());
+  Touch(0, "k");
+  EXPECT_FALSE(a->dirty());
+  EXPECT_FALSE(reg.KeysWatchedLive(*a).empty());
+}
+
 TEST_F(WatchRegistryTest, NullViewCountsAsExisting) {
   reg.Watch(a, 0, "k", true);
   reg.OnModified({{0, "k"}}, nullptr);
