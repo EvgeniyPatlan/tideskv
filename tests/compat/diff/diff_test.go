@@ -80,6 +80,13 @@ func runSeed(t *testing.T, seed int64, ours, ref string) {
 			t.Fatal(err)
 		}
 	}
+	if seed%2 == 1 { // odd seeds run the whole stream in RESP3
+		for _, c := range []*Conn{a, b} {
+			if _, err := c.Do("HELLO", "3"); err != nil { // its reply (server info) differs by design
+				t.Fatal(err)
+			}
+		}
+	}
 	g := NewGen(seed)
 	var history []string
 	for step := 0; step < ops(); step++ {

@@ -13,8 +13,8 @@ Status ParseRandomCount(std::string_view arg, int64_t* out);
 // (SPOP count: kErrMustBePositive; SINTERCARD LIMIT: kErrLimitNegative).
 Status ParsePositiveCount(std::string_view arg, std::string_view error, int64_t* out);
 
-// getPositiveLongFromObjectOrReply(NULL) (LPOP/RPOP/ZPOPMIN/ZPOPMAX count): kErrNotInteger for a
-// non-integer, kErrMustBePositive for a negative value.
+// getPositiveLongFromObjectOrReply(NULL) (LPOP/RPOP count): getRangeLong replies the default
+// message kErrMustBePositive for a non-integer and for a negative value alike.
 Status ParseNonNegativeCount(std::string_view arg, int64_t* out);
 
 }  // namespace tideskv

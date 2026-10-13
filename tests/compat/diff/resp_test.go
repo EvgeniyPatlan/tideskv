@@ -29,7 +29,9 @@ func TestReaderRejectsBadFraming(t *testing.T) {
 		"bad bulk trailer":         "$3\r\nfooXY",
 		"bare LF line":             "+OK\n",
 		"empty line":               "\r\n",
-		"unknown type":             "%1\r\n",
+		"unknown type":             "?1\r\n",
+		"RESP3 set null length":    "~-1\r\n",
+		"RESP3 map null length":    "%-1\r\n",
 		"bare LF inside array":     "*1\r\n:1\n",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -92,5 +94,47 @@ func TestShapeNormalisers(t *testing.T) {
 	s2 := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "0"}, q}}
 	if !reflect.DeepEqual(NormaliseScan(s1, true), NormaliseScan(s2, true)) {
 		t.Fatal("HSCAN pages with the same pairs must compare equal")
+	}
+}
+
+func TestReaderParsesResp3(t *testing.T) {
+	for wire, want := range map[string]string{
+		",1.5\r\n":                     `,"1.5"`,
+		"_\r\n":                        `_""`,
+		"#t\r\n":                       `#"t"`,
+		"%1\r\n+a\r\n:1\r\n":           `[+"a", :"1"]`,
+		"~2\r\n$1\r\na\r\n$1\r\nb\r\n": `[$"a", $"b"]`,
+		"=7\r\ntxt:abc\r\n":            `="txt:abc"`,
+	} {
+		r, raw, err := pipeConn(t, wire).DoRaw("PING")
+		if err != nil {
+			t.Fatalf("%q: %v", wire, err)
+		}
+		if r.String() != want || string(raw) != wire {
+			t.Fatalf("%q parsed as %s (raw %q), want %s", wire, r, raw, want)
+		}
+	}
+}
+
+func TestNormalisersAcceptResp3Kinds(t *testing.T) {
+	mk := func(kind byte, xs ...string) Reply {
+		r := Reply{Kind: kind}
+		for _, x := range xs {
+			r.Elems = append(r.Elems, Reply{Kind: '$', Str: x})
+		}
+		return r
+	}
+	if !reflect.DeepEqual(SortPairs(mk('%', "b", "2", "a", "1")), mk('%', "a", "1", "b", "2")) {
+		t.Fatal("HGETALL map pairs must sort and keep kind %")
+	}
+	if !reflect.DeepEqual(SortElems(mk('~', "b", "a")), mk('~', "a", "b")) {
+		t.Fatal("SMEMBERS set must sort and keep kind ~")
+	}
+	s := Reply{Kind: '*', Elems: []Reply{{Kind: '$', Str: "0"}, mk('~', "b", "a")}}
+	if got := NormaliseScan(s, false).Elems[1]; !reflect.DeepEqual(got, mk('~', "a", "b")) {
+		t.Fatalf("scan page not sorted: %s", got)
+	}
+	if !sameShape(mk('~', "a"), mk('~', "z")) || sameShape(mk('~', "a"), mk('*', "a")) {
+		t.Fatal("sameShape must compare RESP3 kinds and lengths")
 	}
 }

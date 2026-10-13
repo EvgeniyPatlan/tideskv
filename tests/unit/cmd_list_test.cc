@@ -50,7 +50,7 @@ TEST_F(ListCmds, PopForms) {
   EXPECT_EQ(h.Run({"LPOP", "l"}), kNil);
   EXPECT_EQ(h.Run({"LPOP", "l", "0"}), "*-1\r\n");  // missing key with count: null array
   EXPECT_EQ(h.Run({"RPOP", "l", "-1"}), Err(kErrMustBePositive));
-  EXPECT_EQ(h.Run({"RPOP", "l", "x"}), Err(kErrNotInteger));
+  EXPECT_EQ(h.Run({"RPOP", "l", "x"}), Err(kErrMustBePositive));
   EXPECT_EQ(h.Run({"LPOP", "l", "1", "2"}), Err("ERR wrong number of arguments for 'lpop' command"));
 }
 
@@ -74,6 +74,18 @@ TEST_F(ListCmds, Lset) {
   EXPECT_EQ(h.Run({"LSET", "l", "2", "x"}), Err(kErrIndexOutOfRange));
   EXPECT_EQ(h.Run({"LSET", "l", "x", "x"}), Err(kErrNotInteger));
   EXPECT_EQ(h.Run({"LSET", "nokey", "x", "x"}), Err(kErrNoSuchKey));  // the key is checked first
+}
+
+// Redis 7.2.5 listTypeReplaceAtIndex takes an `int` index, so LSET truncates the 64-bit argument to
+// its low 32 bits (verified against redis:7.2.5: LSET l 9223372036854775807 replaces the last element).
+TEST_F(ListCmds, LsetTruncatesIndexToInt32LikeRedis72) {
+  EXPECT_EQ(h.Run({"RPUSH", "l", "a", "b", "c"}), Int(3));
+  EXPECT_EQ(h.Run({"LSET", "l", "9223372036854775807", "X"}), kOk);   // low 32 bits: -1
+  EXPECT_EQ(h.Run({"LSET", "l", "4294967296", "Y"}), kOk);            // 0
+  EXPECT_EQ(h.Run({"LSET", "l", "-9223372036854775808", "Z"}), kOk);  // 0
+  EXPECT_EQ(h.Run({"LSET", "l", "4294967297", "W"}), kOk);            // 1
+  EXPECT_EQ(h.Run({"LRANGE", "l", "0", "-1"}), Arr({Bulk("Z"), Bulk("W"), Bulk("X")}));
+  EXPECT_EQ(h.Run({"LSET", "l", "2147483648", "x"}), Err(kErrIndexOutOfRange));  // -2147483648
 }
 
 TEST_F(ListCmds, WrongTypeEverywhere) {

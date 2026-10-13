@@ -29,7 +29,7 @@ TEST(CountArgs, NonNegativeCount) {
   int64_t n = -1;
   EXPECT_TRUE(ParseNonNegativeCount("0", &n).ok());
   EXPECT_EQ(n, 0);
-  EXPECT_EQ(ParseNonNegativeCount("x", &n).message(), kErrNotInteger);
+  EXPECT_EQ(ParseNonNegativeCount("x", &n).message(), kErrMustBePositive);  // 7.2.5: getPositiveLong msg
   EXPECT_EQ(ParseNonNegativeCount("-1", &n).message(), kErrMustBePositive);
 }
 

@@ -146,6 +146,8 @@ Status ListSet(WriteTxn& txn, uint8_t db, std::string_view key, std::string_view
   if (!c->exists()) return Status::UserError(std::string(kErrNoSuchKey));
   int64_t index = 0;
   if (!ParseInt64(index_arg, &index)) return Status::UserError(std::string(kErrNotInteger));
+  // Redis 7.2.5 listTypeReplaceAtIndex(robj*, int index, ...) truncates the parsed long to int.
+  index = static_cast<int32_t>(static_cast<uint64_t>(index) & 0xFFFFFFFFu);
   const std::optional<uint64_t> pos = PositionOf(index, c->size());
   if (!pos) return Status::UserError(std::string(kErrIndexOutOfRange));
   return txn.Put(ColumnFamily::kSubkey, ListElementKey(*c, *pos), value);

@@ -15,7 +15,8 @@ import (
 	"time"
 )
 
-// Reply is a parsed RESP2 reply. Kind is the RESP type byte: + - : $ *.
+// Reply is a parsed RESP2/RESP3 reply. Kind is the RESP type byte (+ - : $ * and, in RESP3,
+// , # ( _ = ~ > %); maps keep Kind '%' with their pairs flattened into Elems.
 type Reply struct {
 	Kind  byte
 	Str   string
@@ -27,7 +28,7 @@ func (r Reply) String() string {
 	switch {
 	case r.Null:
 		return string(r.Kind) + "<nil>"
-	case r.Kind == '*':
+	case isAggregate(r.Kind):
 		parts := make([]string, len(r.Elems))
 		for i, e := range r.Elems {
 			parts[i] = e.String()
@@ -60,11 +61,13 @@ func (rd *reader) line() (string, error) {
 // length parses a $/* header length; only -1 (null) and non-negative values are valid.
 func length(kind byte, s string) (int, error) {
 	n, err := strconv.Atoi(s)
-	if err != nil || n < -1 {
+	if err != nil || n < -1 || (n == -1 && kind != '*' && kind != '$') {
 		return 0, fmt.Errorf("bad %c length %q", kind, s)
 	}
 	return n, nil
 }
+
+func isAggregate(kind byte) bool { return kind == '*' || kind == '~' || kind == '>' || kind == '%' }
 
 func (rd *reader) read() (Reply, error) {
 	l, err := rd.line()
@@ -76,23 +79,27 @@ func (rd *reader) read() (Reply, error) {
 	}
 	r := Reply{Kind: l[0], Str: l[1:]}
 	switch r.Kind {
-	case '+', '-', ':':
+	case '+', '-', ':', ',', '#', '(': // simple, error, integer, double, boolean, big number
 		return r, nil
-	case '$':
-		return rd.bulk(r.Str)
-	case '*':
-		return rd.array(r.Str)
+	case '_': // RESP3 null
+		return r, nil
+	case '$', '=': // bulk, verbatim
+		return rd.bulk(r.Kind, r.Str)
+	case '*', '~', '>': // array, set, push
+		return rd.array(r.Kind, r.Str, 1)
+	case '%': // map: n pairs, flattened like HGETALL in RESP2
+		return rd.array(r.Kind, r.Str, 2)
 	}
 	return Reply{}, fmt.Errorf("unknown reply type %q", l)
 }
 
-func (rd *reader) bulk(hdr string) (Reply, error) {
-	n, err := length('$', hdr)
+func (rd *reader) bulk(kind byte, hdr string) (Reply, error) {
+	n, err := length(kind, hdr)
 	if err != nil {
 		return Reply{}, err
 	}
 	if n < 0 {
-		return Reply{Kind: '$', Null: true}, nil
+		return Reply{Kind: kind, Null: true}, nil
 	}
 	buf := make([]byte, n+2)
 	got, err := io.ReadFull(rd.r, buf)
@@ -103,19 +110,23 @@ func (rd *reader) bulk(hdr string) (Reply, error) {
 	if string(buf[n:]) != "\r\n" {
 		return Reply{}, fmt.Errorf("bulk payload not followed by CRLF: %q", buf[n:])
 	}
-	return Reply{Kind: '$', Str: string(buf[:n])}, nil
+	return Reply{Kind: kind, Str: string(buf[:n])}, nil
 }
 
-func (rd *reader) array(hdr string) (Reply, error) {
-	n, err := length('*', hdr)
+// array reads n*per elements; -1 (null) is valid for '*' only.
+func (rd *reader) array(kind byte, hdr string, per int) (Reply, error) {
+	n, err := length(kind, hdr)
 	if err != nil {
 		return Reply{}, err
 	}
 	if n < 0 {
-		return Reply{Kind: '*', Null: true}, nil
+		if kind != '*' {
+			return Reply{}, fmt.Errorf("bad %c length %q", kind, hdr)
+		}
+		return Reply{Kind: kind, Null: true}, nil
 	}
-	out := Reply{Kind: '*', Elems: make([]Reply, 0, n)}
-	for i := 0; i < n; i++ {
+	out := Reply{Kind: kind, Elems: make([]Reply, 0, n*per)}
+	for i := 0; i < n*per; i++ {
 		e, err := rd.read()
 		if err != nil {
 			return Reply{}, err
@@ -195,7 +206,7 @@ func PositiveAsToken(r Reply) Reply {
 
 // SortPairs normalises a flat field/value array (HGETALL, HRANDFIELD ... WITHVALUES) by pair.
 func SortPairs(r Reply) Reply {
-	if r.Kind != '*' || len(r.Elems)%2 != 0 {
+	if (r.Kind != '*' && r.Kind != '%') || len(r.Elems)%2 != 0 {
 		return r
 	}
 	type pair struct{ k, v Reply }
@@ -209,7 +220,7 @@ func SortPairs(r Reply) Reply {
 		}
 		return ps[i].v.Str < ps[j].v.Str
 	})
-	out := Reply{Kind: '*', Elems: make([]Reply, 0, len(r.Elems))}
+	out := Reply{Kind: r.Kind, Elems: make([]Reply, 0, len(r.Elems))}
 	for _, p := range ps {
 		out.Elems = append(out.Elems, p.k, p.v)
 	}
@@ -243,7 +254,7 @@ func sameShape(a, b Reply) bool {
 	switch a.Kind {
 	case '-':
 		return a.Str == b.Str
-	case '*':
+	case '*', '~', '%', '>':
 		return len(a.Elems) == len(b.Elems)
 	}
 	return true
