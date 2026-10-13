@@ -78,7 +78,7 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   CompactionScheduler::Options co;
   co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
   scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
-  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get());
+  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_);
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
@@ -105,6 +105,9 @@ net::ServerOptions App::MakeServerOptions() {
     return static_cast<size_t>(config_->Snapshot().client_query_buffer_limit);
   };
   o.init_session = [this](Session& s) { s.authenticated = config_->Snapshot().requirepass.empty(); };
+  o.on_disconnect = [this](Session& s) {
+    if (s.watch) watches_.UnwatchAll(*s.watch);
+  };
   return o;
 }
 

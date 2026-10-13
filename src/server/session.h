@@ -2,10 +2,12 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace tideskv {
 
 class BlockedClient;  // server/blocking.h
+class WatchClient;    // server/watch.h
 
 // How another thread reaches a connection: implemented by net::Connection (M4 plan F5).
 class ClientLink {
@@ -15,6 +17,13 @@ class ClientLink {
   // (served by a push, or CLIENT UNBLOCK): the connection appends `reply` (encoded bytes) and resumes
   // executing its pipelined input.
   virtual void Unblock(std::string reply) = 0;
+};
+
+// MULTI state (M5a plan G3).
+struct MultiState {
+  bool active = false;      // between MULTI and EXEC/DISCARD (Redis CLIENT_MULTI)
+  bool dirty_exec = false;  // a command was rejected while queueing: EXEC aborts (CLIENT_DIRTY_EXEC)
+  std::vector<std::vector<std::string>> queued;
 };
 
 // Per-connection state. Owned by the connection; touched only on its worker thread.
@@ -30,6 +39,8 @@ struct Session {
   std::string lib_ver;                     // CLIENT SETINFO LIB-VER
   std::weak_ptr<ClientLink> link;          // set by the connection when it starts; empty in unit tests
   std::shared_ptr<BlockedClient> blocked;  // set while a blocking command waits (M4 F5)
+  MultiState multi;                        // M5a G3
+  std::shared_ptr<WatchClient> watch;      // created by the first WATCH (M5a G2)
 };
 
 }  // namespace tideskv

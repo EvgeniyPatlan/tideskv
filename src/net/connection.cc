@@ -10,13 +10,15 @@
 namespace tideskv::net {
 
 Connection::Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
-                       std::shared_ptr<ConnStats> stats, size_t query_buffer_limit)
+                       std::shared_ptr<ConnStats> stats, size_t query_buffer_limit,
+                       std::function<void(Session&)> on_disconnect)
     : socket_(std::move(socket)),
       block_timer_(socket_.get_executor()),
       session_(std::move(session)),
       executor_(std::move(executor)),
       stats_(std::move(stats)),
       query_buffer_limit_(query_buffer_limit),
+      on_disconnect_(std::move(on_disconnect)),
       reply_(session_.protocol) {
   stats_->connected.fetch_add(1);
   stats_->total_connections.fetch_add(1);
@@ -24,6 +26,7 @@ Connection::Connection(asio::ip::tcp::socket socket, Session session, CommandExe
 
 Connection::~Connection() {
   if (session_.blocked) session_.blocked->Cancel();  // e.g. Server::Stop destroying pending handlers
+  if (on_disconnect_) on_disconnect_(session_);
   stats_->connected.fetch_sub(1);
 }
 

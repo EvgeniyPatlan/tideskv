@@ -41,10 +41,17 @@ void GetEx(ExecContext& ctx, const ArgList& argv) {
 
 void Append(ExecContext& ctx, const ArgList& argv) {
   int64_t len = 0;
-  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
-    len = 0;
-    return MoveInto(StringAppend(txn, ctx.session.db, argv[1], argv[2], now_ms), &len);
-  });
+  // Redis signals on every non-error APPEND (t_string.c:723).
+  std::vector<std::string> also;
+  const bool ok = WriteOneKey(
+      ctx, argv[1],
+      [&](WriteTxn& txn, int64_t now_ms) {
+        len = 0;
+        Status s = MoveInto(StringAppend(txn, ctx.session.db, argv[1], argv[2], now_ms), &len);
+        if (s.ok()) also.push_back(argv[1]);
+        return s;
+      },
+      &also);
   if (ok) ctx.reply.Integer(len);
 }
 

@@ -35,8 +35,9 @@ inline void SignalReady(ExecContext& ctx, std::string_view key) {
 // caller then replies); on failure replies the error and returns false. fn runs again
 // after a commit conflict, so it must reset its outputs.
 template <typename Fn>
-bool WriteOneKey(ExecContext& ctx, std::string_view key, Fn&& fn) {
-  const Status st = ctx.server.engine().Write(ctx.session.db, {key}, fn);
+bool WriteOneKey(ExecContext& ctx, std::string_view key, Fn&& fn,
+                 std::vector<std::string>* also_modified = nullptr) {
+  const Status st = ctx.server.engine().Write(ctx.session.db, {key}, fn, also_modified);
   if (st.ok()) return true;
   ReplyError(ctx, st);
   return false;

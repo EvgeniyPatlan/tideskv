@@ -80,4 +80,7 @@ inline constexpr std::string_view kErrZrangeLimit =
 inline constexpr std::string_view kErrZrangeWithscoresLex =
     "ERR syntax error, WITHSCORES not supported in combination with BYLEX";
 
+// Transactions (M5a; multi.c, server.c 7.2.5).
+inline constexpr std::string_view kErrWatchInMulti = "ERR WATCH inside MULTI is not allowed";
+
 }  // namespace tideskv

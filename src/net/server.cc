@@ -107,7 +107,7 @@ void Server::OnAccept(asio::ip::tcp::socket socket, Worker& worker) {
   session.peer = ec ? "?" : remote.address().to_string() + ":" + std::to_string(remote.port());
   if (options_.init_session) options_.init_session(session);
   auto conn = std::make_shared<Connection>(std::move(socket), std::move(session), executor_, stats_,
-                                           options_.query_buffer_limit());
+                                           options_.query_buffer_limit(), options_.on_disconnect);
   asio::post(worker.ctx, [conn] { conn->Start(); });  // start on the connection's own thread
 }
 

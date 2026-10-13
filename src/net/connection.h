@@ -29,7 +29,8 @@ struct ConnStats {
 class Connection : public std::enable_shared_from_this<Connection>, public ClientLink {
  public:
   Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
-             std::shared_ptr<ConnStats> stats, size_t query_buffer_limit);
+             std::shared_ptr<ConnStats> stats, size_t query_buffer_limit,
+             std::function<void(Session&)> on_disconnect = nullptr);
   ~Connection() override;
   Connection(const Connection&) = delete;
   Connection& operator=(const Connection&) = delete;
@@ -55,6 +56,7 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   CommandExecutor executor_;
   std::shared_ptr<ConnStats> stats_;
   size_t query_buffer_limit_;
+  std::function<void(Session&)> on_disconnect_;
   resp::RequestParser parser_;
   resp::ReplyBuilder reply_;
   std::string in_;

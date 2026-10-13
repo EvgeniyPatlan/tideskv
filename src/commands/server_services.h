@@ -11,6 +11,7 @@ class CommandRegistry;
 class CursorStore;
 class Engine;
 class OidAllocator;
+class WatchRegistry;
 
 struct ServerStats {
   std::string version;
@@ -50,6 +51,7 @@ class ServerServices {
   virtual OidAllocator& oids() = 0;          // collection object ids (M3 E1)
   virtual CursorStore& cursors() = 0;        // SCAN cursor table (Task 14)
   virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
+  virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
 };
 
 }  // namespace tideskv

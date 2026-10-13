@@ -392,5 +392,24 @@ TEST(NetServerBlocking, ManyRepliesWhileReadingStayOrdered) {
   }
 }
 
+TEST(NetServer, OnDisconnectRunsOncePerConnection) {
+  std::atomic<int> calls{0};
+  std::atomic<uint64_t> last_id{0};
+  ServerOptions o;
+  o.on_disconnect = [&](Session& s) {
+    last_id = s.id;
+    ++calls;
+  };
+  auto server = StartServer(std::move(o));
+  auto c = RespClient::Connect(server->port());
+  ASSERT_NE(c, nullptr);
+  const int64_t id = c->Command({"ID"}).integer;
+  c->Close();
+  EXPECT_TRUE(WaitFor([&] { return calls.load() == 1; }));
+  EXPECT_EQ(last_id.load(), static_cast<uint64_t>(id));
+  server->Stop();
+  EXPECT_EQ(calls.load(), 1);
+}
+
 }  // namespace
 }  // namespace tideskv::net

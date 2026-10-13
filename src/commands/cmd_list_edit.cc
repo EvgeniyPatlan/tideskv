@@ -13,6 +13,7 @@
 #include "types/errors.h"
 #include "types/list_edit.h"
 #include "types/list_move.h"
+#include "types/object_store.h"
 
 namespace tideskv {
 namespace {
@@ -47,9 +48,19 @@ void LRem(ExecContext& ctx, const ArgList& argv) {
 void LTrim(ExecContext& ctx, const ArgList& argv) {
   int64_t start = 0, stop = 0;
   if (!ParseInt64(argv[2], &start) || !ParseInt64(argv[3], &stop)) return ctx.reply.Error(kErrNotInteger);
-  const bool ok = WriteOneKey(ctx, argv[1], [&](WriteTxn& txn, int64_t now_ms) {
-    return ListTrim(txn, ctx.session.db, argv[1], start, stop, now_ms);
-  });
+  // Redis signals the key whenever it holds a list, even if nothing is trimmed (t_list.c:940).
+  std::vector<std::string> also;
+  const bool ok = WriteOneKey(
+      ctx, argv[1],
+      [&](WriteTxn& txn, int64_t now_ms) {
+        auto obj = LoadObject(txn, ctx.session.db, argv[1], now_ms);
+        if (!obj.ok()) return obj.status();
+        const bool live = obj->state == ObjectState::kLive;
+        Status s = ListTrim(txn, ctx.session.db, argv[1], start, stop, now_ms);
+        if (s.ok() && live) also.push_back(argv[1]);
+        return s;
+      },
+      &also);
   if (ok) ctx.reply.SimpleString("OK");
 }
 

@@ -7,6 +7,7 @@
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "server/blocking.h"
+#include "server/watch.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 #include "types/cursor_store.h"
@@ -30,6 +31,7 @@ class FakeServerServices final : public ServerServices {
   CursorStore& cursors() override { return cursors_; }
   OidAllocator& oids() override { return oids_; }
   BlockingRegistry& blocking() override { return blocking_; }
+  WatchRegistry& watches() override { return watches_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -40,9 +42,10 @@ class FakeServerServices final : public ServerServices {
   InMemoryStorage storage_;
   LockManager locks_;
   FakeClock clock_;
-  BlockingRegistry blocking_;                // before engine_
-  OidAllocator oids_{storage_};              // after storage_
-  Engine engine_{storage_, locks_, clock_};  // declared after what it references
+  BlockingRegistry blocking_;                                    // before engine_
+  WatchRegistry watches_;                                        // before engine_
+  OidAllocator oids_{storage_};                                  // after storage_
+  Engine engine_{storage_, locks_, clock_, nullptr, &watches_};  // declared after what it references
 };
 
 }  // namespace tideskv::test

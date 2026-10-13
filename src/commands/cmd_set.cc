@@ -117,11 +117,17 @@ void SRandMember(ExecContext& ctx, const ArgList& argv) {
 
 void SMove(ExecContext& ctx, const ArgList& argv) {
   int64_t moved = 0;
-  const Status st =
-      ctx.server.engine().Write(ctx.session.db, {argv[1], argv[2]}, [&](WriteTxn& txn, int64_t now_ms) {
-        return MoveInto(SetMove(txn, ctx.server.oids(), ctx.session.db, argv[1], argv[2], argv[3], now_ms),
-                        &moved);
-      });
+  // Redis signals the destination whenever the member left the source (t_set.c smoveCommand).
+  std::vector<std::string> also;
+  const Status st = ctx.server.engine().Write(
+      ctx.session.db, {argv[1], argv[2]},
+      [&](WriteTxn& txn, int64_t now_ms) {
+        Status s = MoveInto(
+            SetMove(txn, ctx.server.oids(), ctx.session.db, argv[1], argv[2], argv[3], now_ms), &moved);
+        if (s.ok() && moved == 1 && argv[1] != argv[2]) also.push_back(argv[2]);
+        return s;
+      },
+      &also);
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(moved);
 }

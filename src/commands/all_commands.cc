@@ -24,6 +24,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterZsetAlgebraCommands(registry);
   RegisterBlockingZsetCommands(registry);
   RegisterElementScanCommands(registry);
+  RegisterMultiCommands(registry);
 }
 
 }  // namespace tideskv

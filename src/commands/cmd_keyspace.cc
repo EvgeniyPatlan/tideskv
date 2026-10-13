@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -81,14 +82,17 @@ void FlushDbCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
   const uint8_t db = ctx.session.db;
   const Status st =
-      ctx.server.engine().WriteExclusive([db](WriteTxn& txn, int64_t) { return FlushDb(txn, db); });
+      ctx.server.engine().WriteExclusive([db](WriteTxn& txn, int64_t) { return FlushDb(txn, db); }, {db});
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }
 
 void FlushAllCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
-  const Status st = ctx.server.engine().WriteExclusive([](WriteTxn& txn, int64_t) { return FlushAll(txn); });
+  std::vector<uint8_t> all(encoding::kNumDatabases);
+  std::iota(all.begin(), all.end(), uint8_t{0});
+  const Status st =
+      ctx.server.engine().WriteExclusive([](WriteTxn& txn, int64_t) { return FlushAll(txn); }, all);
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }

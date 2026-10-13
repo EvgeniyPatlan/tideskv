@@ -21,7 +21,8 @@ struct ServerOptions {
   // Read at every accept, so runtime CONFIG SET applies to new connections.
   std::function<int()> maxclients = [] { return 10000; };
   std::function<size_t()> query_buffer_limit = [] { return size_t{1} << 30; };
-  std::function<void(Session&)> init_session;  // optional
+  std::function<void(Session&)> init_session;   // optional
+  std::function<void(Session&)> on_disconnect;  // optional; runs when a connection is destroyed
 };
 
 struct ServerCounters {

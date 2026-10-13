@@ -99,6 +99,10 @@ Result<std::vector<std::string>> SetCombine(ReadView& view, uint8_t db, SetOp op
 
 Result<int64_t> SetCombineStore(WriteTxn& txn, OidAllocator& oids, uint8_t db, SetOp op, std::string_view dst,
                                 const std::vector<std::string_view>& keys, int64_t now_ms) {
+  // Redis looks each source up with lookupKeyRead, which deletes an expired key and signals it.
+  for (std::string_view key : keys) {
+    if (auto src = LoadForWrite(txn, db, key, now_ms); !src.ok()) return src.status();
+  }
   auto members = SetCombine(txn, db, op, keys, now_ms);
   if (!members.ok()) return members.status();
   auto old = LoadForWrite(txn, db, dst, now_ms);

@@ -29,6 +29,7 @@ void RegisterZsetRangeCommands(CommandRegistry& registry);     // cmd_zset_range
 void RegisterZsetPopCommands(CommandRegistry& registry);       // cmd_zset_pop.cc
 void RegisterZsetAlgebraCommands(CommandRegistry& registry);   // cmd_zset_algebra.cc
 void RegisterBlockingZsetCommands(CommandRegistry& registry);  // cmd_blocking_zset.cc
+void RegisterMultiCommands(CommandRegistry& registry);         // cmd_multi.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv
