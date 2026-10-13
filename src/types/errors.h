@@ -50,9 +50,9 @@ inline constexpr std::string_view kErrRankZero =
     "from the end of the list";
 inline constexpr std::string_view kErrCountNegative = "ERR COUNT can't be negative";
 inline constexpr std::string_view kErrMaxlenNegative = "ERR MAXLEN can't be negative";
+inline constexpr std::string_view kErrCountGreaterThanZero = "ERR count should be greater than 0";
 inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
-inline constexpr std::string_view kErrCountGreaterThanZero = "ERR count should be greater than 0";
 // getTimeoutFromObjectOrReply(UNIT_SECONDS) (timeout.c:165).
 inline constexpr std::string_view kErrTimeoutNotFloat = "ERR timeout is not a float or out of range";
 inline constexpr std::string_view kErrTimeoutNegative = "ERR timeout is negative";
