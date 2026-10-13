@@ -22,6 +22,7 @@ void RegisterElementScanCommands(CommandRegistry& registry);  // cmd_element_sca
 void RegisterSetCommands(CommandRegistry& registry);          // cmd_set.cc
 void RegisterSetAlgebraCommands(CommandRegistry& registry);   // cmd_set_algebra.cc
 void RegisterListCommands(CommandRegistry& registry);         // cmd_list.cc
+void RegisterListEditCommands(CommandRegistry& registry);     // cmd_list_edit.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv

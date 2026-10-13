@@ -44,6 +44,11 @@ inline constexpr std::string_view kErrNumkeysTooMany =
 inline constexpr std::string_view kErrLimitNegative = "ERR LIMIT can't be negative";
 // M4 (Redis 7.2.5 t_list.c, t_zset.c, blocked.c, timeout.c; see notes/m4-research).
 inline constexpr std::string_view kErrIndexOutOfRange = "ERR index out of range";
+inline constexpr std::string_view kErrRankZero =
+    "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start "
+    "from the end of the list";
+inline constexpr std::string_view kErrCountNegative = "ERR COUNT can't be negative";
+inline constexpr std::string_view kErrMaxlenNegative = "ERR MAXLEN can't be negative";
 inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bulk-len
 
 }  // namespace tideskv
