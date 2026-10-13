@@ -2,12 +2,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include <exception>
 #include <optional>
 #include <string>
 
 #include "commands/server_services.h"
 #include "exec/engine.h"
 #include "server/blocking.h"
+#include "types/errors.h"
 #include "types/object_store.h"
 
 namespace tideskv {
@@ -33,6 +35,22 @@ std::optional<std::string> ReRun(const CommandRegistry& registry, ServerServices
   return reply.Take();
 }
 
+// TryServe with ReRun. An exception from the re-run must not reach the pusher whose command signalled the
+// key: it is logged and that waiter's wait ends with kErrInternal, delivered like a CLIENT UNBLOCK reply
+// (the client is not left stuck; its connection stays open). Reported as kGone so the scan goes on.
+BlockedClient::ServeResult ServeOne(const CommandRegistry& registry, ServerServices& server,
+                                    BlockedClient& waiter, ReadyKeys& ready) {
+  try {
+    return waiter.TryServe([&] { return ReRun(registry, server, waiter, ready); });
+  } catch (const std::exception& e) {
+    spdlog::error("serving blocked client id={} failed: {}", waiter.client_id(), e.what());
+  }
+  resp::ReplyBuilder reply(waiter.session().protocol);
+  reply.Error(kErrInternal);
+  waiter.Unblock(reply.Take());
+  return BlockedClient::ServeResult::kGone;
+}
+
 // The live type of (db, key), or nullopt when it is missing or expired.
 Result<std::optional<encoding::ValueType>> LiveType(Engine& engine, uint8_t db, std::string_view key) {
   std::optional<encoding::ValueType> type;
@@ -55,7 +73,7 @@ void ServeKey(const CommandRegistry& registry, ServerServices& server, const Rea
     }
     if (!*type) return;                      // the key is gone: nobody can be served from it
     if (**type != waiter->type()) continue;  // e.g. a BLPOP waiter on a key that became a zset
-    const auto result = waiter->TryServe([&] { return ReRun(registry, server, *waiter, ready); });
+    const auto result = ServeOne(registry, server, *waiter, ready);
     if (result == BlockedClient::ServeResult::kStillBlocked) return;  // the key is empty again
   }
 }

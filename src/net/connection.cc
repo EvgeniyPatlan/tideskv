@@ -5,6 +5,8 @@
 #include <string_view>
 #include <utility>
 
+#include "types/errors.h"
+
 namespace tideskv::net {
 
 Connection::Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
@@ -69,7 +71,7 @@ void Connection::ProcessInput() {
     } catch (const std::exception& e) {
       spdlog::error("command failed for client id={}: {}", session_.id, e.what());
       reply_.Truncate(reply_mark);  // drop any half-written reply
-      reply_.Error("ERR internal error");
+      reply_.Error(kErrInternal);
       session_.close_after_reply = true;
     }
     if (session_.blocked) {  // the command parked itself: stop until it ends (F5)

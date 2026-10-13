@@ -60,6 +60,8 @@ inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of
 
 inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
 inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";
+// TidesKV-only: an exception escaped a command (the connection's catch-all, a blocked command's re-run).
+inline constexpr std::string_view kErrInternal = "ERR internal error";
 
 // M4 sorted sets (zslParseRange, zslParseLexRange, ZADD/ZINCRBY NaN, ZUNION WEIGHTS).
 inline constexpr std::string_view kErrMinMaxNotFloat = "ERR min or max is not a float";

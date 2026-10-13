@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+
 #include "commands/blocking_serve.h"
 #include "commands/cmd_util.h"
 #include "support/command_harness.h"
+#include "types/errors.h"
 #include "types/list_move.h"
 
 namespace tideskv {
@@ -11,12 +14,14 @@ namespace {
 using test::Arr;
 using test::Bulk;
 using test::CommandHarness;
+using test::Err;
 using test::Int;
 using test::SecondClient;
 
 // Set by a test to make the next TBPOP act as if every key were empty (simulates a push landing between
 // the pop attempt and the registration).
 bool g_pretend_empty = false;
+bool g_rerun = false;  // TTHROW: the next run is a re-run
 
 // TBPOP key [key ...]: BLPOP with an infinite timeout and a plain bulk reply; TPUSH key v: RPUSH that
 // signals.
@@ -48,11 +53,21 @@ void TPush(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.Integer(n);
 }
 
+// TTHROW key: blocks on key the first time it runs; every re-run throws (a command bug on the serve path).
+void TThrow(ExecContext& ctx, const ArgList& argv) {
+  if (!std::exchange(g_rerun, true)) {
+    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0});
+  }
+  throw std::runtime_error("tthrow re-run");
+}
+
 struct BlockingServe : ::testing::Test {
   void SetUp() override {
     g_pretend_empty = false;
+    g_rerun = false;
     h.services.registry_.Register({"tbpop", -2, kCmdWrite, 1, -1, 1, &TBPop});
     h.services.registry_.Register({"tpush", -3, kCmdWrite, 1, 1, 1, &TPush});
+    h.services.registry_.Register({"tthrow", 2, kCmdWrite, 1, 1, 1, &TThrow});
   }
   CommandHarness h;
 };
@@ -99,6 +114,16 @@ TEST_F(BlockingServe, WaiterOfAnotherTypeIsSkipped) {
   ServeBlockedClients(h.services.registry(), h.services, ready);  // as if SADD had signalled
   EXPECT_TRUE(h.TakeUnblocked().empty());
   EXPECT_EQ(h.services.blocking_.blocked_clients(), 1u);
+}
+
+TEST_F(BlockingServe, ReRunThatThrowsEndsThatWaitWithAnErrorNotThePusher) {
+  EXPECT_EQ(h.Run({"TTHROW", "k"}), "");
+  SecondClient b(h), pusher(h);
+  EXPECT_EQ(b.Run({"TBPOP", "k"}), "");
+  EXPECT_EQ(pusher.Run({"TPUSH", "k", "x"}), Int(1));  // the exception did not reach the pusher
+  EXPECT_EQ(h.TakeUnblocked(), (std::vector<std::string>{Err(kErrInternal)}));
+  EXPECT_EQ(b.TakeUnblocked(), (std::vector<std::string>{Bulk("x")}));  // the next waiter is served
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
 }
 
 }  // namespace
