@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <functional>
 #include <string>
-#include <thread>
 
+#include "support/it_helpers.h"
 #include "support/test_server.h"
+#include "types/errors.h"
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
@@ -14,21 +14,6 @@ namespace {
 
 using Type = RespValue::Type;
 using namespace std::chrono_literals;
-
-int64_t InfoField(RespClient& c, const std::string& section, const std::string& field) {
-  const std::string info = c.Command({"INFO", section}).str;
-  const size_t at = info.find(field + ":");
-  return at == std::string::npos ? -1 : std::stoll(info.substr(at + field.size() + 1));
-}
-
-bool WaitFor(const std::function<bool()>& cond, std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (cond()) return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  }
-  return cond();
-}
 
 struct BlockingOrderIT : ::testing::Test {
   TestServer s{TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}}};
@@ -110,7 +95,7 @@ TEST_F(BlockingOrderIT, ClientUnblockAcrossConnections) {
   auto r = a->Read();
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->type, Type::kError);
-  EXPECT_EQ(r->str, "UNBLOCKED client unblocked via CLIENT UNBLOCK");
+  EXPECT_EQ(r->str, kErrUnblockedByClient);
   EXPECT_EQ(a->Command({"PING"}).str, "PONG");  // the connection works normally afterwards
 }
 

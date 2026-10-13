@@ -3,6 +3,7 @@
 #include <chrono>
 #include <thread>
 
+#include "support/it_helpers.h"
 #include "support/temp_dir.h"
 #include "support/test_server.h"
 
@@ -10,12 +11,6 @@
 
 namespace tideskv::test {
 namespace {
-
-int64_t InfoField(RespClient& c, const std::string& section, const std::string& field) {
-  const std::string info = c.Command({"INFO", section}).str;
-  const size_t at = info.find(field + ":");
-  return at == std::string::npos ? -1 : std::stoll(info.substr(at + field.size() + 1));
-}
 
 TEST(CollectionPersistenceIT, HashesSetsAndTtlsSurviveRestart) {
   TempDir dir("tideskv-coll");

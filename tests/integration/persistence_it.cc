@@ -3,6 +3,7 @@
 #include <chrono>
 #include <thread>
 
+#include "support/it_helpers.h"
 #include "support/temp_dir.h"
 #include "support/test_server.h"
 
@@ -10,13 +11,6 @@
 
 namespace tideskv::test {
 namespace {
-
-int64_t InfoField(RespClient& c, const std::string& section, const std::string& field) {
-  const std::string info = c.Command({"INFO", section}).str;
-  const size_t at = info.find(field + ":");
-  if (at == std::string::npos) return -1;
-  return std::stoll(info.substr(at + field.size() + 1));
-}
 
 TEST(PersistenceIT, ValuesAndTtlsSurviveRestart) {  // Review Focus #5
   TempDir dir("tideskv-persist");

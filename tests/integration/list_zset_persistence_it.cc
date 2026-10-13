@@ -1,9 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <chrono>
-#include <functional>
 #include <string>
-#include <thread>
 
 #include "support/test_server.h"
 
@@ -11,8 +8,6 @@
 
 namespace tideskv::test {
 namespace {
-
-using Type = RespValue::Type;
 
 TEST(ListZsetPersistenceIT, ListsAndZsetsSurviveRestart) {
   TempDir dir("tideskv-lz");
