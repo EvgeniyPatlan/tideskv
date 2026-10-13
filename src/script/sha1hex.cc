@@ -23,7 +23,7 @@ std::string Sha1Hex(std::string_view data) {
   SHA1Final(digest, &ctx);
   static constexpr char kHex[] = "0123456789abcdef";
   std::string out(40, '0');
-  for (int i = 0; i < 20; ++i) {
+  for (size_t i = 0; i < sizeof(digest); ++i) {
     out[2 * i] = kHex[digest[i] >> 4];
     out[2 * i + 1] = kHex[digest[i] & 0xf];
   }
