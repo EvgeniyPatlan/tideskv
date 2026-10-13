@@ -1,6 +1,8 @@
 package diff
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"math/rand"
 	"strconv"
 )
@@ -67,11 +69,14 @@ const (
 )
 
 // Next returns the next command and how its reply is normalised before comparing. About one
-// command in 12 is a transaction command; inside MULTI every command replies +QUEUED and EXEC's
+// command in 12 is a transaction command, one in 10 a script command (always compared byte for byte); inside MULTI every command replies +QUEUED and EXEC's
 // array is compared byte for byte, so only NormNone commands are queued.
 func (g *Gen) Next() ([]string, Norm) {
 	if g.r.Intn(12) == 0 {
 		return g.txnCmd(), NormNone
+	}
+	if g.r.Intn(10) == 0 {
+		return g.scriptCmd(), NormNone
 	}
 	for {
 		cmd, norm := g.dataCmd()
@@ -490,4 +495,77 @@ func (g *Gen) algebraOpts() []string {
 
 func (g *Gen) storeOpts() []string {
 	return [][]string{nil, {"WEIGHTS", "inf", "-inf"}, {"AGGREGATE", "MIN"}, {"WITHSCORES"}}[g.r.Intn(4)]
+}
+
+// Scripts whose replies Redis 7.2.5 and TidesKV must match byte for byte. Excluded on purpose:
+// math.random (process-global stream), getfenv/setfenv/newproxy and basic-type metatable writes
+// (7.2.16 sandbox vs 7.2.5, M5b H9), bit.tohex(x, INT32_MIN) (crashes 7.2.5), redis.REDIS_VERSION.
+var diffScripts = []string{
+	"return redis.call('get', KEYS[1])",
+	"return redis.call('set', KEYS[1], ARGV[1])",
+	"return redis.pcall('lpush', KEYS[1], ARGV[1])",
+	"return redis.call('incr', KEYS[1])",
+	"return {1, 2.7, 'x', true, false, {ok='fine'}, {err='E x'}, {1, {2}}}",
+	// HGETALL field order is unspecified (the diff compares it as NormPairs), so sort inside the script.
+	"local t = redis.call('hgetall', KEYS[1]) table.sort(t) return t",
+	"redis.setresp(3) local m = redis.call('hgetall', KEYS[1]).map local ks = {} " +
+		"for k in pairs(m) do ks[#ks + 1] = k end table.sort(ks) local r = {} " +
+		"for _, k in ipairs(ks) do r[#r + 1] = k r[#r + 1] = m[k] end return r",
+	"redis.setresp(3) return {redis.call('get', KEYS[1]), true, false}",
+	"return cjson.encode({a=1, b={1,2,'x'}, c=cjson.null})",
+	"return cjson.decode(ARGV[1])",
+	"x = 1",
+	"return a",
+	"return redis.call('nosuch')",
+	"return redis.call('get')",
+	"return redis.call('multi')",
+	"return redis.sha1hex(ARGV[1])",
+	"return redis.error_reply(ARGV[1])",
+	"return redis.status_reply(ARGV[1])",
+	"return tostring(0/0)",
+	"return string.format('%q', ARGV[1])",
+	"return bit.band(tonumber(ARGV[1]) or 0, 255)",
+	"return cmsgpack.unpack(cmsgpack.pack({1, 2, 'x'}))",
+	"return struct.unpack('>I2', ARGV[1] .. '\\0\\0')",
+	"redis.call('select', 1) return redis.call('get', KEYS[1])",
+	"return redis.call('blpop', KEYS[1], 0)",
+	"return redis.call('lrange', KEYS[1], 0, -1)",
+	"return redis.call('zadd', KEYS[1], ARGV[1], 'm')",
+	"return =",
+	"error({err='MY custom'})",
+	"error('plain')",
+	"local ok, e = pcall(redis.call, 'incr', KEYS[1]) return {ok, e}",
+	"#!lua flags=no-writes\nreturn redis.call('set', KEYS[1], 'x')",
+	"#!lua flags=what\nreturn 1",
+	"return 100.5",
+	"return #ARGV",
+}
+
+func (g *Gen) scriptCmd() []string {
+	k := g.key()
+	s := diffScripts[g.r.Intn(len(diffScripts))]
+	switch g.r.Intn(12) {
+	case 0:
+		return []string{"EVAL_RO", s, "1", k, g.value()}
+	case 1:
+		return []string{"EVALSHA", sha1Hex(s), "1", k, g.value()} // NOSCRIPT until loaded
+	case 2:
+		return []string{"SCRIPT", "LOAD", s}
+	case 3:
+		return []string{"SCRIPT", "EXISTS", sha1Hex(s), sha1Hex("nope")}
+	case 4:
+		if g.r.Intn(4) == 0 {
+			return []string{"SCRIPT", "FLUSH"}
+		}
+		return []string{"SCRIPT", g.pick("KILL", "HELP", "FOO")}
+	case 5:
+		return []string{"EVAL", s, g.pick("-1", "x", "3"), k}
+	default:
+		return []string{"EVAL", s, "1", k, g.value()}
+	}
+}
+
+func sha1Hex(s string) string {
+	sum := sha1.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
