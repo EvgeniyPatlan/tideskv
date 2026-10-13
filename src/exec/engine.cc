@@ -108,6 +108,18 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
   return st;
 }
 
+Result<uint64_t> Engine::BatchMark() {
+  Batch* b = ActiveBatch();
+  if (b == nullptr) return Status::Internal("no active batch");
+  return b->Mark();
+}
+
+Status Engine::BatchRollbackTo(uint64_t mark) {
+  Batch* b = ActiveBatch();
+  if (b == nullptr) return Status::Internal("no active batch");
+  return b->RollbackTo(mark);
+}
+
 Result<std::unique_ptr<Engine::Batch>> Engine::BeginBatch() {
   if (engine_internal::t_batch != nullptr) return Status::Internal("nested batch");
   [[maybe_unused]] const ReentryCheck reentry;

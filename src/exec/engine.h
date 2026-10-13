@@ -80,6 +80,8 @@ class Engine {
 
    private:
     friend class Engine;
+    Result<uint64_t> Mark();           // savepoint at the current write position; the mark id
+    Status RollbackTo(uint64_t mark);  // undoes the writes (and their modified keys) after the mark
     Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn, int64_t now_ms);
     Status RunRead(const ReadFn& fn);
     Status RunWrite(const WriteFn& fn, const engine_internal::WriteScope& scope);
@@ -92,12 +94,17 @@ class Engine {
     int64_t now_ms_;
     uint64_t next_savepoint_ = 0;
     std::vector<DbKey> modified_;
-    Status broken_;  // a savepoint rollback failed: the txn may hold half a command
+    std::vector<size_t> marks_;  // modified_.size() at each Mark()
+    Status broken_;              // a savepoint rollback failed: the txn may hold half a command
     bool done_ = false;
   };
   // Fails with kInternal if this thread already has a batch (G1).
   Result<std::unique_ptr<Batch>> BeginBatch();
   bool InBatch() const { return ActiveBatch() != nullptr; }
+  // Script-level undo inside the active batch (M5b H3): BatchRollbackTo(mark) undoes every write
+  // made after BatchMark() and forgets their modified keys. kInternal outside a batch.
+  Result<uint64_t> BatchMark();
+  Status BatchRollbackTo(uint64_t mark);
 
  private:
   Batch* ActiveBatch() const;

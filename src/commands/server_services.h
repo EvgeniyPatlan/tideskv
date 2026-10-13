@@ -35,7 +35,9 @@ struct ServerStats {
   uint64_t background_compaction_failures = 0;  // jobs given up after retries
   uint64_t expired_keys = 0;                    // removed by the active-expiry reaper
   uint64_t blocked_clients = 0;                 // clients waiting in a blocking command
-  uint64_t blocking_keys = 0;                   // distinct keys with at least one blocked client
+  uint64_t lua_memory = 0;                      // bytes held by the Lua VM
+  uint64_t cached_scripts = 0;
+  uint64_t blocking_keys = 0;  // distinct keys with at least one blocked client
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and

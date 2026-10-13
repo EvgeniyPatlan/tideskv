@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <mutex>
 
 #include "common/glob.h"
@@ -121,6 +122,16 @@ const std::vector<Option>& Options() {
          return SetInt(v, 0, 1'000'000'000, &c.compaction_collection_deletes);
        },
        [](const ConfigValues& c) { return std::to_string(c.compaction_collection_deletes); }},
+      {"busy-reply-threshold", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetInt(v, 0, std::numeric_limits<int64_t>::max(), &c.busy_reply_threshold_ms);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.busy_reply_threshold_ms); }},
+      {"lua-time-limit", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetInt(v, 0, std::numeric_limits<int64_t>::max(), &c.busy_reply_threshold_ms);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.busy_reply_threshold_ms); }},
       {"maxclients", true,
        [](ConfigValues& c, std::string_view v) { return SetInt(v, 1, 1'000'000, &c.maxclients); },
        [](const ConfigValues& c) { return std::to_string(c.maxclients); }},

@@ -220,5 +220,21 @@ TEST_F(BatchTest, ThousandCommandsWithFailuresInterleaved) {
   EXPECT_EQ(observer.reported.size(), 666u);
 }
 
+TEST_F(BatchTest, MarkAndRollbackUndoTheWritesAfterTheMark) {
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  ASSERT_TRUE(Put(0, "a", "1").ok());
+  auto mark = engine.BatchMark();
+  ASSERT_TRUE(mark.ok());
+  ASSERT_TRUE(Put(0, "b", "2").ok());
+  ASSERT_TRUE(engine.BatchRollbackTo(*mark).ok());
+  ASSERT_TRUE((*batch)->Commit().ok());
+  batch->reset();
+  EXPECT_EQ(Get(0, "a"), "1");
+  EXPECT_EQ(Get(0, "b"), "<missing>");
+  EXPECT_EQ(observer.reported, (std::vector<DbKey>{{0, "a"}}));
+  EXPECT_EQ(engine.BatchMark().status().code(), StatusCode::kInternal);
+}
+
 }  // namespace
 }  // namespace tideskv

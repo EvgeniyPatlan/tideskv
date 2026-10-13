@@ -180,6 +180,8 @@ ServerStats App::Stats() const {
   s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
   s.blocked_clients = blocking_.blocked_clients();
   s.blocking_keys = blocking_.blocking_keys();
+  s.lua_memory = scripts_.lua_memory();
+  s.cached_scripts = scripts_.cached_scripts();
   return s;
 }
 

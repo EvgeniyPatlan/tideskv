@@ -1,0 +1,166 @@
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "commands/all_commands.h"
+#include "commands/registry.h"
+#include "commands/reply_util.h"
+#include "commands/script_bridge.h"
+#include "commands/server_services.h"
+#include "common/string_util.h"
+#include "exec/engine.h"
+#include "resp/reply_builder.h"
+#include "script/script_engine.h"
+#include "server/config.h"
+#include "types/errors.h"
+
+namespace tideskv {
+namespace {
+
+// H3: run inside a batch (our own, or EXEC's); a killed script is undone to its mark; the reply is
+// sent only once our own batch committed.
+void RunScript(ExecContext& ctx, const ScriptEngine::EvalRequest& req) {
+  Engine& engine = ctx.server.engine();
+  std::unique_ptr<Engine::Batch> own;
+  if (!engine.InBatch()) {
+    auto batch = engine.BeginBatch();
+    if (!batch.ok()) return ReplyError(ctx, batch.status());
+    own = std::move(batch).value();
+  }
+  auto mark = engine.BatchMark();
+  if (!mark.ok()) return ReplyError(ctx, mark.status());
+  resp::ReplyBuilder scratch(ctx.reply.protocol());
+  ScriptBridge bridge(ctx);
+  const ScriptEngine::EvalResult result = ctx.server.scripts().Eval(req, bridge, scratch);
+  if (result.killed) {
+    if (Status st = engine.BatchRollbackTo(*mark); !st.ok())
+      spdlog::error("rolling back a killed script: {}", st.ToString());
+  }
+  if (own) {
+    const Status st = own->Commit();
+    own.reset();  // release the gate before replying
+    if (!st.ok()) return ReplyError(ctx, st);
+  }
+  ctx.reply.Raw(scratch.buffer());
+}
+
+void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_only) {
+  if (by_sha && argv[1].size() != 40) return ctx.reply.Error(kErrNoScript);  // before numkeys (ev:559)
+  int64_t numkeys = 0;
+  if (!ParseInt64(argv[2], &numkeys)) return ctx.reply.Error(kErrNotInteger);
+  if (numkeys > static_cast<int64_t>(argv.size()) - 3) return ctx.reply.Error(kErrNumkeysTooBig);
+  if (numkeys < 0) return ctx.reply.Error(kErrNumkeysNegative);
+  const auto split = argv.begin() + 3 + numkeys;
+  const std::vector<std::string> keys(argv.begin() + 3, split);
+  const std::vector<std::string> args(split, argv.end());
+  RunScript(ctx, {argv[1], by_sha, read_only, &keys, &args, ctx.reply.protocol(),
+                  ctx.server.config().Snapshot().busy_reply_threshold_ms});
+}
+
+void Eval(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, false, false); }
+void EvalSha(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, true, false); }
+void EvalRo(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, false, true); }
+void EvalShaRo(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, true, true); }
+
+struct ScriptSub {
+  std::string_view name;
+  int arity;
+};
+constexpr std::array<ScriptSub, 6> kScriptSubs = {
+    {{"load", 3}, {"exists", -3}, {"flush", -2}, {"kill", 2}, {"debug", 3}, {"help", 2}}};
+
+void ScriptHelp(ExecContext& ctx) {
+  static constexpr std::array<std::string_view, 16> kLines = {
+      "DEBUG (YES|SYNC|NO)",
+      "    Set the debug mode for subsequent scripts executed.",
+      "EXISTS <sha1> [<sha1> ...]",
+      "    Return information about the existence of the scripts in the script cache.",
+      "FLUSH [ASYNC|SYNC]",
+      "    Flush the Lua scripts cache. Very dangerous on replicas.",
+      "    When called without the optional mode argument, the behavior is determined by the",
+      "    lazyfree-lazy-user-flush configuration directive. Valid modes are:",
+      "    * ASYNC: Asynchronously flush the scripts cache.",
+      "    * SYNC: Synchronously flush the scripts cache.",
+      "KILL",
+      "    Kill the currently executing Lua script.",
+      "LOAD <script>",
+      "    Load a script into the scripts cache without executing it.",
+      "HELP",
+      "    Print this help."};
+  ctx.reply.ArrayHeader(kLines.size() + 1);
+  ctx.reply.SimpleString("SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:");
+  for (std::string_view line : kLines) ctx.reply.SimpleString(line);
+}
+
+void ScriptFlush(ExecContext& ctx, const ArgList& argv) {
+  if (argv.size() > 3) return ctx.reply.Error(kErrScriptFlushOption);
+  if (argv.size() == 3) {
+    const std::string mode = ToLower(argv[2]);
+    if (mode != "sync" && mode != "async") return ctx.reply.Error(kErrScriptFlushOption);
+  }
+  Engine& engine = ctx.server.engine();
+  std::unique_ptr<Engine::Batch> own;  // holds the gate while the Lua state is replaced (H3)
+  if (!engine.InBatch()) {
+    auto batch = engine.BeginBatch();
+    if (!batch.ok()) return ReplyError(ctx, batch.status());
+    own = std::move(batch).value();
+  }
+  ctx.server.scripts().Flush();
+  own.reset();  // nothing was written: the batch rolls back
+  ctx.reply.SimpleString("OK");
+}
+
+void ScriptDebug(ExecContext& ctx, const ArgList& argv) {
+  const std::string mode = ToLower(argv[2]);
+  if (mode == "no") return ctx.reply.SimpleString("OK");
+  if (mode == "yes" || mode == "sync") return ctx.reply.Error(kErrScriptDebugUnsupported);
+  ctx.reply.Error(kErrScriptDebugOption);
+}
+
+void ScriptExists(ExecContext& ctx, const ArgList& argv) {
+  const std::vector<std::string> shas(argv.begin() + 2, argv.end());
+  const std::vector<bool> found = ctx.server.scripts().Exists(shas);
+  ctx.reply.ArrayHeader(found.size());
+  for (bool f : found) ctx.reply.Integer(f ? 1 : 0);
+}
+
+void ScriptLoad(ExecContext& ctx, const ArgList& argv) {
+  auto sha = ctx.server.scripts().Load(argv[2]);
+  if (!sha.ok()) return ReplyError(ctx, sha.status());
+  ctx.reply.Bulk(*sha);
+}
+
+void Script(ExecContext& ctx, const ArgList& argv) {
+  const std::string sub = ToLower(argv[1]);
+  const ScriptSub* spec = nullptr;
+  for (const ScriptSub& s : kScriptSubs) {
+    if (s.name == sub) spec = &s;
+  }
+  if (spec == nullptr) return ctx.reply.Error("ERR unknown subcommand '" + argv[1] + "'. Try SCRIPT HELP.");
+  if (!ArityOk(spec->arity, argv.size()))
+    return ctx.reply.Error("ERR wrong number of arguments for 'script|" + sub + "' command");
+  // Before anything that takes the engine's mutex: a running script holds it (Task 9).
+  if (sub != "kill" && ctx.server.scripts().TimedOut()) return ctx.reply.Error(kErrBusyScript);
+  if (sub == "load") return ScriptLoad(ctx, argv);
+  if (sub == "exists") return ScriptExists(ctx, argv);
+  if (sub == "flush") return ScriptFlush(ctx, argv);
+  if (sub == "debug") return ScriptDebug(ctx, argv);
+  if (sub == "help") return ScriptHelp(ctx);
+  if (ctx.server.scripts().Kill()) return ctx.reply.SimpleString("OK");
+  ctx.reply.Error(kErrNotBusy);
+}
+
+}  // namespace
+
+void RegisterScriptCommands(CommandRegistry& r) {
+  r.Register({"eval", -3, kCmdNoScript, 0, 0, 0, &Eval});
+  r.Register({"evalsha", -3, kCmdNoScript, 0, 0, 0, &EvalSha});
+  r.Register({"eval_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalRo});
+  r.Register({"evalsha_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalShaRo});
+  r.Register({"script", -2, kCmdNoScript, 0, 0, 0, &Script});
+}
+
+}  // namespace tideskv

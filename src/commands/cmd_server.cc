@@ -43,6 +43,10 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                                {"blocked_clients", std::to_string(s.blocked_clients)},
                                {"total_blocking_keys", std::to_string(s.blocking_keys)}});
   }
+  if (name == "memory") {
+    return Section("Memory", {{"used_memory_lua", std::to_string(s.lua_memory)},
+                              {"number_of_cached_scripts", std::to_string(s.cached_scripts)}});
+  }
   if (name == "stats") {
     return Section("Stats", {{"total_connections_received", std::to_string(s.total_connections)},
                              {"total_commands_processed", std::to_string(s.total_commands)},
@@ -67,7 +71,8 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
 }
 
 const std::vector<std::string>& AllSections() {
-  static const std::vector<std::string> kAll = {"server", "clients", "stats", "persistence", "keyspace"};
+  static const std::vector<std::string> kAll = {"server", "clients",     "memory",
+                                                "stats",  "persistence", "keyspace"};
   return kAll;
 }
 

@@ -61,6 +61,25 @@ Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
   return Status::Ok();
 }
 
+Result<uint64_t> Engine::Batch::Mark() {
+  if (!broken_.ok()) return broken_;
+  const uint64_t id = marks_.size();
+  if (Status st = recorder_.Savepoint("mark" + std::to_string(id)); !st.ok()) return st;
+  marks_.push_back(modified_.size());
+  return id;
+}
+
+Status Engine::Batch::RollbackTo(uint64_t mark) {
+  if (mark >= marks_.size()) return Status::Internal("unknown batch mark");
+  if (!broken_.ok()) return broken_;
+  if (Status st = recorder_.RollbackToSavepoint("mark" + std::to_string(mark)); !st.ok()) {
+    broken_ = st;
+    return st;
+  }
+  modified_.resize(marks_[mark]);
+  return Status::Ok();
+}
+
 Status Engine::Batch::Commit() {
   if (done_) return Status::Internal("batch already finished");
   done_ = true;
