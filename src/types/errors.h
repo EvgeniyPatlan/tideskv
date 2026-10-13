@@ -67,4 +67,10 @@ inline constexpr std::string_view kErrMinMaxNotString = "ERR min or max not vali
 inline constexpr std::string_view kErrScoreNan = "ERR resulting score is not a number (NaN)";
 inline constexpr std::string_view kErrWeightNotFloat = "ERR weight value is not a float";
 
+inline constexpr std::string_view kErrZaddXxNx = "ERR XX and NX options at the same time are not compatible";
+inline constexpr std::string_view kErrZaddGtLtNx =
+    "ERR GT, LT, and/or NX options at the same time are not compatible";
+inline constexpr std::string_view kErrZaddIncrPair =
+    "ERR INCR option supports a single increment-element pair";
+
 }  // namespace tideskv

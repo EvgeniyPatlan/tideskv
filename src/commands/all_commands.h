@@ -24,6 +24,7 @@ void RegisterSetAlgebraCommands(CommandRegistry& registry);    // cmd_set_algebr
 void RegisterListCommands(CommandRegistry& registry);          // cmd_list.cc
 void RegisterListEditCommands(CommandRegistry& registry);      // cmd_list_edit.cc
 void RegisterBlockingListCommands(CommandRegistry& registry);  // cmd_blocking_list.cc
+void RegisterZsetCommands(CommandRegistry& registry);          // cmd_zset.cc
 void RegisterAllCommands(CommandRegistry& registry);
 
 }  // namespace tideskv
