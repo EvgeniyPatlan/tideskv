@@ -1,6 +1,9 @@
 #include "commands/registry.h"
 
+#include <algorithm>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include "commands/multi_state.h"
@@ -11,16 +14,24 @@
 namespace tideskv {
 namespace {
 
-constexpr size_t kMaxEchoedArgs = 16;
-constexpr size_t kMaxEchoedArgLen = 128;
+constexpr size_t kMaxEchoedLen = 128;
 
+// C "%.<max>s": at most `max` bytes, ended early by an embedded NUL.
+std::string_view CStrPrefix(const std::string& s, size_t max) {
+  std::string_view v(s.data(), std::min(s.size(), max));
+  return v.substr(0, v.find('\0'));
+}
+
+// Redis 7.2 processCommand: the name is "%.128s"; args are "'%.*s' " while the args text is
+// shorter than 128 bytes, each limited to the room left.
 std::string UnknownCommandMessage(const ArgList& argv) {
-  std::string msg =
-      "ERR unknown command '" + argv[0].substr(0, kMaxEchoedArgLen) + "', with args beginning with: ";
-  for (size_t i = 1; i < argv.size() && i <= kMaxEchoedArgs; ++i) {
-    msg += "'" + argv[i].substr(0, kMaxEchoedArgLen) + "' ";
+  std::string args;
+  for (size_t i = 1; i < argv.size() && args.size() < kMaxEchoedLen; ++i) {
+    const size_t room = kMaxEchoedLen - args.size();
+    args.append("'").append(CStrPrefix(argv[i], room)).append("' ");
   }
-  return msg;
+  return "ERR unknown command '" + std::string(CStrPrefix(argv[0], kMaxEchoedLen)) +
+         "', with args beginning with: " + args;
 }
 
 // Run at once even inside MULTI (server.c:4155-4161).

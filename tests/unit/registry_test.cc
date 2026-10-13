@@ -51,6 +51,18 @@ TEST_F(RegistryTest, UnknownCommandListsArgs) {
   EXPECT_EQ(Run({"nope"}), "-ERR unknown command 'nope', with args beginning with: \r\n");
 }
 
+// Redis 7.2 formats the name with "%.128s" and the args with "'%.*s' " while the args text is
+// shorter than 128 bytes, so an embedded NUL ends a string and the args stop growing at ~128.
+TEST_F(RegistryTest, UnknownCommandEchoesLikeRedisPrintf) {
+  using namespace std::string_literals;
+  EXPECT_EQ(Run({"nope", "bin\0x"s}), "-ERR unknown command 'nope', with args beginning with: 'bin' \r\n");
+  EXPECT_EQ(Run({"no\0pe"s, "a"}), "-ERR unknown command 'no', with args beginning with: 'a' \r\n");
+  const std::string a(100, 'a');
+  // First arg takes 103 bytes; the second is cut to the 25 bytes left; the third is not echoed.
+  EXPECT_EQ(Run({"nope", a, a, "c"}), "-ERR unknown command 'nope', with args beginning with: '" + a + "' '" +
+                                          std::string(25, 'a') + "' \r\n");
+}
+
 TEST_F(RegistryTest, ArityExactAndMinimum) {
   EXPECT_EQ(Run({"echo"}), "-ERR wrong number of arguments for 'echo' command\r\n");
   EXPECT_EQ(Run({"echo", "a", "b"}), "-ERR wrong number of arguments for 'echo' command\r\n");
