@@ -38,6 +38,7 @@ TEST(FormatScore, RedisD2string) {
       {-0.0, "-0"},
   };
   for (const auto& [v, want] : cases) EXPECT_EQ(FormatScore(v), want) << v;
+  EXPECT_EQ(FormatScore(std::numeric_limits<double>::quiet_NaN()), "nan");
 }
 
 TEST(FormatScore, RedisLd2stringAuto) {
@@ -47,6 +48,8 @@ TEST(FormatScore, RedisLd2stringAuto) {
   EXPECT_EQ(FormatScore17g(1e17), "1e+17");
   EXPECT_EQ(FormatScore17g(std::numeric_limits<double>::infinity()), "inf");
   EXPECT_EQ(FormatScore17g(-std::numeric_limits<double>::infinity()), "-inf");
+  EXPECT_EQ(FormatScore17g(std::numeric_limits<double>::quiet_NaN()), "nan");
+  EXPECT_EQ(FormatScore17g(-0.0), "-0");
 }
 
 TEST(ParseScore, RedisString2d) {
