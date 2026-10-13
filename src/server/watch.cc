@@ -1,7 +1,6 @@
 #include "server/watch.h"
 
 #include <algorithm>
-#include <optional>
 
 #include "encoding/key_codec.h"
 
@@ -95,11 +94,15 @@ void WatchRegistry::OnModified(const std::vector<DbKey>& keys, ReadView* committ
     std::lock_guard lock(s.mu);
     auto it = s.by_key.find(mk);
     if (it == s.by_key.end()) continue;
-    std::optional<bool> exists;  // probed once, and only for a watcher whose key was expired at WATCH
+    bool probed = false;
+    bool exists = false;  // probed once, and only for a watcher whose key was expired at WATCH
     for (Entry& e : it->second) {
       if (e.expired) {
-        if (!exists) exists = committed == nullptr || MetaExists(*committed, k.db, k.key);
-        if (!*exists) {  // the stale key was deleted: no logical change (multi.c:393-402)
+        if (!probed) {
+          exists = committed == nullptr || MetaExists(*committed, k.db, k.key);
+          probed = true;
+        }
+        if (!exists) {  // the stale key was deleted: no logical change (multi.c:393-402)
           e.expired = false;
           continue;
         }
