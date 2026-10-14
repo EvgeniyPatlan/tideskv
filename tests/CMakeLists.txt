@@ -75,7 +75,8 @@ if(STRESS_SOURCES)
   gtest_discover_tests(stress_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 120 LABELS stress)
 endif()
 
-# kill -9 durability rounds restart the server many times: own executable, label and timeout
+# kill -9 durability rounds restart the server many times: own executable, label and timeout. The crash
+# and multinode suites share one resource lock: one heavy test at a time, the rest of ctest -j alongside.
 file(GLOB CRASH_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/crash/*.cc)
 if(CRASH_SOURCES AND TARGET tideskv-server)
   add_executable(crash_tests ${CRASH_SOURCES})
@@ -83,7 +84,7 @@ if(CRASH_SOURCES AND TARGET tideskv-server)
   target_compile_definitions(crash_tests PRIVATE TIDESKV_SERVER_BIN="$<TARGET_FILE:tideskv-server>")
   add_dependencies(crash_tests tideskv-server)
   tideskv_defaults(crash_tests)
-  gtest_discover_tests(crash_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 300 LABELS crash RUN_SERIAL TRUE)
+  gtest_discover_tests(crash_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 300 LABELS crash RESOURCE_LOCK heavy_servers)
 endif()
 
 # L5 replication (M6a exit criterion): several servers per test, kill -9 loops and failovers
@@ -94,5 +95,5 @@ if(MULTINODE_SOURCES AND TARGET tideskv-server)
   target_compile_definitions(multinode_tests PRIVATE TIDESKV_SERVER_BIN="$<TARGET_FILE:tideskv-server>")
   add_dependencies(multinode_tests tideskv-server)
   tideskv_defaults(multinode_tests)
-  gtest_discover_tests(multinode_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 900 LABELS multinode RUN_SERIAL TRUE)
+  gtest_discover_tests(multinode_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 900 LABELS multinode RESOURCE_LOCK heavy_servers)
 endif()

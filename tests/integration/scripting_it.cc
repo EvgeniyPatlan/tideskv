@@ -43,12 +43,25 @@ int64_t IntValue(RespClient& c, const std::string& key) {
 }
 
 // Task 13: batch writes are linear now, so the script can be long: about 0.6 s on a release server.
-// Debug and sanitizer servers are 10x or more slower, so they run fewer iterations.
-#ifdef NDEBUG
+// Debug servers are 10x slower and sanitizer servers slower still (TSan: about 4 s per run, 20 s for the
+// test unloaded, three times that beside the multinode suite), so they run fewer iterations: the test
+// stays well inside its ctest timeout on a loaded machine (F10).
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define TIDESKV_IT_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define TIDESKV_IT_SANITIZED 1
+#endif
+#endif
+#if defined(NDEBUG)
 constexpr int kKillIterations = 300000;
+#elif defined(TIDESKV_IT_SANITIZED)
+constexpr int kKillIterations = 8000;
 #else
 constexpr int kKillIterations = 30000;
 #endif
+// The uninterrupted run's reply: as long as the test's own ctest timeout allows.
+constexpr auto kEvalReplyTimeout = std::chrono::seconds(60);
 
 TEST(ScriptingIT, EvalDeletingFortyCollectionsCommits) {  // D2: TidesDB's 32-range-per-commit limit
   TestServer s(TIDESKV_SERVER_BIN);
@@ -69,7 +82,7 @@ TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
   int64_t run_ms = 0;
   {
     TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
-    auto c = RespClient::Connect(s.port(), 60s);
+    auto c = RespClient::Connect(s.port(), kEvalReplyTimeout);
     ASSERT_NE(c, nullptr);
     const auto start = std::chrono::steady_clock::now();
     ASSERT_EQ(c->Command({"EVAL", script, "0"}).integer, 1);
