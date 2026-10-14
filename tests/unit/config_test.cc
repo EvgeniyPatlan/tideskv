@@ -1,9 +1,13 @@
 #include "server/config.h"
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <sstream>
 #include <string_view>
 #include <vector>
 
@@ -118,7 +122,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 17u);
+  EXPECT_EQ(c.Get("*").size(), 32u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -254,6 +258,173 @@ TEST(Config, CompactionCollectionDeletes) {
   EXPECT_TRUE(c.Set("compaction-collection-deletes", "0", true).ok());  // runtime-mutable; 0 = never
   EXPECT_EQ(c.Snapshot().compaction_collection_deletes, 0u);
   EXPECT_FALSE(c.Set("compaction-collection-deletes", "-1", true).ok());
+}
+
+std::string GetOne(const Config& c, std::string_view name) {
+  const auto got = c.Get(name);
+  return got.size() == 1 ? got[0].second : "<missing>";
+}
+
+TEST(ConfigRepl, Defaults) {
+  const ConfigValues v = Config().Snapshot();
+  EXPECT_EQ(v.replicaof, "");
+  EXPECT_EQ(v.masterauth, "");
+  EXPECT_EQ(v.masteruser, "");
+  EXPECT_TRUE(v.replica_read_only);
+  EXPECT_EQ(v.repl_backlog_size, 1ULL << 30);
+  EXPECT_EQ(v.repl_backlog_ttl, 3600);
+  EXPECT_EQ(v.repl_timeout, 60);
+  EXPECT_EQ(v.replica_announce_ip, "");
+  EXPECT_EQ(v.replica_announce_port, 0);
+  EXPECT_EQ(v.replica_priority, 100);
+  Config c;
+  EXPECT_EQ(GetOne(c, "replica-read-only"), "yes");
+  EXPECT_EQ(GetOne(c, "repl-backlog-size"), "1073741824");
+}
+
+TEST(ConfigRepl, MutableKeysRoundTrip) {
+  Config c;
+  ASSERT_TRUE(c.Set("masterauth", "s3cret", true).ok());
+  ASSERT_TRUE(c.Set("masteruser", "repl", true).ok());
+  ASSERT_TRUE(c.Set("repl-backlog-size", "2mb", true).ok());
+  ASSERT_TRUE(c.Set("repl-backlog-ttl", "0", true).ok());
+  ASSERT_TRUE(c.Set("repl-timeout", "5", true).ok());
+  ASSERT_TRUE(c.Set("replica-announce-ip", "10.0.0.7", true).ok());
+  ASSERT_TRUE(c.Set("replica-announce-port", "7001", true).ok());
+  ASSERT_TRUE(c.Set("replica-priority", "0", true).ok());
+  ASSERT_TRUE(c.Set("replica-read-only", "YES", true).ok());
+  const ConfigValues v = c.Snapshot();
+  EXPECT_EQ(v.masterauth, "s3cret");
+  EXPECT_EQ(v.masteruser, "repl");
+  EXPECT_EQ(v.repl_backlog_size, 2097152u);
+  EXPECT_EQ(v.repl_backlog_ttl, 0);
+  EXPECT_EQ(v.repl_timeout, 5);
+  EXPECT_EQ(v.replica_announce_ip, "10.0.0.7");
+  EXPECT_EQ(v.replica_announce_port, 7001);
+  EXPECT_EQ(v.replica_priority, 0);
+  EXPECT_EQ(GetOne(c, "masterauth"), "s3cret");  // clear text, like requirepass
+  EXPECT_EQ(GetOne(c, "repl-backlog-size"), "2097152");
+}
+
+TEST(ConfigRepl, BoundsErrorTexts) {
+  Config c;
+  EXPECT_EQ(c.Set("repl-backlog-size", "0", true).message(),
+            "argument must be between 1 and 9223372036854775807 inclusive");
+  EXPECT_FALSE(c.Set("repl-backlog-size", "junk", true).ok());
+  EXPECT_EQ(c.Set("repl-timeout", "0", true).message(),
+            "argument must be between 1 and 2147483647 inclusive");
+  EXPECT_FALSE(c.Set("repl-timeout", "2147483648", true).ok());
+  EXPECT_EQ(c.Set("repl-backlog-ttl", "-1", true).message(),
+            "argument must be between 0 and 9223372036854775807 inclusive");
+  EXPECT_EQ(c.Set("replica-announce-port", "65536", true).message(),
+            "argument must be between 0 and 65535 inclusive");
+  EXPECT_EQ(c.Set("replica-priority", "-1", true).message(),
+            "argument must be between 0 and 2147483647 inclusive");
+  EXPECT_EQ(c.Set("replica-read-only", "maybe", true).message(), "argument must be 'yes' or 'no'");
+  EXPECT_FALSE(c.Set("masterauth", "a\nb", true).ok());
+  EXPECT_EQ(c.Snapshot().repl_timeout, 60);  // failures change nothing
+}
+
+TEST(ConfigRepl, WritableReplicasRejected) {
+  Config c;
+  const Status st = c.Set("replica-read-only", "no", true);
+  EXPECT_EQ(st.code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(st.message(), "writable replicas are not supported");
+  EXPECT_TRUE(c.Snapshot().replica_read_only);
+}
+
+TEST(ConfigRepl, AliasesResolveToSameValue) {
+  Config c;
+  ASSERT_TRUE(c.Set("slave-read-only", "yes", true).ok());
+  ASSERT_TRUE(c.Set("slave-announce-ip", "1.2.3.4", true).ok());
+  ASSERT_TRUE(c.Set("slave-announce-port", "9", true).ok());
+  ASSERT_TRUE(c.Set("slave-priority", "7", true).ok());
+  EXPECT_EQ(c.Snapshot().replica_announce_ip, "1.2.3.4");
+  EXPECT_EQ(c.Snapshot().replica_announce_port, 9);
+  EXPECT_EQ(c.Snapshot().replica_priority, 7);
+  EXPECT_EQ(GetOne(c, "slave-announce-ip"), "1.2.3.4");  // asked name is the returned name
+  EXPECT_EQ(GetOne(c, "slave-priority"), "7");
+  EXPECT_EQ(GetOne(c, "slave-read-only"), "yes");
+  EXPECT_EQ(c.Set("slave-read-only", "no", true).message(), "writable replicas are not supported");
+  ASSERT_TRUE(c.Set("slaveof", "h 1", false).ok());
+  EXPECT_EQ(c.Snapshot().replicaof, "h 1");
+  EXPECT_EQ(GetOne(c, "slaveof"), "h 1");
+}
+
+TEST(ConfigRepl, ReplicaofParsing) {
+  Config c;
+  ASSERT_TRUE(c.Set("replicaof", "example.org 6379", false).ok());
+  EXPECT_EQ(c.Snapshot().replicaof, "example.org 6379");
+  EXPECT_EQ(GetOne(c, "replicaof"), "example.org 6379");
+  ASSERT_TRUE(c.Set("replicaof", "NO ONE", false).ok());
+  EXPECT_EQ(c.Snapshot().replicaof, "");
+  EXPECT_EQ(c.Set("replicaof", "host 65536", false).message(), "Invalid master port");
+  EXPECT_EQ(c.Set("replicaof", "host -1", false).message(), "Invalid master port");
+  EXPECT_EQ(c.Set("replicaof", "host 12x", false).message(), "Invalid master port");
+  EXPECT_EQ(c.Set("replicaof", "justhost", false).message(), "wrong number of arguments");
+  EXPECT_EQ(c.Set("replicaof", "a b c", false).message(), "wrong number of arguments");
+  EXPECT_EQ(c.Snapshot().replicaof, "");
+}
+
+TEST(ConfigRepl, ReplicaofIsStartupOnly) {
+  Config c;
+  const Status st = c.Set("replicaof", "no one", true);
+  EXPECT_EQ(st.message(), "can't set immutable config");
+  EXPECT_EQ(c.Set("slaveof", "h 1", true).message(), "can't set immutable config");
+  ASSERT_TRUE(c.ApplyArgs({"--replicaof", "10.0.0.1 7000"}).ok());
+  EXPECT_EQ(c.Snapshot().replicaof, "10.0.0.1 7000");
+}
+
+TEST(ConfigRepl, ReplicaofFromFileAndRewrite) {
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "replicaof 10.0.0.1 7000\nmasterauth \"p w\"\n");
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  EXPECT_EQ(c.Snapshot().replicaof, "10.0.0.1 7000");
+  ASSERT_TRUE(c.Rewrite().ok());
+  std::ifstream in(path);
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_NE(text.find("\nreplicaof 10.0.0.1 7000\n"), std::string::npos) << text;
+  EXPECT_EQ(text.find("slaveof"), std::string::npos) << text;  // aliases are not rewritten
+  EXPECT_EQ(text.find("slave-"), std::string::npos) << text;
+  Config reloaded;
+  ASSERT_TRUE(reloaded.LoadFile(path).ok());
+  EXPECT_EQ(reloaded.Snapshot().replicaof, "10.0.0.1 7000");
+  EXPECT_EQ(reloaded.Snapshot().masterauth, "p w");
+  EXPECT_EQ(reloaded.Snapshot().repl_backlog_size, 1ULL << 30);
+}
+
+TEST(ConfigRepl, RewriteOmitsReplicaofForMaster) {
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "port 7000\n");
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  ASSERT_TRUE(c.Rewrite().ok());
+  std::ifstream in(path);
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(text.find("replicaof"), std::string::npos) << text;
+  EXPECT_NE(text.find("repl-timeout 60"), std::string::npos) << text;
+}
+
+TEST(ConfigRepl, MasterauthNeverLogged) {
+  constexpr std::string_view kSecret = "hunter2-masterauth";
+  std::ostringstream captured;
+  auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(captured);
+  auto logger = std::make_shared<spdlog::logger>("capture", sink);
+  logger->set_level(spdlog::level::trace);
+  auto previous = spdlog::default_logger();
+  spdlog::set_default_logger(logger);
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "masterauth " + std::string(kSecret) + "\n");
+  Status results[] = {c.LoadFile(path), c.Set("masterauth", kSecret, true),
+                      c.ApplyArgs({"--masterauth", std::string(kSecret)}), c.Rewrite(),
+                      c.Set("masterauth", std::string(kSecret) + "\n", true)};
+  spdlog::set_default_logger(previous);
+  EXPECT_TRUE(results[0].ok() && results[1].ok() && results[2].ok() && results[3].ok());
+  EXPECT_FALSE(results[4].ok());
+  EXPECT_EQ(results[4].message().find(kSecret), std::string::npos) << results[4].message();
+  EXPECT_EQ(captured.str().find(kSecret), std::string::npos) << captured.str();
 }
 
 }  // namespace
