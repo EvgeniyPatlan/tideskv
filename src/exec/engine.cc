@@ -26,8 +26,15 @@ void Engine::SetBusyGuard(std::function<bool()> busy, std::string busy_reply) {
   busy_reply_ = std::move(busy_reply);
 }
 
+Engine::WaitThroughBusyScope::WaitThroughBusyScope()
+    : previous_(std::exchange(engine_internal::t_wait_through_busy, true)) {}
+
+Engine::WaitThroughBusyScope::~WaitThroughBusyScope() { engine_internal::t_wait_through_busy = previous_; }
+
+bool Engine::BusyGuarded() const { return busy_ && !engine_internal::t_wait_through_busy; }
+
 bool Engine::AcquireShared() {
-  if (!busy_) {
+  if (!BusyGuarded()) {
     gate_.lock_shared();
     return true;
   }
@@ -35,7 +42,7 @@ bool Engine::AcquireShared() {
 }
 
 bool Engine::AcquireExclusive() {
-  if (!busy_) {
+  if (!BusyGuarded()) {
     gate_.lock();
     return true;
   }

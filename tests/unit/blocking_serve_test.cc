@@ -1,12 +1,17 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <stdexcept>
+#include <thread>
 
 #include "commands/blocking_serve.h"
 #include "commands/cmd_util.h"
+#include "script/script_engine.h"
 #include "support/command_harness.h"
 #include "types/errors.h"
 #include "types/list_move.h"
+#include "types/list_type.h"
 
 namespace tideskv {
 namespace {
@@ -143,6 +148,99 @@ TEST_F(BlockingServe, ReRunThatThrowsEndsThatWaitWithAnErrorNotThePusher) {
   EXPECT_EQ(pusher.Run({"TPUSH", "k", "x"}), Int(1));  // the exception did not reach the pusher
   EXPECT_EQ(h.TakeUnblocked(), (std::vector<std::string>{Err(kErrInternal)}));
   EXPECT_EQ(b.TakeUnblocked(), (std::vector<std::string>{Bulk("x")}));  // the next waiter is served
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
+}
+
+// Stands in for a script that holds the gate (its batch) and has passed busy-reply-threshold, then ends
+// by itself after `hold`. Its end clears BUSY before the gate is released, as RunScript does.
+class TimedOutScript {
+ public:
+  TimedOutScript(ServerServices& server, std::chrono::milliseconds hold) {
+    thread_ = std::thread([&server, hold, this] {
+      auto batch = server.engine().BeginBatch();
+      started_ = batch.ok() ? 1 : 2;
+      std::this_thread::sleep_for(hold);
+      server.scripts().ForceTimedOutForTests(false);
+    });
+    while (started_.load() == 0) std::this_thread::yield();
+    server.scripts().ForceTimedOutForTests(true);
+  }
+  ~TimedOutScript() { Join(); }
+  TimedOutScript(const TimedOutScript&) = delete;
+  TimedOutScript& operator=(const TimedOutScript&) = delete;
+  bool started() const { return started_.load() == 1; }
+  void Join() {
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  std::atomic<int> started_{0};
+  std::thread thread_;
+};
+
+struct BlockingServeBusy : BlockingServe {
+  void SetUp() override {
+    BlockingServe::SetUp();
+    ScriptEngine& scripts = h.services.scripts_;
+    h.services.engine_.SetBusyGuard([&scripts] { return scripts.TimedOut(); }, std::string(kErrBusyScript));
+  }
+};
+
+// A push committed just before a script took the gate; its serve runs while the script is timed out. The
+// serve waits for the script (as Redis serves blocked clients after it) instead of giving up with BUSY and
+// stranding the waiter with data present.
+TEST_F(BlockingServeBusy, ServeDuringATimedOutScriptWaitsForItThenServes) {
+  g_pretend_empty = true;
+  EXPECT_EQ(h.Run({"TBPOP", "k"}), "");
+  ASSERT_EQ(h.services.blocking_.blocked_clients(), 1u);
+  ASSERT_TRUE(
+      h.services.engine_
+          .Write(
+              0, {"k"},
+              [&](WriteTxn& txn, int64_t now) {
+                return ListPush(txn, h.services.oids(), 0, "k", ListEnd::kRight, {"a"}, false, now).status();
+              })
+          .ok());
+  std::atomic<bool> served{false};
+  {
+    TimedOutScript script(h.services, std::chrono::milliseconds(200));
+    ASSERT_TRUE(script.started());
+    std::thread pusher([&] {  // the pusher's serve, during BUSY
+      ReadyKeys ready{{0, "k"}};
+      ServeBlockedClients(h.services.registry_, h.services, ready);
+      served = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(served.load()) << "the serve gave up instead of waiting for the script";
+    script.Join();
+    pusher.join();
+  }
+  EXPECT_EQ(h.TakeUnblocked(), (std::vector<std::string>{Bulk("a")}));
+  EXPECT_EQ(h.Run({"LLEN", "k"}), Int(0));
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
+}
+
+std::unique_ptr<TimedOutScript> g_script;
+// First run: blocks. Re-run: a script takes the gate and times out just before the pop, in the window
+// between the serve's type check and the re-run's own Engine call.
+void TBusyPop(ExecContext& ctx, const ArgList& argv) {
+  if (!std::exchange(g_rerun, true)) {
+    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0});
+  }
+  g_script = std::make_unique<TimedOutScript>(dynamic_cast<ServerServices&>(ctx.server),
+                                              std::chrono::milliseconds(100));
+  TBPop(ctx, argv);
+}
+
+TEST_F(BlockingServeBusy, BlockedClientNeverReceivesBusy) {
+  h.services.registry_.Register({"tbusypop", 2, kCmdWrite, 1, 1, 1, &TBusyPop});
+  EXPECT_EQ(h.Run({"TBUSYPOP", "k"}), "");
+  SecondClient other(h);
+  EXPECT_EQ(other.Run({"RPUSH", "k", "a"}), Int(1));
+  ASSERT_NE(g_script, nullptr);
+  g_script.reset();  // joins
+  EXPECT_EQ(h.TakeUnblocked(), (std::vector<std::string>{Bulk("a")}));
+  EXPECT_EQ(h.Run({"LLEN", "k"}), Int(0));
   EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
 }
 

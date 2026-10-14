@@ -104,6 +104,42 @@ TEST(BusyGate, EngineCallsAnswerBusyWhileAScriptHoldsTheGate) {
   batch->reset();
 }
 
+TEST(BusyGate, AWaitThroughBusyScopeWaitsForTheScriptInsteadOfGivingUp) {
+  InMemoryStorage storage;
+  LockManager locks;
+  test::FakeClock clock;
+  Engine engine(storage, locks, clock);
+  std::atomic<bool> busy{true};
+  engine.SetBusyGuard([&] { return busy.load(); }, "BUSY test");
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  std::atomic<bool> done{false};
+  Status read, write, exclusive, outside;
+  std::thread serving([&] {
+    {
+      const Engine::WaitThroughBusyScope outer;
+      const Engine::WaitThroughBusyScope inner;  // nests
+    }
+    outside = engine.Read([](ReadView&, int64_t) { return Status::Ok(); });  // the scope ended: BUSY
+    const Engine::WaitThroughBusyScope scope;
+    read = engine.Read([](ReadView&, int64_t) { return Status::Ok(); });
+    write = engine.Write(0, {"k"}, [](WriteTxn&, int64_t) { return Status::Ok(); });
+    exclusive = engine.WriteExclusive([](WriteTxn&, int64_t) { return Status::Ok(); });
+    done = true;
+  });
+  std::this_thread::sleep_for(30ms);
+  engine.WakeWaiters();  // the timeout's wake-up must not release it either
+  std::this_thread::sleep_for(30ms);
+  EXPECT_FALSE(done.load());
+  busy = false;
+  batch->reset();  // the script ends
+  serving.join();
+  EXPECT_EQ(outside.message(), "BUSY test");
+  EXPECT_TRUE(read.ok()) << read.ToString();
+  EXPECT_TRUE(write.ok()) << write.ToString();
+  EXPECT_TRUE(exclusive.ok()) << exclusive.ToString();
+}
+
 TEST(BusyGate, EngineWithoutAGuardOrWithAFreeGateRunsNormally) {
   InMemoryStorage storage;
   LockManager locks;

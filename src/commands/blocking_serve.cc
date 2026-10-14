@@ -81,7 +81,14 @@ void ServeKey(const CommandRegistry& registry, ServerServices& server, const Rea
 
 }  // namespace
 
+// Redis serves blocked clients after the script, so a waiter never sees BUSY and is never left parked with
+// data present: a serve that meets a timed-out script waits for it to end (SCRIPT KILL comes from another
+// worker). Safe: this thread holds at most one BlockedClient::mu_ while it waits for the gate, and a
+// script never takes a BlockedClient::mu_ (CLIENT is noscript; EXEC defers CLIENT UNBLOCK until after its
+// batch); BlockingRegistry::mu_, which a script takes briefly in SignalReady, is never held here then.
 void ServeBlockedClients(const CommandRegistry& registry, ServerServices& server, ReadyKeys& ready) {
+  if (ready.empty()) return;
+  const Engine::WaitThroughBusyScope wait_for_scripts;
   // Index loop: serving may append (BLMOVE destinations).
   for (size_t i = 0; i < ready.size(); ++i) {
     const ReadyKey rk = ready[i];  // copy: `ready` may reallocate while serving

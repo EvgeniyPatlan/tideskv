@@ -235,5 +235,45 @@ TEST(ScriptingIT, WaiterIsServedAfterTheScript) {  // Review Focus #5
   EXPECT_EQ(got->elements.at(1).str, "x");
 }
 
+// Review fix A: a waiter whose key is pushed around a busy script is served once the script ends, and never
+// receives -BUSY. Placement (3 workers, round-robin accept): waiter (conn 0, worker 0), runner (conn 1,
+// worker 1), pusher (conn 2, worker 2), killer (conn 3, worker 0: free, as the waiter is parked). The
+// pusher's LPUSH races the script: it lands before it (served at once), waits on the gate and answers BUSY,
+// answers BUSY at dispatch, or commits just before the script takes the gate, so that its serve waits for the
+// script (the pusher's worker is then stuck until the kill, hence a separate killer). If nothing was pushed,
+// the pusher pushes again after the kill.
+TEST(ScriptingIT, WaiterOfAKeyPushedAroundABusyScriptIsServedNotBusy) {
+  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "3", "--lua-time-limit", "50"}});
+  auto waiter = s.Connect();
+  auto runner = s.Connect();
+  auto pusher = s.Connect();
+  auto killer = s.Connect();
+  ASSERT_TRUE(waiter && runner && pusher && killer);
+  for (int round = 0; round < 5; ++round) {
+    ASSERT_TRUE(waiter->Send({"BLPOP", "k", "0"}));
+    ASSERT_TRUE(WaitFor([&] { return InfoField(*killer, "clients", "blocked_clients") == 1; }));
+    ASSERT_TRUE(runner->Send({"EVAL", kSpin, "0"}));
+    ASSERT_TRUE(pusher->Send({"LPUSH", "k", "v"}));
+    ASSERT_TRUE(WaitFor([&] { return killer->Command({"SCRIPT", "KILL"}).str == "OK"; }, 5s));
+    const auto killed = runner->Read();
+    ASSERT_TRUE(killed.has_value());
+    EXPECT_NE(killed->str.find("Script killed by user with SCRIPT KILL..."), std::string::npos)
+        << killed->str;
+    const auto pushed = pusher->Read();
+    ASSERT_TRUE(pushed.has_value());
+    ASSERT_TRUE(pushed->type == RespValue::Type::kInteger || pushed->str == kBusyText)
+        << ToDebugString(*pushed);
+    if (pushed->type != RespValue::Type::kInteger) {
+      EXPECT_EQ(pusher->Command({"LPUSH", "k", "v"}).integer, 1);
+    }
+    const auto got = waiter->Read();  // RespClient times out after 5 s: a stranded waiter fails here
+    ASSERT_TRUE(got.has_value()) << "round " << round;
+    ASSERT_EQ(got->type, RespValue::Type::kArray) << ToDebugString(*got);
+    EXPECT_EQ(got->elements.at(0).str, "k");
+    EXPECT_EQ(got->elements.at(1).str, "v");
+    EXPECT_EQ(killer->Command({"EXISTS", "k"}).integer, 0) << "round " << round;
+  }
+}
+
 }  // namespace
 }  // namespace tideskv::test

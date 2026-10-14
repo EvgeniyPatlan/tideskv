@@ -12,6 +12,7 @@
 namespace tideskv::engine_internal {
 
 inline thread_local Engine::Batch* t_batch = nullptr;  // the active batch of this thread (G1)
+inline thread_local bool t_wait_through_busy = false;  // an Engine::WaitThroughBusyScope is alive
 
 #ifndef NDEBUG
 inline thread_local bool t_in_engine = false;

@@ -123,9 +123,25 @@ class Engine {
   void SetBusyGuard(std::function<bool()> busy, std::string busy_reply);
   void WakeWaiters() { gate_.Wake(); }  // takes only the gate's internal mutex, never the gate
 
+  // While one is alive on this thread, its Engine calls ignore the busy guard: they wait for the gate,
+  // through a timed-out script, as Redis serves blocked clients after the script. For work that must not
+  // fail with BUSY (ServeBlockedClients). The thread must hold no lock a script can need while it holds
+  // the gate. Scopes nest; each restores the previous state.
+  class WaitThroughBusyScope {
+   public:
+    WaitThroughBusyScope();
+    ~WaitThroughBusyScope();
+    WaitThroughBusyScope(const WaitThroughBusyScope&) = delete;
+    WaitThroughBusyScope& operator=(const WaitThroughBusyScope&) = delete;
+
+   private:
+    bool previous_;
+  };
+
  private:
-  bool AcquireShared();     // false: gave up because busy_
-  bool AcquireExclusive();  // false: gave up because busy_
+  bool AcquireShared();      // false: gave up because busy_
+  bool AcquireExclusive();   // false: gave up because busy_
+  bool BusyGuarded() const;  // busy_ is set and no WaitThroughBusyScope is alive on this thread
   Status BusyStatus() const { return Status::UserError(busy_reply_); }
   Batch* ActiveBatch() const;
   Status RunTxn(const WriteFn& fn, const engine_internal::WriteScope& scope);
