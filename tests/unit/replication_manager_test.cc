@@ -335,6 +335,30 @@ TEST_F(RoleTest, BecomeReplicaFencesThenStopsTheReaperUnblocksAndDropsReplicas) 
   EXPECT_EQ(Take().size(), 3u);
 }
 
+// F8: M6a has no chained replication. A replica refuses PSYNC with an error (no decision, nothing
+// registered), and becoming a replica forgets the hand-offs a master had registered.
+TEST_F(RoleTest, AReplicaRefusesPsyncAndForgetsPendingHandOffs) {
+  auto m = MakeWithHooks();
+  const PsyncResult pending = m->HandlePsync({id.replid, 4}, {});
+  ASSERT_EQ(pending.decision, PsyncDecision::kContinue);
+  ASSERT_EQ(m->pending_count(), 1u);
+  m->BecomeReplica("h", 1);
+  EXPECT_EQ(m->pending_count(), 0u);
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  Fd late(fds[1]);
+  m->AttachReplica(pending.pending_id, fds[0], "");  // the hand-off completes too late: closed
+  EXPECT_TRUE(PeerClosed(late.get()));
+  EXPECT_TRUE(m->Replicas().empty());
+  const PsyncResult refused = m->HandlePsync({id.replid, 4}, {});
+  EXPECT_EQ(refused.error, kErrPsyncOnReplica);
+  EXPECT_EQ(refused.pending_id, 0u);
+  EXPECT_EQ(m->pending_count(), 0u);
+  EXPECT_EQ(m->counters().sync_partial_ok, 1u);  // the one before the demotion
+  ASSERT_TRUE(m->BecomeMaster().ok());
+  EXPECT_TRUE(m->HandlePsync({m->replid(), 4}, {}).error.empty());
+}
+
 TEST_F(RoleTest, RoleReportsTheMasterAndALinkThatIsDown) {
   auto m = MakeWithHooks();
   RoleInfo r = m->Role();

@@ -60,6 +60,10 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
   const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   std::lock_guard lock(mu_);
   PsyncResult r;
+  if (role() == ReplRole::kReplica) {  // F8: no chained replication (checked under mu_, as BecomeReplica)
+    r.error = std::string(kErrPsyncOnReplica);
+    return r;
+  }
   if (clients + LiveSendersLocked() > maxclients) {  // F4: this caller's link would exceed maxclients
     r.error = std::string(kErrMaxClients);
     return r;
@@ -122,6 +126,7 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
     master_host_ = host;
     master_port_ = port;
     role_.store(ReplRole::kReplica, std::memory_order_release);
+    pending_.clear();  // F8: a replica serves no replica; a hand-off still in flight is refused
   }
   if (hooks.stop_reaper) hooks.stop_reaper();
   // A blocking command dispatched before this point either registered already (and is ended here) or

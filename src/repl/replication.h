@@ -81,6 +81,7 @@ class Replication {
   virtual ReplRole role() const = 0;  // one atomic load
   bool IsReplica() const { return role() == ReplRole::kReplica; }
   // Decides PSYNC (D8) and, on kContinue, registers a pending replica that AttachReplica completes.
+  // Refused with PsyncResult::error, and nothing decided, on a replica (F8) or beyond maxclients (F4).
   virtual PsyncResult HandlePsync(const repl::PsyncRequest& req, const ReplicaPeer& peer) = 0;
   // Called by the connection once the +CONTINUE reply has been flushed and asio has released the socket:
   // takes ownership of fd (closes it if pending_id is unknown or replication is shut down). unread holds

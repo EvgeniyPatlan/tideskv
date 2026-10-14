@@ -63,6 +63,10 @@ inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unbl
 // REPLICAOF NO ONE that could not persist the promotion (TidesKV; + the storage error). The node stays a
 // replica of the same master.
 inline constexpr std::string_view kErrPromotionFailed = "ERR REPLICAOF NO ONE failed, still a replica: ";
+// TidesKV-only (F8): M6a has no chained replication, so a replica serves no PSYNC. (Redis 7.2 does; its
+// only refusal of this kind is "-NOMASTERLINK Can't SYNC while not connected with my master".)
+inline constexpr std::string_view kErrPsyncOnReplica =
+    "ERR PSYNC refused: this node is a replica and TidesKV has no chained replication";
 // Every blocked client gets this when the node becomes a replica (blocked.c disconnectAllBlockedClients).
 inline constexpr std::string_view kErrUnblockedRoleChange =
     "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";

@@ -132,6 +132,16 @@ TEST_F(ReplicationIT, InfoReplicationOffsetsAgreeAfterSync) {
   EXPECT_TRUE(WaitFor(acked, 2s)) << InfoString(*m, "replication", "slave0");
 }
 
+// F8: no chained replication in M6a: a replica answers PSYNC with an error and keeps the client.
+TEST_F(ReplicationIT, ReplicaRefusesPsync) {
+  Follow(*replica);
+  auto r = Client(*replica);
+  const RespValue psync = r->Command({"PSYNC", "?", "-1"});
+  EXPECT_EQ(psync.type, Type::kError);
+  EXPECT_EQ(psync.str, "ERR PSYNC refused: this node is a replica and TidesKV has no chained replication");
+  EXPECT_EQ(r->Command({"PING"}).str, "PONG");
+}
+
 TEST_F(ReplicationIT, ReplicaIsReadOnly) {
   Follow(*replica);
   auto r = Client(*replica);

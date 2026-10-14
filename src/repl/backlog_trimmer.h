@@ -87,7 +87,8 @@ class BacklogTrimmer {
   // A no-op once local writes are fenced: the fence (raised before a replica starts applying) is checked
   // under ReplLog::mu_ by every trim txn, so no master trim commits once a replica may apply.
   Status RunOnce();
-  // One replica round, on the applier thread between batches: there are no replicas of a replica.
+  // One replica round, on the applier thread between batches. No replica needs this log: a replica
+  // refuses PSYNC (M6a has no chained replication, F8) and dropped its replicas when it was demoted.
   Status RunOnReplica();
 
   uint64_t trimmed_total() const { return trimmed_total_.load(std::memory_order_relaxed); }
