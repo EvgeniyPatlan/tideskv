@@ -96,15 +96,23 @@ TEST_F(ReplicationMasterIT, FullResyncClosesTheLink) {
 TEST(ReplicationLimitIT, ReplicaLinksCountAgainstMaxclients) {
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--maxclients", "2"}});
   std::vector<std::unique_ptr<RespClient>> links;
-  for (int i = 0; i < 2; ++i) {  // at once: neither hand-off may have happened when the other asks
-    links.push_back(s.Connect());
-    ASSERT_NE(links.back(), nullptr);
+  for (int i = 0; i < 2; ++i) {
+    // The server may still count the readiness probe's connection and refuse this one at accept.
+    std::unique_ptr<RespClient> link;
+    ASSERT_TRUE(WaitFor([&] {
+      link = s.Connect();
+      return link != nullptr && link->Command({"PING"}).str == "PONG";
+    }));
+    links.push_back(std::move(link));
   }
-  for (auto& link : links) ASSERT_TRUE(link->Send({"PSYNC", "?", "1"}));
+  // At the limit (2 connections): the first link is handed off, leaving 1 connection + 1 link, and
+  // the second fits too.
   for (auto& link : links) {
-    const auto r = link->Read();
-    ASSERT_TRUE(r.has_value());
-    ASSERT_EQ(r->str.rfind("CONTINUE ", 0), 0u) << r->str;
+    const RespValue r = link->Command({"PSYNC", "?", "1"});
+    ASSERT_EQ(r.str.rfind("CONTINUE ", 0), 0u) << r.str;
+    if (&link == &links.front()) {
+      ASSERT_TRUE(WaitFor([&] { return InfoField(*links.back(), "clients", "connected_clients") == 1; }));
+    }
   }
   std::unique_ptr<RespClient> c;
   ASSERT_TRUE(WaitFor([&] {  // both hand-offs done: their connections are gone

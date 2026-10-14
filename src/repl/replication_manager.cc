@@ -57,8 +57,10 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
   const LogBounds bounds{log_.first_retained(), log_.last(), options_.baseline_unknown};
   const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
-  const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   std::lock_guard lock(mu_);
+  // Read under mu_ with the senders: a hand-off attaching meanwhile is then seen as a connection, not
+  // yet a sender (or, for the instant before its connection uncounts itself, as both: never neither).
+  const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   PsyncResult r;
   if (role() == ReplRole::kReplica) {  // F8: no chained replication (checked under mu_, as BecomeReplica)
     r.error = std::string(kErrPsyncOnReplica);
