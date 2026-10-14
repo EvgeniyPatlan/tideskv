@@ -112,6 +112,28 @@ func runSeed(t *testing.T, seed int64, ours, ref string) {
 			t.Fatalf("seed %d: %s: %v\nlast commands:\n  %s", seed, name, err, lastCommands(history))
 		}
 	}
+	checkDigest(t, seed, ours, ref, history)
+}
+
+// checkDigest ends every stream with DEBUG DIGEST on fresh connections (the stream's may be inside MULTI
+// or in RESP3): every reply matched, so the datasets must too, byte for byte (Redis's own algorithm).
+func checkDigest(t *testing.T, seed int64, ours, ref string, history []string) {
+	a, b := mustDial(t, ours), mustDial(t, ref)
+	defer a.Close()
+	defer b.Close()
+	ra, rawA, errA := a.DoRaw("DEBUG", "DIGEST")
+	rb, rawB, errB := b.DoRaw("DEBUG", "DIGEST")
+	if errA != nil || errB != nil {
+		t.Fatalf("seed %d: DEBUG DIGEST transport error\ntideskv: %v\nredis:   %v", seed, errA, errB)
+	}
+	if rb.Kind == '-' {
+		t.Fatalf("seed %d: the reference refused DEBUG DIGEST (%s): start it with --enable-debug-command yes", seed, rb)
+	}
+	if !bytes.Equal(rawA, rawB) {
+		t.Fatalf("seed %d: every reply matched but DEBUG DIGEST differs\ntideskv: %s\nredis:   %s\nlast commands:\n  %s",
+			seed, ra, rb, lastCommands(history))
+	}
+	t.Logf("seed %d: DEBUG DIGEST %s on both", seed, ra)
 }
 
 // sameReply compares un-normalised replies byte-for-byte on the wire; normalised ones

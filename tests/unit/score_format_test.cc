@@ -52,6 +52,23 @@ TEST(FormatScore, RedisLd2stringAuto) {
   EXPECT_EQ(FormatScore17g(-0.0), "-0");
 }
 
+// The score text DEBUG DIGEST hashes (debug.c xorObjectDigest calls fpconv_dtoa directly). Expected
+// texts recovered from redis:7.2.5 DEBUG DIGEST-VALUE (see cmd_debug_test ZsetScoresUseFpconvText).
+TEST(FormatDtoa, RedisFpconvDtoa) {
+  EXPECT_EQ(FormatDtoa(2), "2");
+  EXPECT_EQ(FormatDtoa(1.5), "1.5");
+  EXPECT_EQ(FormatDtoa(0.1), "0.1");
+  EXPECT_EQ(FormatDtoa(100), "100");
+  EXPECT_EQ(FormatDtoa(1e16), "1e+16");  // FormatScore: 10000000000000000
+  EXPECT_EQ(FormatDtoa(1e20), "1e+20");
+  EXPECT_EQ(FormatDtoa(3e-7), "3e-7");
+  EXPECT_EQ(FormatDtoa(123456789012345678.0), "123456789012345680");
+  EXPECT_EQ(FormatDtoa(std::numeric_limits<double>::infinity()), "inf");
+  EXPECT_EQ(FormatDtoa(-std::numeric_limits<double>::infinity()), "-inf");
+  EXPECT_EQ(FormatDtoa(0.0), "0");
+  EXPECT_EQ(FormatDtoa(-0.0), "-0");
+}
+
 TEST(ParseScore, RedisString2d) {
   double d = 0;
   for (const char* ok :

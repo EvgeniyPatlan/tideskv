@@ -21,6 +21,11 @@ std::string UnknownSubcommandError(std::string_view sub, std::string_view comman
          " HELP.";
 }
 
+std::string SubcommandSyntaxError(std::string_view sub, std::string_view command) {
+  return "ERR unknown subcommand or wrong number of arguments for '" + std::string(sub.substr(0, 128)) +
+         "'. Try " + std::string(command) + " HELP.";
+}
+
 std::string UnsupportedOptionError(std::string_view opt) {
   return "ERR Unsupported option " + std::string(opt);
 }

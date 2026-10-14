@@ -21,7 +21,7 @@ trap cleanup EXIT
 
 docker build -q -t "$IMAGE" -f docker/ci.Dockerfile docker >/dev/null
 docker network create "$TAG-net" >/dev/null
-docker run -d --rm --name "$TAG-redis" --network "$TAG-net" redis:7.2.5 --save "" --appendonly no >/dev/null
+docker run -d --rm --name "$TAG-redis" --network "$TAG-net" redis:7.2.5 --save "" --appendonly no --enable-debug-command yes >/dev/null
 
 # seccomp=unconfined lets TSan's ctest run under setarch -R (ASLR off) inside the container.
 docker run --rm --name "$TAG-build" --network "$TAG-net" --security-opt seccomp=unconfined \

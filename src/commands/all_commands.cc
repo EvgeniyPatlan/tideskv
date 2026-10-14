@@ -26,6 +26,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterElementScanCommands(registry);
   RegisterMultiCommands(registry);
   RegisterScriptCommands(registry);
+  RegisterDebugCommands(registry);
 }
 
 }  // namespace tideskv

@@ -26,6 +26,10 @@ std::string FormatScore(double v) {
     const auto ll = static_cast<int64_t>(v);
     if (static_cast<double>(ll) == v) return std::to_string(ll);
   }
+  return FormatDtoa(v);
+}
+
+std::string FormatDtoa(double v) {
   char buf[32];
   const int n = fpconv_dtoa(v, buf);
   return std::string(buf, static_cast<size_t>(n));

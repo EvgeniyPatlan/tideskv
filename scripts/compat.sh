@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs the Go compatibility suites (tests/compat) against a tideskv-server binary.
 #   scripts/compat.sh <path/to/tideskv-server> [--diff]
-# --diff also runs the differential test against Redis 7.2: uses $TIDESKV_REF_ADDR if set,
+# --diff also runs the differential test against Redis 7.2 (started with --enable-debug-command yes, for the
+# DEBUG DIGEST that ends every stream): uses $TIDESKV_REF_ADDR if set,
 # otherwise starts Docker ${TIDESKV_REF_IMAGE:-redis:7.2.5} on 127.0.0.1:${TIDESKV_REF_PORT:-16379}.
 set -euo pipefail
 usage() { echo "usage: $0 <path/to/tideskv-server> [--diff]" >&2; exit 2; }
@@ -20,7 +21,7 @@ cleanup() { if [[ -n "$CID" ]]; then docker rm -f "$CID" >/dev/null; fi; }
 trap cleanup EXIT
 if [[ $DIFF == 1 && -z "${TIDESKV_REF_ADDR:-}" ]]; then
   PORT=${TIDESKV_REF_PORT:-16379}
-  CID=$(docker run -d --rm -p "127.0.0.1:$PORT:6379" "${TIDESKV_REF_IMAGE:-redis:7.2.5}" --save "" --appendonly no)
+  CID=$(docker run -d --rm -p "127.0.0.1:$PORT:6379" "${TIDESKV_REF_IMAGE:-redis:7.2.5}" --save "" --appendonly no --enable-debug-command yes)
   ready=0
   for _ in $(seq 50); do
     if docker exec "$CID" redis-cli ping >/dev/null 2>&1; then ready=1; break; fi
