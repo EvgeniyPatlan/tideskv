@@ -31,7 +31,11 @@ jobs:
           key: deps-${{ matrix.preset }}-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset ${{ matrix.preset }} -DTIDESKV_WERROR=ON
       - run: cmake --build --preset ${{ matrix.preset }} -j
+      # Runs every label, including multinode (replication) and crash (kill -9 durability); the crash
+      # suite is shortened here and runs its full default rounds in the nightly crash job.
       - run: ctest --preset ${{ matrix.preset }} -j 4
+        env:
+          TIDESKV_CRASH_ROUNDS: "8"
 
   coverage:
     runs-on: ubuntu-24.04
@@ -61,6 +65,18 @@ jobs:
           sudo apt-get install -y ninja-build clang-18 llvm-18 libclang-rt-18-dev liblz4-dev libzstd-dev
       - run: cmake --preset fuzz -DTIDESKV_WERROR=ON && cmake --build --preset fuzz -j --target resp_parser_fuzz
       - run: mkdir -p corpus && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=1800 -max_len=65536
+
+  crash:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 llvm-18 libclang-rt-18-dev liblz4-dev libzstd-dev
+      - run: cmake --preset release -DTIDESKV_WERROR=ON && cmake --build --preset release -j
+      - run: ctest --preset release -L crash --output-on-failure
 
   compat:
     runs-on: ubuntu-24.04

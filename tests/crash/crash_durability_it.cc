@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,8 +17,18 @@ namespace tideskv::test {
 namespace {
 
 constexpr int kWriters = 8;
-constexpr int kRounds = 20;
+constexpr int kDefaultRounds = 20;
 constexpr int kKeysPerTxn = 32;
+
+// TIDESKV_CRASH_ROUNDS shortens the run in CI; anything that is not a positive integer keeps the default.
+int Rounds() {
+  const char* env = std::getenv("TIDESKV_CRASH_ROUNDS");
+  if (env == nullptr) return kDefaultRounds;
+  char* end = nullptr;
+  const long parsed = std::strtol(env, &end, 10);
+  if (end == env || *end != '\0' || parsed < 1 || parsed > 1000) return kDefaultRounds;
+  return static_cast<int>(parsed);
+}
 
 using AckedIndexes = std::vector<std::vector<int>>;  // per writer: acknowledged indexes, in order
 
@@ -29,14 +40,17 @@ std::string KeyOf(int writer, int txn, int key) {
 AckedIndexes RunWritersUntilKilled(TestServer& srv, std::chrono::milliseconds run_for) {
   AckedIndexes acked(kWriters);
   std::vector<std::unique_ptr<RespClient>> clients;
+  clients.reserve(kWriters);
   for (int w = 0; w < kWriters; ++w) clients.push_back(srv.Connect());
   std::vector<std::thread> threads;
+  threads.reserve(kWriters);
   for (int w = 0; w < kWriters; ++w) {
     threads.emplace_back([&acked, &clients, w] {
       RespClient& c = *clients[w];
       const std::string value(256, 'x');  // fills the 1 MiB memtable fast: frequent rotations
       for (int i = 0;; ++i) {
         std::vector<std::string> mset = {"MSET"};
+        mset.reserve(1 + 2 * kKeysPerTxn);
         for (int j = 0; j < kKeysPerTxn; ++j) {
           mset.push_back(KeyOf(w, i, j));
           mset.push_back(value);
@@ -82,11 +96,11 @@ void RunCrashRound(const std::string& sync_mode, int round) {
 }
 
 TEST(CrashDurability, ConcurrentWritersSurviveKill9UnderFull) {
-  for (int round = 0; round < kRounds; ++round) RunCrashRound("full", round);
+  for (int round = 0; round < Rounds(); ++round) RunCrashRound("full", round);
 }
 
 TEST(CrashDurability, ConcurrentWritersSurviveKill9UnderInterval) {
-  for (int round = 0; round < kRounds; ++round) RunCrashRound("interval", round);
+  for (int round = 0; round < Rounds(); ++round) RunCrashRound("interval", round);
 }
 
 }  // namespace

@@ -179,7 +179,8 @@ int SetRespImpl(lua_State* L) {
   return 0;
 }
 
-// redis.set_repl (sl:1105-1128): validated, then a no-op (TidesKV has no replication).
+// redis.set_repl (sl:1105-1128): validated, then a no-op. Replication is physical (the replica applies the
+// exact ops the master committed), so a script cannot choose what to propagate.
 int SetReplImpl(lua_State* L) {
   if (lua_gettop(L) != 1) return PushLibError(L, kScriptErrSetReplArgs);
   constexpr unsigned kReplAll = 3;  // PROPAGATE_AOF | PROPAGATE_REPL

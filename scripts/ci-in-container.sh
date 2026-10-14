@@ -10,6 +10,8 @@ J=$(nproc)
 JOBS=" ${JOBS:-debug release asan tsan coverage format boundary tidy fuzz compat} "
 FUZZ_SECONDS=${FUZZ_SECONDS:-120}
 DIFF_SEEDS=${DIFF_SEEDS:-1-200}
+# ctest runs every label (multinode, crash included); the crash suite is shortened as in ci.yml.
+export TIDESKV_CRASH_ROUNDS=${TIDESKV_CRASH_ROUNDS:-8}
 declare -A R
 run() {
   [[ "$JOBS" == *" $1 "* ]] || return 0

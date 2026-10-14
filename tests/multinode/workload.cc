@@ -191,7 +191,8 @@ void Workload::RunClient(uint32_t seed) {
       last = c->Read();
       if (!last.has_value()) return;
     }
-    if (last->type == RespValue::Type::kError) continue;  // WRONGTYPE, no such key, EXECABORT ...
+    if (!last.has_value() || last->type == RespValue::Type::kError)
+      continue;  // WRONGTYPE, no such key, EXECABORT ...
     acked_writes_.fetch_add(1, std::memory_order_relaxed);
     if (op.ack.has_value() && last->type == RespValue::Type::kSimple && last->str == "OK") {
       std::lock_guard lock(acked_mu_);
