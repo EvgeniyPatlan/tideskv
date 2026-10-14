@@ -195,5 +195,127 @@ TEST(InfoBlocking, ClientsSectionHasBlockedFields) {
   EXPECT_NE(info.find("total_blocking_keys:3\r\n"), std::string::npos);
 }
 
+// ---- INFO replication (M6a D16) ----
+
+const std::string kId(40, 'a');
+const std::string kZeros(40, '0');
+
+ReplicationStats MasterRepl() {
+  ReplicationStats r;
+  r.replid = kId;
+  r.master_offset = r.applied_seq = r.read_seq = 15;
+  r.backlog_size_config = 1073741824;
+  r.first_retained = 2;
+  r.histlen = 14;
+  return r;
+}
+
+std::string Repl(const ReplicationStats& r) {
+  ServerStats s = SampleStats();
+  s.repl = r;
+  return FormatInfo(s, {"replication"});
+}
+
+TEST(InfoReplication, MasterWithoutReplicasIsExact) {
+  EXPECT_EQ(Repl(MasterRepl()),
+            "# Replication\r\nrole:master\r\nconnected_slaves:0\r\n"
+            "master_failover_state:no-failover\r\nmaster_replid:" +
+                kId + "\r\nmaster_replid2:" + kZeros +
+                "\r\nmaster_repl_offset:15\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:1\r\n"
+                "repl_backlog_size:1073741824\r\nrepl_backlog_first_byte_offset:2\r\n"
+                "repl_backlog_histlen:14\r\n");
+}
+
+TEST(InfoReplication, EmptyLogHasZeroHistlen) {
+  ReplicationStats r = MasterRepl();
+  r.master_offset = 0;
+  r.first_retained = 1;
+  r.histlen = 0;
+  const std::string info = Repl(r);
+  EXPECT_NE(info.find("master_repl_offset:0\r\n"), std::string::npos);
+  EXPECT_NE(info.find("repl_backlog_histlen:0\r\n"), std::string::npos);
+}
+
+TEST(InfoReplication, MasterListsReplicas) {
+  ReplicationStats r = MasterRepl();
+  r.replicas = {{"10.0.0.2", 7001, 15, 0}, {"10.0.0.3", 7002, 12, 2}};
+  const std::string info = Repl(r);
+  EXPECT_NE(info.find("role:master\r\nconnected_slaves:2\r\n"
+                      "slave0:ip=10.0.0.2,port=7001,state=online,offset=15,lag=0\r\n"
+                      "slave1:ip=10.0.0.3,port=7002,state=online,offset=12,lag=2\r\n"
+                      "master_failover_state:no-failover\r\n"),
+            std::string::npos)
+      << info;
+}
+
+TEST(InfoReplication, ConnectedReplica) {
+  ReplicationStats r = MasterRepl();
+  r.replica = true;
+  r.master_host = "m1";
+  r.master_port = 6379;
+  r.link_up = true;
+  r.last_io_seconds_ago = 8;
+  r.replica_priority = 100;
+  EXPECT_EQ(Repl(r).substr(0, Repl(r).find("connected_slaves")),
+            "# Replication\r\nrole:slave\r\nmaster_host:m1\r\nmaster_port:6379\r\n"
+            "master_link_status:up\r\nmaster_last_io_seconds_ago:8\r\nmaster_sync_in_progress:0\r\n"
+            "slave_read_repl_offset:15\r\nslave_repl_offset:15\r\nslave_priority:100\r\n"
+            "slave_read_only:1\r\nreplica_announced:1\r\n");
+  EXPECT_EQ(Repl(r).find("master_link_down_since_seconds"), std::string::npos);
+}
+
+TEST(InfoReplication, DownReplicaShowsDownSince) {
+  ReplicationStats r = MasterRepl();
+  r.replica = true;
+  r.master_host = "m1";
+  r.master_port = 6379;
+  r.link_down_since_seconds = -1;  // never connected
+  std::string info = Repl(r);
+  EXPECT_NE(info.find("master_link_status:down\r\nmaster_last_io_seconds_ago:-1\r\n"
+                      "master_sync_in_progress:0\r\nslave_read_repl_offset:15\r\n"
+                      "slave_repl_offset:15\r\nmaster_link_down_since_seconds:-1\r\nslave_priority:100\r\n"),
+            std::string::npos)
+      << info;
+  r.link_down_since_seconds = 42;
+  r.read_only = false;
+  info = Repl(r);
+  EXPECT_NE(info.find("master_link_down_since_seconds:42\r\n"), std::string::npos);
+  EXPECT_NE(info.find("slave_read_only:0\r\n"), std::string::npos);
+}
+
+TEST(InfoReplication, PromotedMasterShowsSecondReplid) {
+  ReplicationStats r = MasterRepl();
+  r.replid2 = std::string(40, 'b');
+  r.second_offset = 11;
+  const std::string info = Repl(r);
+  EXPECT_NE(info.find("master_replid2:" + std::string(40, 'b') + "\r\n"), std::string::npos);
+  EXPECT_NE(info.find("second_repl_offset:11\r\n"), std::string::npos);
+}
+
+TEST(InfoReplication, KeyspaceHasSequenceInPlainInfoAndSection) {
+  ServerStats s = SampleStats();
+  s.repl = MasterRepl();
+  s.repl.applied_seq = 9;
+  EXPECT_NE(FormatInfo(s, {}).find("# Keyspace\r\nsequence:9\r\n"), std::string::npos);
+  EXPECT_EQ(FormatInfo(s, {"keyspace"}), "# Keyspace\r\nsequence:9\r\n");
+  EXPECT_NE(FormatInfo(s, {}).find("# Replication\r\nrole:master"), std::string::npos);
+}
+
+TEST(InfoReplication, StatsHasSyncCounters) {
+  ServerStats s = SampleStats();
+  s.repl.sync_full = 3;
+  s.repl.sync_partial_ok = 2;
+  s.repl.sync_partial_err = 1;
+  const std::string info = FormatInfo(s, {"stats"});
+  EXPECT_NE(info.find("sync_full:3\r\nsync_partial_ok:2\r\nsync_partial_err:1\r\n"), std::string::npos);
+}
+
+TEST(Hello, RoleFollowsReplication) {
+  CommandHarness h;
+  EXPECT_NE(h.Run({"HELLO", "3"}).find("role\r\n$6\r\nmaster\r\n"), std::string::npos);
+  h.services.replication().BecomeReplica("m", 1);
+  EXPECT_NE(h.Run({"HELLO", "3"}).find("role\r\n$7\r\nreplica\r\n"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace tideskv

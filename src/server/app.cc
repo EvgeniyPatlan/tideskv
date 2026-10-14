@@ -220,6 +220,19 @@ ServerStats App::Stats() const {
   s.data_dir = v.dir;
   s.sync_mode = v.sync_mode;
   s.storage_compression = std::string(CompressionName(storage_->compression()));
+  FillStorageStats(s);
+  s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
+  s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
+  s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
+  s.blocked_clients = blocking_.blocked_clients();
+  s.blocking_keys = blocking_.blocking_keys();
+  s.lua_memory = scripts_.lua_memory();
+  s.cached_scripts = scripts_.cached_scripts();
+  FillReplStats(s, v);
+  return s;
+}
+
+void App::FillStorageStats(ServerStats& s) const {
   if (auto st = storage_->Stats(); st.ok()) {  // stats are best-effort; never fail INFO
     for (ColumnFamily cf : kAllColumnFamilies) {
       if (cf == ColumnFamily::kReplog) continue;  // the backlog has its own retention (M6a), not compaction's
@@ -229,14 +242,59 @@ ServerStats App::Stats() const {
     s.storage_flushes = st->flush_count;
     s.storage_compactions = st->compaction_count;
   }
-  s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
-  s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
-  s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
-  s.blocked_clients = blocking_.blocked_clients();
-  s.blocking_keys = blocking_.blocking_keys();
-  s.lua_memory = scripts_.lua_memory();
-  s.cached_scripts = scripts_.cached_scripts();
-  return s;
+}
+
+namespace {
+
+int64_t NowUnixMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// Whole seconds since a unix-ms stamp; -1 when the stamp is unset (<= 0).
+int64_t SecondsSince(int64_t unix_ms, int64_t now_ms) {
+  return unix_ms > 0 ? std::max<int64_t>(0, (now_ms - unix_ms) / 1000) : -1;
+}
+
+}  // namespace
+
+// Reads only atomics and short-lived manager locks: never ReplLog::mu_, so INFO does not wait behind a
+// commit's fsync (CF4).
+void App::FillReplStats(ServerStats& s, const ConfigValues& v) const {
+  ReplicationStats& r = s.repl;
+  const int64_t now = NowUnixMs();
+  const RoleInfo role = replication_->Role();
+  r.replica = role.role == ReplRole::kReplica;
+  r.master_host = role.host;
+  r.master_port = role.port;
+  r.link_up = r.replica && role.state == ReplicaLinkState::kConnected;
+  if (r.replica) {
+    const auto link = replication_->Link();
+    r.last_io_seconds_ago = SecondsSince(link.last_io_ms, now);
+    r.link_down_since_seconds =
+        link.link_down_since_ms > 0 ? SecondsSince(link.link_down_since_ms, now) : link.link_down_since_ms;
+  }
+  for (const ReplicaInfo& i : role.replicas) {
+    r.replicas.push_back(
+        {i.ip, i.listening_port, i.acked, std::max<int64_t>(0, SecondsSince(i.last_ack_ms, now))});
+  }
+  const repl::ReplIdentity id = replication_->identity();
+  r.replid = id.replid;
+  if (!id.history.empty()) {
+    r.replid2 = id.history.front().replid;
+    r.second_offset = static_cast<int64_t>(id.history.front().end_seq) + 1;
+  }
+  r.master_offset = r.applied_seq = r.read_seq = repl_log_->last();
+  r.first_retained = repl_log_->first_retained();
+  r.histlen = r.master_offset >= r.first_retained ? r.master_offset - r.first_retained + 1 : 0;
+  r.backlog_size_config = v.repl_backlog_size;
+  r.replica_priority = v.replica_priority;
+  r.read_only = v.replica_read_only;
+  const auto c = replication_->counters();
+  r.sync_full = c.sync_full;
+  r.sync_partial_ok = c.sync_partial_ok;
+  r.sync_partial_err = c.sync_partial_err;
 }
 
 }  // namespace tideskv

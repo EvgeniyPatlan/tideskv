@@ -4,6 +4,7 @@
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "repl/replication.h"
 #include "server/blocking.h"
 #include "types/errors.h"
 
@@ -79,7 +80,7 @@ void WriteHelloReply(ExecContext& ctx) {
   r.Bulk("mode");
   r.Bulk("standalone");
   r.Bulk("role");
-  r.Bulk("master");
+  r.Bulk(ctx.server.replication().IsReplica() ? "replica" : "master");
   r.Bulk("modules");
   r.ArrayHeader(0);
 }

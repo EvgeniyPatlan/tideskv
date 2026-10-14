@@ -200,6 +200,16 @@ RoleInfo ReplicationManager::Role() const {
   return r;
 }
 
+ReplicationManager::LinkTimes ReplicationManager::Link() const {
+  std::shared_ptr<ReplClient> client;
+  {
+    std::lock_guard lock(mu_);
+    client = client_;
+  }
+  if (!client) return {};
+  return {client->last_io_ms(), client->link_down_since_ms()};
+}
+
 bool ReplicationManager::SameMaster(const std::string& host, uint16_t port) const {
   std::lock_guard lock(mu_);
   return role() == ReplRole::kReplica && EqualsIgnoreCase(host, master_host_) && port == master_port_;

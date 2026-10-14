@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "server/config.h"
 
@@ -15,7 +16,41 @@ class Replication;
 class ScriptEngine;
 class WatchRegistry;
 
+// One attached replica as INFO lists it (state is always "online": only streaming replicas are tracked).
+struct ReplicaLine {
+  std::string ip;
+  int port = 0;
+  uint64_t offset = 0;      // last REPLCONF ACK (a seq)
+  int64_t lag_seconds = 0;  // now - last ACK
+};
+
+// What INFO's Replication, Keyspace `sequence` and sync counters show (M6a D16). Offsets are TidesKV seqs.
+struct ReplicationStats {
+  bool replica = false;
+  std::string master_host;
+  int master_port = 0;
+  bool link_up = false;
+  int64_t last_io_seconds_ago = -1;
+  int64_t link_down_since_seconds = -1;  // -1 = never connected since REPLICAOF
+  uint64_t applied_seq = 0;
+  uint64_t read_seq = 0;
+  int replica_priority = 100;
+  bool read_only = true;
+  std::vector<ReplicaLine> replicas;
+  std::string replid;
+  std::string replid2;         // empty = unset (shown as 40 zeros)
+  int64_t second_offset = -1;  // newest history end_seq + 1, or -1
+  uint64_t master_offset = 0;  // the log's last seq
+  uint64_t backlog_size_config = 0;
+  uint64_t first_retained = 1;
+  uint64_t histlen = 0;
+  uint64_t sync_full = 0;
+  uint64_t sync_partial_ok = 0;
+  uint64_t sync_partial_err = 0;
+};
+
 struct ServerStats {
+  ReplicationStats repl;
   std::string version;
   int64_t pid = 0;
   uint16_t tcp_port = 0;
@@ -58,7 +93,7 @@ class ServerServices {
   virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
   virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
   virtual ScriptEngine& scripts() = 0;       // EVAL / SCRIPT (M5b)
-  virtual Replication& replication() = 0;   // role queries (M6a)
+  virtual Replication& replication() = 0;    // role queries (M6a)
 };
 
 }  // namespace tideskv

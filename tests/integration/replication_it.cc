@@ -108,6 +108,29 @@ TEST_F(ReplicationIT, ReplicaFollowsMaster) {
   EXPECT_EQ(r->Command({"HGET", "h1", "f1"}).str, "1");  // the replica serves reads
 }
 
+// INFO's offsets are seqs: the master's master_repl_offset equals the replica's slave_repl_offset, and the
+// master's slave0 offset (the replica's ACK) converges to it within the ACK cadence.
+TEST_F(ReplicationIT, InfoReplicationOffsetsAgreeAfterSync) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  MixedWrites(*m, 200);
+  ASSERT_TRUE(Synced(*m, *r));
+  const int64_t offset = InfoField(*m, "replication", "master_repl_offset");
+  EXPECT_GT(offset, 0);
+  EXPECT_EQ(InfoField(*r, "replication", "slave_repl_offset"), offset);
+  EXPECT_EQ(InfoString(*r, "replication", "role"), "slave");
+  EXPECT_EQ(InfoString(*r, "replication", "master_link_status"), "up");
+  EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), offset);
+  EXPECT_EQ(InfoField(*m, "keyspace", "sequence"), offset);
+  EXPECT_EQ(InfoField(*m, "stats", "sync_full") + InfoField(*m, "stats", "sync_partial_ok"), 1);
+  const auto acked = [&] {
+    const std::string line = InfoString(*m, "replication", "slave0");
+    return line.find(",offset=" + std::to_string(offset) + ",") != std::string::npos;
+  };
+  EXPECT_TRUE(WaitFor(acked, 2s)) << InfoString(*m, "replication", "slave0");
+}
+
 TEST_F(ReplicationIT, ReplicaIsReadOnly) {
   Follow(*replica);
   auto r = Client(*replica);

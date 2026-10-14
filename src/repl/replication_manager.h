@@ -83,6 +83,13 @@ class ReplicationManager final : public Replication {
   // Stops every sender (demotion, promotion: sub-replicas must resync, Redis disconnectSlaves; shutdown).
   void DropAllReplicas();
 
+  // The replica link's I/O times (unix ms), for INFO. Defaults when there is no client.
+  struct LinkTimes {
+    int64_t last_io_ms = 0;           // 0 = never
+    int64_t link_down_since_ms = -1;  // -1 = never up, 0 = up
+  };
+  LinkTimes Link() const;
+
   std::string replid() const;
   ReplIdentity identity() const;
   Counters counters() const;

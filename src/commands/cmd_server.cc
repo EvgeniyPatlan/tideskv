@@ -52,7 +52,10 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
   if (name == "stats") {
     return Section("Stats", {{"total_connections_received", std::to_string(s.total_connections)},
                              {"total_commands_processed", std::to_string(s.total_commands)},
-                             {"expired_keys", std::to_string(s.expired_keys)}});
+                             {"expired_keys", std::to_string(s.expired_keys)},
+                             {"sync_full", std::to_string(s.repl.sync_full)},
+                             {"sync_partial_ok", std::to_string(s.repl.sync_partial_ok)},
+                             {"sync_partial_err", std::to_string(s.repl.sync_partial_err)}});
   }
   if (name == "persistence") {
     return Section("Persistence",
@@ -68,13 +71,14 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                     {"background_compactions", std::to_string(s.background_compactions)},
                     {"background_compaction_failures", std::to_string(s.background_compaction_failures)}});
   }
-  if (name == "keyspace") return Section("Keyspace", {});
+  if (name == "replication") return FormatReplicationSection(s.repl);
+  if (name == "keyspace") return Section("Keyspace", {{"sequence", std::to_string(s.repl.applied_seq)}});
   return "";
 }
 
 const std::vector<std::string>& AllSections() {
-  static const std::vector<std::string> kAll = {"server", "clients",     "memory",
-                                                "stats",  "persistence", "keyspace"};
+  static const std::vector<std::string> kAll = {"server",      "clients",     "memory",  "stats",
+                                                "persistence", "replication", "keyspace"};
   return kAll;
 }
 

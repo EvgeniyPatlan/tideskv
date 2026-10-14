@@ -54,6 +54,8 @@ class App final : public ServerServices {
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
   net::ServerOptions MakeServerOptions();
   Status CreateReplication();
+  void FillStorageStats(ServerStats& s) const;
+  void FillReplStats(ServerStats& s, const ConfigValues& v) const;
   Status StartRole();  // the reaper on a master, the replica client when replicaof is set
 
   std::unique_ptr<Config> config_;
