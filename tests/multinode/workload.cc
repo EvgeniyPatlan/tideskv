@@ -177,27 +177,56 @@ std::vector<uint64_t> Workload::acked_ack_keys() const {
   return acked_keys_;
 }
 
-// Ends quietly when the server goes away: a reply that never comes is not acknowledged.
+uint64_t Workload::Stats::error_count() const {
+  uint64_t n = 0;
+  for (const auto& [text, count] : errors) n += count;
+  return n;
+}
+
+Workload::Stats Workload::stats() const {
+  std::lock_guard lock(acked_mu_);
+  return stats_;
+}
+
+void Workload::Record(const std::vector<RespValue>& replies, std::optional<uint64_t> ack) {
+  const auto count = [this](const RespValue& v) {
+    if (v.type == RespValue::Type::kError) ++stats_.errors[v.str];
+  };
+  std::lock_guard lock(acked_mu_);
+  ++stats_.steps;
+  for (const RespValue& r : replies) {
+    count(r);
+    if (r.type == RespValue::Type::kArray)
+      for (const RespValue& e : r.elements) count(e);  // EXEC's per-command replies
+  }
+  const RespValue& last = replies.back();
+  if (last.type == RespValue::Type::kError) return;  // WRONGTYPE, no such key, EXECABORT ...
+  acked_writes_.fetch_add(1, std::memory_order_relaxed);
+  if (ack.has_value() && last.type == RespValue::Type::kSimple && last.str == "OK")
+    acked_keys_.push_back(*ack);
+}
+
+// A client ends early when it cannot connect, or its server closes the link or does not answer within
+// the client's read timeout; a reply that never comes is not acknowledged.
 void Workload::RunClient(uint32_t seed) {
   Rng rng(seed);
   const std::unique_ptr<RespClient> c = RespClient::Connect(port_);
-  if (c == nullptr) return;
+  bool failed = c == nullptr;
   const bool expiry = mix_ == Mix::kAll;
-  while (!stop_.load(std::memory_order_acquire)) {
+  while (!failed && !stop_.load(std::memory_order_acquire)) {
     const Op op = NextOp(rng, expiry, next_ack_);
-    if (!c->SendRaw(Encode(op.commands))) return;
-    std::optional<RespValue> last;
-    for (size_t i = 0; i < op.commands.size(); ++i) {
-      last = c->Read();
-      if (!last.has_value()) return;
+    failed = !c->SendRaw(Encode(op.commands));
+    std::vector<RespValue> replies;
+    for (size_t i = 0; i < op.commands.size() && !failed; ++i) {
+      std::optional<RespValue> r = c->Read();
+      failed = !r.has_value();
+      if (r.has_value()) replies.push_back(std::move(*r));
     }
-    if (!last.has_value() || last->type == RespValue::Type::kError)
-      continue;  // WRONGTYPE, no such key, EXECABORT ...
-    acked_writes_.fetch_add(1, std::memory_order_relaxed);
-    if (op.ack.has_value() && last->type == RespValue::Type::kSimple && last->str == "OK") {
-      std::lock_guard lock(acked_mu_);
-      acked_keys_.push_back(*op.ack);
-    }
+    if (!failed) Record(replies, op.ack);
+  }
+  if (failed) {
+    std::lock_guard lock(acked_mu_);
+    ++stats_.early_exits;
   }
 }
 

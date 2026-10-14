@@ -39,8 +39,7 @@ TEST(Convergence, ReplicaMatchesMasterUnderLoad) {
   load.Start();
   std::this_thread::sleep_for(10s);
   load.Stop();
-  std::printf("[ multinode ] %llu writes acknowledged\n",
-              static_cast<unsigned long long>(load.acked_writes()));
+  ExpectHealthyLoad(load);
   EXPECT_GT(load.acked_writes(), 1000u);
   ExpectConverged(master, {&r1, &r2});
   // The TSan smoke runs this test against a -fsanitize=thread server: a race report fails it here, with
@@ -69,6 +68,7 @@ TEST(Convergence, ReplicaKill9Loop) {
     ASSERT_TRUE(replica.IsRunning()) << "round " << round << ":\n" << replica.StderrSinceStart();
   }
   load.Stop();
+  ExpectHealthyLoad(load);
   ExpectConverged(master, {&replica});
   auto m = Client(master);
   // The first link plus one per restart; a restart that came up before the old link was reaped still
@@ -109,6 +109,7 @@ TEST(Convergence, MasterKill9Loop) {
   load.Start();
   std::this_thread::sleep_for(1s);
   load.Stop();
+  ReportLoad(load);
   ExpectConverged(master, {&replica});
   const std::vector<uint64_t> acked = load.acked_ack_keys();
   ASSERT_FALSE(acked.empty());

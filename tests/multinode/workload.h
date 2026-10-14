@@ -1,16 +1,22 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
 // A seeded, multi-client write load against one server (M6a Task 15). Every client loops over a weighted
 // mix of writes on a bounded keyspace, so keys collide often: strings with EX, counters, hashes, lists,
 // sets, sorted sets, DEL, EXPIRE/PERSIST, RENAME, MULTI/EXEC, EVAL and, rarely, FLUSHDB of db 2.
-// A client whose server goes away (kill -9) ends its loop quietly; Start() after Stop() runs a fresh set
-// of clients, and the `ack:<n>` numbering continues across runs.
+// A client whose server goes away (kill -9) ends its loop; Start() after Stop() runs a fresh set of
+// clients, and the `ack:<n>` numbering continues across runs. Error replies and clients that ended before
+// Stop() are counted (Stats), so a test whose server stays up can tell a healthy load from a failed one.
 namespace tideskv::test {
+
+struct RespValue;
 
 class Workload {
  public:
@@ -25,13 +31,25 @@ class Workload {
 
   void Start();
   void Stop();  // joins the clients
+  struct Stats {
+    uint64_t steps = 0;        // ops sent: one command, or MULTI .. EXEC, or SELECT .. SELECT
+    uint64_t early_exits = 0;  // clients that ended before Stop(): no connection, EOF or a reply timeout
+    // Every error reply, top level or inside EXEC's array, by its full text.
+    std::map<std::string, uint64_t> errors;
+    uint64_t error_count() const;
+  };
+
   // Write commands the server answered without an error.
   uint64_t acked_writes() const { return acked_writes_.load(std::memory_order_relaxed); }
+  Stats stats() const;  // over every run so far
   // The n of every `SET ack:<n>` the server answered +OK; none is ever deleted or expired.
   std::vector<uint64_t> acked_ack_keys() const;
 
  private:
   void RunClient(uint32_t seed);
+  // One step's replies (one per command sent): counts its errors, and acknowledges it unless the last
+  // reply is an error.
+  void Record(const std::vector<RespValue>& replies, std::optional<uint64_t> ack);
 
   const uint16_t port_;
   const uint32_t seed_;
@@ -43,6 +61,7 @@ class Workload {
   std::atomic<uint64_t> next_ack_{0};
   mutable std::mutex acked_mu_;
   std::vector<uint64_t> acked_keys_;  // guarded by acked_mu_
+  Stats stats_;                       // guarded by acked_mu_
   std::vector<std::thread> threads_;
 };
 

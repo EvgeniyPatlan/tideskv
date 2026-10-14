@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "multinode/workload.h"
 #include "support/it_helpers.h"
 #include "support/test_server.h"
 
@@ -57,6 +58,30 @@ inline uint32_t Seed() {
       env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : std::random_device{}();
   std::printf("[ multinode ] seed %u (rerun with TIDESKV_MULTINODE_SEED=%u)\n", seed, seed);
   return seed;
+}
+
+// Prints what a load did: steps, clients that ended early, and every error reply by text.
+inline void ReportLoad(const Workload& load) {
+  const Workload::Stats st = load.stats();
+  std::printf("[ multinode ] load: %llu steps, %llu acknowledged, %llu early exits, %llu errors\n",
+              static_cast<unsigned long long>(st.steps), static_cast<unsigned long long>(load.acked_writes()),
+              static_cast<unsigned long long>(st.early_exits),
+              static_cast<unsigned long long>(st.error_count()));
+  for (const auto& [text, n] : st.errors) {
+    std::printf("[ multinode ]   %llu x %s\n", static_cast<unsigned long long>(n), text.c_str());
+  }
+}
+
+// For a load whose server stayed up: every client ran until Stop(), and the only error replies are the
+// ones the mix makes by design (RENAME of a key that does not exist, about 1% of the steps), at a bounded
+// rate. Prints the load first.
+inline void ExpectHealthyLoad(const Workload& load) {
+  ReportLoad(load);
+  const Workload::Stats st = load.stats();
+  EXPECT_GT(st.steps, 0u);
+  EXPECT_EQ(st.early_exits, 0u) << "a client lost its connection or timed out";
+  for (const auto& [text, n] : st.errors) EXPECT_EQ(text, "ERR no such key") << n << " replies";
+  EXPECT_LE(st.error_count() * 10, st.steps) << "more than 10% of the steps failed";
 }
 
 // Waits until every replica has applied the master's last seq, then compares DEBUG DIGEST. The master

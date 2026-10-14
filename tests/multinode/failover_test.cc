@@ -49,6 +49,7 @@ TEST(Failover, PromoteReplicaThenDemoteOldMasterPartialSyncs) {
     load.Start();
     std::this_thread::sleep_for(3s);
     load.Stop();
+    ExpectHealthyLoad(load);
   }
   ExpectConverged(a, {&b});
   auto ac = Client(a);
@@ -64,6 +65,7 @@ TEST(Failover, PromoteReplicaThenDemoteOldMasterPartialSyncs) {
     load.Start();
     std::this_thread::sleep_for(3s);
     load.Stop();
+    ExpectHealthyLoad(load);
   }
   ExpectConverged(b, {&a});
 }
@@ -83,6 +85,7 @@ TEST(Failover, PromoteUnderLoadThenRepointSecondReplica) {
   std::this_thread::sleep_for(3s);
   m.Kill9();
   load.Stop();
+  ReportLoad(load);
   auto ac = Client(a);
   auto bc = Client(b);
   // Once a link is down its buffered frames are applied; replicas do not expire keys, so seqs are frozen.
