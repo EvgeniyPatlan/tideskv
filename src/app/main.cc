@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
   for (const auto& var : ignored_env) spdlog::warn("{} is set but empty; ignored", var);
   auto app = tideskv::App::Create(std::move(config));
   if (!app.ok()) {
-    spdlog::critical("cannot open storage: {}", app.status().message());
+    spdlog::critical("cannot start: {}", app.status().message());
     return 2;
   }
   if (const tideskv::Status st = (*app)->Start(); !st.ok()) {

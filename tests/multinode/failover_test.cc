@@ -117,8 +117,9 @@ TEST(Failover, PromoteUnderLoadThenRepointSecondReplica) {
 
 // F7: the case above with B strictly behind A, made certain. Pausing B alone is not enough (frames
 // already in its socket buffers would still arrive once it thaws), so the master drops B's silent link
-// (repl-timeout 1 s while B is paused) and the load runs on for 200 ms that A applies and B never
-// receives. Then the master dies: A's backlog serves B, which continues and converges.
+// (repl-timeout 3 s while B is paused; above the 1 s ACK interval so A stays linked) and the load runs on for
+// 200 ms that A applies and B never receives. Then the master dies: A's backlog serves B, which continues and
+// converges.
 TEST(Failover, PromoteThenRepointASecondReplicaThatIsBehind) {
   const uint32_t seed = Seed();
   SCOPED_TRACE("seed " + std::to_string(seed));
@@ -132,7 +133,7 @@ TEST(Failover, PromoteThenRepointASecondReplicaThatIsBehind) {
   load.Start();
   std::this_thread::sleep_for(1s);
   b.Pause();
-  ASSERT_EQ(mc->Command({"CONFIG", "SET", "repl-timeout", "1"}).str, "OK");
+  ASSERT_EQ(mc->Command({"CONFIG", "SET", "repl-timeout", "3"}).str, "OK");
   ASSERT_TRUE(WaitFor([&] { return InfoField(*mc, "replication", "connected_slaves") == 1; }, 30s));
   ASSERT_EQ(mc->Command({"CONFIG", "SET", "repl-timeout", "60"}).str, "OK");
   const uint64_t acked_at_drop = load.acked_writes();
