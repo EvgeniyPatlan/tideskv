@@ -158,12 +158,13 @@ class TimedOutScript {
   TimedOutScript(ServerServices& server, std::chrono::milliseconds hold) {
     thread_ = std::thread([&server, hold, this] {
       auto batch = server.engine().BeginBatch();
+      // Set here, before started_, so the flag cannot be raised after the sleep below has lowered it.
+      if (batch.ok()) server.scripts().ForceTimedOutForTests(true);
       started_ = batch.ok() ? 1 : 2;
       std::this_thread::sleep_for(hold);
       server.scripts().ForceTimedOutForTests(false);
     });
     while (started_.load() == 0) std::this_thread::yield();
-    server.scripts().ForceTimedOutForTests(true);
   }
   ~TimedOutScript() { Join(); }
   TimedOutScript(const TimedOutScript&) = delete;

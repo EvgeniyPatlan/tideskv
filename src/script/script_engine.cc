@@ -146,12 +146,12 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
       sandbox_->Run(*sha, req.keys != nullptr ? *req.keys : kNone, req.args != nullptr ? *req.args : kNone,
                     host, {req.busy_threshold_ms > 0}, out);
   // B1: the run ends here, atomically with Kill()'s CAS. A Kill() that won after the script's last kill
-  // check answered +OK, so it must still kill this run: its reply becomes the kill error (without a script
-  // location: the script had already returned) and the caller undoes its writes. Any later Kill() sees
-  // kIdle and answers NOTBUSY.
+  // check answered +OK, so it must still kill this run: its reply becomes the kill error (with no location
+  // suffix, as WriteScriptError formats a location-less error) and the caller undoes its writes. Any later
+  // Kill() sees kIdle and answers NOTBUSY.
   if (phase_.exchange(kIdle) == kKilled && !r.killed) {
     out.Truncate(reply_start);
-    out.Error("ERR " + std::string(kScriptErrKilled) + " script: " + *sha + ".");
+    out.Error("ERR " + std::string(kScriptErrKilled));
     return {true};
   }
   return {r.killed};

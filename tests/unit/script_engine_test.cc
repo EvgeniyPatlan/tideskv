@@ -162,7 +162,7 @@ TEST_F(ScriptEngineFixture, KillAnsweredOkAlwaysKillsTheRun) {
   ASSERT_TRUE(killing.timed_out) << "the loop ended before the 1 ms threshold";
   ASSERT_TRUE(killing.kill_answered_ok);
   EXPECT_TRUE(result.killed) << reply;
-  EXPECT_EQ(reply.rfind("-ERR Script killed by user with SCRIPT KILL...", 0), 0u) << reply;
+  EXPECT_EQ(reply, "-ERR Script killed by user with SCRIPT KILL...\r\n") << reply;
   EXPECT_FALSE(se.TimedOut());
   EXPECT_FALSE(se.Kill());  // the run is over
 }
