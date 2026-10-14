@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +28,12 @@ struct MultiState {
   std::vector<std::vector<std::string>> queued;
 };
 
+// What a would-be replica told us with REPLCONF (M6a), copied into the replica's entry at PSYNC.
+struct ReplicaHandshake {
+  int64_t listening_port = 0;  // REPLCONF listening-port (no range check, as in Redis)
+  std::string ip_address;      // REPLCONF ip-address; empty = the peer address
+};
+
 // Per-connection state. Owned by the connection; touched only on its worker thread.
 struct Session {
   uint64_t id = 0;
@@ -42,6 +49,11 @@ struct Session {
   std::shared_ptr<BlockedClient> blocked;  // set while a blocking command waits (M4 F5)
   MultiState multi;                        // M5a G3
   std::shared_ptr<WatchClient> watch;      // created by the first WATCH (M5a G2)
+  ReplicaHandshake replica_handshake;      // REPLCONF state (M6a)
+  // Set by PSYNC +CONTINUE (M6a D10): once the reply is flushed the connection releases its socket and
+  // calls this with the fd and the unread input after PSYNC, then dies without touching the socket again.
+  std::function<void(int fd, std::string unread)> takeover;
+  bool is_replica_link = false;  // PSYNC succeeded: further PSYNC/SYNC are ignored (Redis CLIENT_SLAVE)
 };
 
 }  // namespace tideskv

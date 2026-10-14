@@ -19,6 +19,7 @@ enum class StatusCode : uint8_t {
   kCorruption,
   kInternal,   // a bug: invariant violated
   kUserError,  // a command-level error; message is the exact Redis reply text
+  kTimedOut,   // a deadline passed before the operation could complete (blocking socket I/O)
 };
 
 std::string_view StatusCodeName(StatusCode code);
@@ -37,6 +38,7 @@ class [[nodiscard]] Status {
   static Status Corruption(std::string msg) { return {StatusCode::kCorruption, std::move(msg)}; }
   static Status Internal(std::string msg) { return {StatusCode::kInternal, std::move(msg)}; }
   static Status UserError(std::string reply) { return {StatusCode::kUserError, std::move(reply)}; }
+  static Status TimedOut(std::string msg = {}) { return {StatusCode::kTimedOut, std::move(msg)}; }
 
   bool ok() const { return code_ == StatusCode::kOk; }
   bool IsNotFound() const { return code_ == StatusCode::kNotFound; }

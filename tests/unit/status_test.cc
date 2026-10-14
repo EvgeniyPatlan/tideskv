@@ -73,5 +73,10 @@ TEST(Status, UserErrorCarriesTheReplyText) {
   EXPECT_EQ(StatusCodeName(StatusCode::kUserError), "UserError");
 }
 
+TEST(Status, TimedOut) {
+  EXPECT_EQ(Status::TimedOut().code(), StatusCode::kTimedOut);
+  EXPECT_EQ(Status::TimedOut("no data").ToString(), "TimedOut: no data");
+}
+
 }  // namespace
 }  // namespace tideskv

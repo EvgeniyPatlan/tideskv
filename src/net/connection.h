@@ -48,6 +48,8 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   void ArmBlockTimer();
   void OnUnblocked(const std::string& reply);
   void ResumeAfterBlock();  // the blocked command ended: run the pipeline again
+  void Handoff();           // PSYNC's reply is flushed: give the socket to session_.takeover (M6a D10)
+  void FinishHandoff();
   void Close();
 
   asio::ip::tcp::socket socket_;
@@ -63,8 +65,9 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   std::string out_;
   std::array<char, size_t{16} * 1024> read_buf_{};
   bool closed_ = false;
-  bool reading_ = false;  // at most one read in flight
-  bool writing_ = false;  // at most one write in flight
+  bool reading_ = false;          // at most one read in flight
+  bool writing_ = false;          // at most one write in flight
+  bool handoff_pending_ = false;  // Handoff() cancelled an in-flight read and waits for its completion
 };
 
 }  // namespace tideskv::net

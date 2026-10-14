@@ -1,4 +1,6 @@
 #pragma once
+#include <unistd.h>
+
 #include <atomic>
 #include <stdexcept>
 #include <string>
@@ -21,17 +23,48 @@
 
 namespace tideskv::test {
 
-// A Replication whose role the test sets.
+// A Replication whose role the test sets. PSYNC is decided with the real rule (DecidePsync) over `log`;
+// every call is recorded. Not thread-safe beyond role().
 class FakeReplication final : public Replication {
  public:
+  struct Attached {
+    uint64_t pending_id = 0;
+    std::string unread;
+  };
+
   ReplRole role() const override { return role_.load(); }
   void set_role(ReplRole r) { role_.store(r); }
+  PsyncResult HandlePsync(const repl::PsyncRequest& req, const ReplicaPeer& peer) override {
+    psyncs.push_back(req);
+    last_peer = peer;
+    const repl::LogBounds bounds{log->first_retained(), log->last()};
+    PsyncResult r{repl::DecidePsync(identity, bounds, req), identity.replid, bounds.last, 0};
+    if (r.decision == repl::PsyncDecision::kContinue) r.pending_id = last_pending_id = ++next_pending_id_;
+    return r;
+  }
+  void AttachReplica(uint64_t pending_id, int fd, std::string unread) override {
+    ::close(fd);
+    attached.push_back({pending_id, std::move(unread)});
+  }
+  void OnReplconf(Session&, const ReplconfOptions& o) override { replconfs.push_back(o); }
+
   std::atomic<ReplRole> role_{ReplRole::kMaster};
+  repl::ReplIdentity identity{std::string(repl::kReplIdLength, 'c'), {}};
+  const ReplLog* log = nullptr;  // set by FakeServerServices
+  std::vector<repl::PsyncRequest> psyncs;
+  ReplicaPeer last_peer;
+  uint64_t last_pending_id = 0;
+  std::vector<Attached> attached;
+  std::vector<ReplconfOptions> replconfs;
+
+ private:
+  uint64_t next_pending_id_ = 0;
 };
 
 class FakeServerServices final : public ServerServices {
  public:
   FakeServerServices() {
+    replication_.log = &repl_log_;
     if (Status st = repl_log_.Recover(); !st.ok())
       throw std::runtime_error("ReplLog::Recover: " + st.ToString());
     const Status st = oids_.Init();

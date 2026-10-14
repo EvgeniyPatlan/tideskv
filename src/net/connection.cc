@@ -44,19 +44,25 @@ void Connection::DoRead() {
 
 void Connection::OnRead(std::error_code ec, size_t n) {
   reading_ = false;
+  if (handoff_pending_) {  // the read Handoff() cancelled: keep any bytes it did get, then hand over
+    if (!ec) in_.append(read_buf_.data(), n);
+    return FinishHandoff();
+  }
   if (ec) return Close();  // EOF, reset, or shutdown
   in_.append(read_buf_.data(), n);
   if (in_.size() + parser_.buffered_bytes() > query_buffer_limit_) {
     spdlog::warn("closing client id={} addr={}: query buffer limit exceeded", session_.id, session_.peer);
     return Close();
   }
-  if (!session_.blocked) ProcessInput();  // while blocked, input is only buffered
+  if (!session_.blocked && !session_.takeover) ProcessInput();  // while blocked, input is only buffered
   AfterInput();
 }
 
+// Stops after a command that set session_.takeover (PSYNC): what follows it in in_ belongs to the
+// replication stream, so it is neither executed nor answered; Handoff() passes it on unread.
 void Connection::ProcessInput() {
   size_t offset = 0;
-  while (!session_.close_after_reply) {
+  while (!session_.close_after_reply && !session_.takeover) {
     size_t consumed = 0;
     parser_.SetUnauthenticated(!session_.authenticated);
     const resp::ParseStatus st = parser_.Parse(std::string_view(in_).substr(offset), &consumed);
@@ -91,7 +97,10 @@ void Connection::AfterInput() {
     StartWrite();
   } else if (session_.close_after_reply && !writing_) {
     return Close();
+  } else if (session_.takeover && !writing_) {
+    return Handoff();
   }
+  if (session_.takeover) return;  // no new reads: the socket is about to change hands
   // Blocked: keep reading (EOF detection, buffering). Otherwise read only when no write is in flight.
   if (session_.blocked || !writing_) DoRead();
 }
@@ -109,6 +118,7 @@ void Connection::OnWrite(std::error_code ec) {
   if (ec) return Close();
   if (!reply_.empty()) return StartWrite();
   if (session_.close_after_reply) return Close();
+  if (session_.takeover) return Handoff();
   DoRead();
 }
 
@@ -144,6 +154,42 @@ void Connection::ArmBlockTimer() {
     self->reply_.NullArray();        // Redis replyToBlockedClientTimedOut for list/zset (F5)
     self->ResumeAfterBlock();
   });
+}
+
+// Every pending async op must be finished before the socket is released, or a completion could run
+// against a descriptor another thread now owns. The block timer is cancelled (its handler only checks
+// closed_); an in-flight read is cancelled and FinishHandoff() runs from its completion, which also
+// collects any bytes that read had already received. No write is in flight here (OnWrite/AfterInput
+// only call this with writing_ false).
+void Connection::Handoff() {
+  if (closed_ || handoff_pending_) return;
+  handoff_pending_ = true;
+  block_timer_.cancel();
+  if (session_.blocked) {
+    session_.blocked->Cancel();
+    session_.blocked.reset();
+  }
+  if (reading_) {
+    std::error_code ignored;
+    socket_.cancel(ignored);  // OnRead runs with operation_aborted (or with data that already arrived)
+    return;
+  }
+  FinishHandoff();
+}
+
+void Connection::FinishHandoff() {
+  closed_ = true;
+  auto takeover = std::move(session_.takeover);
+  session_.takeover = nullptr;
+  std::error_code ec;
+  const int fd = socket_.release(ec);
+  if (ec) {
+    spdlog::warn("replica hand-off failed for client id={}: {}", session_.id, ec.message());
+    socket_.close(ec);
+    return;
+  }
+  takeover(fd, std::move(in_));
+  in_.clear();
 }
 
 void Connection::Close() {

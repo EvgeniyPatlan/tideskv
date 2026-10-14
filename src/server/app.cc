@@ -70,6 +70,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
   std::unique_ptr<App> app(new App(std::move(config), std::move(storage).value()));
   if (Status st = app->repl_log_->Recover(); !st.ok()) return st;  // before any commit (the oid lease)
+  if (Status st = app->CreateReplication(); !st.ok()) return st;   // before any commit, like Recover
   if (Status st = app->oids_->Init(); !st.ok()) return st;
   return app;
 }
@@ -102,6 +103,16 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
 
 App::~App() { Stop(); }
 
+Status App::CreateReplication() {
+  auto identity = repl::LoadOrCreateIdentity(*storage_);
+  if (!identity.ok()) return identity.status();
+  repl::ReplicationManager::Options o;
+  o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
+  replication_ = std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_,
+                                                            std::move(identity).value(), std::move(o));
+  return Status::Ok();
+}
+
 net::ServerOptions App::MakeServerOptions() {
   const ConfigValues v = config_->Snapshot();
   net::ServerOptions o;
@@ -126,6 +137,7 @@ Status App::Start() {
   if (Status st = server_->Start(); !st.ok()) return st;
   reaper_->Start();
   scheduler_->Start();
+  replication_->Start();
   return Status::Ok();
 }
 
@@ -149,14 +161,15 @@ void App::RequestShutdown() {
 void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
-  scripts_.KillForShutdown();  // a running script must not hold up the worker threads
-  server_->Stop();             // no command can touch storage after this
-  reaper_.reset();             // joins the reaper thread; it writes through engine_
-  engine_.reset();             // references storage_, so it goes first
-  scheduler_.reset();          // compacts storage_; nothing commits (feeds it) once the engine is gone
-  oids_.reset();               // likewise (its persist hook checkpoints storage_)
-  repl_log_.reset();           // engine_ and oids_ committed through it
-  storage_.reset();            // flushes and closes TidesDB
+  if (replication_) replication_->Shutdown();  // replica links first: senders read the replog (M6a)
+  scripts_.KillForShutdown();                  // a running script must not hold up the worker threads
+  server_->Stop();                             // no command can touch storage after this
+  reaper_.reset();                             // joins the reaper thread; it writes through engine_
+  engine_.reset();                             // references storage_, so it goes first
+  scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
+  oids_.reset();       // likewise (its persist hook checkpoints storage_)
+  repl_log_.reset();   // engine_ and oids_ committed through it
+  storage_.reset();    // flushes and closes TidesDB
 }
 
 ServerStats App::Stats() const {

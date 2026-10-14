@@ -31,6 +31,7 @@ void RegisterBlockingZsetCommands(CommandRegistry& registry);  // cmd_blocking_z
 void RegisterMultiCommands(CommandRegistry& registry);         // cmd_multi.cc
 void RegisterScriptCommands(CommandRegistry& registry);        // cmd_script.cc (M5b)
 void RegisterDebugCommands(CommandRegistry& registry);         // cmd_debug.cc (M6a)
+void RegisterReplicationCommands(CommandRegistry& registry);   // cmd_replication.cc (M6a)
 // Redis rejects an unknown or mis-sized SCRIPT subcommand at lookup time, before MULTI queues it.
 // Returns the error text, or empty when `argv` (size >= 2) names a valid subcommand.
 std::string ScriptSubcommandError(const ArgList& argv);

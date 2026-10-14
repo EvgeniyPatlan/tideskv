@@ -24,6 +24,8 @@ std::string_view StatusCodeName(StatusCode code) {
       return "Internal";
     case StatusCode::kUserError:
       return "UserError";
+    case StatusCode::kTimedOut:
+      return "TimedOut";
   }
   return "Unknown";
 }

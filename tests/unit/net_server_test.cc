@@ -2,7 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -409,6 +415,112 @@ TEST(NetServer, OnDisconnectRunsOncePerConnection) {
   EXPECT_EQ(last_id.load(), static_cast<uint64_t>(id));
   server->Stop();
   EXPECT_EQ(calls.load(), 1);
+}
+
+// Takeover executor: PSYNC replies +CONTINUE and asks for the socket; BLOCK <ms> parks; others echo.
+struct Takeover {
+  std::mutex mu;
+  std::condition_variable cv;
+  int fd = -1;
+  std::string unread;
+  bool done = false;
+
+  bool Wait(std::chrono::milliseconds timeout = 2s) {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, timeout, [&] { return done; });
+  }
+};
+
+std::unique_ptr<Server> StartTakeoverServer(Takeover& t, BlockingRegistry& registry) {
+  ServerOptions o;
+  o.port = 0;
+  o.workers = 1;
+  auto exec = [&t, &registry](Session& s, const std::vector<std::string>& argv, resp::ReplyBuilder& r) {
+    if (argv[0] == "PSYNC") {
+      r.SimpleString("CONTINUE");
+      s.takeover = [&t](int fd, std::string unread) {
+        std::lock_guard lock(t.mu);
+        t.fd = fd;
+        t.unread = std::move(unread);
+        t.done = true;
+        t.cv.notify_all();
+      };
+    } else if (argv[0] == "BLOCK") {
+      ReadyKeys ready;
+      ConnectionBlockHandler block(registry, s, argv, ready);
+      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1])});
+    } else {
+      r.Bulk(argv[0]);
+    }
+  };
+  auto server = std::make_unique<Server>(std::move(o), exec);
+  EXPECT_TRUE(server->Start().ok());
+  return server;
+}
+
+// Reads from a raw fd until `n` bytes arrive or the timeout passes.
+std::string ReadRaw(int fd, size_t n, std::chrono::milliseconds timeout = 2s) {
+  std::string out;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (out.size() < n && std::chrono::steady_clock::now() < deadline) {
+    pollfd p{fd, POLLIN, 0};
+    if (::poll(&p, 1, 20) <= 0) continue;
+    char buf[4096];
+    const ssize_t got = ::recv(fd, buf, sizeof(buf), 0);
+    if (got <= 0) break;
+    out.append(buf, static_cast<size_t>(got));
+  }
+  return out;
+}
+
+TEST(NetServerTakeover, HandsTheSocketAndTheUnreadBytesOver) {
+  Takeover t;
+  BlockingRegistry registry;
+  auto server = StartTakeoverServer(t, registry);
+  auto c = RespClient::Connect(server->port(), 300ms);
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(WaitFor([&] { return server->counters().connected == 1; }));
+  const std::string rest = test::EncodeCommand({"REPLCONF", "ACK", "1"}) + test::EncodeCommand({"ECHO"});
+  ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"PSYNC"}) + rest));
+  auto first = c->Read();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->str, "CONTINUE");
+  EXPECT_FALSE(c->Read().has_value());  // nothing after PSYNC is answered: it belongs to the stream
+  ASSERT_TRUE(t.Wait());
+  EXPECT_EQ(t.unread, rest);
+  ASSERT_GE(t.fd, 0);
+  EXPECT_TRUE(WaitFor([&] { return server->counters().connected == 0; }));  // no longer a client
+  ASSERT_TRUE(c->SendRaw("late"));
+  EXPECT_EQ(ReadRaw(t.fd, 4), "late");  // the new owner reads the socket
+  const std::string hello = "+hello\r\n";
+  ASSERT_EQ(::send(t.fd, hello.data(), hello.size(), MSG_NOSIGNAL), static_cast<ssize_t>(hello.size()));
+  auto pushed = c->Read();
+  ASSERT_TRUE(pushed.has_value());
+  EXPECT_EQ(pushed->str, "hello");
+  ::close(t.fd);
+  EXPECT_TRUE(c->WaitForClose());
+}
+
+// After a blocking command a read is in flight when PSYNC runs: the hand-off must cancel it without
+// losing bytes, and the socket must survive the cancelled read's completion.
+TEST(NetServerTakeover, HandoffWithAReadInFlightLosesNoBytes) {
+  Takeover t;
+  BlockingRegistry registry;
+  auto server = StartTakeoverServer(t, registry);
+  auto c = RespClient::Connect(server->port(), 300ms);
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->SendRaw(test::EncodeCommand({"BLOCK", "50"}) + test::EncodeCommand({"PSYNC"})));
+  auto timed_out = c->Read();
+  ASSERT_TRUE(timed_out.has_value());
+  EXPECT_EQ(timed_out->type, RespValue::Type::kNull);
+  auto cont = c->Read();
+  ASSERT_TRUE(cont.has_value());
+  EXPECT_EQ(cont->str, "CONTINUE");
+  ASSERT_TRUE(t.Wait());
+  EXPECT_EQ(t.unread, "");
+  ASSERT_TRUE(c->SendRaw("after"));
+  EXPECT_EQ(ReadRaw(t.fd, 5), "after");
+  ::close(t.fd);
 }
 
 }  // namespace
