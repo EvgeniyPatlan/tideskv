@@ -44,6 +44,14 @@ TEST_F(RegistryTest, DuplicateRegistrationThrows) {
   EXPECT_THROW(services_.registry_.Register({"ECHO", 2, 0, 0, 0, 0, &EchoHandler}), std::logic_error);
 }
 
+TEST_F(RegistryTest, WriteCommandsAreRefusedOnAReplica) {
+  services_.registry_.Register({"wr", 1, kCmdWrite, 0, 0, 0, &CountHandler});
+  EXPECT_EQ(Run({"wr"}), ":1\r\n");
+  services_.replication_.set_role(ReplRole::kReplica);
+  EXPECT_EQ(Run({"wr"}), "-READONLY You can't write against a read only replica.\r\n");
+  EXPECT_EQ(Run({"echo", "x"}), "$1\r\nx\r\n");
+}
+
 TEST_F(RegistryTest, RunsHandler) { EXPECT_EQ(Run({"ECHO", "hi"}), "$2\r\nhi\r\n"); }
 
 TEST_F(RegistryTest, UnknownCommandListsArgs) {

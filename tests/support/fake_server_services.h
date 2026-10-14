@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -8,6 +9,7 @@
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "exec/repl_log.h"
+#include "repl/replication.h"
 #include "script/script_engine.h"
 #include "server/blocking.h"
 #include "server/watch.h"
@@ -18,6 +20,14 @@
 #include "types/oid_allocator.h"
 
 namespace tideskv::test {
+
+// A Replication whose role the test sets.
+class FakeReplication final : public Replication {
+ public:
+  ReplRole role() const override { return role_.load(); }
+  void set_role(ReplRole r) { role_.store(r); }
+  std::atomic<ReplRole> role_{ReplRole::kMaster};
+};
 
 class FakeServerServices final : public ServerServices {
  public:
@@ -39,6 +49,7 @@ class FakeServerServices final : public ServerServices {
   BlockingRegistry& blocking() override { return blocking_; }
   WatchRegistry& watches() override { return watches_; }
   ScriptEngine& scripts() override { return scripts_; }
+  Replication& replication() override { return replication_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -47,6 +58,7 @@ class FakeServerServices final : public ServerServices {
   bool shutdown_requested_ = false;
   CursorStore cursors_;
   ScriptEngine scripts_;
+  FakeReplication replication_;
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

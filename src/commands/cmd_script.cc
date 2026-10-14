@@ -12,6 +12,7 @@
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "exec/engine.h"
+#include "repl/replication.h"
 #include "resp/reply_builder.h"
 #include "script/script_engine.h"
 #include "server/config.h"
@@ -59,8 +60,9 @@ void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_o
   const auto split = argv.begin() + 3 + numkeys;
   const std::vector<std::string> keys(argv.begin() + 3, split);
   const std::vector<std::string> args(split, argv.end());
-  RunScript(ctx, {argv[1], by_sha, read_only, &keys, &args,
-                  ctx.server.config().Snapshot().busy_reply_threshold_ms});
+  RunScript(ctx,
+            {argv[1], by_sha, read_only, &keys, &args, ctx.server.config().Snapshot().busy_reply_threshold_ms,
+             ctx.server.replication().IsReplica()});
 }
 
 void Eval(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, false, false); }

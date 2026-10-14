@@ -40,6 +40,7 @@ class ScriptEngine {
     const std::vector<std::string>* keys = nullptr;
     const std::vector<std::string>* args = nullptr;
     int64_t busy_threshold_ms = 5000;  // 0 = no hook
+    bool replica = false;  // this node is a replica: a shebang script without no-writes is refused
   };
   struct EvalResult {
     bool killed = false;

@@ -11,6 +11,7 @@
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "repl/replication.h"
 #include "script/script_engine.h"
 #include "server/watch.h"
 #include "types/errors.h"
@@ -64,7 +65,10 @@ void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   }
   const auto& w = ctx.session.watch;
   const bool doomed = ctx.session.multi.dirty_exec || (w != nullptr && w->dirty());
-  if (!doomed) ctx.session.multi.queued.push_back(argv);  // multi.c:67
+  if (!doomed) {  // multi.c:67
+    ctx.session.multi.queued.push_back(argv);
+    ctx.session.multi.has_write |= (spec.flags & kCmdWrite) != 0;
+  }
   ctx.reply.SimpleString("QUEUED");
 }
 
@@ -108,6 +112,9 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, ArityError(spec->name));
   }
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
+  if ((spec->flags & kCmdWrite) != 0 && ctx.server.replication().IsReplica()) {
+    return Reject(ctx, spec, kErrReadOnlyReplica);  // sv:4060, before BUSY; MULTI -> dirty
+  }
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }

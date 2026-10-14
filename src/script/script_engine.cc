@@ -126,6 +126,10 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
     return {};
   }
   const ScriptFlags flags = scripts_.at(*sha).flags;
+  if (req.replica && flags.shebang && !flags.no_writes) {  // scriptPrepareForRun, before the *_ro rule
+    out.Error(kErrReadOnlyReplica);
+    return {};
+  }
   if (req.read_only_command && flags.shebang && !flags.no_writes) {
     out.Error(kErrRoScriptWithWriteFlag);
     return {};

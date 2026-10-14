@@ -89,6 +89,8 @@ inline constexpr std::string_view kErrNotAllowedInMulti = "ERR Command not allow
 inline constexpr std::string_view kErrExecAbort =
     "EXECABORT Transaction discarded because of previous errors.";
 inline constexpr std::string_view kErrExecAbortBecause = "EXECABORT Transaction discarded because of: ";
+inline constexpr std::string_view kErrExecAbortReadOnly =
+    "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.";
 inline constexpr std::string_view kErrNoAuth = "NOAUTH Authentication required.";
 
 // Scripting (M5b; eval.c, script_lua.c, script.c 7.2).

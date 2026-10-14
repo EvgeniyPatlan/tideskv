@@ -5,6 +5,7 @@
 #include <exception>
 
 #include "commands/server_services.h"
+#include "repl/replication.h"
 #include "types/errors.h"
 
 namespace tideskv {
@@ -32,8 +33,13 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
     *error = std::string(kScriptErrNoScript);
     return std::nullopt;
   }
-  if (read_only_ && (spec->flags & kCmdWrite) != 0) {
+  const bool is_write = (spec->flags & kCmdWrite) != 0;
+  if (read_only_ && is_write) {  // the *_ro rule wins over the replica refusal
     *error = std::string(kScriptErrWriteInRo);
+    return std::nullopt;
+  }
+  if (is_write && caller_.server.replication().IsReplica()) {
+    *error = "-" + std::string(kErrReadOnlyReplica);
     return std::nullopt;
   }
   session_.protocol = resp;

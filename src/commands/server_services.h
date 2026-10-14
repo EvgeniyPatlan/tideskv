@@ -11,6 +11,7 @@ class CommandRegistry;
 class CursorStore;
 class Engine;
 class OidAllocator;
+class Replication;
 class ScriptEngine;
 class WatchRegistry;
 
@@ -57,6 +58,7 @@ class ServerServices {
   virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
   virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
   virtual ScriptEngine& scripts() = 0;       // EVAL / SCRIPT (M5b)
+  virtual Replication& replication() = 0;   // role queries (M6a)
 };
 
 }  // namespace tideskv

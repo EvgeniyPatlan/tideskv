@@ -8,6 +8,7 @@
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "exec/engine.h"
+#include "repl/replication.h"
 #include "resp/reply_builder.h"
 #include "server/config.h"
 #include "server/watch.h"
@@ -114,6 +115,10 @@ void RunQueued(ExecContext& ctx, const std::vector<ArgList>& queued, std::unique
 void Exec(ExecContext& ctx, const ArgList&) {
   MultiState& m = ctx.session.multi;
   if (!m.active) return ctx.reply.Error(kErrExecNoMulti);
+  if (m.has_write && ctx.server.replication().IsReplica()) {  // role flipped since queueing (multi.c:136)
+    DiscardTransaction(ctx);
+    return ctx.reply.Error(kErrExecAbortReadOnly);
+  }
   if (m.dirty_exec) {
     DiscardTransaction(ctx);
     return ctx.reply.Error(kErrExecAbort);
