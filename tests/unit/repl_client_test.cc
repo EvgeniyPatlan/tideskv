@@ -408,7 +408,7 @@ TEST_F(ReplClientTest, AnOversizedBatchFrameDropsTheLink) {  // Task 3 hardening
   StartClient();
   Link l = AcceptLink();
   Handshake(l, "CONTINUE " + master_id());
-  l.Send("*3\r\n$5\r\nBATCH\r\n$1\r\n1\r\n$" + std::to_string(kMaxBatchFrameBytes + 1) + "\r\n");
+  l.Send("*3\r\n$5\r\nBATCH\r\n$1\r\n1\r\n$" + std::to_string(encoding::kMaxReplBatchBytes + 1) + "\r\n");
   EXPECT_TRUE(l.Closed());
   EXPECT_EQ(replica.log.last(), 0u);
 }

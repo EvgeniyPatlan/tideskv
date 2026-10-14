@@ -110,6 +110,8 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
   if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
   const uint64_t seq = last_.load(std::memory_order_relaxed) + 1;
   const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
+  // R12: a batch no replica would accept is refused like a fenced commit: nothing taken, nothing written.
+  if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
   return AppendAndCommit(txn, seq, record, cum_ + record.size());
 }
 

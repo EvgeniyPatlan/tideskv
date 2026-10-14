@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/string_util.h"
+#include "encoding/replog_codec.h"
 
 namespace tideskv::repl {
 namespace {
@@ -15,10 +16,12 @@ using namespace std::chrono_literals;
 using resp::ReplyNode;
 
 constexpr size_t kMaxReplyLine = size_t{64} * 1024;
-// What may sit unparsed: one maximal BATCH frame plus its header. The parser refuses a bigger bulk.
-constexpr size_t kMaxInput = kMaxBatchFrameBytes + size_t{64} * 1024;
+// The largest BATCH frame payload accepted from a master is the largest batch a master commits (R12):
+// a bigger frame is a protocol error and drops the link, so a hostile or broken master cannot make the
+// replica buffer (or decode) more than this. What may sit unparsed: one maximal frame plus its header.
+constexpr size_t kMaxInput = encoding::kMaxReplBatchBytes + size_t{64} * 1024;
 // The master sends only BATCH <seq> <payload> and PING (D9).
-constexpr resp::ParserLimits kMasterStreamLimits{/*max_bulk_len=*/kMaxBatchFrameBytes,
+constexpr resp::ParserLimits kMasterStreamLimits{/*max_bulk_len=*/encoding::kMaxReplBatchBytes,
                                                  /*max_multibulk_len=*/8, /*max_inline_len=*/1024};
 
 int64_t UnixMs() {

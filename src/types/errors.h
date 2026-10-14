@@ -66,6 +66,9 @@ inline constexpr std::string_view kErrPromotionFailed = "ERR REPLICAOF NO ONE fa
 // Every blocked client gets this when the node becomes a replica (blocked.c disconnectAllBlockedClients).
 inline constexpr std::string_view kErrUnblockedRoleChange =
     "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";
+// TidesKV-only (R12): the write's replicated batch would exceed encoding::kMaxReplBatchBytes, which no
+// replica accepts; nothing is committed.
+inline constexpr std::string_view kErrTooLargeToReplicate = "ERR transaction too large to replicate";
 // TidesKV-only: an exception escaped a command (the connection's catch-all, a blocked command's re-run).
 inline constexpr std::string_view kErrInternal = "ERR internal error";
 

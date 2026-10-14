@@ -27,6 +27,9 @@ struct ReplOp {
 };
 
 inline constexpr uint8_t kReplogVersion = 1;
+// R12: the largest encoded batch (replog value, BATCH frame payload). A master refuses to commit a bigger
+// one (ReplLog::Commit) and a replica refuses a bigger frame, so every committed batch can be replicated.
+inline constexpr size_t kMaxReplBatchBytes = size_t{1} << 30;
 inline constexpr size_t kReplogHeaderSize = 1 + 8 + 8 + 4;  // version, timestamp, cum_bytes, op_count
 
 std::string ReplogKey(uint64_t seq);  // 8-byte big-endian

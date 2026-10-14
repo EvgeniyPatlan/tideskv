@@ -28,7 +28,8 @@ class ReplLog {
   // Reads the last replog entry (seq, cum_bytes) and sys/repl_first. Call once before use.
   Status Recover();
   // Commits txn; if ops is non-empty first appends replog[last+1] = their batch. kUserError with
-  // the READONLY text while local writes are fenced (replica). On failure nothing is consumed.
+  // the READONLY text while local writes are fenced (replica), and with kErrTooLargeToReplicate when the
+  // encoded batch exceeds max_batch_bytes() (R12). On failure nothing is consumed.
   // txn must be the underlying transaction, not a RecordingTxn (which refuses the replog CF).
   Status Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
   // OidAllocator and other standalone writers: one small txn of `ops` through Commit.
@@ -48,6 +49,9 @@ class ReplLog {
   // and Commit checks the fence under the same lock, so once this returns no local commit takes a seq.
   void FenceLocalWrites(bool fenced);
   bool fenced() const { return fenced_.load(std::memory_order_acquire); }
+  // R12: Commit refuses a batch whose encoding exceeds this (encoding::kMaxReplBatchBytes). Tests lower it.
+  void SetMaxBatchBytes(size_t bytes) { max_batch_bytes_.store(bytes, std::memory_order_relaxed); }
+  size_t max_batch_bytes() const { return max_batch_bytes_.load(std::memory_order_relaxed); }
   // Backlog trimming (Task 14) updates first_retained after its own trim txn commits.
   void SetFirstRetained(uint64_t first);
   // Backlog trimming (D18): one txn range-deletes replog[first_retained() .. up_to] and persists
@@ -77,6 +81,7 @@ class ReplLog {
   std::atomic<uint64_t> first_{1};
   uint64_t cum_ = 0;  // guarded by mu_
   std::atomic<bool> fenced_{false};
+  std::atomic<size_t> max_batch_bytes_{encoding::kMaxReplBatchBytes};
 };
 
 }  // namespace tideskv

@@ -27,11 +27,6 @@
 // the master's replid) are persisted on this thread, between batches.
 namespace tideskv::repl {
 
-// The largest BATCH frame payload accepted from a master: Redis's default proto-max-bulk-len. A bigger
-// frame is a protocol error and drops the link, so a hostile or broken master cannot make the replica
-// buffer (or decode) more than this.
-inline constexpr size_t kMaxBatchFrameBytes = size_t{512} * 1024 * 1024;
-
 class ReplClient {
  public:
   using ConfigSnapshotFn = std::function<ConfigValues()>;

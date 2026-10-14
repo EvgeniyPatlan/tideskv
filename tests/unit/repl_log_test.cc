@@ -363,6 +363,33 @@ TEST(ReplLogTest, CommitStandaloneFencedIsRefusedAndWritesNothing) {
   EXPECT_TRUE((*view)->Get(ColumnFamily::kMeta, "a").status().IsNotFound());
 }
 
+// R12 (F2): a batch a replica could not accept is never committed. One shared limit; the default is
+// encoding::kMaxReplBatchBytes and tests lower it rather than allocate 1 GiB.
+TEST(ReplLogTest, ABatchOverTheReplicationLimitIsRefusedAndConsumesNoSeq) {
+  InMemoryStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  EXPECT_EQ(log.max_batch_bytes(), encoding::kMaxReplBatchBytes);
+  ASSERT_TRUE(CommitPuts(s, log, MetaPut("small")).ok());
+  const uint64_t cum = log.cum_bytes();
+  log.SetMaxBatchBytes(200);
+  const Status st = CommitPuts(s, log, MetaPut("big", std::string(300, 'x')));
+  EXPECT_EQ(st.code(), StatusCode::kUserError);
+  EXPECT_EQ(st.message(), kErrTooLargeToReplicate);
+  EXPECT_EQ(log.CommitStandalone(MetaPut("big2", std::string(300, 'x'))).message(), kErrTooLargeToReplicate);
+  EXPECT_EQ(log.last(), 1u);
+  EXPECT_EQ(log.cum_bytes(), cum);
+  {
+    auto view = s.BeginRead();
+    EXPECT_TRUE((*view)->Get(ColumnFamily::kMeta, "big").status().IsNotFound());
+    EXPECT_TRUE((*view)->Get(ColumnFamily::kMeta, "big2").status().IsNotFound());
+  }
+  EXPECT_TRUE(ReplogAt(s, 2).status().IsNotFound());
+  ASSERT_TRUE(CommitPuts(s, log, MetaPut("next")).ok());  // within the limit: the next seq
+  EXPECT_EQ(log.last(), 2u);
+}
+
 }  // namespace
 }  // namespace tideskv
 
