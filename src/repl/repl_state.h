@@ -46,6 +46,13 @@ ReplIdentity Adopt(const ReplIdentity& old, std::string_view new_replid, uint64_
 // Promotion: Adopt(old, NewReplId(), last_seq). Pure apart from the id.
 ReplIdentity Promote(const ReplIdentity& old, uint64_t last_seq);
 
+// R12: a node that starts as a master (no replicaof) takes a fresh replid before it accepts any
+// connection: Promote(id, last_seq), persisted. A master that lost an unsynced tail (sync-mode interval,
+// OS crash) then re-issues those seqs under the new id, so a replica that applied the lost ones is ahead
+// of the history entry and gets FULLRESYNC instead of a silently diverging CONTINUE. On error nothing
+// is stored and the node must not start.
+Result<ReplIdentity> RotateForMasterStart(Storage& storage, const ReplIdentity& id, uint64_t last_seq);
+
 struct PsyncRequest {
   std::string replid;  // "?" = unknown
   uint64_t next_seq = 0;

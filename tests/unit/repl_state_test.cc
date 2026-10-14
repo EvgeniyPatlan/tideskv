@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "storage/memory_storage.h"
+#include "support/faulty_storage.h"
 
 namespace tideskv::repl {
 namespace {
@@ -104,6 +105,50 @@ TEST(ReplState, PromoteGeneratesAFreshIdAndRecordsTheOldOne) {
   EXPECT_TRUE(IsValidReplId(p.replid));
   EXPECT_NE(p.replid, me.replid);
   EXPECT_EQ(p.history, (std::vector<HistoryEntry>{{me.replid, 42}}));
+}
+
+// R12 (F1): every master start takes a fresh replid, persisted, with the old one in the history up to
+// the recovered last seq.
+TEST(ReplState, MasterStartRotatesAndPersistsTheIdentity) {
+  InMemoryStorage s;
+  auto old = LoadOrCreateIdentity(s);
+  ASSERT_TRUE(old.ok());
+  auto rotated = RotateForMasterStart(s, *old, 90);
+  ASSERT_TRUE(rotated.ok()) << rotated.status().ToString();
+  EXPECT_TRUE(IsValidReplId(rotated->replid));
+  EXPECT_NE(rotated->replid, old->replid);
+  EXPECT_EQ(rotated->history, (std::vector<HistoryEntry>{{old->replid, 90}}));
+  auto loaded = LoadOrCreateIdentity(s);
+  ASSERT_TRUE(loaded.ok());
+  EXPECT_EQ(loaded->replid, rotated->replid);
+  EXPECT_EQ(loaded->history, rotated->history);
+}
+
+TEST(ReplState, MasterStartRotationThatCannotPersistFailsAndKeepsTheStoredIdentity) {
+  test::FaultyStorage s;
+  auto old = LoadOrCreateIdentity(s);
+  ASSERT_TRUE(old.ok());
+  s.fail_commit_in = 1;
+  EXPECT_FALSE(RotateForMasterStart(s, *old, 7).ok());
+  auto loaded = LoadOrCreateIdentity(s);
+  ASSERT_TRUE(loaded.ok());
+  EXPECT_EQ(loaded->replid, old->replid);
+  EXPECT_TRUE(loaded->history.empty());
+}
+
+// A master that lost an unsynced tail (sync-mode interval) restarts at last 90 and re-issues 91..95 under
+// its rotated id: a replica at or behind 90 continues through the history, one that applied the lost
+// 91..95 must not.
+TEST(ReplState, AfterAMasterRestartOnlyReplicasAtOrBehindItsRecoveredLastContinue) {
+  InMemoryStorage s;
+  const ReplIdentity before{Id('a'), {}};
+  auto after = RotateForMasterStart(s, before, 90);
+  ASSERT_TRUE(after.ok());
+  const LogBounds log{1, 95};
+  EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 91}), PsyncDecision::kContinue);
+  EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 40}), PsyncDecision::kContinue);
+  EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 92}), PsyncDecision::kFullResync);
+  EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 96}), PsyncDecision::kFullResync);
 }
 
 // D8 decision table.

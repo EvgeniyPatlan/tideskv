@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -271,6 +272,91 @@ TEST_F(ReplicationIT, TrimmedBacklogForcesFullResyncForAFarBehindReplica) {
   EXPECT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") > full_before; }, 5s));
   EXPECT_NE(LinkState(*r), "connected");
   EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), applied);  // nothing was applied
+}
+
+// R12 (F1): a master takes a fresh replid at every start; the old one stays valid up to its last seq.
+TEST_F(ReplicationIT, MasterRestartRotatesTheReplid) {
+  auto m = Client(master);
+  MixedWrites(*m, 50);
+  const std::string old_id = InfoString(*m, "replication", "master_replid");
+  const int64_t last = InfoField(*m, "replication", "master_repl_offset");
+  ASSERT_GT(last, 0);
+  m.reset();
+  ASSERT_EQ(master.Terminate(), 0);
+  master.Restart();
+  m = Client(master);
+  const std::string new_id = InfoString(*m, "replication", "master_replid");
+  EXPECT_EQ(new_id.size(), 40u);
+  EXPECT_NE(new_id, old_id);
+  EXPECT_EQ(InfoString(*m, "replication", "master_replid2"), old_id);
+  EXPECT_EQ(InfoField(*m, "replication", "second_repl_offset"), last + 1);
+}
+
+// R12 (F1): a replica at the restarted master's last seq continues through the history entry.
+TEST_F(ReplicationIT, ReplicaContinuesAfterTheMasterRestarts) {
+  Follow(*replica);
+  {
+    auto m = Client(master);
+    auto r = Client(*replica);
+    MixedWrites(*m, 100);
+    ASSERT_TRUE(Synced(*m, *r));
+  }
+  ASSERT_EQ(master.Terminate(), 0);
+  master.Restart();
+  auto m = Client(master);
+  auto r = Client(*replica);
+  MixedWrites(*m, 100);
+  ASSERT_TRUE(Synced(*m, *r, 30s)) << replica->Stderr();
+  EXPECT_GE(InfoField(*m, "stats", "sync_partial_ok"), 1);
+  EXPECT_EQ(InfoField(*m, "stats", "sync_full"), 0);
+  EXPECT_EQ(Digest(*r), Digest(*m));
+  EXPECT_EQ(InfoString(*r, "replication", "master_replid"), InfoString(*m, "replication", "master_replid"));
+}
+
+// R12 (F1): a master that lost a tail its replica had applied (an OS crash under sync-mode interval;
+// simulated by restoring an older copy of its data dir) re-issues those seqs with other writes. Its
+// replid rotated when it restarted, so the replica's id is unknown to it: FULLRESYNC, never CONTINUE.
+TEST_F(ReplicationIT, ReplicaAheadOfARestartedMasterGetsFullResync) {
+  namespace fs = std::filesystem;
+  TempDir replica_dir("tideskv-it-replica");
+  TestServer::Options o;
+  o.dir = replica_dir.str();
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  MixedWrites(*m, 50);
+  ASSERT_TRUE(Synced(*m, *r));
+  m.reset();
+  ASSERT_EQ(master.Terminate(), 0);
+  TempDir backup("tideskv-it-backup");
+  fs::copy(master.dir(), backup.path(), fs::copy_options::recursive);  // the master as of now
+  master.Restart();
+  m = Client(master);
+  MixedWrites(*m, 50);  // seqs past the backup, which the replica applies
+  ASSERT_TRUE(Synced(*m, *r, 30s)) << replica->Stderr();
+  const int64_t replica_seq = RoleOffset(*r);
+  r.reset();
+  ASSERT_EQ(replica->Terminate(), 0);
+  m.reset();
+  ASSERT_EQ(master.Terminate(), 0);
+  fs::remove_all(master.dir());  // the tail is lost
+  fs::copy(backup.path(), master.dir(), fs::copy_options::recursive);
+  master.Restart();
+  m = Client(master);
+  for (int i = 0; InfoField(*m, "keyspace", "sequence") <= replica_seq + 5; ++i) {
+    ASSERT_EQ(m->Command({"SET", "other" + std::to_string(i), "v"}).str, "OK");
+  }
+  o.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())};
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  EXPECT_TRUE(WaitFor(
+      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
+      10s))
+      << replica->Stderr();
+  EXPECT_GE(InfoField(*m, "stats", "sync_full"), 1);
+  EXPECT_EQ(InfoField(*m, "stats", "sync_partial_ok"), 0);
+  r = Client(*replica);
+  EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), replica_seq);  // nothing was applied
 }
 
 }  // namespace

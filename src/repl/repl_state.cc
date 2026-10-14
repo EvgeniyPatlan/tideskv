@@ -114,6 +114,12 @@ ReplIdentity Adopt(const ReplIdentity& old, std::string_view new_replid, uint64_
 
 ReplIdentity Promote(const ReplIdentity& old, uint64_t last_seq) { return Adopt(old, NewReplId(), last_seq); }
 
+Result<ReplIdentity> RotateForMasterStart(Storage& storage, const ReplIdentity& id, uint64_t last_seq) {
+  ReplIdentity rotated = Promote(id, last_seq);
+  if (Status st = PersistIdentity(storage, rotated); !st.ok()) return st;
+  return rotated;
+}
+
 PsyncDecision DecidePsync(const ReplIdentity& me, const LogBounds& log, const PsyncRequest& req) {
   const bool in_backlog = req.next_seq >= log.first_retained && req.next_seq <= log.last + 1;
   if (!in_backlog) return PsyncDecision::kFullResync;

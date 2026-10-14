@@ -107,6 +107,13 @@ App::~App() { Stop(); }
 Status App::CreateReplication() {
   auto identity = repl::LoadOrCreateIdentity(*storage_);
   if (!identity.ok()) return identity.status();
+  if (config_->Snapshot().replicaof.empty()) {  // R12: every master start rotates its replid
+    const std::string previous = identity->replid;
+    identity = repl::RotateForMasterStart(*storage_, *identity, repl_log_->last());
+    if (!identity.ok()) return identity.status();
+    spdlog::info("starting as a master with replication id {}; {} is valid through seq {}", identity->replid,
+                 previous, repl_log_->last());
+  }
   repl::ReplicationManager::Options o;
   o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
   repl::ReplicationManager::RoleHooks& h = o.role;
