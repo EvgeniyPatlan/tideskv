@@ -161,6 +161,19 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
   return {r.killed};
 }
 
+bool ScriptEngine::DeclaresWrites(std::string_view script, bool by_sha) const {
+  std::unique_lock<std::mutex> lock(mu_, std::try_to_lock);
+  if (!lock.owns_lock()) return false;  // a script is running: the BUSY check answers
+  if (by_sha) {
+    const auto it = scripts_.find(Lower(script));
+    return it != scripts_.end() && it->second.flags.shebang && !it->second.flags.no_writes;
+  }
+  const auto it = scripts_.find(Sha1Hex(script));
+  if (it != scripts_.end()) return it->second.flags.shebang && !it->second.flags.no_writes;
+  const Result<ParsedScript> parsed = ParseShebang(script);
+  return parsed.ok() && parsed->flags.shebang && !parsed->flags.no_writes;
+}
+
 Result<std::string> ScriptEngine::Load(std::string_view body) {
   std::lock_guard<std::mutex> lock(mu_);
   Result<std::string> sha = LookupOrCompile(body, false);

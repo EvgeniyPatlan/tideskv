@@ -58,6 +58,15 @@ void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
   ctx.reply.Error(error);
 }
 
+// Redis command flags as processCommand sees them: EVAL-family commands with a shebang script that
+// lacks no-writes count as writes (evalGetCommandFlags).
+bool IsWrite(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
+  if ((spec.flags & kCmdWrite) != 0) return true;
+  const std::string_view n = spec.name;
+  if (n != "eval" && n != "evalsha" && n != "eval_ro" && n != "evalsha_ro") return false;
+  return argv.size() >= 2 && ctx.server.scripts().DeclaresWrites(argv[1], n.starts_with("evalsha"));
+}
+
 void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
   if (spec.name == "script") {  // subcommand lookup precedes queueing in Redis processCommand
@@ -67,7 +76,7 @@ void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   const bool doomed = ctx.session.multi.dirty_exec || (w != nullptr && w->dirty());
   if (!doomed) {  // multi.c:67
     ctx.session.multi.queued.push_back(argv);
-    ctx.session.multi.has_write |= (spec.flags & kCmdWrite) != 0;
+    ctx.session.multi.has_write |= IsWrite(ctx, spec, argv);
   }
   ctx.reply.SimpleString("QUEUED");
 }
@@ -112,7 +121,7 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, ArityError(spec->name));
   }
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
-  if ((spec->flags & kCmdWrite) != 0 && ctx.server.replication().IsReplica()) {
+  if (ctx.server.replication().IsReplica() && IsWrite(ctx, *spec, argv)) {
     return Reject(ctx, spec, kErrReadOnlyReplica);  // sv:4060, before BUSY; MULTI -> dirty
   }
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {

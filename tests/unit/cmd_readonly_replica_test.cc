@@ -23,6 +23,7 @@ TEST(ReadOnlyReplica, WritesAreRefusedReadsWork) {
   EXPECT_EQ(h.Run({"GET", "k"}), Bulk("v"));
   EXPECT_EQ(h.Run({"PING"}), "+PONG\r\n");
   EXPECT_EQ(h.Run({"SELECT", "1"}), kOk);
+  EXPECT_EQ(h.Run({"INFO", "server"}).rfind("$", 0), 0u);
   EXPECT_EQ(h.Run({"SCRIPT", "LOAD", "return 1"}), Bulk(Sha1Hex("return 1")));
 }
 
@@ -85,6 +86,44 @@ TEST(ReadOnlyReplica, EvalRoShebangOnMasterKeepsItsOwnError) {
   ReplicaHarness h;
   EXPECT_EQ(h.Run({"EVAL_RO", "#!lua\nreturn 1", "0"}),
             Err("ERR Can not execute a script with write flag using *_ro command."));
+}
+
+TEST(ReadOnlyReplica, ReadOnlyComesBeforeBusy) {
+  ReplicaHarness h;
+  h.BecomeReplica();
+  h.services.scripts().ForceTimedOutForTests(true);
+  EXPECT_EQ(h.Run({"SET", "k", "v"}), Err(kReadOnly));
+  EXPECT_EQ(h.Run({"EVAL", "#!lua\nreturn 1", "0"}), Err(kReadOnly));
+  h.services.scripts().ForceTimedOutForTests(false);
+}
+
+TEST(ReadOnlyReplica, ShebangScriptCountsAsWriteInMulti) {
+  ReplicaHarness h;
+  h.BecomeReplica();
+  EXPECT_EQ(h.Run({"MULTI"}), kOk);
+  EXPECT_EQ(h.Run({"EVAL", "#!lua\nreturn 1", "0"}), Err(kReadOnly));
+  EXPECT_EQ(h.Run({"EVAL", "#!lua flags=no-writes\nreturn 1", "0"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"EXEC"}), Err("EXECABORT Transaction discarded because of previous errors."));
+}
+
+TEST(ReadOnlyReplica, ShebangEvalshaUsesCachedFlags) {
+  ReplicaHarness h;
+  const std::string body = "#!lua\nreturn 1";
+  const std::string sha = Sha1Hex(body);
+  EXPECT_EQ(h.Run({"SCRIPT", "LOAD", body}), Bulk(sha));
+  h.BecomeReplica();
+  EXPECT_EQ(h.Run({"EVALSHA", sha, "0"}), Err(kReadOnly));
+  EXPECT_EQ(h.Run({"EVALSHA", std::string(40, 'f'), "0"}),
+            Err("NOSCRIPT No matching script. Please use EVAL."));
+}
+
+TEST(ReadOnlyReplica, PlainScriptInMultiFailsAtRunTime) {
+  ReplicaHarness h;
+  h.BecomeReplica();
+  const std::string c = "return redis.call('set','x','1')";
+  EXPECT_EQ(h.Run({"MULTI"}), kOk);
+  EXPECT_EQ(h.Run({"EVAL", c, "0"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({Err(std::string(kReadOnly) + Suffix(c))}));
 }
 
 }  // namespace
