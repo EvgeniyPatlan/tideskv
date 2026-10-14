@@ -44,7 +44,7 @@ class FakeReplication final : public Replication {
       refused.error = psync_error;
       return refused;
     }
-    const repl::LogBounds bounds{log->first_retained(), log->last()};
+    const repl::LogBounds bounds{log->first_retained(), log->last(), false};
     PsyncResult r{repl::DecidePsync(identity, bounds, req), identity.replid, bounds.last, 0, {}};
     if (r.decision == repl::PsyncDecision::kContinue) r.pending_id = last_pending_id = ++next_pending_id_;
     return r;

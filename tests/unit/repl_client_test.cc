@@ -255,6 +255,19 @@ TEST_F(ReplClientTest, HandshakeSendsTheExpectedCommands) {
   EXPECT_EQ(third[1], (Args{"AUTH", "repl", "secret"}));
 }
 
+// F5: a replica whose own baseline is unknown never asks with "?" (which an empty log would otherwise
+// send); it names its own replid, which no master continues from seq 1.
+TEST_F(ReplClientTest, AnUnknownBaselineNamesItsOwnReplidInsteadOfQuestionMark) {
+  ReplClient::Options o = Fast();
+  o.baseline_unknown = true;
+  StartClient(o);
+  Link l = AcceptLink();
+  const auto seen = Handshake(l, "FULLRESYNC " + master_id() + " 0");
+  ASSERT_FALSE(seen.empty());
+  EXPECT_EQ(seen.back(), (Args{"PSYNC", Identity().replid, "1"}));
+  EXPECT_EQ(replica.log.last(), 0u);
+}
+
 TEST_F(ReplClientTest, ARefusedAuthGoesToBackoff) {
   {
     std::lock_guard lock(mu);

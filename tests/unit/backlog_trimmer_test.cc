@@ -188,7 +188,7 @@ TEST(BacklogTrimTest, SenderAfterTrimStartsAtFirstRetained) {
   ASSERT_TRUE(log.Trim(5).ok());
   ReplIdentity me;
   me.replid = std::string(kReplIdLength, 'c');
-  const LogBounds bounds{log.first_retained(), log.last()};
+  const LogBounds bounds{log.first_retained(), log.last(), false};
   EXPECT_EQ(DecidePsync(me, bounds, {me.replid, 3}), PsyncDecision::kFullResync);
   EXPECT_EQ(DecidePsync(me, bounds, {me.replid, 5}), PsyncDecision::kFullResync);
   EXPECT_EQ(DecidePsync(me, bounds, {me.replid, 6}), PsyncDecision::kContinue);

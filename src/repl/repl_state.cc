@@ -17,6 +17,19 @@ Result<std::string> GetSys(ReadView& view, std::string_view key, bool* found) {
   return raw.status();
 }
 
+// Any key in a keyspace CF (sys and the replog are node-local or the log itself).
+Result<bool> HasKeyspaceData(ReadView& view) {
+  for (ColumnFamily cf :
+       {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore, ColumnFamily::kExpire}) {
+    auto it = view.NewIterator(cf);
+    if (!it.ok()) return it.status();
+    const Status st = (*it)->SeekToFirst();
+    if (!st.ok() && !st.IsNotFound()) return st;
+    if (st.ok() && (*it)->Valid()) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string NewReplId() {
@@ -120,12 +133,30 @@ Result<ReplIdentity> RotateForMasterStart(Storage& storage, const ReplIdentity& 
   return rotated;
 }
 
+Result<bool> LoadOrDetectBaselineUnknown(Storage& storage, uint64_t last_seq) {
+  {
+    auto view = storage.BeginRead();
+    if (!view.ok()) return view.status();
+    bool flagged = false;
+    auto raw = GetSys(**view, kSysReplBaselineUnknown, &flagged);
+    if (!raw.ok()) return raw.status();
+    if (flagged || last_seq != 0) return flagged;
+    auto has_keys = HasKeyspaceData(**view);
+    if (!has_keys.ok() || !*has_keys) return has_keys;
+  }
+  auto txn = storage.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  if (Status st = (*txn)->Put(ColumnFamily::kSys, kSysReplBaselineUnknown, "1"); !st.ok()) return st;
+  if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  return true;
+}
+
 PsyncDecision DecidePsync(const ReplIdentity& me, const LogBounds& log, const PsyncRequest& req) {
   const bool in_backlog = req.next_seq >= log.first_retained && req.next_seq <= log.last + 1;
   if (!in_backlog) return PsyncDecision::kFullResync;
-  if (req.replid == "?") {
-    return req.next_seq == 1 && log.first_retained == 1 ? PsyncDecision::kContinue
-                                                        : PsyncDecision::kFullResync;
+  if (req.replid == "?") {  // an empty replica: only a log that starts at seq 1 over no data can serve it
+    return req.next_seq == 1 && log.first_retained == 1 && !log.baseline_unknown ? PsyncDecision::kContinue
+                                                                                 : PsyncDecision::kFullResync;
   }
   if (req.replid == me.replid) return PsyncDecision::kContinue;
   for (const HistoryEntry& e : me.history) {

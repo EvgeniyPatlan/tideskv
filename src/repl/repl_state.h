@@ -16,6 +16,9 @@ inline constexpr size_t kMaxHistory = 4;
 inline constexpr std::string_view kSysReplId = "repl_id";
 inline constexpr std::string_view kSysReplHistory = "repl_history";
 inline constexpr std::string_view kSysReplFirst = "repl_first";  // written by the trimmer (Task 14)
+// F5: "1" when the data predates the replication log (a pre-M6a directory). Node-local; a full sync
+// (M6b) clears it.
+inline constexpr std::string_view kSysReplBaselineUnknown = "repl_baseline_unknown";
 
 struct HistoryEntry {
   std::string replid;
@@ -53,6 +56,12 @@ ReplIdentity Promote(const ReplIdentity& old, uint64_t last_seq);
 // is stored and the node must not start.
 Result<ReplIdentity> RotateForMasterStart(Storage& storage, const ReplIdentity& id, uint64_t last_seq);
 
+// F5: whether this node's replication log describes its data. True when sys/repl_baseline_unknown is
+// set, or when it is detected now: an empty log (last_seq == 0) over a non-empty keyspace (meta, subkey,
+// zscore or expire), i.e. a directory written before M6a; the flag is then persisted (one raw txn, like
+// the identity). Run once at startup, after ReplLog::Recover and before any commit.
+Result<bool> LoadOrDetectBaselineUnknown(Storage& storage, uint64_t last_seq);
+
 struct PsyncRequest {
   std::string replid;  // "?" = unknown
   uint64_t next_seq = 0;
@@ -60,6 +69,7 @@ struct PsyncRequest {
 struct LogBounds {
   uint64_t first_retained = 1;
   uint64_t last = 0;
+  bool baseline_unknown = false;  // F5: the log does not describe the data it starts from
 };
 enum class PsyncDecision : uint8_t { kContinue, kFullResync };
 PsyncDecision DecidePsync(const ReplIdentity& me, const LogBounds& log, const PsyncRequest& req);

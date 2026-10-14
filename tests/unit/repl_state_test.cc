@@ -144,11 +144,76 @@ TEST(ReplState, AfterAMasterRestartOnlyReplicasAtOrBehindItsRecoveredLastContinu
   const ReplIdentity before{Id('a'), {}};
   auto after = RotateForMasterStart(s, before, 90);
   ASSERT_TRUE(after.ok());
-  const LogBounds log{1, 95};
+  const LogBounds log{1, 95, false};
   EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 91}), PsyncDecision::kContinue);
   EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 40}), PsyncDecision::kContinue);
   EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 92}), PsyncDecision::kFullResync);
   EXPECT_EQ(DecidePsync(*after, log, {Id('a'), 96}), PsyncDecision::kFullResync);
+}
+
+// F5: a data directory with keys but no replication log (written before M6a) has a baseline the log
+// does not describe. The flag is node-local, persisted once, and survives restarts and later writes.
+void PutRaw(Storage& s, ColumnFamily cf, const std::string& key) {
+  auto txn = s.BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->Put(cf, key, "v").ok());
+  ASSERT_TRUE((*txn)->Commit().ok());
+}
+
+bool FlagStored(Storage& s) {
+  auto view = s.BeginRead();
+  return view.ok() && (*view)->Get(ColumnFamily::kSys, kSysReplBaselineUnknown).ok();
+}
+
+TEST(ReplState, AnEmptyDirectoryHasAKnownBaseline) {
+  InMemoryStorage s;
+  PutRaw(s, ColumnFamily::kSys, "format_version");  // node-local keys do not count
+  auto unknown = LoadOrDetectBaselineUnknown(s, 0);
+  ASSERT_TRUE(unknown.ok());
+  EXPECT_FALSE(*unknown);
+  EXPECT_FALSE(FlagStored(s));
+}
+
+TEST(ReplState, KeysWithoutAReplicationLogMakeTheBaselineUnknown) {
+  for (ColumnFamily cf :
+       {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore, ColumnFamily::kExpire}) {
+    InMemoryStorage s;
+    PutRaw(s, cf, "old-key");
+    auto unknown = LoadOrDetectBaselineUnknown(s, 0);
+    ASSERT_TRUE(unknown.ok()) << ColumnFamilyName(cf);
+    EXPECT_TRUE(*unknown) << ColumnFamilyName(cf);
+    EXPECT_TRUE(FlagStored(s)) << ColumnFamilyName(cf);
+    // A restart after later writes (last > 0) still sees the flag.
+    auto again = LoadOrDetectBaselineUnknown(s, 42);
+    ASSERT_TRUE(again.ok());
+    EXPECT_TRUE(*again) << ColumnFamilyName(cf);
+  }
+}
+
+TEST(ReplState, KeysDescribedByTheReplicationLogKeepAKnownBaseline) {
+  InMemoryStorage s;
+  PutRaw(s, ColumnFamily::kMeta, "k");
+  auto unknown = LoadOrDetectBaselineUnknown(s, 1);
+  ASSERT_TRUE(unknown.ok());
+  EXPECT_FALSE(*unknown);
+  EXPECT_FALSE(FlagStored(s));
+}
+
+TEST(ReplState, AnUnknownBaselineThatCannotBePersistedFails) {
+  test::FaultyStorage s;
+  PutRaw(s, ColumnFamily::kMeta, "old-key");
+  s.fail_commit_in = 1;
+  EXPECT_FALSE(LoadOrDetectBaselineUnknown(s, 0).ok());
+}
+
+// F5: with an unknown baseline, a replica that asks from the start ("?") must not be streamed seq 1..:
+// the log does not hold the data it would need.
+TEST(ReplState, AnUnknownBaselineNeverContinuesAnUnknownReplica) {
+  const ReplIdentity me{Id('a'), {}};
+  EXPECT_EQ(DecidePsync(me, {1, 10, true}, {"?", 1}), PsyncDecision::kFullResync);
+  EXPECT_EQ(DecidePsync(me, {1, 0, true}, {"?", 1}), PsyncDecision::kFullResync);
+  EXPECT_EQ(DecidePsync(me, {1, 10, false}, {"?", 1}), PsyncDecision::kContinue);
+  EXPECT_EQ(DecidePsync(me, {1, 10, true}, {Id('a'), 5}), PsyncDecision::kContinue);  // it holds our 1..4
 }
 
 // D8 decision table.
@@ -166,21 +231,33 @@ TEST_P(DecidePsyncTest, Decides) {
 INSTANTIATE_TEST_SUITE_P(
     Table, DecidePsyncTest,
     ::testing::Values(
-        Case{"same id, caught up", {1, 100}, {std::string(40, 'a'), 101}, PsyncDecision::kContinue},
-        Case{"same id, behind in backlog", {1, 100}, {std::string(40, 'a'), 1}, PsyncDecision::kContinue},
-        Case{"same id, ahead of master", {1, 100}, {std::string(40, 'a'), 102}, PsyncDecision::kFullResync},
-        Case{"same id, trimmed away", {60, 100}, {std::string(40, 'a'), 59}, PsyncDecision::kFullResync},
-        Case{"same id, first retained", {60, 100}, {std::string(40, 'a'), 60}, PsyncDecision::kContinue},
-        Case{"history id within end", {1, 100}, {std::string(40, 'b'), 51}, PsyncDecision::kContinue},
+        Case{"same id, caught up", {1, 100, false}, {std::string(40, 'a'), 101}, PsyncDecision::kContinue},
+        Case{"same id, behind in backlog",
+             {1, 100, false},
+             {std::string(40, 'a'), 1},
+             PsyncDecision::kContinue},
+        Case{"same id, ahead of master",
+             {1, 100, false},
+             {std::string(40, 'a'), 102},
+             PsyncDecision::kFullResync},
+        Case{"same id, trimmed away",
+             {60, 100, false},
+             {std::string(40, 'a'), 59},
+             PsyncDecision::kFullResync},
+        Case{"same id, first retained",
+             {60, 100, false},
+             {std::string(40, 'a'), 60},
+             PsyncDecision::kContinue},
+        Case{"history id within end", {1, 100, false}, {std::string(40, 'b'), 51}, PsyncDecision::kContinue},
         Case{"history id past end (diverged)",
-             {1, 100},
+             {1, 100, false},
              {std::string(40, 'b'), 52},
              PsyncDecision::kFullResync},
-        Case{"unknown id", {1, 100}, {std::string(40, 'c'), 10}, PsyncDecision::kFullResync},
-        Case{"? from empty, nothing trimmed", {1, 100}, {"?", 1}, PsyncDecision::kContinue},
-        Case{"? from empty, trimmed", {2, 100}, {"?", 1}, PsyncDecision::kFullResync},
-        Case{"? with a position", {1, 100}, {"?", 5}, PsyncDecision::kFullResync},
-        Case{"empty master, ? 1", {1, 0}, {"?", 1}, PsyncDecision::kContinue}));
+        Case{"unknown id", {1, 100, false}, {std::string(40, 'c'), 10}, PsyncDecision::kFullResync},
+        Case{"? from empty, nothing trimmed", {1, 100, false}, {"?", 1}, PsyncDecision::kContinue},
+        Case{"? from empty, trimmed", {2, 100, false}, {"?", 1}, PsyncDecision::kFullResync},
+        Case{"? with a position", {1, 100, false}, {"?", 5}, PsyncDecision::kFullResync},
+        Case{"empty master, ? 1", {1, 0, false}, {"?", 1}, PsyncDecision::kContinue}));
 
 }  // namespace
 }  // namespace tideskv::repl

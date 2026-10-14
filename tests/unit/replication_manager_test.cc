@@ -232,6 +232,16 @@ TEST_F(ManagerTest, ReplicaLinksCountAgainstMaxclients) {
   EXPECT_TRUE(WaitFor([&] { return m->HandlePsync({id.replid, 4}, {}).error.empty(); }));
 }
 
+// F5: with an unknown baseline the master never continues a "?" request.
+TEST_F(ManagerTest, AnUnknownBaselineAnswersQuestionMarkWithFullResync) {
+  ReplicationManager::Options o;
+  o.baseline_unknown = true;
+  auto m = Make(std::move(o));
+  EXPECT_EQ(m->HandlePsync({"?", 1}, {}).decision, PsyncDecision::kFullResync);
+  EXPECT_EQ(m->HandlePsync({id.replid, 2}, {}).decision, PsyncDecision::kContinue);
+  EXPECT_EQ(Make()->HandlePsync({"?", 1}, {}).decision, PsyncDecision::kContinue);
+}
+
 // Task 14: what the backlog trimmer may not delete, and the drop of replicas beyond the limits.
 TEST_F(ManagerTest, OldestNeededIsTheMinOverReplicasAndHandOffs) {
   auto m = Make();

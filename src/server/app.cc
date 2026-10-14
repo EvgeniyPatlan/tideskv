@@ -104,17 +104,34 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
 
 App::~App() { Stop(); }
 
-Status App::CreateReplication() {
-  auto identity = repl::LoadOrCreateIdentity(*storage_);
-  if (!identity.ok()) return identity.status();
-  if (config_->Snapshot().replicaof.empty()) {  // R12: every master start rotates its replid
-    const std::string previous = identity->replid;
-    identity = repl::RotateForMasterStart(*storage_, *identity, repl_log_->last());
-    if (!identity.ok()) return identity.status();
-    spdlog::info("starting as a master with replication id {}; {} is valid through seq {}", identity->replid,
-                 previous, repl_log_->last());
+// The node's replication identity and whether its log describes its data; both persisted before any
+// connection is accepted. R12: a node that starts as a master takes a fresh replid. F5: a directory that
+// predates the replication log is flagged once and logged at every start.
+Status App::LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown) {
+  const uint64_t last = repl_log_->last();
+  auto unknown = repl::LoadOrDetectBaselineUnknown(*storage_, last);
+  if (!unknown.ok()) return unknown.status();
+  *baseline_unknown = *unknown;
+  if (*baseline_unknown) {
+    spdlog::warn(
+        "this data directory predates the replication log: its keys are not in it, so it neither serves nor "
+        "takes a partial resynchronisation from an empty log (a full resynchronisation, M6b, clears this)");
   }
+  auto loaded = repl::LoadOrCreateIdentity(*storage_);
+  if (!loaded.ok()) return loaded.status();
+  if (!config_->Snapshot().replicaof.empty()) return MoveInto(std::move(loaded), identity);
+  const std::string previous = loaded->replid;
+  auto rotated = repl::RotateForMasterStart(*storage_, *loaded, last);
+  if (!rotated.ok()) return rotated.status();
+  spdlog::info("starting as a master with replication id {}; {} is valid through seq {}", rotated->replid,
+               previous, last);
+  return MoveInto(std::move(rotated), identity);
+}
+
+Status App::CreateReplication() {
+  repl::ReplIdentity identity;
   repl::ReplicationManager::Options o;
+  if (Status st = LoadReplState(&identity, &o.baseline_unknown); !st.ok()) return st;
   o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
   o.maxclients = [this] { return static_cast<uint64_t>(config_->Snapshot().maxclients); };
   o.connected_clients = [this] { return server_->counters().connected; };
@@ -132,8 +149,8 @@ Status App::CreateReplication() {
     }
   };
   h.trim_backlog = [this] { return trimmer_->RunOnReplica(); };  // the client starts after trimmer_ exists
-  replication_ = std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_,
-                                                            std::move(identity).value(), std::move(o));
+  replication_ =
+      std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_, std::move(identity), std::move(o));
   repl::BacklogTrimmer::Hooks th;
   th.config = [this] { return config_->Snapshot(); };
   th.oldest_needed = [this] { return replication_->OldestNeeded(); };

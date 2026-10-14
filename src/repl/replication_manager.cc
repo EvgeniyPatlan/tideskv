@@ -55,7 +55,7 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
 }
 
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
-  const LogBounds bounds{log_.first_retained(), log_.last()};
+  const LogBounds bounds{log_.first_retained(), log_.last(), options_.baseline_unknown};
   const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
   const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   std::lock_guard lock(mu_);
@@ -234,8 +234,10 @@ std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
   cb.trim_backlog = options_.role.trim_backlog;
   ReplClient::ConfigSnapshotFn config = options_.role.config;
   if (!config) config = [] { return ConfigValues{}; };
+  ReplClient::Options client_options = options_.client;
+  client_options.baseline_unknown = options_.baseline_unknown;
   return std::make_shared<ReplClient>(*options_.role.engine, log_, std::move(config), std::move(cb),
-                                      options_.client);
+                                      client_options);
 }
 
 Status ReplicationManager::PersistAndPublish(const ReplIdentity& id) {

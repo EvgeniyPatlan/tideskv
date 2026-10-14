@@ -54,6 +54,7 @@ class App final : public ServerServices {
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
   net::ServerOptions MakeServerOptions();
+  Status LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown);
   Status CreateReplication();
   void FillStorageStats(ServerStats& s) const;
   void FillReplStats(ServerStats& s, const ConfigValues& v) const;

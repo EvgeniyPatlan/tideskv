@@ -45,6 +45,9 @@ class ReplClient {
     std::chrono::milliseconds backoff_max{30000};
     std::chrono::milliseconds ack_interval{1000};
     std::chrono::milliseconds trim_interval{1000};
+    // F5: this node's log does not describe its data, so PSYNC never says "?" (which asks to be streamed
+    // from seq 1 onto an empty node): it names the node's own replid, and the master answers FULLRESYNC.
+    bool baseline_unknown = false;
   };
 
   // config is read at each connection attempt (masterauth, masteruser, repl-timeout, port and the

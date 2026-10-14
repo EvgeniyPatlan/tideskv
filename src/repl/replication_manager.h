@@ -54,6 +54,9 @@ class ReplicationManager final : public Replication {
     // client connections (a PSYNC caller is still one). Either null = no limit.
     std::function<uint64_t()> maxclients;
     std::function<uint64_t()> connected_clients;
+    // F5: this node's log does not describe its data (LoadOrDetectBaselineUnknown). As a master it never
+    // continues a "?" request; as a replica its client never sends "?".
+    bool baseline_unknown = false;
     RoleHooks role;
     ReplClient::Options client;
   };

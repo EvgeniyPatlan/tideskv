@@ -177,7 +177,7 @@ Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
 // PSYNC <replid|?> <last+1> (D8). OK only for +CONTINUE: *continued is set and streaming may begin.
 Status ReplClient::Psync(int fd, bool* continued) {
   const uint64_t last = log_.last();
-  const std::string replid = last == 0 ? "?" : cb_.identity().replid;
+  const std::string replid = last == 0 && !options_.baseline_unknown ? "?" : cb_.identity().replid;  // F5
   const std::string next = std::to_string(last + 1);
   auto r = Command(fd, {"PSYNC", replid, next});
   if (!r.ok()) return r.status();
