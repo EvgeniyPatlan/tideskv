@@ -3,8 +3,12 @@
 #include <array>
 #include <chrono>
 #include <mutex>
+#include <set>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -162,6 +166,15 @@ Result<std::unique_ptr<Iterator>> TxnIterator(tidesdb_txn_t* txn, tidesdb_column
   return std::unique_ptr<Iterator>(std::make_unique<TidesIterator>(it, std::move(opts)));
 }
 
+// Same semantics as encoding::PrefixUpperBound (smallest string above every string with this prefix;
+// empty = no bound). Kept local: the storage layer does not depend on the encoding layer.
+std::string PrefixUpperBoundLocal(std::string_view prefix) {
+  std::string out(prefix);
+  while (!out.empty() && static_cast<uint8_t>(out.back()) == 0xff) out.pop_back();
+  if (!out.empty()) out.back() = static_cast<char>(static_cast<uint8_t>(out.back()) + 1);
+  return out;
+}
+
 class TidesReadView final : public ReadView {
  public:
   TidesReadView(tidesdb_txn_t* txn, tidesdb_snapshot_t* snapshot, CfHandles cfs)
@@ -208,15 +221,26 @@ class TidesWriteTxn final : public WriteTxn {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
     return FromTdb(tidesdb_txn_delete(txn_, Cf(cf), Bytes(key), key.size()), "delete");
   }
+  // D2 (M6a): TidesDB 10.1.1 holds at most 32 distinct range intervals per commit (global table,
+  // TDB_MVCC_MAX_RANGE_RESERVATIONS). Past kMaxNativeRangeDeletes distinct ranges, further ones are
+  // applied as point deletes of the keys currently in range (this txn's own buffered writes
+  // included): the same result at O(keys in range).
   Status DeletePrefix(ColumnFamily cf, std::string_view prefix) override {
     if (Status st = Check(ValidatePrefix(prefix)); !st.ok()) return st;
-    return FromTdb(tidesdb_txn_delete_prefix(txn_, Cf(cf), Bytes(prefix), prefix.size()), "delete_prefix");
+    // Tagged "\x01" + prefix so the triple never equals a DeleteRange triple.
+    if (UseNativeRange(cf, std::string(prefix), "\x01" + std::string(prefix))) {
+      return FromTdb(tidesdb_txn_delete_prefix(txn_, Cf(cf), Bytes(prefix), prefix.size()), "delete_prefix");
+    }
+    return DeleteKeysIn(cf, std::string(prefix), PrefixUpperBoundLocal(prefix));
   }
   Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override {
     if (Status st = Check(ValidateRange(lo, hi)); !st.ok()) return st;
-    const uint8_t* hi_ptr = hi.empty() ? nullptr : Bytes(hi);
-    return FromTdb(tidesdb_txn_delete_range(txn_, Cf(cf), Bytes(lo), lo.size(), hi_ptr, hi.size()),
-                   "delete_range");
+    if (UseNativeRange(cf, std::string(lo), std::string(hi))) {
+      const uint8_t* hi_ptr = hi.empty() ? nullptr : Bytes(hi);
+      return FromTdb(tidesdb_txn_delete_range(txn_, Cf(cf), Bytes(lo), lo.size(), hi_ptr, hi.size()),
+                     "delete_range");
+    }
+    return DeleteKeysIn(cf, std::string(lo), std::string(hi));
   }
 
   Status Savepoint(std::string_view name) override {
@@ -255,9 +279,43 @@ class TidesWriteTxn final : public WriteTxn {
     return arg_status;
   }
 
+  // True when this range may be sent to the engine as a native range delete: it is already reserved
+  // (the engine de-duplicates identical intervals) or a slot below the cap is free, which is then
+  // taken. A rolled-back savepoint keeps its slots, which only makes the cap conservative.
+  bool UseNativeRange(ColumnFamily cf, std::string lo, std::string hi) {
+    if (native_ranges_.size() >= kMaxNativeRangeDeletes && !native_ranges_.contains({cf, lo, hi})) {
+      return false;
+    }
+    native_ranges_.emplace(cf, std::move(lo), std::move(hi));
+    return true;
+  }
+
+  // Point-deletes every key in [lo, hi) (empty hi = to the end). Keys are collected first: never
+  // delete while iterating.
+  Status DeleteKeysIn(ColumnFamily cf, std::string lo, std::string hi) {
+    std::vector<std::string> keys;
+    {
+      auto created = TxnIterator(txn_, Cf(cf), {std::move(lo), std::move(hi)});
+      if (!created.ok()) return created.status();
+      std::unique_ptr<Iterator> it = std::move(created).value();
+      if (Status st = it->SeekToFirst(); !st.ok()) return st;
+      while (it->Valid()) {
+        keys.emplace_back(it->key());
+        if (Status st = it->Next(); !st.ok()) return st;
+      }
+    }
+    for (const std::string& key : keys) {
+      if (Status st = FromTdb(tidesdb_txn_delete(txn_, Cf(cf), Bytes(key), key.size()), "delete"); !st.ok()) {
+        return st;
+      }
+    }
+    return Status::Ok();
+  }
+
   tidesdb_txn_t* txn_;
   CfHandles cfs_;
   std::mutex& commit_mu_;
+  std::set<std::tuple<ColumnFamily, std::string, std::string>> native_ranges_;
   bool finished_ = false;
 };
 

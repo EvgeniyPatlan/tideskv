@@ -13,6 +13,10 @@
 namespace tideskv {
 
 inline constexpr size_t kMaxRangeBoundSize = 256;  // TidesDB TDB_MAX_RANGE_BOUND_SIZE
+// TidesDB reserves at most 32 distinct range intervals per commit. TidesStorage sends this many
+// distinct DeletePrefix/DeleteRange calls per transaction to the engine as native range deletes and
+// materialises the rest as point deletes, leaving headroom below the engine's table.
+inline constexpr size_t kMaxNativeRangeDeletes = 30;
 
 struct IterOptions {
   std::string lower;  // inclusive; empty = from the first key
@@ -69,8 +73,9 @@ class WriteTxn : public ReadView {
  public:
   virtual Status Put(ColumnFamily cf, std::string_view key, std::string_view value) = 0;
   virtual Status Delete(ColumnFamily cf, std::string_view key) = 0;
-  // O(1) to write. prefix: 1..kMaxRangeBoundSize bytes. A later Put in the same
-  // transaction under the prefix survives.
+  // Any number of DeletePrefix/DeleteRange calls may be buffered in one transaction.
+  // O(1) to write (O(keys in range) past kMaxNativeRangeDeletes distinct ranges).
+  // prefix: 1..kMaxRangeBoundSize bytes. A later Put in the same transaction under the prefix survives.
   virtual Status DeletePrefix(ColumnFamily cf, std::string_view prefix) = 0;
   // Deletes [lo, hi). lo: 1..256 bytes; hi: 0..256 bytes, empty = to the end; lo < hi.
   virtual Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) = 0;

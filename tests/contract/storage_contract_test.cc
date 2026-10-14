@@ -138,6 +138,54 @@ TEST_P(StorageContractTest, PutAfterDeletePrefixInSameTxnSurvives) {
   EXPECT_EQ(ScanCommitted(storage(), kMeta), (Rows{{"p1b", "new"}}));
 }
 
+// D2: TidesDB reserves at most 32 distinct range intervals per commit; the adapter must hide that.
+void PutTwoUnder(Storage& s, ColumnFamily cf, const std::string& p) {
+  auto w = s.BeginWrite();
+  ASSERT_TRUE(w.ok());
+  ASSERT_TRUE((*w)->Put(cf, p + "a", "1").ok());
+  ASSERT_TRUE((*w)->Put(cf, p + "b", "2").ok());
+  ASSERT_TRUE((*w)->Commit().ok());
+}
+
+TEST_P(StorageContractTest, ManyDistinctDeletePrefixesInOneTxnCommit) {
+  for (int i = 0; i < 40; ++i) PutTwoUnder(storage(), kSub, "p" + std::to_string(100 + i) + "/");
+  auto w = storage().BeginWrite();
+  ASSERT_TRUE(w.ok());
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_TRUE((*w)->DeletePrefix(kSub, "p" + std::to_string(100 + i) + "/").ok());
+  }
+  ASSERT_TRUE((*w)->Put(kSub, "p139/c", "3").ok());  // a later put under a prefix survives
+  ASSERT_TRUE((*w)->Commit().ok());
+  EXPECT_EQ(ScanCommitted(storage(), kSub), (Rows{{"p139/c", "3"}}));
+}
+
+TEST_P(StorageContractTest, ManyDistinctDeleteRangesInOneTxnCommit) {
+  for (int i = 0; i < 40; ++i) PutTwoUnder(storage(), kSub, "r" + std::to_string(100 + i) + "/");
+  PutAll(storage(), kSub, {{"s/keep", "k"}, {"zz", "z"}});
+  auto w = storage().BeginWrite();
+  ASSERT_TRUE(w.ok());
+  for (int i = 0; i < 40; ++i) {
+    const std::string n = std::to_string(100 + i);
+    ASSERT_TRUE((*w)->DeleteRange(kSub, "r" + n + "/", "r" + n + "0").ok());
+  }
+  ASSERT_TRUE((*w)->DeleteRange(kSub, "zz", "").ok());  // the 41st call: to the end
+  ASSERT_TRUE((*w)->Put(kSub, "r139/c", "3").ok());
+  ASSERT_TRUE((*w)->Commit().ok());
+  EXPECT_EQ(ScanCommitted(storage(), kSub), (Rows{{"r139/c", "3"}, {"s/keep", "k"}}));
+}
+
+TEST_P(StorageContractTest, DeletesBeyondTheNativeLimitSeeThisTxnsOwnWrites) {
+  auto w = storage().BeginWrite();
+  ASSERT_TRUE(w.ok());
+  for (int i = 0; i < 40; ++i) {
+    const std::string p = "q" + std::to_string(100 + i) + "/";
+    ASSERT_TRUE((*w)->Put(kSub, p + "a", "1").ok());  // buffered, not yet committed
+    ASSERT_TRUE((*w)->DeletePrefix(kSub, p).ok());
+  }
+  ASSERT_TRUE((*w)->Commit().ok());
+  EXPECT_TRUE(ScanCommitted(storage(), kSub).empty());
+}
+
 TEST_P(StorageContractTest, DeleteRangeIsHalfOpen) {
   PutAll(storage(), kMeta, kAtoE);
   auto txn = storage().BeginWrite();

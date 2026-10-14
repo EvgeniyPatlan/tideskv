@@ -51,6 +51,22 @@ int64_t IntValue(RespClient& c, const std::string& key) {
   return v.type == RespValue::Type::kBulk ? std::stoll(v.str) : 0;
 }
 
+TEST(MultiIT, ExecDeletingFortyCollectionsCommits) {  // D2: TidesDB's 32-range-per-commit limit
+  TestServer s(TIDESKV_SERVER_BIN);
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  std::vector<std::vector<std::string>> dels;
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_EQ(c->Command({"HSET", "h" + std::to_string(i), "f", "v"}).integer, 1);
+    dels.push_back({"DEL", "h" + std::to_string(i)});
+  }
+  const RespValue r = Transaction(*c, dels);
+  ASSERT_EQ(r.type, RespValue::Type::kArray);
+  ASSERT_EQ(r.elements.size(), 40U);
+  for (const auto& e : r.elements) EXPECT_EQ(e.integer, 1);
+  EXPECT_EQ(c->Command({"DBSIZE"}).integer, 0);
+}
+
 TEST(MultiIT, ExecIsIsolatedFromConcurrentWriters) {  // Review Focus #2
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--workers", "4"}});
   std::atomic<bool> stop{false};

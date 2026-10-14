@@ -12,7 +12,8 @@
 namespace tideskv {
 
 // Test fake. Copy-on-write: every commit copies the tables, so snapshots are just
-// shared_ptrs. Correct and simple, deliberately not fast.
+// shared_ptrs. Correct and simple, deliberately not fast. Unlike TidesDB it has no limit on the
+// number of range deletes per transaction (see kMaxNativeRangeDeletes in storage.h).
 class InMemoryStorage final : public Storage {
  public:
   using Table = std::map<std::string, std::string, std::less<>>;

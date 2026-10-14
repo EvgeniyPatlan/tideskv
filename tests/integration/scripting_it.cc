@@ -50,6 +50,15 @@ constexpr int kKillIterations = 300000;
 constexpr int kKillIterations = 30000;
 #endif
 
+TEST(ScriptingIT, EvalDeletingFortyCollectionsCommits) {  // D2: TidesDB's 32-range-per-commit limit
+  TestServer s(TIDESKV_SERVER_BIN);
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  for (int i = 0; i < 40; ++i) ASSERT_EQ(c->Command({"HSET", "h" + std::to_string(i), "f", "v"}).integer, 1);
+  EXPECT_EQ(c->Command({"EVAL", "for i=0,39 do redis.call('del','h'..i) end return 1", "0"}).integer, 1);
+  EXPECT_EQ(c->Command({"DBSIZE"}).integer, 0);
+}
+
 TEST(ScriptingIT, KillDuringEvalIsAllOrNothing) {  // Review Focus #1
   TempDir dir("tideskv-it-eval-kill");
   std::mt19937 rng(std::random_device{}());
