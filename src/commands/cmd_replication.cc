@@ -42,7 +42,7 @@ void Psync(ExecContext& ctx, const ArgList& argv) {
   Replication& repl = ctx.server.replication();
   const repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset)};
   const PsyncResult r = repl.HandlePsync(req, PeerOf(s));
-  if (!r.error.empty()) return ctx.reply.Error(r.error);  // refused (F4): stays an ordinary client
+  if (!r.error.empty()) return ctx.reply.Error(r.error);  // maxclients (F4), a replica (F8): no hand-off
   if (r.decision == repl::PsyncDecision::kFullResync) {
     ctx.reply.SimpleString("FULLRESYNC " + r.replid + " " + std::to_string(r.seq));
     s.close_after_reply = true;
