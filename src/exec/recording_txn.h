@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "encoding/replog_codec.h"
 #include "exec/commit_listener.h"
 #include "exec/write_observer.h"
 #include "storage/storage.h"
@@ -35,18 +36,25 @@ class RecordingTxn final : public WriteTxn {
   size_t writes() const { return writes_; }
   // Keys whose meta record was put or deleted, in write order; may repeat (M5a plan G2).
   const std::vector<DbKey>& meta_keys() const { return meta_keys_; }
+  // Replication capture (M6a D5): off by default. When on, every successful mutation is recorded as
+  // one physical op, exactly as called, in program order and minus those rolled back.
+  void CaptureOps(bool on) { capture_ = on; }
+  const std::vector<encoding::ReplOp>& ops() const { return ops_; }
 
  private:
   void Wrote(ColumnFamily cf, std::string_view key);  // after a successful Put/Delete
+  void Capture(encoding::ReplOpType type, ColumnFamily cf, std::string_view key, std::string_view value);
   struct Mark {
     std::string name;
-    size_t deletes, writes, meta_keys;  // sizes at the savepoint
+    size_t deletes, writes, meta_keys, ops;  // sizes at the savepoint
   };
 
   WriteTxn& inner_;
   std::vector<RangeDelete> deletes_;
   size_t writes_ = 0;
   std::vector<DbKey> meta_keys_;
+  bool capture_ = false;
+  std::vector<encoding::ReplOp> ops_;
   std::vector<Mark> savepoints_;
 };
 
