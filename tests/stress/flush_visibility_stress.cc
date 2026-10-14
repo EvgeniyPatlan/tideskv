@@ -128,7 +128,12 @@ TEST(FlushVisibilityStress, DeletedRangeStaysDeletedWhileCheckpointing) {
   const int iters = Iterations();
   std::atomic<bool> stop{false};
   std::thread flusher([&] {  // like the compaction scheduler: flushes whenever it likes
-    while (!stop.load()) EXPECT_TRUE((*s)->Checkpoint().ok());
+    while (!stop.load()) {
+      EXPECT_TRUE((*s)->Checkpoint().ok());
+      // Checkpoint shares the commit mutex with writers (D1) and std::mutex is not fair: a back-to-back
+      // loop would starve the writer. The real scheduler flushes on a timer, not in a spin.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   });
   std::thread reader([&] { ReaderLoop(**s, m, deleted, acked, iters); });
   WriterLoop(**s, deleted, acked, iters);
