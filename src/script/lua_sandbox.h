@@ -26,7 +26,6 @@ class LuaSandbox {
   Status Compile(const std::string& sha, std::string_view code);
 
   struct RunOptions {
-    int caller_resp = 2;
     bool hook = true;  // the count hook that asks host.ShouldKill()
   };
   struct RunResult {

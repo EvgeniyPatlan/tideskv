@@ -59,7 +59,7 @@ void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_o
   const auto split = argv.begin() + 3 + numkeys;
   const std::vector<std::string> keys(argv.begin() + 3, split);
   const std::vector<std::string> args(split, argv.end());
-  RunScript(ctx, {argv[1], by_sha, read_only, &keys, &args, ctx.reply.protocol(),
+  RunScript(ctx, {argv[1], by_sha, read_only, &keys, &args,
                   ctx.server.config().Snapshot().busy_reply_threshold_ms});
 }
 

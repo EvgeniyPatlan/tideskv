@@ -47,7 +47,7 @@ struct SandboxTest : ::testing::Test {
     const Status st = sb->Compile(sha, code);
     if (!st.ok()) return "COMPILE:" + st.message();
     resp::ReplyBuilder out(caller_resp);
-    killed = sb->Run(sha, keys, args, host, {caller_resp, true}, out).killed;
+    killed = sb->Run(sha, keys, args, host, {true}, out).killed;
     return out.Take();
   }
   // "-<msg> script: <sha>, on @user_script:<line>.\r\n"
@@ -248,7 +248,7 @@ TEST_F(SandboxTest, KillIsStickyWhenTheHostAsksOnlyOnce) {
   const std::string sha = Sha1Hex(c);
   ASSERT_TRUE(sb->Compile(sha, c).ok());
   resp::ReplyBuilder out(2);
-  EXPECT_TRUE(sb->Run(sha, {}, {}, once, {2, true}, out).killed);
+  EXPECT_TRUE(sb->Run(sha, {}, {}, once, {true}, out).killed);
   EXPECT_NE(out.Take().find("Script killed by user with SCRIPT KILL..."), std::string::npos);
   EXPECT_EQ(once.polls, 1);
 }

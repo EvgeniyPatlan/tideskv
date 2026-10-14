@@ -39,7 +39,6 @@ class ScriptEngine {
     bool read_only_command = false;  // EVAL_RO / EVALSHA_RO
     const std::vector<std::string>* keys = nullptr;
     const std::vector<std::string>* args = nullptr;
-    int caller_resp = 2;
     int64_t busy_threshold_ms = 5000;  // 0 = no hook
   };
   struct EvalResult {

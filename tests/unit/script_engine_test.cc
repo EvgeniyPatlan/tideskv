@@ -42,7 +42,7 @@ struct ScriptEngineFixture : ::testing::Test {
 
   std::string Eval(std::string_view script, bool by_sha = false, bool ro = false, int64_t threshold = 5000) {
     resp::ReplyBuilder out(2);
-    killed = se.Eval({script, by_sha, ro, &keys, &args, 2, threshold}, caller, out).killed;
+    killed = se.Eval({script, by_sha, ro, &keys, &args, threshold}, caller, out).killed;
     return out.Take();
   }
 };
@@ -129,6 +129,51 @@ TEST_F(ScriptEngineFixture, ShutdownKillsAHookedScriptEvenBeforeItTimesOut) {
   runner.join();
   EXPECT_TRUE(killed);
   EXPECT_NE(reply.find("Script killed by user with SCRIPT KILL..."), std::string::npos);
+}
+
+// A caller whose redis.call answers SCRIPT KILL (as if it came from another worker) once the run timed out.
+class KillingCaller final : public ScriptCaller {
+ public:
+  explicit KillingCaller(ScriptEngine& se) : se_(se) {}
+  void SetReadOnly(bool) override {}
+  std::optional<std::string> Call(const std::vector<std::string>&, int, std::string*) override {
+    timed_out = se_.TimedOut();
+    kill_answered_ok = se_.Kill();
+    return std::string(":1\r\n");
+  }
+  bool CommandExists(std::string_view) const override { return true; }
+  bool timed_out = false;
+  bool kill_answered_ok = false;
+
+ private:
+  ScriptEngine& se_;
+};
+
+// B1: a SCRIPT KILL that lands after the script's last kill check (here: its last statement) but before the
+// run ended either kills the run (its reply is the kill error, so its writes are undone) or answers NOTBUSY.
+// It never answers +OK for a script that then completes normally.
+TEST_F(ScriptEngineFixture, KillAnsweredOkAlwaysKillsTheRun) {
+  KillingCaller killing(se);
+  resp::ReplyBuilder out(2);
+  const auto result = se.Eval({"local i = 0 while i < 3000000 do i = i + 1 end return redis.call('ping')",
+                               false, false, &keys, &args, 1},
+                              killing, out);
+  const std::string reply = out.Take();
+  ASSERT_TRUE(killing.timed_out) << "the loop ended before the 1 ms threshold";
+  ASSERT_TRUE(killing.kill_answered_ok);
+  EXPECT_TRUE(result.killed) << reply;
+  EXPECT_EQ(reply.rfind("-ERR Script killed by user with SCRIPT KILL...", 0), 0u) << reply;
+  EXPECT_FALSE(se.TimedOut());
+  EXPECT_FALSE(se.Kill());  // the run is over
+}
+
+TEST_F(ScriptEngineFixture, LoadRefreshesTheLuaMemoryFigure) {  // B2: INFO used_memory_lua after SCRIPT LOAD
+  const size_t before = se.lua_memory();
+  std::string body = "local t = {";
+  for (int i = 0; i < 2000; ++i) body += "'s" + std::to_string(i) + "',";
+  body += "} return t";
+  ASSERT_TRUE(se.Load(body).ok());
+  EXPECT_GT(se.lua_memory(), before);
 }
 
 }  // namespace

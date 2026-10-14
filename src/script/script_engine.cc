@@ -141,15 +141,27 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
   } guard{*this};
   phase_ = kRunning;
   Host host(*this, caller, *sha, req.busy_threshold_ms);
+  const size_t reply_start = out.buffer().size();
   const auto r =
       sandbox_->Run(*sha, req.keys != nullptr ? *req.keys : kNone, req.args != nullptr ? *req.args : kNone,
-                    host, {req.caller_resp, req.busy_threshold_ms > 0}, out);
+                    host, {req.busy_threshold_ms > 0}, out);
+  // B1: the run ends here, atomically with Kill()'s CAS. A Kill() that won after the script's last kill
+  // check answered +OK, so it must still kill this run: its reply becomes the kill error (without a script
+  // location: the script had already returned) and the caller undoes its writes. Any later Kill() sees
+  // kIdle and answers NOTBUSY.
+  if (phase_.exchange(kIdle) == kKilled && !r.killed) {
+    out.Truncate(reply_start);
+    out.Error("ERR " + std::string(kScriptErrKilled) + " script: " + *sha + ".");
+    return {true};
+  }
   return {r.killed};
 }
 
 Result<std::string> ScriptEngine::Load(std::string_view body) {
   std::lock_guard<std::mutex> lock(mu_);
-  return LookupOrCompile(body, false);
+  Result<std::string> sha = LookupOrCompile(body, false);
+  lua_memory_ = sandbox_->memory_bytes();  // INFO used_memory_lua, as after EVAL
+  return sha;
 }
 
 std::vector<bool> ScriptEngine::Exists(const std::vector<std::string>& shas) const {
