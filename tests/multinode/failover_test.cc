@@ -28,11 +28,13 @@ void ExpectStaysDown(TestServer& replica, size_t log_mark, int64_t seq) {
       WaitFor([&] { return replica.Stderr().find(kFullResyncLog, log_mark) != std::string::npos; }, 10s))
       << replica.Stderr().substr(log_mark);
   auto c = Client(replica);
+  bool connected = false;
   const auto until = std::chrono::steady_clock::now() + 1500ms;
-  while (std::chrono::steady_clock::now() < until) {
-    EXPECT_NE(LinkState(*c), "connected");
+  while (!connected && std::chrono::steady_clock::now() < until) {
+    connected = LinkState(*c) == "connected";
     std::this_thread::sleep_for(50ms);
   }
+  EXPECT_FALSE(connected) << "the replica's link came up after a FULLRESYNC";
   EXPECT_EQ(Sequence(*c), seq);
 }
 
@@ -113,6 +115,53 @@ TEST(Failover, PromoteUnderLoadThenRepointSecondReplica) {
   }
 }
 
+// F7: the case above with B strictly behind A, made certain. Pausing B alone is not enough (frames
+// already in its socket buffers would still arrive once it thaws), so the master drops B's silent link
+// (repl-timeout 1 s while B is paused) and the load runs on for 200 ms that A applies and B never
+// receives. Then the master dies: A's backlog serves B, which continues and converges.
+TEST(Failover, PromoteThenRepointASecondReplicaThatIsBehind) {
+  const uint32_t seed = Seed();
+  SCOPED_TRACE("seed " + std::to_string(seed));
+  TestServer m(TIDESKV_SERVER_BIN);
+  TestServer a(TIDESKV_SERVER_BIN, {.extra_args = ReplicaOfArgs(m)});
+  TestServer b(TIDESKV_SERVER_BIN, {.extra_args = ReplicaOfArgs(m)});
+  ASSERT_TRUE(WaitConnected(a));
+  ASSERT_TRUE(WaitConnected(b));
+  auto mc = Client(m);
+  Workload load(m.port(), seed, kClients);
+  load.Start();
+  std::this_thread::sleep_for(1s);
+  b.Pause();
+  ASSERT_EQ(mc->Command({"CONFIG", "SET", "repl-timeout", "1"}).str, "OK");
+  ASSERT_TRUE(WaitFor([&] { return InfoField(*mc, "replication", "connected_slaves") == 1; }, 30s));
+  ASSERT_EQ(mc->Command({"CONFIG", "SET", "repl-timeout", "60"}).str, "OK");
+  const uint64_t acked_at_drop = load.acked_writes();
+  std::this_thread::sleep_for(200ms);  // writes B will never get from this master
+  ASSERT_GT(load.acked_writes(), acked_at_drop);
+  m.Kill9();
+  load.Stop();
+  ReportLoad(load);
+  b.Resume();
+  auto ac = Client(a);
+  auto bc = Client(b);
+  ASSERT_TRUE(WaitFor([&] { return LinkState(*ac) != "connected" && LinkState(*bc) != "connected"; }, 30s));
+  const int64_t a_seq = Sequence(*ac);
+  const int64_t b_seq = Sequence(*bc);
+  const int64_t a_first = InfoField(*ac, "replication", "repl_backlog_first_byte_offset");
+  std::printf("[ multinode ] A seq %lld, B seq %lld, A backlog from %lld\n", static_cast<long long>(a_seq),
+              static_cast<long long>(b_seq), static_cast<long long>(a_first));
+  ASSERT_GT(b_seq, 0);
+  ASSERT_LT(b_seq, a_seq);
+  ASSERT_GE(b_seq + 1, a_first);
+  ASSERT_EQ(ac->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
+  const size_t log_mark = b.Stderr().size();
+  ASSERT_EQ(bc->Command({"REPLICAOF", "127.0.0.1", std::to_string(a.port())}).str, "OK");
+  ASSERT_TRUE(WaitConnected(b)) << b.Stderr().substr(log_mark);
+  EXPECT_EQ(InfoField(*ac, "stats", "sync_partial_ok"), 1);
+  EXPECT_EQ(InfoField(*ac, "stats", "sync_full"), 0);
+  ExpectConverged(a, {&b});
+}
+
 // Review Focus #3: writes the old master took while its replica was cut off are never merged into the
 // promoted replica; the old master, ahead of the new master's history, gets FULLRESYNC and stays down.
 TEST(Failover, OldMasterWithUnreplicatedWritesNeverMerges) {
@@ -135,9 +184,12 @@ TEST(Failover, OldMasterWithUnreplicatedWritesNeverMerges) {
   }
   const std::string m_digest = Digest(*mc);
   const int64_t m_seq = Sequence(*mc);
-  // Promote before the replica's reconnect backoff (1 s) runs out.
+  // The thawed replica must not reconnect before it is promoted: with a password on the master (this
+  // connection stays authenticated) its PSYNC is refused with NOAUTH and it backs off.
+  ASSERT_EQ(mc->Command({"CONFIG", "SET", "requirepass", "f7-no-reconnect"}).str, "OK");
   r.Resume();
   ASSERT_EQ(rc->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
+  ASSERT_EQ(mc->Command({"CONFIG", "SET", "requirepass", ""}).str, "OK");
   EXPECT_EQ(rc->Command(exists_lost).integer, 0);
   ASSERT_LT(Sequence(*rc), m_seq);
   const size_t log_mark = m.Stderr().size();
