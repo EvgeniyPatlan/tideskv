@@ -225,6 +225,7 @@ std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
   ReplClient::Callbacks cb;
   cb.identity = [this] { return identity(); };
   cb.persist_identity = [this](const ReplIdentity& id) { return PersistAndPublish(id); };
+  cb.trim_backlog = options_.role.trim_backlog;
   ReplClient::ConfigSnapshotFn config = options_.role.config;
   if (!config) config = [] { return ConfigValues{}; };
   return std::make_shared<ReplClient>(*options_.role.engine, log_, std::move(config), std::move(cb),
@@ -249,6 +250,36 @@ void ReplicationManager::DropAllReplicas() {
     doomed.swap(senders_);
   }
   for (auto& s : doomed) s->Stop();  // outside mu_: joins
+}
+
+uint64_t ReplicationManager::OldestNeeded() const {
+  std::lock_guard lock(mu_);
+  uint64_t oldest = kNoReplicaNeeds;
+  for (const auto& s : senders_) {
+    if (s->alive()) oldest = std::min(oldest, s->oldest_needed());
+  }
+  for (const auto& [id, p] : pending_) oldest = std::min(oldest, std::max<uint64_t>(p.next_seq, 1));
+  return oldest;
+}
+
+void ReplicationManager::DropReplicasNeeding(uint64_t up_to) {
+  std::vector<std::unique_ptr<ReplSender>> doomed;
+  {
+    std::lock_guard lock(mu_);
+    const auto split = std::stable_partition(senders_.begin(), senders_.end(),
+                                             [&](const auto& s) { return s->oldest_needed() > up_to; });
+    std::move(split, senders_.end(), std::back_inserter(doomed));
+    senders_.erase(split, senders_.end());
+    std::erase_if(pending_,
+                  [&](const auto& kv) { return std::max<uint64_t>(kv.second.next_seq, 1) <= up_to; });
+  }
+  for (auto& s : doomed) {  // outside mu_: joins
+    spdlog::warn(
+        "dropping replica {}:{}: it needs seq {}, but the backlog is trimmed through {}; it needs a "
+        "full resynchronisation",
+        s->peer_ip(), s->listening_port(), s->oldest_needed(), up_to);
+    s->Stop();
+  }
 }
 
 void ReplicationManager::TickLoop() {

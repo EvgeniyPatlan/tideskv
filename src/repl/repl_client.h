@@ -41,11 +41,15 @@ class ReplClient {
     std::function<Status(const ReplIdentity& id)> persist_identity;
     std::function<void(const std::string& replid)> on_adopt;  // optional: after a new replid is persisted
     std::function<void(ReplicaLinkState)> on_state;           // optional: every state change
+    // Optional: trims the backlog (D18). Called on the client thread between batches, at most every
+    // trim_interval, so a trim never runs concurrently with an apply. A failure is logged, not fatal.
+    std::function<Status()> trim_backlog;
   };
   struct Options {
     std::chrono::milliseconds backoff_initial{1000};  // D19: 1 s, 2 s, 4 s ... 30 s
     std::chrono::milliseconds backoff_max{30000};
     std::chrono::milliseconds ack_interval{1000};
+    std::chrono::milliseconds trim_interval{1000};
   };
 
   // config is read at each connection attempt (masterauth, masteruser, repl-timeout, port and the
@@ -84,6 +88,7 @@ class ReplClient {
   Status ParseFrames();
   Status HandleFrame(const std::vector<std::string>& args);
   Status MaybeAck(int fd);
+  void MaybeTrim();
   void SetState(ReplicaLinkState s);
   void WaitBackoff(std::chrono::milliseconds d);
   bool stopping() const { return stop_.load(std::memory_order_acquire); }
@@ -102,6 +107,7 @@ class ReplClient {
   resp::RequestParser parser_;
   SteadyClock::time_point last_io_{};
   SteadyClock::time_point last_ack_{};
+  SteadyClock::time_point last_trim_{};
   bool ack_due_ = false;
   uint64_t acked_ = 0;
 

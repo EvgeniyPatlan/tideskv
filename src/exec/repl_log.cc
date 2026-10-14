@@ -79,6 +79,12 @@ Status ReplLog::Recover() {
   uint64_t first = 1;
   if (Status st = RecoverLast(**view, &last, &cum); !st.ok()) return st;
   if (Status st = RecoverFirst(**view, last, &first); !st.ok()) return st;
+  // CF3: trimming keeps the newest batch, so first <= last; last + 1 means everything up to last is
+  // gone (a full sync's baseline, M6b). Anything else is a damaged sys/repl_first.
+  if (first == 0 || first > last + 1) {
+    return Status::Corruption("sys/repl_first " + std::to_string(first) + " is outside [1, " +
+                              std::to_string(last + 1) + "]");
+  }
   std::lock_guard lock(mu_);
   cum_ = cum;
   first_.store(first, std::memory_order_release);
@@ -156,5 +162,45 @@ uint64_t ReplLog::WaitBeyond(uint64_t seq, std::chrono::milliseconds timeout) co
 }
 
 void ReplLog::SetFirstRetained(uint64_t first) { first_.store(first, std::memory_order_release); }
+
+// One txn: range-delete replog[first .. up_to] and persist repl_first = up_to + 1 (D18). Begun and
+// committed under mu_: no commit section runs meanwhile, and the keys it writes are disjoint from any
+// commit section's (replog[last()+1] and keyspace CFs), so it cannot hit or cause a kConflict.
+Status ReplLog::TrimLocked(uint64_t up_to) {
+  const uint64_t last = last_.load(std::memory_order_relaxed);
+  if (up_to >= last) {
+    return Status::InvalidArgument("cannot trim the replication log to " + std::to_string(up_to) +
+                                   ": the newest batch " + std::to_string(last) + " is always kept");
+  }
+  const uint64_t first = first_.load(std::memory_order_relaxed);
+  if (up_to < first) return Status::Ok();
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  std::string next;
+  coding::PutFixed64BE(&next, up_to + 1);
+  if (Status st = (*txn)->DeleteRange(ColumnFamily::kReplog, encoding::ReplogKey(first),
+                                      encoding::ReplogKey(up_to + 1));
+      !st.ok()) {
+    return st;
+  }
+  if (Status st = (*txn)->Put(ColumnFamily::kSys, kReplFirstKey, next); !st.ok()) return st;
+  if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  first_.store(up_to + 1, std::memory_order_release);
+  return Status::Ok();
+}
+
+Status ReplLog::Trim(uint64_t up_to) {
+  std::lock_guard lock(mu_);
+  return TrimLocked(up_to);
+}
+
+Status ReplLog::TrimUnlessFenced(uint64_t up_to, bool* trimmed) {
+  *trimmed = false;
+  std::lock_guard lock(mu_);
+  if (fenced()) return Status::Ok();
+  if (Status st = TrimLocked(up_to); !st.ok()) return st;
+  *trimmed = true;
+  return Status::Ok();
+}
 
 }  // namespace tideskv

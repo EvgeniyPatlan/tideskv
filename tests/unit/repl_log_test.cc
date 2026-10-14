@@ -473,5 +473,72 @@ TEST(ReplLogTest, NoLocalCommitLandsAfterTheFenceReturns) {
   }
 }
 
+// CF3: a stored first retained seq must be in [1, last + 1].
+TEST(ReplLogTest, RecoverRejectsAFirstOutsideOneToLastPlusOne) {
+  for (const uint64_t stored : {uint64_t{0}, uint64_t{1}, uint64_t{4}, uint64_t{5}, uint64_t{100}}) {
+    InMemoryStorage s;
+    FakeClock clock;
+    {
+      ReplLog log(s, clock);
+      ASSERT_TRUE(log.Recover().ok());
+      for (int i = 1; i <= 3; ++i) ASSERT_TRUE(CommitPuts(s, log, MetaPut("k" + std::to_string(i))).ok());
+    }
+    std::string first;
+    coding::PutFixed64BE(&first, stored);
+    auto txn = s.BeginWrite();
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kSys, "repl_first", first).ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
+    ReplLog log(s, clock);
+    const Status st = log.Recover();
+    if (stored >= 1 && stored <= 4) {  // last + 1 = 4: everything was trimmed (a full sync baseline)
+      EXPECT_TRUE(st.ok()) << stored << ": " << st.ToString();
+      EXPECT_EQ(log.first_retained(), stored);
+    } else {
+      EXPECT_EQ(st.code(), StatusCode::kCorruption) << stored;
+    }
+  }
+}
+
+// CF3: the newest batch is never trimmed, whatever the caller asks for.
+TEST(ReplLogTest, TrimRefusesTheNewestBatch) {
+  InMemoryStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  EXPECT_EQ(log.Trim(0).code(), StatusCode::kInvalidArgument);  // empty log: nothing may go
+  for (int i = 1; i <= 4; ++i) ASSERT_TRUE(CommitPuts(s, log, MetaPut("k" + std::to_string(i))).ok());
+  EXPECT_EQ(log.Trim(4).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(log.Trim(9).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(log.first_retained(), 1u);
+  EXPECT_TRUE(ReplogAt(s, 1).ok());
+  ASSERT_TRUE(log.Trim(3).ok());
+  EXPECT_EQ(log.first_retained(), 4u);
+  ASSERT_TRUE(log.Trim(2).ok());  // below first: nothing to do
+  EXPECT_EQ(log.first_retained(), 4u);
+  EXPECT_TRUE(ReplogAt(s, 4).ok());
+  ASSERT_TRUE(CommitPuts(s, log, MetaPut("k5")).ok());  // commits continue after a trim
+  EXPECT_EQ(log.last(), 5u);
+}
+
+TEST(ReplLogTest, TrimUnlessFencedDoesNothingOnceFenced) {
+  InMemoryStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  for (int i = 1; i <= 4; ++i) ASSERT_TRUE(CommitPuts(s, log, MetaPut("k" + std::to_string(i))).ok());
+  bool trimmed = true;
+  log.FenceLocalWrites(true);
+  ASSERT_TRUE(log.TrimUnlessFenced(2, &trimmed).ok());
+  EXPECT_FALSE(trimmed);
+  EXPECT_EQ(log.first_retained(), 1u);
+  EXPECT_TRUE(ReplogAt(s, 1).ok());
+  ASSERT_TRUE(log.Trim(1).ok());  // the replica's applier is not fenced out
+  EXPECT_EQ(log.first_retained(), 2u);
+  log.FenceLocalWrites(false);
+  ASSERT_TRUE(log.TrimUnlessFenced(2, &trimmed).ok());
+  EXPECT_TRUE(trimmed);
+  EXPECT_EQ(log.first_retained(), 3u);
+}
+
 }  // namespace
 }  // namespace tideskv

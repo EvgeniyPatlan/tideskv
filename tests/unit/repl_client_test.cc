@@ -18,12 +18,14 @@
 #include <vector>
 
 #include "common/string_util.h"
+#include "repl/backlog_trimmer.h"
 #include "repl/repl_sender.h"
 #include "repl/repl_state.h"
 #include "repl/socket_io.h"
 #include "resp/request_parser.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
+#include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "support/resp_client.h"
 
@@ -141,6 +143,7 @@ struct ReplClientTest : ::testing::Test {
       std::lock_guard lock(mu);
       adopted.push_back(id);
     };
+    cb.trim_backlog = trim_hook;
     cb.on_state = [this](ReplicaLinkState s) {
       std::lock_guard lock(mu);
       states.push_back(s);
@@ -203,8 +206,9 @@ struct ReplClientTest : ::testing::Test {
   }
 
   test::CommandHarness master;
-  InMemoryStorage replica_storage;
+  test::FaultyStorage replica_storage;  // counts the write txns alive at once
   test::ReplicaStack replica{replica_storage};
+  std::function<Status()> trim_hook;
   FakeMaster fake;
   std::mutex mu;
   ConfigValues cfg;
@@ -488,6 +492,44 @@ TEST_F(ReplClientTest, StopIsPromptDuringConnectAndBackoff) {
   start = std::chrono::steady_clock::now();
   client->Stop();
   EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+}
+
+// D18 / CF10: a replica trims its log on the applier thread, between batches, never during an apply
+// (Engine::ApplyReplicated does not retry kConflict).
+TEST_F(ReplClientTest, ReplicaTrimsBetweenBatchesWithoutConcurrentCommits) {
+  for (int i = 0; i < 1000; ++i) Write({"SET", "k" + std::to_string(i % 50), std::to_string(i)});
+  ASSERT_EQ(master_last(), 1000u);
+  {
+    std::lock_guard lock(mu);
+    cfg.repl_backlog_size = 2000;  // a few dozen batches
+  }
+  BacklogTrimmer::Hooks hooks;
+  hooks.config = [this] {
+    std::lock_guard lock(mu);
+    return cfg;
+  };
+  BacklogTrimmer trimmer(replica_storage, replica.log, nullptr, replica.clock, hooks, {});
+  std::atomic<int> trims{0};
+  std::atomic<int> during_apply{0};  // the test hook counter: trims that saw another write txn open
+  trim_hook = [&] {
+    if (replica_storage.open_txns.load() != 0) ++during_apply;
+    ++trims;
+    return trimmer.RunOnReplica();
+  };
+  ReplClient::Options o = Fast();
+  o.trim_interval = 0ms;  // every chance it gets
+  StartClient(o);
+  Link l = AcceptLink();
+  Handshake(l, "CONTINUE " + master_id());
+  for (uint64_t from = 1; from <= 1000; from += 100) SendBatches(l, from, from + 99);
+  ASSERT_TRUE(WaitAck(l, 1000, 10s));
+  EXPECT_EQ(replica.log.last(), 1000u);
+  EXPECT_GT(trims.load(), 1);
+  EXPECT_EQ(during_apply.load(), 0);
+  EXPECT_EQ(replica_storage.max_open_txns.load(), 1);  // no two write txns were ever open at once
+  EXPECT_GT(replica.log.first_retained(), 900u);
+  EXPECT_GT(trimmer.trimmed_total(), 900u);
+  EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
 }
 
 TEST(ReplicaLinkStateNames, MatchRole) {

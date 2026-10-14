@@ -234,5 +234,44 @@ TEST_F(ReplicationIT, ReplicaWithForeignDataGetsFullResyncAndStaysDown) {
   EXPECT_EQ(r->Command({"EXISTS", "theirs"}).integer, 0);
 }
 
+// D18: a master whose backlog was trimmed past what a stopped replica holds answers its PSYNC with
+// +FULLRESYNC; M6a has no full sync, so the replica stays down, logs the M6b line and applies nothing.
+TEST_F(ReplicationIT, TrimmedBacklogForcesFullResyncForAFarBehindReplica) {
+  TempDir dir("tideskv-it-replica");
+  TestServer::Options o;
+  o.dir = dir.str();
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  Follow(*replica);
+  auto m = Client(master);
+  {
+    auto r = Client(*replica);
+    MixedWrites(*m, 100);
+    ASSERT_TRUE(Synced(*m, *r));
+  }
+  ASSERT_EQ(replica->Terminate(), 0);
+  const int64_t applied = RoleOffset(*m);
+  ASSERT_EQ(m->Command({"CONFIG", "SET", "repl-backlog-size", "2000"}).str, "OK");
+  const int64_t full_before = InfoField(*m, "stats", "sync_full");
+  MixedWrites(*m, 200);
+  // The trimmer ticks every second; it keeps about 2000 bytes, far less than the 200 batches.
+  ASSERT_TRUE(WaitFor(
+      [&] { return InfoField(*m, "replication", "repl_backlog_first_byte_offset") > applied + 1; }, 10s))
+      << InfoString(*m, "replication", "repl_backlog_first_byte_offset");
+  EXPECT_LT(InfoField(*m, "replication", "repl_backlog_histlen"), 200);
+  EXPECT_EQ(InfoField(*m, "replication", "repl_backlog_first_byte_offset") +
+                InfoField(*m, "replication", "repl_backlog_histlen") - 1,
+            RoleOffset(*m));
+  o.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())};
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  auto r = Client(*replica);
+  EXPECT_TRUE(WaitFor(
+      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
+      10s))
+      << replica->Stderr();
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") > full_before; }, 5s));
+  EXPECT_NE(LinkState(*r), "connected");
+  EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), applied);  // nothing was applied
+}
+
 }  // namespace
 }  // namespace tideskv::test

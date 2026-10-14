@@ -20,6 +20,10 @@ class FaultyStorage final : public Storage {
   std::atomic<int> fail_release_savepoint_in{-1};
   // Successful Savepoint calls minus successful ReleaseSavepoint calls, over every transaction.
   std::atomic<int> unreleased_savepoints{0};
+  // Write transactions alive now, the most ever alive at once, and successful commits.
+  std::atomic<int> open_txns{0};
+  std::atomic<int> max_open_txns{0};
+  std::atomic<int> commits{0};
 
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override {
     auto txn = inner_.BeginWrite();
@@ -44,7 +48,15 @@ class FaultyStorage final : public Storage {
  private:
   class Txn final : public WriteTxn {
    public:
-    Txn(std::unique_ptr<WriteTxn> inner, FaultyStorage& owner) : inner_(std::move(inner)), owner_(owner) {}
+    Txn(std::unique_ptr<WriteTxn> inner, FaultyStorage& owner) : inner_(std::move(inner)), owner_(owner) {
+      const int open = ++owner_.open_txns;
+      int max = owner_.max_open_txns.load();
+      while (open > max && !owner_.max_open_txns.compare_exchange_weak(max, open)) {
+      }
+    }
+    ~Txn() override { --owner_.open_txns; }
+    Txn(const Txn&) = delete;
+    Txn& operator=(const Txn&) = delete;
     Result<std::string> Get(ColumnFamily cf, std::string_view k) override { return inner_->Get(cf, k); }
     Result<std::unique_ptr<Iterator>> NewIterator(ColumnFamily cf, IterOptions o) override {
       return inner_->NewIterator(cf, std::move(o));
@@ -75,7 +87,9 @@ class FaultyStorage final : public Storage {
     }
     Status Commit() override {
       if (Trip(owner_.fail_commit_in)) return Status::IOError("injected commit failure");
-      return inner_->Commit();
+      Status st = inner_->Commit();
+      if (st.ok()) ++owner_.commits;
+      return st;
     }
     Status Rollback() override { return inner_->Rollback(); }
 

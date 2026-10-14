@@ -122,8 +122,15 @@ Status App::CreateReplication() {
       spdlog::warn("cannot record replicaof in the config: {}", st.ToString());
     }
   };
+  h.trim_backlog = [this] { return trimmer_->RunOnReplica(); };  // the client starts after trimmer_ exists
   replication_ = std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_,
                                                             std::move(identity).value(), std::move(o));
+  repl::BacklogTrimmer::Hooks th;
+  th.config = [this] { return config_->Snapshot(); };
+  th.oldest_needed = [this] { return replication_->OldestNeeded(); };
+  th.drop_replicas_needing = [this](uint64_t up_to) { replication_->DropReplicasNeeding(up_to); };
+  trimmer_ = std::make_unique<repl::BacklogTrimmer>(*storage_, *repl_log_, storage_.get(), clock_,
+                                                    std::move(th), repl::BacklogTrimmer::Options{});
   return Status::Ok();
 }
 
@@ -169,6 +176,7 @@ Status App::Start() {
   if (Status st = server_->Start(); !st.ok()) return st;
   scheduler_->Start();
   replication_->Start();
+  trimmer_->Start();  // it does nothing while this node is a (fenced) replica
   return Status::Ok();
 }
 
@@ -192,6 +200,7 @@ void App::RequestShutdown() {
 void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
+  if (trimmer_) trimmer_->Stop();              // it calls into replication_ and trims the replog
   if (replication_) replication_->Shutdown();  // replica links first: senders read the replog (M6a)
   scripts_.KillForShutdown();                  // a running script must not hold up the worker threads
   server_->Stop();                             // no command can touch storage after this
@@ -199,6 +208,7 @@ void App::Stop() {
   engine_.reset();                             // references storage_, so it goes first
   scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
   oids_.reset();       // likewise (its persist hook checkpoints storage_)
+  trimmer_.reset();    // its thread and the replica client (its other caller) are stopped
   repl_log_.reset();   // engine_ and oids_ committed through it
   storage_.reset();    // flushes and closes TidesDB
 }

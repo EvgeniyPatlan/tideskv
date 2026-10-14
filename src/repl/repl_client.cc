@@ -244,6 +244,7 @@ Status ReplClient::Stream(int fd) {
   if (Status st = ParseFrames(); !st.ok()) return st;  // bytes that followed +CONTINUE
   while (!stopping()) {
     if (Status st = MaybeAck(fd); !st.ok()) return st;
+    MaybeTrim();  // an idle link trims too (by age)
     Status st = ReadSome(fd, &in_, std::min(options_.ack_interval, timeout_));
     const auto now = SteadyClock::now();
     if (st.ok()) {
@@ -295,7 +296,18 @@ Status ReplClient::HandleFrame(const std::vector<std::string>& args) {
     spdlog::error("cannot apply replicated batch {}: {}", seq, st.ToString());
     return st;
   }
+  MaybeTrim();  // between batches: the apply has committed, the next has not begun (CF10)
   return Status::Ok();
+}
+
+// D18 on a replica: the trim runs on this thread, the only committer, so never during an apply.
+void ReplClient::MaybeTrim() {
+  if (!cb_.trim_backlog) return;
+  const auto now = SteadyClock::now();
+  if (now - last_trim_ < options_.trim_interval) return;
+  last_trim_ = now;
+  if (Status st = cb_.trim_backlog(); !st.ok())
+    spdlog::warn("replica backlog trim failed: {}", st.ToString());
 }
 
 // Exactly `REPLCONF ACK <seq>` (CF12): every ack_interval, after a PING, and on catching up.

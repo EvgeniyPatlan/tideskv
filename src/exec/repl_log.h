@@ -50,12 +50,24 @@ class ReplLog {
   bool fenced() const { return fenced_.load(std::memory_order_acquire); }
   // Backlog trimming (Task 14) updates first_retained after its own trim txn commits.
   void SetFirstRetained(uint64_t first);
+  // Backlog trimming (D18): one txn range-deletes replog[first_retained() .. up_to] and persists
+  // sys/repl_first = up_to + 1; it is begun and committed under mu_, so it never interleaves with a
+  // commit section, and then first_retained() becomes up_to + 1. Not refused by the fence: a replica's
+  // applier trims between batches. InvalidArgument when up_to >= last(): the newest batch is always kept,
+  // so last and cum_bytes survive a restart. Nothing to do (Ok) when up_to < first_retained().
+  // Conflicts: the txn writes only replog keys below last() and sys/repl_first; a commit section writes
+  // replog[last()+1] and keyspace CFs, and nothing else writes repl_first, so the two never conflict.
+  Status Trim(uint64_t up_to);
+  // The master's trimmer thread: Trim, unless local writes are fenced (checked under mu_), in which case
+  // nothing is written and *trimmed is false. Once FenceLocalWrites(true) returns, no such trim commits.
+  Status TrimUnlessFenced(uint64_t up_to, bool* trimmed);
 
  private:
   // Requires mu_: puts replog[seq] = record on txn, commits it and publishes seq.
   Status AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum);
   Status RecoverLast(ReadView& view, uint64_t* last, uint64_t* cum);
   Status RecoverFirst(ReadView& view, uint64_t last, uint64_t* first);
+  Status TrimLocked(uint64_t up_to);  // requires mu_
 
   Storage& storage_;
   const Clock& clock_;

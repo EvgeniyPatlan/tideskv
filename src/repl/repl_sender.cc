@@ -47,7 +47,8 @@ ReplSender::ReplSender(Storage& storage, ReplLog& log, Fd fd, uint64_t next_seq,
       log_(log),
       fd_(std::move(fd)),
       cb_(std::move(cb)),
-      next_(std::max<uint64_t>(next_seq, 1)),
+      start_(std::max<uint64_t>(next_seq, 1)),
+      next_(start_),
       parser_(kReplicaInputLimits),
       sent_(next_ - 1) {}
 

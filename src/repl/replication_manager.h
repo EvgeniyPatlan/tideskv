@@ -15,6 +15,7 @@
 #include "common/status.h"
 #include "exec/engine.h"
 #include "exec/repl_log.h"
+#include "repl/backlog_trimmer.h"
 #include "repl/repl_client.h"
 #include "repl/repl_sender.h"
 #include "repl/repl_state.h"
@@ -27,9 +28,9 @@
 // role changes REPLICAOF host port (BecomeReplica) and REPLICAOF NO ONE (BecomeMaster).
 //
 // Threads: a maintenance thread ticks every second to reap dead senders and expire pending hand-offs
-// (the Task 14 trimmer is a separate concern, so the tick does not piggyback on it). mu_ guards the
-// identity, the pending table, the sender list, the master address and the client pointer; it is never
-// held while calling the Engine, while blocked on a socket, or while joining a thread. role_mu_
+// (the Task 14 BacklogTrimmer is a separate thread: it asks OldestNeeded and calls DropReplicasNeeding). mu_
+// guards the identity, the pending table, the sender list, the master address and the client pointer; it is
+// never held while calling the Engine, while blocked on a socket, or while joining a thread. role_mu_
 // serialises role changes (and Shutdown's stop of the client); it is held across those joins, so nothing
 // a joined thread does may take it.
 namespace tideskv::repl {
@@ -45,6 +46,7 @@ class ReplicationManager final : public Replication {
     std::function<void(std::string_view error)> disconnect_blocked;  // D14: every blocked client
     std::function<Status()> reinit_oids;                             // CF7: OidAllocator::Init
     std::function<void(const std::string& value)> set_replicaof;     // D15: "host port", or "" for none
+    std::function<Status()> trim_backlog;  // D18: the replica's trim, run by its client between batches
   };
   struct Options {
     std::function<std::chrono::milliseconds()> repl_timeout;  // null = 60 s
@@ -82,6 +84,12 @@ class ReplicationManager final : public Replication {
 
   // Stops every sender (demotion, promotion: sub-replicas must resync, Redis disconnectSlaves; shutdown).
   void DropAllReplicas();
+  // Backlog trimming (D18). The oldest seq an attached replica or a pending hand-off still needs (a
+  // sender: max(acked, its start - 1) + 1); kNoReplicaNeeds when there is none.
+  uint64_t OldestNeeded() const;
+  // Stops the senders, and forgets the hand-offs, that need a seq <= up_to: they are beyond the backlog
+  // limits and will get +FULLRESYNC (M6b) when they come back. Joins outside mu_, as DropAllReplicas.
+  void DropReplicasNeeding(uint64_t up_to);
 
   // The replica link's I/O times (unix ms), for INFO. Defaults when there is no client.
   struct LinkTimes {

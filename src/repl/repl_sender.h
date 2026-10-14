@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -44,6 +45,8 @@ class ReplSender {
   void Stop();
 
   uint64_t acked() const { return acked_.load(std::memory_order_acquire); }  // last REPLCONF ACK seq
+  // The oldest seq the replica may still ask for (D18): past its ACK, and never below where it started.
+  uint64_t oldest_needed() const { return std::max(acked(), start_ - 1) + 1; }
   int64_t last_ack_ms() const { return last_ack_ms_.load(std::memory_order_acquire); }  // unix ms
   uint64_t sent() const { return sent_.load(std::memory_order_acquire); }               // last seq written
   bool alive() const { return alive_.load(std::memory_order_acquire); }  // false once the link dropped
@@ -67,6 +70,7 @@ class ReplSender {
   ReplLog& log_;
   Fd fd_;
   Callbacks cb_;
+  const uint64_t start_;  // the first seq streamed (the replica held start_ - 1)
   std::string peer_ip_;
   uint16_t listening_port_ = 0;
 

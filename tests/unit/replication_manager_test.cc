@@ -14,6 +14,7 @@
 
 #include "encoding/replog_codec.h"
 #include "exec/repl_log.h"
+#include "repl/backlog_trimmer.h"
 #include "repl/socket_io.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
@@ -204,6 +205,36 @@ TEST_F(ManagerTest, DestructorShutsDown) {
   Fd r1 = Attach(*m, 4);
   m.reset();
   EXPECT_TRUE(PeerClosed(r1.get()));
+}
+
+// Task 14: what the backlog trimmer may not delete, and the drop of replicas beyond the limits.
+TEST_F(ManagerTest, OldestNeededIsTheMinOverReplicasAndHandOffs) {
+  auto m = Make();
+  EXPECT_EQ(m->OldestNeeded(), kNoReplicaNeeds);
+  Fd r1 = Attach(*m, 4);
+  EXPECT_EQ(m->OldestNeeded(), 4u);  // holds 3, has not acknowledged yet
+  Fd r2 = Attach(*m, 2);
+  EXPECT_EQ(m->OldestNeeded(), 2u);
+  ASSERT_NE(ReadUntil(r2.get(), "\r\n$1\r\n3\r\n").find("$1\r\n3\r\n"), std::string::npos);
+  ASSERT_TRUE(WriteAll(r2.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());
+  EXPECT_TRUE(WaitFor([&] { return m->OldestNeeded() == 4u; }));  // the ACK raised it
+  m->HandlePsync({id.replid, 3}, {});                             // a hand-off that has not attached yet
+  EXPECT_EQ(m->OldestNeeded(), 3u);
+}
+
+TEST_F(ManagerTest, DropReplicasNeedingClosesOnlyTheLaggingLinks) {
+  auto m = Make();
+  Fd ahead = Attach(*m, 4);
+  Fd behind = Attach(*m, 2);
+  m->HandlePsync({id.replid, 3}, {});
+  m->DropReplicasNeeding(2);
+  EXPECT_TRUE(PeerClosed(behind.get()));
+  ASSERT_EQ(m->Replicas().size(), 1u);
+  EXPECT_EQ(m->pending_count(), 1u);
+  m->DropReplicasNeeding(3);  // the hand-off for 3 is forgotten; the replica needing 4 stays
+  EXPECT_EQ(m->pending_count(), 0u);
+  EXPECT_EQ(m->Replicas().size(), 1u);
+  EXPECT_EQ(m->OldestNeeded(), 4u);
 }
 
 // The hooks a role change runs, recorded in order with the fence state each one saw.
