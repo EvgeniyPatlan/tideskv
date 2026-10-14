@@ -44,6 +44,27 @@ TEST(BlockingRegistry, AddFindRemoveAndCounters) {
   EXPECT_EQ(r.blocking_keys(), 0u);
 }
 
+// M6a D14: demotion ends every wait with an error and closes each connection after it.
+TEST(BlockingRegistry, DisconnectAllEndsEveryWaitAndClosesTheConnections) {
+  BlockingRegistry r;
+  auto la = std::make_shared<test::FakeLink>();
+  auto lb = std::make_shared<test::FakeLink>();
+  auto a = MakeClient(r, 1, {"k1"}, la);
+  auto b = MakeClient(r, 2, {"k2", "k3"}, lb, 3);
+  r.Add(a);
+  r.Add(b);
+  EXPECT_EQ(r.DisconnectAll("UNBLOCKED state changed"), 2u);
+  EXPECT_EQ(la->Take(), (std::vector<std::string>{"-UNBLOCKED state changed\r\n"}));
+  EXPECT_EQ(lb->Take(), (std::vector<std::string>{"-UNBLOCKED state changed\r\n"}));
+  EXPECT_EQ(la->closes(), 1);
+  EXPECT_EQ(lb->closes(), 1);
+  EXPECT_EQ(r.blocked_clients(), 0u);
+  EXPECT_EQ(r.blocking_keys(), 0u);
+  EXPECT_FALSE(a->Cancel());  // the wait already ended
+  EXPECT_EQ(r.DisconnectAll("UNBLOCKED again"), 0u);
+  EXPECT_TRUE(la->Take().empty());
+}
+
 TEST(BlockingRegistry, AddingADuplicateClientIdReplacesTheOldEntry) {
   BlockingRegistry r;
   auto link = std::make_shared<test::FakeLink>();

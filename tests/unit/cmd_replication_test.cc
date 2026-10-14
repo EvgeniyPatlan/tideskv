@@ -2,10 +2,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "repl/replication_manager.h"
 #include "script/sha1hex.h"
 #include "support/command_harness.h"
+#include "support/replica_stack.h"
 
 namespace tideskv::test {
 namespace {
@@ -179,6 +184,186 @@ TEST(ReplconfCmd, AllowedWhileAScriptIsBusyAndQueuedInMulti) {
   EXPECT_EQ(h.Run({"MULTI"}), kOk);
   EXPECT_EQ(h.Run({"REPLCONF", "capa", "eof"}), "+QUEUED\r\n");
   EXPECT_EQ(h.Run({"EXEC"}), Arr({kOk}));
+}
+
+}  // namespace
+}  // namespace tideskv::test
+
+namespace tideskv::test {
+namespace {
+
+const std::string kAlready = "+OK Already connected to specified master\r\n";
+const std::string kUnblocked =
+    "-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n";
+
+TEST(ReplicaofCmd, ArityAndPortTexts) {
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"REPLICAOF"}), Err("ERR wrong number of arguments for 'replicaof' command"));
+  EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE", "x"}),
+            Err("ERR wrong number of arguments for 'replicaof' command"));
+  EXPECT_EQ(h.Run({"SLAVEOF", "x"}), Err("ERR wrong number of arguments for 'slaveof' command"));
+  for (const char* port : {"70000", "65536", "-1", "abc", ""}) {
+    EXPECT_EQ(h.Run({"REPLICAOF", "h", port}), Err("ERR Invalid master port")) << port;
+  }
+  EXPECT_TRUE(h.services.replication_.become_replica.empty());
+}
+
+TEST(ReplicaofCmd, BecomesAReplicaAndReportsAlreadyConnected) {
+  CommandHarness h;
+  auto& fake = h.services.replication_;
+  EXPECT_EQ(h.Run({"REPLICAOF", "Master.Example", "0"}), kOk);  // port 0 is accepted, the host never checked
+  EXPECT_EQ(h.Run({"replicaof", "master.example", "0"}), kAlready);  // case-insensitive host
+  EXPECT_EQ(h.Run({"SLAVEOF", "master.example", "65535"}), kOk);
+  EXPECT_EQ(fake.become_replica, (std::vector<std::pair<std::string, uint16_t>>{{"Master.Example", 0},
+                                                                                {"master.example", 65535}}));
+  EXPECT_TRUE(fake.IsReplica());
+}
+
+TEST(ReplicaofCmd, NoOneIsCaseInsensitiveAndAnswersOkOnAMaster) {
+  CommandHarness h;
+  auto& fake = h.services.replication_;
+  EXPECT_EQ(h.Run({"REPLICAOF", "no", "one"}), kOk);
+  EXPECT_EQ(h.Run({"REPLICAOF", "h", "1"}), kOk);
+  EXPECT_EQ(h.Run({"SLAVEOF", "No", "One"}), kOk);
+  EXPECT_EQ(fake.become_master, 2);
+  EXPECT_FALSE(fake.IsReplica());
+}
+
+TEST(ReplicaofCmd, RefusedOnAReplicaLink) {
+  CommandHarness h;
+  h.session.is_replica_link = true;
+  EXPECT_EQ(h.Run({"REPLICAOF", "h", "1"}), Err("ERR Command is not valid when client is a replica."));
+  EXPECT_TRUE(h.services.replication_.become_replica.empty());
+}
+
+TEST(ReplicaofCmd, QueuedInMultiAndAppliedAfterExec) {
+  CommandHarness h;
+  auto& fake = h.services.replication_;
+  EXPECT_EQ(h.Run({"MULTI"}), kOk);
+  EXPECT_EQ(h.Run({"REPLICAOF", "h", "1"}), "+QUEUED\r\n");
+  EXPECT_FALSE(fake.IsReplica());
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({kOk}));
+  EXPECT_TRUE(fake.IsReplica());
+  EXPECT_EQ(h.Run({"MULTI"}), kOk);
+  EXPECT_EQ(h.Run({"REPLICAOF", "H", "1"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"REPLICAOF", "no", "one"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({kAlready, kOk}));
+  EXPECT_FALSE(fake.IsReplica());
+}
+
+TEST(ReplicaofCmd, NotAllowedFromScripts) {
+  CommandHarness h;
+  for (const std::string c : {"return redis.call('replicaof', 'no', 'one')",
+                              "return redis.call('slaveof', 'h', '1')", "return redis.call('role')"}) {
+    EXPECT_EQ(h.Run({"EVAL", c, "0"}), Err("ERR This Redis command is not allowed from script script: " +
+                                           Sha1Hex(c) + ", on @user_script:1."));
+  }
+}
+
+TEST(RoleCmd, MasterShapes) {
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"ROLE"}), "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
+  EXPECT_EQ(h.Run({"ROLE", "x"}), Err("ERR wrong number of arguments for 'role' command"));
+  h.Run({"SET", "a", "1"});
+  h.Run({"SET", "b", "2"});
+  h.services.replication_.role_info.replicas = {{"10.0.0.1", 7000, 2, 0, true},
+                                                {"10.0.0.2", 7001, 1, 0, false}};
+  // Only live replicas, with port and offset as bulk strings (addReplyBulkLongLong).
+  EXPECT_EQ(h.Run({"ROLE"}),
+            "*3\r\n$6\r\nmaster\r\n:2\r\n*1\r\n*3\r\n$8\r\n10.0.0.1\r\n$4\r\n7000\r\n$1\r\n2\r\n");
+  const CommandSpec* spec = h.services.registry().Find("role");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_NE(spec->flags & kCmdFast, 0u);
+}
+
+TEST(RoleCmd, ReplicaShapes) {
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"REPLICAOF", "nonexistent-host", "6379"}), kOk);
+  EXPECT_EQ(h.Run({"ROLE"}),
+            "*5\r\n$5\r\nslave\r\n$16\r\nnonexistent-host\r\n:6379\r\n$7\r\nconnect\r\n:-1\r\n");
+  auto& info = h.services.replication_.role_info;
+  info.state = ReplicaLinkState::kConnected;
+  info.offset_or_minus1 = 43;
+  EXPECT_EQ(h.Run({"ROLE"}),
+            "*5\r\n$5\r\nslave\r\n$16\r\nnonexistent-host\r\n:6379\r\n$9\r\nconnected\r\n:43\r\n");
+}
+
+// The real ReplicationManager over the harness's in-memory stack, with the App's hooks wired to the
+// harness. Its replica client points at a port where nothing listens, so it never applies anything.
+struct RoleHarness : CommandHarness {
+  RoleHarness() {
+    auto id = repl::LoadOrCreateIdentity(services.storage_);
+    EXPECT_TRUE(id.ok());
+    repl::ReplicationManager::Options o;
+    o.role.engine = &services.engine_;
+    o.role.config = [this] { return services.config_.Snapshot(); };
+    o.role.stop_reaper = [this] { reaper_running = false; };
+    o.role.start_reaper = [this] { reaper_running = true; };
+    o.role.disconnect_blocked = [this](std::string_view e) { services.blocking_.DisconnectAll(e); };
+    o.role.reinit_oids = [this] { return services.oids_.Init(); };
+    o.role.set_replicaof = [this](const std::string& v) {
+      EXPECT_TRUE(services.config_.Set("replicaof", v.empty() ? "no one" : v, false).ok());
+    };
+    manager =
+        std::make_unique<repl::ReplicationManager>(services.storage_, services.repl_log_, *id, std::move(o));
+    services.real_replication = manager.get();
+  }
+  ~RoleHarness() { manager->Shutdown(); }
+
+  bool reaper_running = true;
+  std::unique_ptr<repl::ReplicationManager> manager;
+};
+
+TEST(RoleChange, DemotionUnblocksBlockedClientsAndClosesThem) {
+  RoleHarness h;
+  SecondClient b(h);
+  EXPECT_EQ(b.Run({"BLPOP", "list", "0"}), "");
+  ASSERT_TRUE(b.session.blocked);
+  EXPECT_EQ(h.Run({"REPLICAOF", "127.0.0.1", "1"}), kOk);
+  EXPECT_EQ(b.TakeUnblocked(), (std::vector<std::string>{kUnblocked}));
+  EXPECT_EQ(b.link->closes(), 1);
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 0u);
+  EXPECT_FALSE(h.reaper_running);
+}
+
+TEST(RoleChange, AReplicaIsReadOnlyUntilPromoted) {
+  RoleHarness h;
+  EXPECT_EQ(h.Run({"SET", "a", "1"}), kOk);
+  const std::string old_id = h.manager->replid();
+  const uint64_t last = h.services.repl_log_.last();
+  EXPECT_EQ(h.Run({"REPLICAOF", "127.0.0.1", "1"}), kOk);
+  EXPECT_EQ(h.services.config_.Snapshot().replicaof, "127.0.0.1 1");
+  EXPECT_EQ(h.Run({"SET", "a", "2"}), Err("READONLY You can't write against a read only replica."));
+  EXPECT_EQ(h.Run({"REPLICAOF", "127.0.0.1", "1"}), kAlready);
+  EXPECT_EQ(h.Run({"ROLE"}).substr(0, 14), "*5\r\n$5\r\nslave\r");
+  EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE"}), kOk);
+  EXPECT_EQ(h.services.config_.Snapshot().replicaof, "");
+  EXPECT_TRUE(h.reaper_running);
+  EXPECT_EQ(h.Run({"SET", "a", "3"}), kOk);
+  EXPECT_NE(h.manager->replid(), old_id);  // INFO's master_replid; replid2 is checked in Task 13
+  const repl::ReplIdentity now = h.manager->identity();
+  ASSERT_FALSE(now.history.empty());
+  EXPECT_EQ(now.history[0], (repl::HistoryEntry{old_id, last}));
+  auto persisted = repl::LoadOrCreateIdentity(h.services.storage_);
+  ASSERT_TRUE(persisted.ok());
+  EXPECT_EQ(persisted->replid, now.replid);
+  EXPECT_EQ(h.Run({"ROLE"}), "*3\r\n$6\r\nmaster\r\n:" + std::to_string(last + 1) + "\r\n*0\r\n");
+}
+
+// CF7: a promoted replica allocates object ids above the high-water mark it applied from its master.
+TEST(RoleChange, APromotedReplicaLeasesOidsAboveTheMastersHighWaterMark) {
+  CommandHarness master;
+  EXPECT_EQ(master.Run({"HSET", "h", "f", "v"}), Int(1));  // leases the master's first oid block
+  const uint64_t master_hwm = master.services.oids_.hwm();
+  ASSERT_GT(master_hwm, 1u);
+  RoleHarness replica;
+  EXPECT_EQ(replica.Run({"REPLICAOF", "127.0.0.1", "1"}), kOk);
+  ASSERT_TRUE(
+      ShipAll(master.services.storage_, master.services.repl_log_.last(), replica.services.engine_).ok());
+  EXPECT_EQ(replica.Run({"REPLICAOF", "NO", "ONE"}), kOk);
+  auto oid = replica.services.oids_.Next();
+  ASSERT_TRUE(oid.ok()) << oid.status().ToString();
+  EXPECT_GE(*oid, master_hwm);
 }
 
 }  // namespace

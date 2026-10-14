@@ -5,8 +5,12 @@
 
 #include <chrono>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "encoding/replog_codec.h"
 #include "exec/repl_log.h"
@@ -200,6 +204,103 @@ TEST_F(ManagerTest, DestructorShutsDown) {
   Fd r1 = Attach(*m, 4);
   m.reset();
   EXPECT_TRUE(PeerClosed(r1.get()));
+}
+
+// The hooks a role change runs, recorded in order with the fence state each one saw.
+struct RoleTest : ManagerTest {
+  std::unique_ptr<ReplicationManager> MakeWithHooks() {
+    ReplicationManager::Options o;
+    o.role.stop_reaper = [this] { Record("stop_reaper"); };
+    o.role.start_reaper = [this] { Record("start_reaper"); };
+    o.role.disconnect_blocked = [this](std::string_view e) {
+      Record("disconnect");
+      error = std::string(e);
+    };
+    o.role.reinit_oids = [this] {
+      Record("reinit_oids");
+      return Status::Ok();
+    };
+    o.role.set_replicaof = [this](const std::string& v) { Record("replicaof=" + v); };
+    auto m = std::make_unique<ReplicationManager>(storage, log, id, std::move(o));
+    m->Start();
+    return m;
+  }
+  void Record(const std::string& what) {
+    std::lock_guard lock(mu);
+    events.push_back(what + (log.fenced() ? " fenced" : ""));
+  }
+  std::vector<std::string> Take() {
+    std::lock_guard lock(mu);
+    return std::exchange(events, {});
+  }
+
+  std::mutex mu;
+  std::vector<std::string> events;
+  std::string error;
+};
+
+TEST_F(RoleTest, BecomeReplicaFencesThenStopsTheReaperUnblocksAndDropsReplicas) {
+  auto m = MakeWithHooks();
+  Fd sub = Attach(*m, 4);
+  EXPECT_TRUE(m->BecomeReplica("Master.Example", 6379));
+  EXPECT_TRUE(log.fenced());
+  EXPECT_EQ(m->role(), ReplRole::kReplica);
+  EXPECT_EQ(Take(), (std::vector<std::string>{"stop_reaper fenced", "disconnect fenced",
+                                              "replicaof=Master.Example 6379 fenced"}));
+  EXPECT_EQ(error,
+            "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)");
+  EXPECT_TRUE(m->Replicas().empty());
+  EXPECT_TRUE(PeerClosed(sub.get()));
+  EXPECT_FALSE(m->BecomeReplica("master.example", 6379));  // the same master, case-insensitively
+  EXPECT_TRUE(Take().empty());
+  EXPECT_TRUE(m->BecomeReplica("master.example", 6380));  // another master: the steps run again
+  EXPECT_EQ(Take().size(), 3u);
+}
+
+TEST_F(RoleTest, RoleReportsTheMasterAndALinkThatIsDown) {
+  auto m = MakeWithHooks();
+  RoleInfo r = m->Role();
+  EXPECT_EQ(r.role, ReplRole::kMaster);
+  EXPECT_EQ(r.offset, 3u);
+  m->BecomeReplica("10.1.1.1", 7000);
+  r = m->Role();
+  EXPECT_EQ(r.role, ReplRole::kReplica);
+  EXPECT_EQ(r.host, "10.1.1.1");
+  EXPECT_EQ(r.port, 7000);
+  EXPECT_EQ(r.state, ReplicaLinkState::kConnect);  // no engine here: no client runs
+  EXPECT_EQ(r.offset_or_minus1, -1);
+}
+
+TEST_F(RoleTest, BecomeMasterPromotesTheIdentityThenUnfencesAndStartsTheReaper) {
+  auto m = MakeWithHooks();
+  m->BecomeMaster();  // a no-op on a master
+  EXPECT_TRUE(Take().empty());
+  EXPECT_EQ(m->replid(), id.replid);
+  m->BecomeReplica("h", 1);
+  Take();
+  m->BecomeMaster();
+  EXPECT_EQ(Take(), (std::vector<std::string>{"reinit_oids fenced", "start_reaper", "replicaof="}));
+  EXPECT_FALSE(log.fenced());
+  EXPECT_EQ(m->role(), ReplRole::kMaster);
+  const ReplIdentity now = m->identity();
+  EXPECT_NE(now.replid, id.replid);
+  EXPECT_TRUE(IsValidReplId(now.replid));
+  ASSERT_EQ(now.history.size(), 1u);
+  EXPECT_EQ(now.history[0], (HistoryEntry{id.replid, 3}));
+  auto persisted = LoadOrCreateIdentity(storage);
+  ASSERT_TRUE(persisted.ok());
+  EXPECT_EQ(persisted->replid, now.replid);
+  EXPECT_EQ(persisted->history, now.history);
+  EXPECT_EQ(m->Role().role, ReplRole::kMaster);
+}
+
+TEST_F(RoleTest, RoleChangesAfterShutdownStartNothing) {
+  auto m = MakeWithHooks();
+  m->Shutdown();
+  m->BecomeReplica("h", 1);
+  m->BecomeMaster();
+  EXPECT_TRUE(Take().empty());
+  EXPECT_FALSE(log.fenced());
 }
 
 }  // namespace

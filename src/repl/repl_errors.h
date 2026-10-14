@@ -13,5 +13,11 @@ inline constexpr std::string_view kErrReplconfUnrecognized =
 inline constexpr std::string_view kErrReplconfIpTooLong =
     "ERR REPLCONF ip-address provided by replica instance is too long: ";
 inline constexpr size_t kReplconfMaxIpLength = 255;  // NET_HOST_STR_LEN - 1
+// REPLICAOF (replicaofCommand, redis72-replication §1.2).
+inline constexpr std::string_view kErrInvalidMasterPort = "ERR Invalid master port";
+inline constexpr std::string_view kErrReplicaofFromReplica =
+    "ERR Command is not valid when client is a replica.";
+inline constexpr std::string_view kReplyAlreadyConnected =
+    "OK Already connected to specified master";  // status
 
 }  // namespace tideskv

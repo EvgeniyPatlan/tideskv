@@ -25,7 +25,9 @@ Result<int64_t> CountExisting(ReadView& view, uint8_t db, const std::vector<std:
 Result<std::string> TypeOf(ReadView& view, uint8_t db, std::string_view key, int64_t now_ms);
 Status FlushDb(WriteTxn& txn, uint8_t db);
 Status FlushAll(WriteTxn& txn);
-// DBSIZE: live keys of db. O(number of stored keys).
+// DBSIZE: live keys of db at now_ms; kCountStoredKeys counts every stored key, expired ones included.
+// O(number of stored keys).
+inline constexpr int64_t kCountStoredKeys = 0;  // no deadline is <= 0
 Result<uint64_t> CountKeys(ReadView& view, uint8_t db, int64_t now_ms);
 
 // EXPIRE options; every flag given is applied, as in Redis (XX LT is not the same as LT).

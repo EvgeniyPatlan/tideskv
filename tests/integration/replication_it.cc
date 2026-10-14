@@ -1,0 +1,203 @@
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "support/it_helpers.h"
+#include "support/temp_dir.h"
+#include "support/test_server.h"
+
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
+// Two real servers (M6a Task 12): a replica follows a master through REPLICAOF, serves reads, refuses
+// writes, survives a restart with a partial resync, and is promoted with REPLICAOF NO ONE.
+namespace tideskv::test {
+namespace {
+
+using Type = RespValue::Type;
+using namespace std::chrono_literals;
+
+std::unique_ptr<RespClient> Client(const TestServer& s) {
+  auto c = s.Connect();
+  EXPECT_NE(c, nullptr);
+  return c;
+}
+
+std::string Digest(RespClient& c) { return c.Command({"DEBUG", "DIGEST"}).str; }
+
+// ROLE's offset: the master's last seq, or the replica's applied seq (-1 while its link is down).
+int64_t RoleOffset(RespClient& c) {
+  const RespValue r = c.Command({"ROLE"});
+  if (r.type != Type::kArray || r.elements.empty()) return -2;
+  if (r.elements[0].str == "master") return r.elements[1].integer;
+  return r.elements.size() == 5 ? r.elements[4].integer : -2;
+}
+
+std::string LinkState(RespClient& c) {
+  const RespValue r = c.Command({"ROLE"});
+  return r.type == Type::kArray && r.elements.size() == 5 ? r.elements[3].str : "";
+}
+
+// Waits until the replica's link is up and it has applied everything the master has.
+bool Synced(RespClient& master, RespClient& replica, std::chrono::milliseconds timeout = 10s) {
+  return WaitFor(
+      [&] {
+        const int64_t m = RoleOffset(master);
+        return LinkState(replica) == "connected" && RoleOffset(replica) == m;
+      },
+      timeout);
+}
+
+// 1000 writes over every type, with deletes, expiries and counters mixed in.
+void MixedWrites(RespClient& c, int n) {
+  for (int i = 0; i < n; ++i) {
+    const std::string s = std::to_string(i);
+    RespValue r;
+    switch (i % 8) {
+      case 0:
+        r = c.Command({"SET", "k" + s, "v" + s});
+        break;
+      case 1:
+        r = c.Command({"HSET", "h" + std::to_string(i % 50), "f" + s, s});
+        break;
+      case 2:
+        r = c.Command({"LPUSH", "l" + std::to_string(i % 20), s});
+        break;
+      case 3:
+        r = c.Command({"ZADD", "z" + std::to_string(i % 30), s, "m" + s});
+        break;
+      case 4:
+        r = c.Command({"SADD", "s" + std::to_string(i % 40), "m" + s});
+        break;
+      case 5:
+        r = c.Command({"DEL", "k" + std::to_string(i - 5)});
+        break;
+      case 6:
+        r = c.Command({"INCRBY", "counter", s});
+        break;
+      default:
+        r = c.Command({"EXPIRE", "h" + std::to_string(i % 50), "100000"});
+        break;
+    }
+    ASSERT_NE(r.type, Type::kError) << i << ": " << r.str;
+  }
+}
+
+struct ReplicationIT : ::testing::Test {
+  TestServer master{TIDESKV_SERVER_BIN};
+  std::unique_ptr<TestServer> replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN);
+
+  void Follow(TestServer& r) {
+    auto c = Client(r);
+    EXPECT_EQ(c->Command({"REPLICAOF", "127.0.0.1", std::to_string(master.port())}).str, "OK");
+  }
+};
+
+TEST_F(ReplicationIT, ReplicaFollowsMaster) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  MixedWrites(*m, 1000);
+  ASSERT_TRUE(Synced(*m, *r)) << "master " << RoleOffset(*m) << ", replica " << RoleOffset(*r);
+  EXPECT_EQ(Digest(*r), Digest(*m));
+  EXPECT_NE(Digest(*m), std::string(40, '0'));
+  EXPECT_EQ(r->Command({"HGET", "h1", "f1"}).str, "1");  // the replica serves reads
+}
+
+TEST_F(ReplicationIT, ReplicaIsReadOnly) {
+  Follow(*replica);
+  auto r = Client(*replica);
+  const RespValue set = r->Command({"SET", "x", "1"});
+  EXPECT_EQ(set.type, Type::kError);
+  EXPECT_EQ(set.str, "READONLY You can't write against a read only replica.");
+  EXPECT_EQ(r->Command({"GET", "x"}).type, Type::kNull);
+}
+
+// D13: expired keys are hidden on the replica but stay stored until the master's DEL arrives.
+TEST_F(ReplicationIT, ReplicaHidesExpiredKeysButKeepsThemUntilMasterDeletes) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  const auto set_at = std::chrono::steady_clock::now();
+  ASSERT_EQ(m->Command({"SET", "e", "v", "PX", "500"}).str, "OK");
+  ASSERT_TRUE(Synced(*m, *r));
+  master.Pause();  // freezes the master's reaper: no DEL can be replicated
+  std::this_thread::sleep_until(set_at + 800ms);
+  EXPECT_EQ(r->Command({"GET", "e"}).type, Type::kNull);
+  EXPECT_EQ(r->Command({"EXISTS", "e"}).integer, 0);
+  EXPECT_EQ(r->Command({"DBSIZE"}).integer, 1);  // still stored: the replica's reaper does not run
+  master.Resume();
+  EXPECT_TRUE(WaitFor([&] { return r->Command({"DBSIZE"}).integer == 0; }, 10s));
+}
+
+TEST_F(ReplicationIT, PromotionKeepsDataAndAcceptsWrites) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  MixedWrites(*m, 200);
+  ASSERT_TRUE(Synced(*m, *r));
+  const std::string digest = Digest(*m);
+  EXPECT_EQ(r->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
+  const RespValue role = r->Command({"ROLE"});
+  ASSERT_EQ(role.type, Type::kArray);
+  EXPECT_EQ(role.elements[0].str, "master");
+  EXPECT_EQ(Digest(*r), digest);
+  EXPECT_EQ(r->Command({"SET", "after", "promotion"}).str, "OK");
+  EXPECT_EQ(r->Command({"HSET", "newhash", "f", "v"}).integer, 1);  // a fresh oid lease above the master's
+  EXPECT_EQ(r->Command({"GET", "after"}).str, "promotion");
+}
+
+TEST_F(ReplicationIT, ReplicaRestartResumesWithPartialSync) {
+  TempDir dir("tideskv-it-replica");
+  TestServer::Options o;
+  o.dir = dir.str();
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  Follow(*replica);
+  auto m = Client(master);
+  {
+    auto r = Client(*replica);
+    MixedWrites(*m, 200);
+    ASSERT_TRUE(Synced(*m, *r));
+  }
+  ASSERT_EQ(replica->Terminate(), 0);
+  const int64_t applied = RoleOffset(*m);
+  MixedWrites(*m, 100);
+  // CF11: the flag takes "host port" as one argument.
+  o.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())};
+  replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
+  auto r = Client(*replica);
+  ASSERT_TRUE(Synced(*m, *r));
+  EXPECT_EQ(Digest(*r), Digest(*m));
+  // A partial resync: the master streamed from where the replica stopped, not from seq 1. (INFO's
+  // sync_partial_ok counter arrives with Task 13.)
+  EXPECT_NE(master.Stderr().find("streaming from seq " + std::to_string(applied + 1)), std::string::npos)
+      << master.Stderr();
+}
+
+TEST_F(ReplicationIT, ReplicaWithForeignDataGetsFullResyncAndStaysDown) {
+  auto r = Client(*replica);
+  for (int i = 0; i < 3; ++i) ASSERT_EQ(r->Command({"SET", "own" + std::to_string(i), "v"}).str, "OK");
+  const std::string digest = Digest(*r);
+  auto m = Client(master);
+  ASSERT_EQ(m->Command({"SET", "theirs", "v"}).str, "OK");
+  Follow(*replica);
+  EXPECT_TRUE(WaitFor(
+      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
+      10s))
+      << replica->Stderr();
+  const auto until = std::chrono::steady_clock::now() + 1500ms;
+  while (std::chrono::steady_clock::now() < until) {
+    EXPECT_NE(LinkState(*r), "connected");
+    std::this_thread::sleep_for(50ms);
+  }
+  EXPECT_EQ(RoleOffset(*r), -1);
+  EXPECT_EQ(Digest(*r), digest);
+  EXPECT_EQ(r->Command({"EXISTS", "theirs"}).integer, 0);
+}
+
+}  // namespace
+}  // namespace tideskv::test

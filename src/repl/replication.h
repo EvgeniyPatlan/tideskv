@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "repl/repl_state.h"
@@ -10,6 +11,43 @@
 namespace tideskv {
 
 enum class ReplRole : uint8_t { kMaster, kReplica };
+
+// A replica's link to its master (M6a D19), as ROLE names it (redis72-replication §2).
+enum class ReplicaLinkState : uint8_t { kConnect, kConnecting, kHandshake, kConnected };
+inline std::string_view LinkStateName(ReplicaLinkState s) {
+  switch (s) {
+    case ReplicaLinkState::kConnect:
+      return "connect";
+    case ReplicaLinkState::kConnecting:
+      return "connecting";
+    case ReplicaLinkState::kHandshake:
+      return "handshake";
+    case ReplicaLinkState::kConnected:
+      return "connected";
+  }
+  return "none";
+}
+
+// One attached replica, as the master sees it.
+struct ReplicaInfo {
+  std::string ip;
+  uint16_t listening_port = 0;
+  uint64_t acked = 0;
+  int64_t last_ack_ms = 0;
+  bool alive = false;
+};
+
+// ROLE's data (redis72-replication §2). A master fills offset and replicas; a replica fills host, port,
+// state and offset_or_minus1 (its applied seq while the link is connected, else -1).
+struct RoleInfo {
+  ReplRole role = ReplRole::kMaster;
+  std::string host;
+  uint16_t port = 0;
+  ReplicaLinkState state = ReplicaLinkState::kConnect;
+  uint64_t offset = 0;  // the last seq in the log (applied or committed)
+  int64_t offset_or_minus1 = -1;
+  std::vector<ReplicaInfo> replicas;
+};
 
 // Where a replica says it can be reached (REPLCONF ip-address / listening-port, else the peer address).
 struct ReplicaPeer {
@@ -49,6 +87,14 @@ class Replication {
   // A valid REPLCONF from session s (listening-port / ip-address / capa / getack), already recorded in
   // s.replica_handshake by the command.
   virtual void OnReplconf(Session& s, const ReplconfOptions& o) = 0;
+
+  // Role changes (M6a D7, D13, D14). Both run on a command thread and never block on the network; they
+  // may wait for replication threads and the expire reaper to stop, so never call them while holding the
+  // Engine gate (inside EXEC they run after the batch).
+  // REPLICAOF host port. False when already replicating that exact master (case-insensitive host).
+  virtual bool BecomeReplica(const std::string& host, uint16_t port) = 0;
+  virtual void BecomeMaster() = 0;  // REPLICAOF NO ONE; a no-op on a master
+  virtual RoleInfo Role() const = 0;
 };
 
 }  // namespace tideskv

@@ -41,6 +41,11 @@ class TestServer {
   int Wait(std::chrono::milliseconds timeout = std::chrono::seconds(10));
   int Terminate();  // SIGTERM, then Wait()
   void Kill9();
+  // SIGSTOP / SIGCONT: freezes every thread of the server (its reaper, its replication threads) and
+  // thaws it. Terminate and the destructor resume a paused server first.
+  void Pause();
+  void Resume();
+  pid_t pid() const { return pid_; }
   bool IsRunning();
   std::string Stderr() const;
 
@@ -57,6 +62,7 @@ class TestServer {
   pid_t pid_ = -1;
   std::optional<int> exit_code_;  // set once the child is reaped
   bool exit_consumed_ = false;    // a test already looked at exit_code_ via Wait()
+  bool paused_ = false;           // SIGSTOP sent and not yet followed by SIGCONT
 };
 
 }  // namespace tideskv::test

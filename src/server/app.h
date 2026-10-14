@@ -54,6 +54,7 @@ class App final : public ServerServices {
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
   net::ServerOptions MakeServerOptions();
   Status CreateReplication();
+  Status StartRole();  // the reaper on a master, the replica client when replicaof is set
 
   std::unique_ptr<Config> config_;
   std::unique_ptr<TidesStorage> storage_;
@@ -68,7 +69,7 @@ class App final : public ServerServices {
   WatchRegistry watches_;                           // before engine_ and the reaper: it must outlive them
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;
-  std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it
+  std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it; started by role
   CommandRegistry registry_;
   CursorStore cursors_;
   BlockingRegistry blocking_;  // before server_: connections cancel their waiters when destroyed

@@ -80,6 +80,19 @@ TEST_F(KeyspaceCmds, DbSizeIsPerDb) {
   EXPECT_EQ(h.Run({"DBSIZE"}), Int(1));
 }
 
+// M6a D13: a replica never deletes an expired key itself; DBSIZE counts it until the master's DEL arrives
+// (Redis counts stored keys), while reads hide it. A master reaps it, and its DBSIZE hides it meanwhile.
+TEST_F(KeyspaceCmds, DbSizeOnAReplicaCountsExpiredKeysThatAreStillStored) {
+  EXPECT_EQ(h.Run({"SET", "e", "v", "PX", "10"}), kOk);
+  EXPECT_EQ(h.Run({"SET", "live", "v"}), kOk);
+  h.clock().Advance(100);
+  EXPECT_EQ(h.Run({"DBSIZE"}), Int(1));
+  h.services.replication_.set_role(ReplRole::kReplica);
+  EXPECT_EQ(h.Run({"DBSIZE"}), Int(2));
+  EXPECT_EQ(h.Run({"EXISTS", "e"}), Int(0));
+  EXPECT_EQ(h.Run({"GET", "e"}), kNil);
+}
+
 TEST_F(KeyspaceCmds, FlushDbClearsOnlyTheCurrentDb) {
   EXPECT_EQ(h.Run({"SET", "a", "1", "EX", "100"}), kOk);
   h.SeedHash(0, "h", 1, true);

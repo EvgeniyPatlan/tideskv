@@ -12,6 +12,7 @@
 
 #include "commands/all_commands.h"
 #include "commands/blocking_serve.h"
+#include "common/string_util.h"
 #include "common/version.h"
 #include "server/connection_block_handler.h"
 #include "types/errors.h"
@@ -108,8 +109,37 @@ Status App::CreateReplication() {
   if (!identity.ok()) return identity.status();
   repl::ReplicationManager::Options o;
   o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
+  repl::ReplicationManager::RoleHooks& h = o.role;
+  h.engine = engine_.get();
+  h.config = [this] { return config_->Snapshot(); };
+  h.stop_reaper = [this] { reaper_->Stop(); };    // role changes are serialised by the manager
+  h.start_reaper = [this] { reaper_->Start(); };  // D13: the reaper runs only on a master
+  h.disconnect_blocked = [this](std::string_view error) { blocking_.DisconnectAll(error); };
+  h.reinit_oids = [this] { return oids_->Init(); };
+  h.set_replicaof = [this](const std::string& value) {
+    if (Status st = config_->Set("replicaof", value.empty() ? "no one" : value, /*at_runtime=*/false);
+        !st.ok()) {
+      spdlog::warn("cannot record replicaof in the config: {}", st.ToString());
+    }
+  };
   replication_ = std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_,
                                                             std::move(identity).value(), std::move(o));
+  return Status::Ok();
+}
+
+// `replicaof` from the config file or --replicaof: "<host> <port>" (validated when it was set).
+Status App::StartRole() {
+  const std::string replicaof = config_->Snapshot().replicaof;
+  if (replicaof.empty()) {
+    reaper_->Start();
+    return Status::Ok();
+  }
+  const size_t space = replicaof.rfind(' ');
+  uint64_t port = 0;
+  if (space == std::string::npos || !ParseUint64(replicaof.substr(space + 1), &port) || port > 65535) {
+    return Status::InvalidArgument("replicaof must be '<host> <port>'");
+  }
+  replication_->BecomeReplica(replicaof.substr(0, space), static_cast<uint16_t>(port));
   return Status::Ok();
 }
 
@@ -134,8 +164,9 @@ Status App::Start() {
   // Handle signals before any socket is bound: a SIGTERM arriving while starting up is
   // queued by asio and delivered once Run() arms the wait.
   signals_.emplace(main_ctx_, SIGINT, SIGTERM);
+  // A configured replica is fenced before the first client connects, so no write lands as a master.
+  if (Status st = StartRole(); !st.ok()) return st;
   if (Status st = server_->Start(); !st.ok()) return st;
-  reaper_->Start();
   scheduler_->Start();
   replication_->Start();
   return Status::Ok();

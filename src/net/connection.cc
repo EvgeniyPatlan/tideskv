@@ -124,16 +124,22 @@ void Connection::OnWrite(std::error_code ec) {
 
 void Connection::Unblock(std::string reply) {
   asio::post(socket_.get_executor(),
-             [self = shared_from_this(), r = std::move(reply)]() { self->OnUnblocked(r); });
+             [self = shared_from_this(), r = std::move(reply)]() { self->OnUnblocked(r, false); });
+}
+
+void Connection::UnblockAndClose(std::string reply) {
+  asio::post(socket_.get_executor(),
+             [self = shared_from_this(), r = std::move(reply)]() { self->OnUnblocked(r, true); });
 }
 
 // Relies on at-most-once delivery: BlockedClient ends a wait exactly once (TryServe, Cancel and Unblock
 // all check and set done_ under its lock), so at most one Unblock is posted per wait, and never after
 // the block timer's Cancel won. A non-null session_.blocked therefore means this reply belongs to the
 // current wait; nothing here has to tell a stale reply from a fresh one.
-void Connection::OnUnblocked(const std::string& reply) {
+void Connection::OnUnblocked(const std::string& reply, bool close_after) {
   if (closed_ || !session_.blocked) return;
   reply_.Raw(reply);
+  if (close_after) session_.close_after_reply = true;  // the pipeline does not run; Close after the write
   ResumeAfterBlock();
 }
 

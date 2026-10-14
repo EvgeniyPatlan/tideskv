@@ -289,6 +289,8 @@ std::unique_ptr<Server> StartBlockingServer(BlockingRegistry& registry) {
     } else if (argv[0] == "WAKE") {
       auto c = registry.Find(std::stoull(argv[1]));
       r.Integer(c != nullptr && c->Unblock("+" + argv[2] + "\r\n") ? 1 : 0);
+    } else if (argv[0] == "DISCONNECTALL") {
+      r.Integer(static_cast<int64_t>(registry.DisconnectAll("UNBLOCKED " + argv[1])));
     } else if (argv[0] == "WAITERS") {
       r.Integer(static_cast<int64_t>(registry.blocked_clients()));
     } else if (argv[0] == "ID") {
@@ -336,6 +338,25 @@ TEST(NetServerBlocking, UnblockFromAnotherConnectionDeliversInOrder) {
   EXPECT_EQ(r1->str, "served");
   EXPECT_EQ(r2->str, "NEXT");
   EXPECT_EQ(b->Command({"WAKE", std::to_string(id), "again"}).integer, 0);  // no longer blocked
+}
+
+// M6a D14: the error is written, the pipelined command behind the block never runs, the link closes.
+TEST(NetServerBlocking, DisconnectAllRepliesThenCloses) {
+  BlockingRegistry registry;
+  auto server = StartBlockingServer(registry);
+  auto a = RespClient::Connect(server->port());
+  auto b = RespClient::Connect(server->port());
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_TRUE(a->SendRaw(test::EncodeCommand({"BLOCK", "0"}) + test::EncodeCommand({"NEXT"})));
+  ASSERT_TRUE(WaitFor([&] { return b->Command({"WAITERS"}).integer == 1; }));
+  EXPECT_EQ(b->Command({"DISCONNECTALL", "gone"}).integer, 1);
+  auto r1 = a->Read();
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(r1->type, RespValue::Type::kError);
+  EXPECT_EQ(r1->str, "UNBLOCKED gone");
+  EXPECT_TRUE(a->WaitForClose());
+  EXPECT_EQ(b->Command({"PING"}).str, "PING");  // other clients are untouched
 }
 
 TEST(NetServerBlocking, PipelinedBlocksRunOneAfterTheOther) {  // Review Focus #2

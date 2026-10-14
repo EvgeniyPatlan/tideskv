@@ -4,10 +4,12 @@
 #include <atomic>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "commands/registry.h"
 #include "commands/server_services.h"
+#include "common/string_util.h"
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "exec/repl_log.h"
@@ -47,6 +49,26 @@ class FakeReplication final : public Replication {
     attached.push_back({pending_id, std::move(unread)});
   }
   void OnReplconf(Session&, const ReplconfOptions& o) override { replconfs.push_back(o); }
+  bool BecomeReplica(const std::string& host, uint16_t port) override {
+    if (role() == ReplRole::kReplica && EqualsIgnoreCase(host, role_info.host) && port == role_info.port) {
+      return false;
+    }
+    become_replica.emplace_back(host, port);
+    role_info = RoleInfo{ReplRole::kReplica, host, port, ReplicaLinkState::kConnect, 0, -1, {}};
+    set_role(ReplRole::kReplica);
+    return true;
+  }
+  void BecomeMaster() override {
+    ++become_master;
+    role_info = RoleInfo{};
+    set_role(ReplRole::kMaster);
+  }
+  RoleInfo Role() const override {
+    RoleInfo r = role_info;
+    r.role = role();
+    r.offset = log->last();
+    return r;
+  }
 
   std::atomic<ReplRole> role_{ReplRole::kMaster};
   repl::ReplIdentity identity{std::string(repl::kReplIdLength, 'c'), {}};
@@ -56,6 +78,9 @@ class FakeReplication final : public Replication {
   uint64_t last_pending_id = 0;
   std::vector<Attached> attached;
   std::vector<ReplconfOptions> replconfs;
+  RoleInfo role_info;  // what Role() reports (role and offset are filled in live)
+  std::vector<std::pair<std::string, uint16_t>> become_replica;
+  int become_master = 0;
 
  private:
   uint64_t next_pending_id_ = 0;
@@ -82,7 +107,9 @@ class FakeServerServices final : public ServerServices {
   BlockingRegistry& blocking() override { return blocking_; }
   WatchRegistry& watches() override { return watches_; }
   ScriptEngine& scripts() override { return scripts_; }
-  Replication& replication() override { return replication_; }
+  Replication& replication() override {
+    return real_replication != nullptr ? *real_replication : replication_;
+  }
 
   CommandRegistry registry_;
   Config config_;
@@ -92,6 +119,7 @@ class FakeServerServices final : public ServerServices {
   CursorStore cursors_;
   ScriptEngine scripts_;
   FakeReplication replication_;
+  Replication* real_replication = nullptr;  // set: replication() returns it instead of the fake
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

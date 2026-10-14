@@ -38,7 +38,7 @@ BlockedClient::ServeResult BlockedClient::TryServe(const Attempt& attempt) {
   std::optional<std::string> reply = attempt();
   if (!reply) return ServeResult::kStillBlocked;
   EndLocked();
-  Deliver(std::move(*reply));
+  Deliver(std::move(*reply), false);
   return ServeResult::kServed;
 }
 
@@ -53,7 +53,15 @@ bool BlockedClient::Unblock(std::string reply) {
   std::lock_guard lock(mu_);
   if (done_) return false;
   EndLocked();
-  Deliver(std::move(reply));
+  Deliver(std::move(reply), false);
+  return true;
+}
+
+bool BlockedClient::UnblockAndClose(std::string reply) {
+  std::lock_guard lock(mu_);
+  if (done_) return false;
+  EndLocked();
+  Deliver(std::move(reply), true);
   return true;
 }
 
@@ -62,8 +70,14 @@ void BlockedClient::EndLocked() {
   registry_.Remove(*this);
 }
 
-void BlockedClient::Deliver(std::string reply) {
-  if (auto link = session_.link.lock()) link->Unblock(std::move(reply));
+void BlockedClient::Deliver(std::string reply, bool close_after) {
+  auto link = session_.link.lock();
+  if (!link) return;
+  if (close_after) {
+    link->UnblockAndClose(std::move(reply));
+  } else {
+    link->Unblock(std::move(reply));
+  }
 }
 
 void BlockingRegistry::Add(const std::shared_ptr<BlockedClient>& client) {
@@ -114,6 +128,22 @@ std::shared_ptr<BlockedClient> BlockingRegistry::Find(uint64_t client_id) const 
   std::lock_guard lock(mu_);
   const auto it = by_client_.find(client_id);
   return it == by_client_.end() ? nullptr : it->second;
+}
+
+size_t BlockingRegistry::DisconnectAll(std::string_view error) {
+  std::vector<std::shared_ptr<BlockedClient>> clients;
+  {
+    std::lock_guard lock(mu_);
+    clients.reserve(by_client_.size());
+    for (const auto& [id, client] : by_client_) clients.push_back(client);
+  }
+  // Outside mu_: ending a wait takes BlockedClient::mu_, then mu_ (Remove).
+  const std::string reply = "-" + std::string(error) + "\r\n";
+  size_t ended = 0;
+  for (const auto& client : clients) {
+    if (client->UnblockAndClose(reply)) ++ended;
+  }
+  return ended;
 }
 
 size_t BlockingRegistry::blocking_keys() const {

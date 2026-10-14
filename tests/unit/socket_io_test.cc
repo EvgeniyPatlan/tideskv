@@ -5,10 +5,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace tideskv::repl {
 namespace {
@@ -131,6 +133,39 @@ TEST(SocketIo, ConnectTcpToAListeningPortSucceeds) {
   std::string out;
   ASSERT_TRUE(ReadSome(accepted.get(), &out, 1s).ok());
   EXPECT_EQ(out, "ping");
+}
+
+// A full accept queue makes the kernel drop further SYNs, so a connect hangs until it is cancelled.
+TEST(SocketIo, ConnectTcpGivesUpPromptlyWhenCancelled) {
+  uint16_t port = 0;
+  Fd l(::socket(AF_INET, SOCK_STREAM, 0));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(l.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  ASSERT_EQ(::listen(l.get(), 0), 0);
+  socklen_t len = sizeof(addr);
+  ASSERT_EQ(::getsockname(l.get(), reinterpret_cast<sockaddr*>(&addr), &len), 0);
+  port = ntohs(addr.sin_port);
+  std::vector<Fd> fillers;
+  for (int i = 0; i < 4; ++i) {
+    auto f = ConnectTcp("127.0.0.1", port, 100ms);
+    if (f.ok()) fillers.push_back(std::move(f).value());
+  }
+  std::atomic<bool> cancel{false};
+  std::thread canceller([&] {
+    std::this_thread::sleep_for(200ms);
+    cancel = true;
+  });
+  const auto start = std::chrono::steady_clock::now();
+  auto fd = ConnectTcp("127.0.0.1", port, 10s, &cancel);
+  const auto took = std::chrono::steady_clock::now() - start;
+  canceller.join();
+  if (fd.ok()) GTEST_SKIP() << "this kernel completed the connect despite the full accept queue";
+  EXPECT_EQ(fd.status().code(), StatusCode::kIOError);
+  EXPECT_EQ(fd.status().message(), "connect: cancelled");
+  EXPECT_GE(took, 150ms);
+  EXPECT_LT(took, 1s);
 }
 
 TEST(SocketIo, ConnectTcpRejectsAnUnresolvableHost) {

@@ -1,6 +1,9 @@
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
@@ -9,8 +12,8 @@
 #include "repl/replication.h"
 #include "types/errors.h"
 
-// The master side of the replication handshake (M6a D8, D10): PSYNC, SYNC and REPLCONF, with Redis 7.2's
-// client-visible texts (redis72-replication §6). REPLICAOF and ROLE arrive with Task 12.
+// The replication commands with Redis 7.2's client-visible texts: the master side of the handshake (M6a D8,
+// D10: PSYNC, SYNC, REPLCONF; redis72-replication §6), and REPLICAOF / SLAVEOF / ROLE (D14, §1-§2).
 namespace tideskv {
 namespace {
 
@@ -99,12 +102,77 @@ void Replconf(ExecContext& ctx, const ArgList& argv) {
   if (!silent) ctx.reply.SimpleString("OK");
 }
 
+// Runs a role change now, or after the batch inside EXEC: the change joins threads that may wait for the
+// Engine gate, which the batch holds exclusively.
+void RunRoleChange(ExecContext& ctx, std::function<void()> change) {
+  if (ctx.after_batch != nullptr) {
+    ctx.after_batch->push_back(std::move(change));
+  } else {
+    change();
+  }
+}
+
+// REPLICAOF host port | NO ONE (replicaofCommand, redis72-replication §1.2).
+void Replicaof(ExecContext& ctx, const ArgList& argv) {
+  Replication& repl = ctx.server.replication();
+  if (EqualsIgnoreCase(argv[1], "no") && EqualsIgnoreCase(argv[2], "one")) {
+    RunRoleChange(ctx, [&repl] { repl.BecomeMaster(); });  // a no-op on a master, still +OK
+    return ctx.reply.SimpleString("OK");
+  }
+  if (ctx.session.is_replica_link) return ctx.reply.Error(kErrReplicaofFromReplica);
+  int64_t port = 0;
+  if (!ParseInt64(argv[2], &port) || port < 0 || port > 65535) return ctx.reply.Error(kErrInvalidMasterPort);
+  const std::string& host = argv[1];
+  const auto p = static_cast<uint16_t>(port);
+  if (ctx.after_batch != nullptr) {
+    const RoleInfo now = repl.Role();
+    if (now.role == ReplRole::kReplica && EqualsIgnoreCase(now.host, host) && now.port == p) {
+      return ctx.reply.SimpleString(kReplyAlreadyConnected);
+    }
+    RunRoleChange(ctx, [&repl, host, p] { repl.BecomeReplica(host, p); });
+    return ctx.reply.SimpleString("OK");
+  }
+  ctx.reply.SimpleString(repl.BecomeReplica(host, p) ? std::string_view("OK") : kReplyAlreadyConnected);
+}
+
+// ROLE (roleCommand, redis72-replication §2): a master lists its live replicas, with port and offset as
+// bulk strings; a replica reports its link state and an offset of -1 while the link is down.
+void Role(ExecContext& ctx, const ArgList& /*argv*/) {
+  const RoleInfo r = ctx.server.replication().Role();
+  resp::ReplyBuilder& out = ctx.reply;
+  if (r.role == ReplRole::kReplica) {
+    out.ArrayHeader(5);
+    out.Bulk("slave");
+    out.Bulk(r.host);
+    out.Integer(r.port);
+    out.Bulk(LinkStateName(r.state));
+    out.Integer(r.offset_or_minus1);
+    return;
+  }
+  out.ArrayHeader(3);
+  out.Bulk("master");
+  out.Integer(static_cast<int64_t>(r.offset));
+  const auto live =
+      std::count_if(r.replicas.begin(), r.replicas.end(), [](const ReplicaInfo& i) { return i.alive; });
+  out.ArrayHeader(static_cast<size_t>(live));
+  for (const ReplicaInfo& i : r.replicas) {
+    if (!i.alive) continue;
+    out.ArrayHeader(3);
+    out.Bulk(i.ip);
+    out.Bulk(std::to_string(i.listening_port));
+    out.Bulk(std::to_string(i.acked));
+  }
+}
+
 }  // namespace
 
 void RegisterReplicationCommands(CommandRegistry& r) {
   r.Register({"psync", -3, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Psync});
   r.Register({"sync", 1, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Sync});
   r.Register({"replconf", -1, kCmdAdmin | kCmdNoScript | kCmdAllowBusy, 0, 0, 0, &Replconf});
+  r.Register({"replicaof", 3, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Replicaof});
+  r.Register({"slaveof", 3, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Replicaof});
+  r.Register({"role", 1, kCmdNoScript | kCmdFast, 0, 0, 0, &Role});
 }
 
 }  // namespace tideskv

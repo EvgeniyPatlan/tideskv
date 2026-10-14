@@ -45,6 +45,8 @@ class BlockedClient {
   bool Cancel();
   // Ends the wait with `reply` delivered through the link (CLIENT UNBLOCK). True if this call ended it.
   bool Unblock(std::string reply);
+  // Like Unblock, and the connection closes after the reply (M6a D14). True if this call ended it.
+  bool UnblockAndClose(std::string reply);
 
   uint64_t client_id() const { return session_.id; }
   uint8_t db() const { return session_.db; }
@@ -56,7 +58,7 @@ class BlockedClient {
 
  private:
   void EndLocked();
-  void Deliver(std::string reply);
+  void Deliver(std::string reply, bool close_after);
 
   BlockingRegistry& registry_;
   const Session session_;
@@ -81,6 +83,9 @@ class BlockingRegistry {
   // The clients blocked on (db, key), in the order they blocked.
   std::vector<std::shared_ptr<BlockedClient>> WaitersOn(uint8_t db, std::string_view key) const;
   std::shared_ptr<BlockedClient> Find(uint64_t client_id) const;
+  // Ends every wait with the error `error` (text without the leading '-') and closes each of those
+  // connections after the reply (Redis disconnectAllBlockedClients; M6a D14). Returns how many it ended.
+  size_t DisconnectAll(std::string_view error);
   size_t blocked_clients() const { return count_.load(); }
   size_t blocking_keys() const;  // distinct (db, key) with at least one waiter
 

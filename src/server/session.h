@@ -18,6 +18,9 @@ class ClientLink {
   // (served by a push, or CLIENT UNBLOCK): the connection appends `reply` (encoded bytes) and resumes
   // executing its pipelined input.
   virtual void Unblock(std::string reply) = 0;
+  // Like Unblock, but the connection is closed once `reply` is written and runs none of its pipelined
+  // input (Redis CLIENT_CLOSE_AFTER_REPLY; M6a D14 demotion).
+  virtual void UnblockAndClose(std::string reply) = 0;
 };
 
 // MULTI state (M5a plan G3).

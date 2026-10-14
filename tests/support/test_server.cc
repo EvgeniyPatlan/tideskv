@@ -161,8 +161,21 @@ int TestServer::Wait(std::chrono::milliseconds timeout) {
   }
 }
 
+void TestServer::Pause() {
+  if (pid_ <= 0 || paused_) return;
+  ::kill(pid_, SIGSTOP);
+  paused_ = true;
+}
+
+void TestServer::Resume() {
+  if (pid_ <= 0 || !paused_) return;
+  ::kill(pid_, SIGCONT);
+  paused_ = false;
+}
+
 int TestServer::Terminate() {
   if (pid_ <= 0) return -1;
+  Resume();  // a stopped process would not act on SIGTERM
   ::kill(pid_, SIGTERM);
   return Wait(std::chrono::seconds(10));
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -29,9 +30,11 @@ class Fd {
   int fd_;
 };
 
-// Resolves host and connects within the timeout. IOError on resolution, refusal or timeout. The returned
-// socket is non-blocking and close-on-exec.
-Result<Fd> ConnectTcp(const std::string& host, uint16_t port, std::chrono::milliseconds timeout);
+// Resolves host and connects within the timeout. IOError on resolution, refusal, timeout or cancellation:
+// a connect in progress gives up within ~50 ms of *cancel becoming true (name resolution itself is not
+// interruptible). The returned socket is non-blocking and close-on-exec.
+Result<Fd> ConnectTcp(const std::string& host, uint16_t port, std::chrono::milliseconds timeout,
+                      const std::atomic<bool>* cancel = nullptr);
 // Sends every byte of data (send with MSG_NOSIGNAL). TimedOut if the peer does not drain it in time;
 // IOError on a socket error (peer gone, shutdown).
 Status WriteAll(int fd, std::string_view data, std::chrono::milliseconds timeout);

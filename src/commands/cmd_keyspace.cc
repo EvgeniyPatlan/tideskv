@@ -11,6 +11,7 @@
 #include "common/string_util.h"
 #include "encoding/key_codec.h"
 #include "exec/engine.h"
+#include "repl/replication.h"
 #include "types/keyspace.h"
 
 namespace tideskv {
@@ -63,11 +64,16 @@ void Select(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.SimpleString("OK");
 }
 
+// DBSIZE. A replica counts every stored key, expired ones included (M6a D13: it never deletes them
+// itself; the master's DEL does, as in Redis). A master's reaper removes them within a cycle, and until
+// then its DBSIZE hides them, as its reads do.
 void DbSize(ExecContext& ctx, const ArgList&) {
   Engine& e = ctx.server.engine();
+  const bool count_stored = ctx.server.replication().IsReplica();
   uint64_t n = 0;
-  const Status st = e.Snapshot(
-      [&](ReadView& v, int64_t now_ms) { return MoveInto(CountKeys(v, ctx.session.db, now_ms), &n); });
+  const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
+    return MoveInto(CountKeys(v, ctx.session.db, count_stored ? kCountStoredKeys : now_ms), &n);
+  });
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.Integer(static_cast<int64_t>(n));
 }

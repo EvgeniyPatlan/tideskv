@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -33,13 +34,26 @@ int PollUntil(int fd, int16_t events, Clock::time_point deadline) {
   }
 }
 
+// PollUntil in slices of kCancelSlice, giving up (0, as a timeout) once *cancel is set.
+constexpr auto kCancelSlice = std::chrono::milliseconds(50);
+int PollCancellable(int fd, int16_t events, Clock::time_point deadline, const std::atomic<bool>* cancel) {
+  if (cancel == nullptr) return PollUntil(fd, events, deadline);
+  for (;;) {
+    if (cancel->load(std::memory_order_acquire)) return 0;
+    const auto slice_end = std::min(deadline, Clock::now() + kCancelSlice);
+    const int n = PollUntil(fd, events, slice_end);
+    if (n != 0 || slice_end >= deadline) return n;
+  }
+}
+
 // One non-blocking connect attempt to `ai`, finished with poll within the deadline.
-Result<Fd> ConnectOne(const addrinfo& ai, Clock::time_point deadline) {
+Result<Fd> ConnectOne(const addrinfo& ai, Clock::time_point deadline, const std::atomic<bool>* cancel) {
   Fd fd(::socket(ai.ai_family, ai.ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK, ai.ai_protocol));
   if (fd.get() < 0) return Status::IOError(Errno("socket"));
   if (::connect(fd.get(), ai.ai_addr, ai.ai_addrlen) == 0) return fd;
   if (errno != EINPROGRESS) return Status::IOError(Errno("connect"));
-  const int ready = PollUntil(fd.get(), POLLOUT, deadline);
+  const int ready = PollCancellable(fd.get(), POLLOUT, deadline, cancel);
+  if (ready == 0 && cancel != nullptr && cancel->load()) return Status::IOError("connect: cancelled");
   if (ready == 0) return Status::IOError("connect: timed out");
   if (ready < 0) return Status::IOError(Errno("poll"));
   int err = 0;
@@ -70,7 +84,8 @@ int Fd::release() {
   return fd;
 }
 
-Result<Fd> ConnectTcp(const std::string& host, uint16_t port, std::chrono::milliseconds timeout) {
+Result<Fd> ConnectTcp(const std::string& host, uint16_t port, std::chrono::milliseconds timeout,
+                      const std::atomic<bool>* cancel) {
   const auto deadline = Clock::now() + timeout;
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
@@ -81,7 +96,7 @@ Result<Fd> ConnectTcp(const std::string& host, uint16_t port, std::chrono::milli
   const std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> list(found, &::freeaddrinfo);
   Status last = Status::IOError("no address for " + host);
   for (const addrinfo* ai = list.get(); ai != nullptr; ai = ai->ai_next) {
-    auto fd = ConnectOne(*ai, deadline);
+    auto fd = ConnectOne(*ai, deadline, cancel);
     if (fd.ok()) return fd;
     last = fd.status();
   }

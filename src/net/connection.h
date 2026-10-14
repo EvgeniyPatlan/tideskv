@@ -36,7 +36,8 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   Connection& operator=(const Connection&) = delete;
 
   void Start();
-  void Unblock(std::string reply) override;  // ClientLink: any thread
+  void Unblock(std::string reply) override;          // ClientLink: any thread
+  void UnblockAndClose(std::string reply) override;  // ClientLink: any thread
 
  private:
   void DoRead();
@@ -46,7 +47,7 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   void StartWrite();
   void OnWrite(std::error_code ec);
   void ArmBlockTimer();
-  void OnUnblocked(const std::string& reply);
+  void OnUnblocked(const std::string& reply, bool close_after);
   void ResumeAfterBlock();  // the blocked command ended: run the pipeline again
   void Handoff();           // PSYNC's reply is flushed: give the socket to session_.takeover (M6a D10)
   void FinishHandoff();

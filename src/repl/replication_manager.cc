@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <utility>
 
+#include "common/string_util.h"
+#include "types/errors.h"
+
 namespace tideskv::repl {
 namespace {
 
@@ -14,6 +17,9 @@ constexpr auto kTick = 1s;
 constexpr auto kDefaultTimeout = 60s;
 
 }  // namespace
+
+ReplicationManager::ReplicationManager(Storage& storage, ReplLog& log, ReplIdentity identity)
+    : ReplicationManager(storage, log, std::move(identity), Options{}) {}
 
 ReplicationManager::ReplicationManager(Storage& storage, ReplLog& log, ReplIdentity identity, Options options)
     : storage_(storage), log_(log), options_(std::move(options)), identity_(std::move(identity)) {}
@@ -36,6 +42,10 @@ void ReplicationManager::Shutdown() {
   {
     std::lock_guard lock(shutdown_mu_);
     if (tick_.joinable()) tick_.join();
+  }
+  {
+    std::lock_guard role_lock(role_mu_);  // waits out a role change in progress, which then starts nothing
+    if (auto client = TakeClient()) client->Stop();
   }
   DropAllReplicas();
 }
@@ -88,6 +98,122 @@ void ReplicationManager::OnReplconf(Session& /*s*/, const ReplconfOptions& /*o*/
   // copies them into the pending entry. GETACK on a replica arrives with Task 12.
 }
 
+// D7, D13, D14: fence, stop the reaper, unblock and close blocked clients, drop sub-replicas, swap the
+// client. Joins threads (reaper, old client, senders) but never waits for the network.
+bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
+  std::lock_guard role_lock(role_mu_);
+  if (SameMaster(host, port)) return false;
+  {
+    std::lock_guard lock(mu_);
+    if (shut_down_) return true;
+  }
+  const RoleHooks& hooks = options_.role;
+  log_.FenceLocalWrites(true);  // a barrier: once it returns no local commit can take a seq (CF1)
+  role_.store(ReplRole::kReplica, std::memory_order_release);
+  if (hooks.stop_reaper) hooks.stop_reaper();
+  if (hooks.disconnect_blocked) hooks.disconnect_blocked(kErrUnblockedRoleChange);
+  DropAllReplicas();
+  if (auto old = TakeClient()) old->Stop();  // shutdown + join: the only committer is gone
+  SetReplicaOf(host + " " + std::to_string(port));
+  std::shared_ptr<ReplClient> client = MakeClient();
+  {
+    std::lock_guard lock(mu_);
+    master_host_ = host;
+    master_port_ = port;
+    client_ = client;
+  }
+  if (client) client->Start(host, port);
+  spdlog::info("REPLICAOF {}:{}: this node is now a replica", host, port);
+  return true;
+}
+
+// REPLICAOF NO ONE (D7): stop the client, then promote the identity on this thread. With the client
+// joined nothing applies concurrently, so this thread is the replica's only committer.
+void ReplicationManager::BecomeMaster() {
+  std::lock_guard role_lock(role_mu_);
+  if (role() == ReplRole::kMaster) return;
+  {
+    std::lock_guard lock(mu_);
+    if (shut_down_) return;
+  }
+  if (auto old = TakeClient()) old->Stop();
+  const uint64_t last = log_.last();
+  const ReplIdentity promoted = Promote(identity(), last);
+  if (Status st = PersistIdentity(storage_, promoted); !st.ok()) {
+    spdlog::error("cannot persist the promoted replication id: {}", st.ToString());
+  }
+  const RoleHooks& hooks = options_.role;
+  if (hooks.reinit_oids) {  // CF7: leases continue above the hwm applied from the master
+    if (Status st = hooks.reinit_oids(); !st.ok())
+      spdlog::error("cannot reload the oid hwm: {}", st.ToString());
+  }
+  {
+    std::lock_guard lock(mu_);
+    identity_ = promoted;
+    master_host_.clear();
+    master_port_ = 0;
+  }
+  log_.FenceLocalWrites(false);
+  role_.store(ReplRole::kMaster, std::memory_order_release);
+  if (hooks.start_reaper) hooks.start_reaper();
+  DropAllReplicas();  // sub-replicas must learn the new replid (Redis disconnectSlaves)
+  SetReplicaOf("");
+  spdlog::info("REPLICAOF NO ONE: this node is now a master, replication id {} from seq {}", promoted.replid,
+               last + 1);
+}
+
+RoleInfo ReplicationManager::Role() const {
+  RoleInfo r;
+  r.offset = log_.last();
+  std::shared_ptr<ReplClient> client;
+  {
+    std::lock_guard lock(mu_);
+    r.role = role();
+    r.host = master_host_;
+    r.port = master_port_;
+    client = client_;
+  }
+  if (r.role == ReplRole::kMaster) {
+    r.replicas = Replicas();
+    return r;
+  }
+  r.state = client ? client->state() : ReplicaLinkState::kConnect;
+  r.offset_or_minus1 = r.state == ReplicaLinkState::kConnected ? static_cast<int64_t>(r.offset) : -1;
+  return r;
+}
+
+bool ReplicationManager::SameMaster(const std::string& host, uint16_t port) const {
+  std::lock_guard lock(mu_);
+  return role() == ReplRole::kReplica && EqualsIgnoreCase(host, master_host_) && port == master_port_;
+}
+
+std::shared_ptr<ReplClient> ReplicationManager::TakeClient() {
+  std::lock_guard lock(mu_);
+  return std::exchange(client_, nullptr);
+}
+
+std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
+  if (options_.role.engine == nullptr) return nullptr;  // no engine to apply through (unit tests)
+  ReplClient::Callbacks cb;
+  cb.identity = [this] { return identity(); };
+  cb.persist_identity = [this](const ReplIdentity& id) { return PersistAndPublish(id); };
+  ReplClient::ConfigSnapshotFn config = options_.role.config;
+  if (!config) config = [] { return ConfigValues{}; };
+  return std::make_shared<ReplClient>(*options_.role.engine, log_, std::move(config), std::move(cb),
+                                      options_.client);
+}
+
+Status ReplicationManager::PersistAndPublish(const ReplIdentity& id) {
+  if (Status st = PersistIdentity(storage_, id); !st.ok()) return st;
+  std::lock_guard lock(mu_);
+  identity_ = id;
+  return Status::Ok();
+}
+
+void ReplicationManager::SetReplicaOf(const std::string& value) {
+  if (options_.role.set_replicaof) options_.role.set_replicaof(value);
+}
+
 void ReplicationManager::DropAllReplicas() {
   std::vector<std::unique_ptr<ReplSender>> doomed;
   {
@@ -127,6 +253,11 @@ void ReplicationManager::Reap() {
 std::string ReplicationManager::replid() const {
   std::lock_guard lock(mu_);
   return identity_.replid;
+}
+
+ReplIdentity ReplicationManager::identity() const {
+  std::lock_guard lock(mu_);
+  return identity_;
 }
 
 ReplicationManager::Counters ReplicationManager::counters() const {
