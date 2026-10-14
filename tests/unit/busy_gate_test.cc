@@ -101,6 +101,9 @@ TEST(BusyGate, EngineCallsAnswerBusyWhileAScriptHoldsTheGate) {
   EXPECT_EQ(read.code(), StatusCode::kUserError);
   EXPECT_EQ(read.message(), "BUSY test");
   EXPECT_EQ(write.message(), "BUSY test");  // started after busy: gives up at once
+  EXPECT_TRUE(engine.IsBusyAnswer(read));
+  EXPECT_FALSE(engine.IsBusyAnswer(Status::UserError("ERR other")));
+  EXPECT_FALSE(engine.IsBusyAnswer(Status::Internal("BUSY test")));
   batch->reset();
 }
 

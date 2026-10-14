@@ -1,6 +1,8 @@
 #include "expire/reaper.h"
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +15,7 @@
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "support/command_harness.h"
+#include "types/errors.h"
 #include "types/object_store.h"
 
 namespace tideskv {
@@ -43,6 +46,40 @@ class ThrowingStorage final : public Storage {
  private:
   Storage& inner_;
   std::atomic<int> throws_left_;
+};
+
+// Forwards to a real storage, but every BeginRead fails with a user error that is not BUSY.
+class UserErrorStorage final : public Storage {
+ public:
+  explicit UserErrorStorage(Storage& inner) : inner_(inner) {}
+  Result<std::unique_ptr<WriteTxn>> BeginWrite() override { return inner_.BeginWrite(); }
+  Result<std::unique_ptr<ReadView>> BeginRead() override { return Status::UserError("ERR injected"); }
+  Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+
+ private:
+  Storage& inner_;
+};
+
+// Captures what is logged while alive (the default logger is swapped back on destruction).
+class LogCapture {
+ public:
+  LogCapture()
+      : sink_(std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64)), saved_(spdlog::default_logger()) {
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("capture", sink_));
+  }
+  ~LogCapture() { spdlog::set_default_logger(saved_); }
+  LogCapture(const LogCapture&) = delete;
+  LogCapture& operator=(const LogCapture&) = delete;
+  bool Contains(std::string_view text) const {
+    for (const std::string& line : sink_->last_formatted()) {
+      if (line.find(text) != std::string::npos) return true;
+    }
+    return false;
+  }
+
+ private:
+  std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink_;
+  std::shared_ptr<spdlog::logger> saved_;
 };
 
 struct ReaperTest : ::testing::Test {
@@ -229,6 +266,43 @@ TEST_F(ReaperTest, StaleEntryOfAnOlderOidDeletesNothing) {
   EXPECT_EQ(h.Cf(ColumnFamily::kMeta).size(), 1u);  // the collection was not deleted
   EXPECT_EQ(h.Cf(ColumnFamily::kSubkey).size(), 1u);
   EXPECT_EQ(h.Cf(ColumnFamily::kExpire).size(), 0u);  // the stale entry was dropped
+}
+
+// B3: only the Engine's BUSY answer (a timed-out script) is retried quietly; other user errors are logged.
+TEST_F(ReaperTest, OnlyTheBusyAnswerIsQuiet) {
+  {
+    UserErrorStorage storage(h.services.storage_);
+    LockManager locks;
+    Engine engine(storage, locks, h.clock());
+    ExpireReaper failing(engine, Fast());
+    LogCapture log;
+    failing.Start();
+    for (int i = 0; i < 200 && !log.Contains("ERR injected"); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    failing.Stop();
+    EXPECT_TRUE(log.Contains("expire reaper: UserError: ERR injected"));
+  }
+  Engine& engine = h.services.engine_;
+  engine.SetBusyGuard([] { return true; }, std::string(kErrBusyScript));
+  std::atomic<int> held{0};
+  std::atomic<bool> release{false};
+  std::thread script([&] {  // a timed-out script holds the gate
+    auto batch = engine.BeginBatch();
+    held = batch.ok() ? 1 : 2;
+    while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  while (held.load() == 0) std::this_thread::yield();
+  const std::string busy = reaper.RunOnce().status().message();
+  LogCapture log;
+  reaper.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // about 10 cycles
+  reaper.Stop();
+  release = true;
+  script.join();
+  EXPECT_EQ(held.load(), 1);
+  EXPECT_EQ(busy, kErrBusyScript);
+  EXPECT_FALSE(log.Contains("expire reaper"));
 }
 
 }  // namespace

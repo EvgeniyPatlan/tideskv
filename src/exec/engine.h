@@ -122,6 +122,10 @@ class Engine {
   // WakeWaiters() so calls already waiting re-check it. Set before the Engine is shared.
   void SetBusyGuard(std::function<bool()> busy, std::string busy_reply);
   void WakeWaiters() { gate_.Wake(); }  // takes only the gate's internal mutex, never the gate
+  // True iff `st` is the busy answer above (and not another user error).
+  bool IsBusyAnswer(const Status& st) const {
+    return busy_ && st.code() == StatusCode::kUserError && st.message() == busy_reply_;
+  }
 
   // While one is alive on this thread, its Engine calls ignore the busy guard: they wait for the gate,
   // through a timed-out script, as Redis serves blocked clients after the script. For work that must not
