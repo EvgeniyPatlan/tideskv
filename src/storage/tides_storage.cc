@@ -2,6 +2,7 @@
 
 #include <array>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -185,7 +186,8 @@ class TidesReadView final : public ReadView {
 
 class TidesWriteTxn final : public WriteTxn {
  public:
-  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs) : txn_(txn), cfs_(cfs) {}
+  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs, std::mutex& commit_mu)
+      : txn_(txn), cfs_(cfs), commit_mu_(commit_mu) {}
   ~TidesWriteTxn() override { tidesdb_txn_free(txn_); }  // rolls back if still open
 
   Result<std::string> Get(ColumnFamily cf, std::string_view key) override {
@@ -236,7 +238,8 @@ class TidesWriteTxn final : public WriteTxn {
 
   Status Commit() override {
     if (Status st = Check(Status::Ok()); !st.ok()) return st;
-    finished_ = true;  // a failed commit is final too; callers retry the whole command
+    finished_ = true;                        // a failed commit is final too; callers retry the whole command
+    const std::lock_guard lock(commit_mu_);  // D1: see TidesStorage::Impl::commit_mu
     return FromTdb(tidesdb_txn_commit(txn_), "commit");
   }
   Status Rollback() override {
@@ -254,6 +257,7 @@ class TidesWriteTxn final : public WriteTxn {
 
   tidesdb_txn_t* txn_;
   CfHandles cfs_;
+  std::mutex& commit_mu_;
   bool finished_ = false;
 };
 
@@ -317,6 +321,10 @@ struct TidesStorage::Impl {
   tidesdb_t* db = nullptr;
   CfHandles cfs{};
   Compression compression = Compression::kNone;
+  // D1 (M6a): TidesDB 10.1.1 can tear or lose concurrently committed txns across a memtable
+  // rotation on kill -9 (notes/m6-research/tidesdb-replication.md §5.2). Every commit and
+  // checkpoint (a forced rotation) runs under this mutex until upstream fixes the split-apply race.
+  std::mutex commit_mu;
   ~Impl() {
     if (db != nullptr) tidesdb_close(db);
   }
@@ -355,7 +363,7 @@ Result<std::unique_ptr<WriteTxn>> TidesStorage::BeginWrite() {
   tidesdb_txn_t* txn = nullptr;
   const int rc = tidesdb_txn_begin_with_isolation(impl_->db, TDB_ISOLATION_READ_COMMITTED, &txn);
   if (rc != TDB_SUCCESS) return FromTdb(rc, "txn_begin");
-  return std::unique_ptr<WriteTxn>(std::make_unique<TidesWriteTxn>(txn, impl_->cfs));
+  return std::unique_ptr<WriteTxn>(std::make_unique<TidesWriteTxn>(txn, impl_->cfs, impl_->commit_mu));
 }
 
 Result<std::unique_ptr<ReadView>> TidesStorage::BeginRead() {
@@ -382,7 +390,10 @@ Status TidesStorage::Backup(const std::string& dir) {
   return FromTdb(tidesdb_backup(impl_->db, dir.c_str()), "backup");
 }
 
-Status TidesStorage::Checkpoint() { return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint"); }
+Status TidesStorage::Checkpoint() {
+  const std::lock_guard lock(impl_->commit_mu);  // D1: a forced rotation must not split a commit
+  return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint");
+}
 
 std::string_view CompressionName(Compression c) {
   switch (c) {

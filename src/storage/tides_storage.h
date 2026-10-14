@@ -45,7 +45,8 @@ struct StorageOptions {
 // called concurrently from multiple threads (the engine is thread-safe; the background
 // compaction scheduler calls Compact from its own thread while transactions run). Each returned
 // WriteTxn/ReadView/Iterator is single-threaded: use it from one thread at a time,
-// and destroy it before this object.
+// and destroy it before this object. WriteTxn::Commit and Checkpoint are mutually exclusive
+// process-wide (D1: TidesDB 10.1.1 split-apply race across memtable rotations on kill -9).
 class TidesStorage final : public Storage, public Compactor {
  public:
   // Busy("... locked ...") when another handle or process holds the directory.
