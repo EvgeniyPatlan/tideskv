@@ -60,7 +60,7 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
   const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   std::lock_guard lock(mu_);
   PsyncResult r;
-  if (clients + LinksLocked() > maxclients) {  // F4: this caller's link would exceed maxclients
+  if (clients + LiveSendersLocked() > maxclients) {  // F4: this caller's link would exceed maxclients
     r.error = std::string(kErrMaxClients);
     return r;
   }
@@ -333,8 +333,7 @@ ReplicationManager::Counters ReplicationManager::counters() const {
   c.sync_partial_ok = sync_partial_ok_.load(std::memory_order_relaxed);
   c.sync_partial_err = sync_partial_err_.load(std::memory_order_relaxed);
   std::lock_guard lock(mu_);
-  c.connected_replicas = static_cast<uint64_t>(
-      std::count_if(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); }));
+  c.connected_replicas = LiveSendersLocked();
   return c;
 }
 
@@ -348,9 +347,9 @@ std::vector<ReplicationManager::ReplicaInfo> ReplicationManager::Replicas() cons
   return out;
 }
 
-uint64_t ReplicationManager::LinksLocked() const {
-  const auto live = std::count_if(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); });
-  return static_cast<uint64_t>(live) + pending_.size();
+uint64_t ReplicationManager::LiveSendersLocked() const {
+  return static_cast<uint64_t>(
+      std::count_if(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); }));
 }
 
 size_t ReplicationManager::pending_count() const {

@@ -96,12 +96,15 @@ TEST_F(ReplicationMasterIT, FullResyncClosesTheLink) {
 TEST(ReplicationLimitIT, ReplicaLinksCountAgainstMaxclients) {
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--maxclients", "2"}});
   std::vector<std::unique_ptr<RespClient>> links;
-  for (int i = 0; i < 2; ++i) {
-    auto link = s.Connect();
-    ASSERT_NE(link, nullptr);
-    const RespValue r = link->Command({"PSYNC", "?", "1"});
-    ASSERT_EQ(r.str.rfind("CONTINUE ", 0), 0u) << i << ": " << r.str;
-    links.push_back(std::move(link));
+  for (int i = 0; i < 2; ++i) {  // at once: neither hand-off may have happened when the other asks
+    links.push_back(s.Connect());
+    ASSERT_NE(links.back(), nullptr);
+  }
+  for (auto& link : links) ASSERT_TRUE(link->Send({"PSYNC", "?", "1"}));
+  for (auto& link : links) {
+    const auto r = link->Read();
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->str.rfind("CONTINUE ", 0), 0u) << r->str;
   }
   std::unique_ptr<RespClient> c;
   ASSERT_TRUE(WaitFor([&] {  // both hand-offs done: their connections are gone

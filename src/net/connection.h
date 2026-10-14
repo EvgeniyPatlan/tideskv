@@ -66,6 +66,7 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   std::string out_;
   std::array<char, size_t{16} * 1024> read_buf_{};
   bool closed_ = false;
+  bool counted_ = true;           // in stats_->connected; false once the socket was handed off
   bool reading_ = false;          // at most one read in flight
   bool writing_ = false;          // at most one write in flight
   bool handoff_pending_ = false;  // Handoff() cancelled an in-flight read and waits for its completion

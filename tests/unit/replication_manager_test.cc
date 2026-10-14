@@ -211,24 +211,36 @@ TEST_F(ManagerTest, DestructorShutsDown) {
   EXPECT_TRUE(PeerClosed(r1.get()));
 }
 
-// F4: live replica links and pending hand-offs count against maxclients with the PSYNC caller; PSYNC
-// beyond the limit gets the server's maxclients error, with no decision taken and nothing registered.
+// F4: live replica links count against maxclients with the server's connections. A hand-off still in
+// flight is one of those connections until its sender runs, so it is not counted twice; a PSYNC beyond
+// the limit gets the server's maxclients error, with no decision taken and nothing registered.
 TEST_F(ManagerTest, ReplicaLinksCountAgainstMaxclients) {
+  uint64_t connected = 2;  // two PSYNC callers at once
   ReplicationManager::Options o;
   o.maxclients = [] { return uint64_t{2}; };
-  o.connected_clients = [] { return uint64_t{1}; };  // the PSYNC caller itself
+  o.connected_clients = [&connected] { return connected; };
   auto m = Make(std::move(o));
-  Fd first = Attach(*m, 4);                                       // 1 client + 0 links
-  const PsyncResult second = m->HandlePsync({id.replid, 4}, {});  // 1 client + 1 link
-  EXPECT_EQ(second.decision, PsyncDecision::kContinue);
-  EXPECT_TRUE(second.error.empty());
-  const PsyncResult refused = m->HandlePsync({id.replid, 4}, {});  // 1 client + 1 link + 1 pending
+  std::vector<uint64_t> pending;
+  for (int i = 0; i < 2; ++i) {  // 2 connections + 0 links: neither hand-off has happened yet
+    const PsyncResult r = m->HandlePsync({id.replid, 4}, {});
+    ASSERT_TRUE(r.error.empty()) << i << ": " << r.error;
+    pending.push_back(r.pending_id);
+  }
+  std::vector<Fd> links;
+  for (uint64_t pending_id : pending) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    links.emplace_back(fds[1]);
+    m->AttachReplica(pending_id, fds[0], "");
+  }
+  connected = 1;                                                   // both handed off; a third caller
+  const PsyncResult refused = m->HandlePsync({id.replid, 4}, {});  // 1 connection + 2 links
   EXPECT_EQ(refused.error, kErrMaxClients);
   EXPECT_EQ(refused.pending_id, 0u);
-  EXPECT_EQ(m->pending_count(), 1u);
+  EXPECT_EQ(m->pending_count(), 0u);
   EXPECT_EQ(m->counters().sync_partial_ok, 2u);
   EXPECT_EQ(m->counters().sync_full, 0u);
-  first = Fd();  // a dropped link frees its slot at once, before it is reaped
+  links.pop_back();  // a dropped link frees its slot at once, before it is reaped
   EXPECT_TRUE(WaitFor([&] { return m->HandlePsync({id.replid, 4}, {}).error.empty(); }));
 }
 

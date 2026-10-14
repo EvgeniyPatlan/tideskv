@@ -27,7 +27,7 @@ Connection::Connection(asio::ip::tcp::socket socket, Session session, CommandExe
 Connection::~Connection() {
   if (session_.blocked) session_.blocked->Cancel();  // e.g. Server::Stop destroying pending handlers
   if (on_disconnect_) on_disconnect_(session_);
-  stats_->connected.fetch_sub(1);
+  if (counted_) stats_->connected.fetch_sub(1);
 }
 
 void Connection::Start() {
@@ -196,6 +196,10 @@ void Connection::FinishHandoff() {
   }
   takeover(fd, std::move(in_));
   in_.clear();
+  // The socket is a replica link now, counted by replication against maxclients (F4) from the moment
+  // takeover returned: stop counting it as a client at once rather than when this object goes.
+  stats_->connected.fetch_sub(1);
+  counted_ = false;
 }
 
 void Connection::Close() {

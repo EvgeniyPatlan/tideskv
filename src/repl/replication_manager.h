@@ -50,8 +50,10 @@ class ReplicationManager final : public Replication {
   };
   struct Options {
     std::function<std::chrono::milliseconds()> repl_timeout;  // null = 60 s
-    // F4: live replica links and pending hand-offs count against maxclients together with the server's
-    // client connections (a PSYNC caller is still one). Either null = no limit.
+    // F4: live replica links count against maxclients together with the server's client connections.
+    // A PSYNC caller, and a hand-off in flight, is still a connection: its sender is alive before the
+    // connection goes, so a link is never uncounted (and counted twice only for that moment). Either
+    // null = no limit.
     std::function<uint64_t()> maxclients;
     std::function<uint64_t()> connected_clients;
     // F5: this node's log does not describe its data (LoadOrDetectBaselineUnknown). As a master it never
@@ -118,7 +120,7 @@ class ReplicationManager final : public Replication {
     std::chrono::steady_clock::time_point created;
   };
 
-  uint64_t LinksLocked() const;  // requires mu_: live senders plus pending hand-offs (F4)
+  uint64_t LiveSendersLocked() const;  // requires mu_
   void TickLoop();
   void Reap();
   std::chrono::milliseconds Timeout() const;
