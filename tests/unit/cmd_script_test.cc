@@ -106,6 +106,16 @@ TEST(ScriptCmd, BadSubcommandInsideMultiIsRejectedAtQueueTime) {
   EXPECT_EQ(h.Run({"EXEC"}), Err("EXECABORT Transaction discarded because of previous errors."));
 }
 
+TEST(ScriptCmd, UnknownSubcommandEchoIsTruncatedTo128Bytes) {  // Redis: "unknown subcommand '%.128s'"
+  CommandHarness h;
+  const std::string name(200, 'x');
+  EXPECT_EQ(h.Run({"SCRIPT", name}),
+            Err("ERR unknown subcommand '" + std::string(128, 'x') + "'. Try SCRIPT HELP."));
+  h.Run({"MULTI"});  // the queue-time check builds the same text
+  EXPECT_EQ(h.Run({"SCRIPT", name}),
+            Err("ERR unknown subcommand '" + std::string(128, 'x') + "'. Try SCRIPT HELP."));
+}
+
 TEST(EvalCmd, FailedCommitRepliesTheErrorAndAppliesNothing) {
   CommandHarness h;
   h.services.storage_.fail_commit_in = 1;

@@ -171,9 +171,9 @@ std::string ScriptSubcommandError(const ArgList& argv) {
   for (const ScriptSub& s : kScriptSubs) {
     if (s.name != sub) continue;
     if (ArityOk(s.arity, argv.size())) return {};
-    return "ERR wrong number of arguments for 'script|" + sub + "' command";
+    return ArityError("script|" + sub);
   }
-  return "ERR unknown subcommand '" + argv[1] + "'. Try SCRIPT HELP.";
+  return UnknownSubcommandError(argv[1], "SCRIPT");
 }
 
 void RegisterScriptCommands(CommandRegistry& r) {
