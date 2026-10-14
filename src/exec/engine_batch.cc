@@ -15,7 +15,9 @@ using engine_internal::WriteScope;
 
 Engine::Batch::Batch(Engine& engine, std::unique_lock<Gate> gate, std::unique_ptr<WriteTxn> txn,
                      int64_t now_ms)
-    : engine_(engine), gate_(std::move(gate)), txn_(std::move(txn)), recorder_(*txn_), now_ms_(now_ms) {}
+    : engine_(engine), gate_(std::move(gate)), txn_(std::move(txn)), recorder_(*txn_), now_ms_(now_ms) {
+  recorder_.CaptureOps(engine_.repl_log_ != nullptr);  // before the batch's first write
+}
 
 Engine::Batch::~Batch() {
   if (done_) return;
@@ -107,6 +109,11 @@ Status Engine::Batch::ReleaseMark(uint64_t mark) {
   return st;
 }
 
+Status Engine::Batch::CommitTxn() {
+  if (engine_.repl_log_ == nullptr) return recorder_.Commit();
+  return engine_.repl_log_->Commit(*txn_, recorder_.ops());  // the recorder refuses the replog CF
+}
+
 Status Engine::Batch::Commit() {
   if (done_) return Status::Internal("batch already finished");
   done_ = true;
@@ -115,7 +122,7 @@ Status Engine::Batch::Commit() {
     if (Status rb = recorder_.Rollback(); !rb.ok()) spdlog::warn("batch rollback: {}", rb.ToString());
     return broken_;
   }
-  Status st = recorder_.Commit();  // no retry: the queued commands' replies are already written
+  Status st = CommitTxn();  // no retry: the queued commands' replies are already written
   if (!st.ok()) {
     if (Status rb = recorder_.Rollback(); !rb.ok()) spdlog::warn("batch rollback: {}", rb.ToString());
     return st;

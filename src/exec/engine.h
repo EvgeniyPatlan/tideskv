@@ -13,6 +13,7 @@
 #include "exec/gate.h"
 #include "exec/lock_manager.h"
 #include "exec/recording_txn.h"
+#include "exec/repl_log.h"
 #include "exec/write_observer.h"
 #include "storage/storage.h"
 
@@ -22,8 +23,9 @@ namespace engine_internal {
 struct WriteScope;
 }
 
-// The only path from commands to storage (spec §5.1). M6 adds the Sequencer and replog here; command code
-// never changes.
+// The only path from commands to storage (spec §5.1). With a ReplLog (M6a D3) every commit goes through
+// it, so each transaction that wrote something appends one replog batch of its ops; command code never
+// changes.
 //
 // Lock order: the Gate is always taken before any key stripe. The Gate is not re-entrant,
 // so a ReadFn/WriteFn must never call back into the Engine (debug builds assert this).
@@ -41,8 +43,15 @@ class Engine {
   static constexpr int kMaxCommitAttempts = 3;  // spec §5.4: TDB_ERR_CONFLICT
 
   Engine(Storage& storage, LockManager& locks, const Clock& clock, CommitListener* listener = nullptr,
-         WriteObserver* observer = nullptr)
-      : storage_(storage), locks_(locks), clock_(clock), listener_(listener), observer_(observer) {}
+         WriteObserver* observer = nullptr, ReplLog* repl_log = nullptr)
+      : storage_(storage),
+        locks_(locks),
+        clock_(clock),
+        listener_(listener),
+        observer_(observer),
+        repl_log_(repl_log) {}
+
+  ReplLog* repl_log() const { return repl_log_; }  // may be null: nothing is logged
 
   // For parse-time work only (turning a relative EX/PX into a deadline, as Redis does at
   // command start); never for an expiry decision, which uses the fn's now_ms.
@@ -89,6 +98,7 @@ class Engine {
     void UndoWrite(const std::string& savepoint);  // rolls back to and releases a write's savepoint
     void Release(const std::string& savepoint);    // a failure only warns: a leftover costs speed
     void Unroute();
+    Status CommitTxn();  // through the ReplLog when there is one
 
     Engine& engine_;
     std::unique_lock<Gate> gate_;    // first: released last, after the txn is gone
@@ -159,6 +169,7 @@ class Engine {
   const Clock& clock_;
   CommitListener* listener_;  // may be null; told about committed range deletes
   WriteObserver* observer_;   // may be null; told which keys each commit modified
+  ReplLog* repl_log_;         // may be null; sequences every commit into the replog
   Gate gate_;
   std::function<bool()> busy_;  // empty: plain gate waits
   std::string busy_reply_;

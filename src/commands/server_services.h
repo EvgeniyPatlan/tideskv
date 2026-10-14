@@ -27,7 +27,8 @@ struct ServerStats {
   std::string data_dir;
   std::string sync_mode;
   std::string storage_compression;  // "no", "lz4" or "zstd"
-  uint64_t storage_keys = 0;        // entries in sstables, all CFs (dead ones until compaction drops them)
+  // Entries in sstables, all CFs but the replog (dead ones until compaction drops them).
+  uint64_t storage_keys = 0;
   uint64_t storage_tombstones = 0;
   uint64_t storage_flushes = 0;
   uint64_t storage_compactions = 0;

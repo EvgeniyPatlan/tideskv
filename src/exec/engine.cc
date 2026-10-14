@@ -122,12 +122,14 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
     auto txn = storage_.BeginWrite();
     if (!txn.ok()) return txn.status();
     RecordingTxn recorder(**txn);
+    recorder.CaptureOps(repl_log_ != nullptr);  // before the first write
     if (scope.also_modified != nullptr) scope.also_modified->clear();
     std::vector<DbKey> flushed;
     if (st = CollectFlushed(recorder, scope, &flushed); !st.ok()) return st;
     st = fn(recorder, clock_.NowMs());  // read under the locks, fresh on every attempt
     if (!st.ok()) return st;            // destroying the unfinished txn rolls it back
-    st = recorder.Commit();
+    // The ReplLog writes replog[seq] on the inner txn: the recorder refuses the replog CF.
+    st = repl_log_ != nullptr ? repl_log_->Commit(**txn, recorder.ops()) : recorder.Commit();
     if (st.ok()) {
       if (listener_ != nullptr && !recorder.deletes().empty()) listener_->OnCommitted(recorder.deletes());
       if (Observing()) {

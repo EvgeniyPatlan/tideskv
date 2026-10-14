@@ -38,6 +38,7 @@ class RecordingTxn final : public WriteTxn {
   const std::vector<DbKey>& meta_keys() const { return meta_keys_; }
   // Replication capture (M6a D5): off by default. When on, every successful mutation is recorded as
   // one physical op, exactly as called, in program order and minus those rolled back.
+  // Contract: set it at transaction start, before the first write; a mid-txn toggle yields a partial list.
   void CaptureOps(bool on) { capture_ = on; }
   const std::vector<encoding::ReplOp>& ops() const { return ops_; }
 

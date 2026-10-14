@@ -101,6 +101,8 @@ inline constexpr std::string_view kErrRoScriptWithWriteFlag =
 inline constexpr std::string_view kErrBusyScript =
     "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
 inline constexpr std::string_view kErrNotBusy = "NOTBUSY No scripts in execution right now.";
+inline constexpr std::string_view kErrReadOnlyReplica =
+    "READONLY You can't write against a read only replica.";
 inline constexpr std::string_view kErrScriptFlushOption = "ERR SCRIPT FLUSH only support SYNC|ASYNC option";
 inline constexpr std::string_view kErrScriptDebugOption = "ERR Use SCRIPT DEBUG YES/SYNC/NO";
 inline constexpr std::string_view kErrScriptDebugUnsupported = "ERR SCRIPT DEBUG YES/SYNC is not supported";

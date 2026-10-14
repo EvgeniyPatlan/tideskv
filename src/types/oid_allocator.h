@@ -2,10 +2,13 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "common/status.h"
+#include "encoding/replog_codec.h"
 #include "storage/storage.h"
 
 namespace tideskv {
@@ -20,9 +23,13 @@ class OidAllocator {
   static constexpr uint64_t kLeaseSize = 65536;
   static constexpr std::string_view kHwmKey = "oid_hwm";
 
+  using CommitFn = std::function<Status(const std::vector<encoding::ReplOp>&)>;
+
   // persist makes the committed hwm durable (App: TidesStorage::Checkpoint); empty = no-op.
-  explicit OidAllocator(Storage& storage, std::function<Status()> persist = {})
-      : storage_(storage), persist_(std::move(persist)) {}
+  // commit, when set, commits the lease's ops instead of the allocator's own transaction (App:
+  // ReplLog::CommitStandalone, so the lease is replicated as its own batch).
+  explicit OidAllocator(Storage& storage, std::function<Status()> persist = {}, CommitFn commit = {})
+      : storage_(storage), persist_(std::move(persist)), commit_(std::move(commit)) {}
 
   // Reads sys/oid_hwm; a missing record starts at 1 (oid 0 is the strings' expire-index value).
   Status Init();
@@ -31,10 +38,12 @@ class OidAllocator {
   uint64_t hwm() const;  // exclusive end of the current lease
 
  private:
-  Status Lease();  // requires mu_
+  Status Lease();                             // requires mu_
+  Status WriteHwm(const std::string& value);  // requires mu_
 
   Storage& storage_;
   std::function<Status()> persist_;
+  CommitFn commit_;
   mutable std::mutex mu_;
   bool initialized_ = false;
   uint64_t next_ = 0;   // next id to hand out

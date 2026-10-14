@@ -9,6 +9,7 @@
 #include "common/clock.h"
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
+#include "exec/repl_log.h"
 #include "expire/reaper.h"
 #include "net/server.h"
 #include "script/script_engine.h"
@@ -53,6 +54,7 @@ class App final : public ServerServices {
 
   std::unique_ptr<Config> config_;
   std::unique_ptr<TidesStorage> storage_;
+  std::unique_ptr<ReplLog> repl_log_;  // before oids_ and engine_: both commit through it
   std::unique_ptr<OidAllocator> oids_;
   std::unique_ptr<LockManager> locks_ = std::make_unique<LockManager>();
   SystemClock clock_;

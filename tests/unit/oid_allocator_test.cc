@@ -118,5 +118,26 @@ TEST(OidAllocator, ConcurrentCallersGetDistinctIds) {
   EXPECT_EQ(all.size(), 80000u);
 }
 
+TEST(OidAllocator, InjectedCommitWritesTheLeaseInsteadOfItsOwnTxn) {
+  InMemoryStorage s;
+  std::vector<std::vector<encoding::ReplOp>> commits;
+  bool fail = true;
+  OidAllocator a(s, {}, [&](const std::vector<encoding::ReplOp>& ops) {
+    commits.push_back(ops);
+    return fail ? Status::IOError("injected") : Status::Ok();
+  });
+  ASSERT_TRUE(a.Init().ok());
+  EXPECT_EQ(a.Next().status().code(), StatusCode::kIOError);  // returned, and retried by the next call
+  fail = false;
+  EXPECT_EQ(*a.Next(), 1u);
+  ASSERT_EQ(commits.size(), 2u);
+  std::string hwm;
+  coding::PutFixed64BE(&hwm, 1 + OidAllocator::kLeaseSize);
+  const std::vector<encoding::ReplOp> expected = {
+      {encoding::ReplOpType::kPut, ColumnFamily::kSys, std::string(OidAllocator::kHwmKey), hwm}};
+  EXPECT_EQ(commits[1], expected);
+  EXPECT_EQ(StoredHwm(s), 0u);  // the commit fn owns the write: nothing of the allocator's own
+}
+
 }  // namespace
 }  // namespace tideskv

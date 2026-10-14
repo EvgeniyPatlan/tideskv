@@ -69,17 +69,22 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   if (!storage.ok()) return storage.status();
   if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
   std::unique_ptr<App> app(new App(std::move(config), std::move(storage).value()));
+  if (Status st = app->repl_log_->Recover(); !st.ok()) return st;  // before any commit (the oid lease)
   if (Status st = app->oids_->Init(); !st.ok()) return st;
   return app;
 }
 
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
-  oids_ = std::make_unique<OidAllocator>(*storage_, [this] { return storage_->Checkpoint(); });
+  repl_log_ = std::make_unique<ReplLog>(*storage_, clock_);
+  oids_ = std::make_unique<OidAllocator>(
+      *storage_, [this] { return storage_->Checkpoint(); },
+      [this](const std::vector<encoding::ReplOp>& ops) { return repl_log_->CommitStandalone(ops); });
   CompactionScheduler::Options co;
   co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
   scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
-  engine_ = std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_);
+  engine_ =
+      std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_, repl_log_.get());
   engine_->SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));  // H6
   scripts_.SetOnTimeout([this] { engine_->WakeWaiters(); });  // the script thread holds the gate: no lock
   reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
@@ -150,6 +155,7 @@ void App::Stop() {
   engine_.reset();             // references storage_, so it goes first
   scheduler_.reset();          // compacts storage_; nothing commits (feeds it) once the engine is gone
   oids_.reset();               // likewise (its persist hook checkpoints storage_)
+  repl_log_.reset();           // engine_ and oids_ committed through it
   storage_.reset();            // flushes and closes TidesDB
 }
 
@@ -171,9 +177,10 @@ ServerStats App::Stats() const {
   s.sync_mode = v.sync_mode;
   s.storage_compression = std::string(CompressionName(storage_->compression()));
   if (auto st = storage_->Stats(); st.ok()) {  // stats are best-effort; never fail INFO
-    for (const CfStats& cf : st->cf) {
-      s.storage_keys += cf.total_keys;
-      s.storage_tombstones += cf.total_tombstones;
+    for (ColumnFamily cf : kAllColumnFamilies) {
+      if (cf == ColumnFamily::kReplog) continue;  // the backlog has its own retention (M6a), not compaction's
+      s.storage_keys += st->cf[CfIndex(cf)].total_keys;
+      s.storage_tombstones += st->cf[CfIndex(cf)].total_tombstones;
     }
     s.storage_flushes = st->flush_count;
     s.storage_compactions = st->compaction_count;

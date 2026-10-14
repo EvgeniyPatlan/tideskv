@@ -1,0 +1,140 @@
+#include "exec/repl_log.h"
+
+#include <string>
+
+#include "common/coding.h"
+#include "types/errors.h"
+
+namespace tideskv {
+namespace {
+
+// sys/repl_first: 8-byte BE seq of the oldest retained replog entry (written by trimming).
+constexpr std::string_view kReplFirstKey = "repl_first";
+
+Status ApplyOp(WriteTxn& txn, const encoding::ReplOp& op) {
+  switch (op.type) {
+    case encoding::ReplOpType::kPut:
+      return txn.Put(op.cf, op.key, op.value);
+    case encoding::ReplOpType::kDelete:
+      return txn.Delete(op.cf, op.key);
+    case encoding::ReplOpType::kDeletePrefix:
+      return txn.DeletePrefix(op.cf, op.key);
+    case encoding::ReplOpType::kDeleteRange:
+      return txn.DeleteRange(op.cf, op.key, op.value);
+  }
+  return Status::InvalidArgument("unknown replication op type");
+}
+
+}  // namespace
+
+Status ReplLog::RecoverLast(ReadView& view, uint64_t* last, uint64_t* cum) {
+  *last = 0;
+  *cum = 0;
+  auto it = view.NewIterator(ColumnFamily::kReplog);
+  if (!it.ok()) return it.status();
+  if (Status st = (*it)->SeekToLast(); !st.ok()) return st.IsNotFound() ? Status::Ok() : st;
+  if (!(*it)->Valid()) return Status::Ok();
+  int64_t timestamp_ms = 0;
+  if (!encoding::DecodeReplogKey((*it)->key(), last) ||
+      !encoding::PeekReplogHeader((*it)->value(), &timestamp_ms, cum)) {
+    return Status::Corruption("the last replog entry is malformed");
+  }
+  return Status::Ok();
+}
+
+Status ReplLog::RecoverFirst(ReadView& view, uint64_t last, uint64_t* first) {
+  *first = 1;
+  auto raw = view.Get(ColumnFamily::kSys, kReplFirstKey);
+  if (raw.ok()) {
+    std::string_view in = *raw;
+    if (in.size() != 8 || !coding::GetFixed64BE(&in, first)) {
+      return Status::Corruption("sys/repl_first is not a valid 8-byte seq");
+    }
+    return Status::Ok();
+  }
+  if (!raw.status().IsNotFound()) return raw.status();
+  if (last == 0) return Status::Ok();
+  // Never trimmed (the replog is new in M6a): the oldest entry is the first retained one.
+  auto it = view.NewIterator(ColumnFamily::kReplog);
+  if (!it.ok()) return it.status();
+  if (Status st = (*it)->SeekToFirst(); !st.ok()) return st;
+  if (!(*it)->Valid() || !encoding::DecodeReplogKey((*it)->key(), first)) {
+    return Status::Corruption("the first replog entry is malformed");
+  }
+  return Status::Ok();
+}
+
+Status ReplLog::Recover() {
+  auto view = storage_.BeginRead();
+  if (!view.ok()) return view.status();
+  uint64_t last = 0;
+  uint64_t cum = 0;
+  uint64_t first = 1;
+  if (Status st = RecoverLast(**view, &last, &cum); !st.ok()) return st;
+  if (Status st = RecoverFirst(**view, last, &first); !st.ok()) return st;
+  std::lock_guard lock(mu_);
+  cum_ = cum;
+  first_.store(first, std::memory_order_release);
+  last_.store(last, std::memory_order_release);
+  return Status::Ok();
+}
+
+Status ReplLog::AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum) {
+  if (Status st = txn.Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), record); !st.ok()) return st;
+  if (Status st = txn.Commit(); !st.ok()) return st;
+  cum_ = cum;
+  last_.store(seq, std::memory_order_release);
+  advanced_.notify_all();
+  return Status::Ok();
+}
+
+Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) {
+  if (ops.empty()) return txn.Commit();
+  // Fenced (replica): refuse without touching txn; the caller's failure path rolls it back as for
+  // any failed commit (RunTxn destroys it, Batch::Commit calls Rollback).
+  if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
+  std::lock_guard lock(mu_);
+  const uint64_t seq = last_.load(std::memory_order_relaxed) + 1;
+  const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
+  return AppendAndCommit(txn, seq, record, cum_ + record.size());
+}
+
+Status ReplLog::CommitStandalone(const std::vector<encoding::ReplOp>& ops) {
+  if (fenced() && !ops.empty()) return Status::UserError(std::string(kErrReadOnlyReplica));
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  for (const encoding::ReplOp& op : ops) {
+    if (Status st = ApplyOp(**txn, op); !st.ok()) return st;
+  }
+  return Commit(**txn, ops);
+}
+
+Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view payload) {
+  int64_t timestamp_ms = 0;
+  uint64_t cum = 0;
+  if (!encoding::PeekReplogHeader(payload, &timestamp_ms, &cum)) {
+    return Status::Corruption("replicated batch has no valid header");
+  }
+  std::lock_guard lock(mu_);
+  const uint64_t expected = last_.load(std::memory_order_relaxed) + 1;
+  if (seq != expected) {
+    return Status::Internal("replicated seq " + std::to_string(seq) + " is not the next seq " +
+                            std::to_string(expected));
+  }
+  return AppendAndCommit(txn, seq, payload, cum);
+}
+
+uint64_t ReplLog::cum_bytes() const {
+  std::lock_guard lock(mu_);
+  return cum_;
+}
+
+uint64_t ReplLog::WaitBeyond(uint64_t seq, std::chrono::milliseconds timeout) const {
+  std::unique_lock lock(mu_);
+  advanced_.wait_for(lock, timeout, [&] { return last_.load(std::memory_order_relaxed) > seq; });
+  return last_.load(std::memory_order_relaxed);
+}
+
+void ReplLog::SetFirstRetained(uint64_t first) { first_.store(first, std::memory_order_release); }
+
+}  // namespace tideskv

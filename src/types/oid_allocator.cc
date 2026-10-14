@@ -25,14 +25,20 @@ Status OidAllocator::Init() {
   return Status::Ok();
 }
 
+Status OidAllocator::WriteHwm(const std::string& value) {
+  if (commit_)
+    return commit_({{encoding::ReplOpType::kPut, ColumnFamily::kSys, std::string(kHwmKey), value}});
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  if (Status st = (*txn)->Put(ColumnFamily::kSys, kHwmKey, value); !st.ok()) return st;
+  return (*txn)->Commit();
+}
+
 Status OidAllocator::Lease() {
   const uint64_t new_limit = limit_ + kLeaseSize;
   std::string value;
   coding::PutFixed64BE(&value, new_limit);
-  auto txn = storage_.BeginWrite();
-  if (!txn.ok()) return txn.status();
-  if (Status st = (*txn)->Put(ColumnFamily::kSys, kHwmKey, value); !st.ok()) return st;
-  if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  if (Status st = WriteHwm(value); !st.ok()) return st;
   if (persist_) {
     if (Status st = persist_(); !st.ok()) return st;
   }
