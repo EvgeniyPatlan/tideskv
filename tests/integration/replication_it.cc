@@ -142,6 +142,28 @@ TEST_F(ReplicationIT, ReplicaRefusesPsync) {
   EXPECT_EQ(r->Command({"PING"}).str, "PONG");
 }
 
+// F9: INFO lists the live replicas ROLE lists. A replica that died is gone from both at once, not only
+// once its sender is reaped (up to a second later).
+TEST_F(ReplicationIT, InfoAndRoleAgreeOnLiveReplicas) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  ASSERT_EQ(m->Command({"SET", "k", "v"}).str, "OK");
+  ASSERT_TRUE(Synced(*m, *r));
+  EXPECT_EQ(InfoField(*m, "replication", "connected_slaves"), 1);
+  const auto role_replicas = [&] {
+    const RespValue role = m->Command({"ROLE"});
+    return role.elements.size() == 3 ? static_cast<int64_t>(role.elements[2].elements.size()) : -1;
+  };
+  ASSERT_EQ(role_replicas(), 1);
+  r.reset();
+  replica->Kill9();
+  ASSERT_TRUE(WaitFor([&] { return role_replicas() == 0; }, 5s));
+  const std::string info = m->Command({"INFO", "replication"}).str;
+  EXPECT_NE(info.find("connected_slaves:0\r\n"), std::string::npos) << info;
+  EXPECT_EQ(info.find("slave0:"), std::string::npos) << info;
+}
+
 TEST_F(ReplicationIT, ReplicaIsReadOnly) {
   Follow(*replica);
   auto r = Client(*replica);

@@ -313,6 +313,7 @@ void App::FillReplStats(ServerStats& s, const ConfigValues& v) const {
         link.link_down_since_ms > 0 ? SecondsSince(link.link_down_since_ms, now) : link.link_down_since_ms;
   }
   for (const ReplicaInfo& i : role.replicas) {
+    if (!i.alive) continue;  // F9: as ROLE, a link that dropped is not listed while it awaits the reaper
     r.replicas.push_back(
         {i.ip, i.listening_port, i.acked, std::max<int64_t>(0, SecondsSince(i.last_ack_ms, now))});
   }
