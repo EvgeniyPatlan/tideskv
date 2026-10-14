@@ -58,23 +58,22 @@ class ReplClient {
 
   void Start(std::string host, uint16_t port);  // once; spawns the thread and never blocks
   // Idempotent and prompt from any thread but the client's own: shuts the socket down (waking any poll,
-  // and cancelling a connect in progress), wakes a backoff wait and joins the thread.
+  // and cancelling a connect in progress), wakes a backoff wait and joins the thread. One wait is not
+  // interruptible: while the master's DNS name is being resolved (getaddrinfo), Stop can wait up to the
+  // resolver's timeout.
   void Stop();
 
   ReplicaLinkState state() const { return state_.load(std::memory_order_acquire); }
   int64_t last_io_ms() const { return last_io_ms_.load(std::memory_order_acquire); }  // unix ms; 0 = never
   // Unix ms when the link last went down; -1 if it never came up; 0 while it is up.
   int64_t link_down_since_ms() const { return link_down_since_ms_.load(std::memory_order_acquire); }
-  const std::string& host() const { return host_; }
-  uint16_t port() const { return port_; }
 
  private:
   using SteadyClock = std::chrono::steady_clock;
 
   void Run();
   Status RunLink(bool* continued);  // one connection, from connect to the link dropping
-  Status Connect(Fd* out);
-  bool Publish(int fd);  // false when Stop() came first
+  bool Publish(int fd);             // false when Stop() came first
   void Unpublish();
   Status Handshake(int fd, const ConfigValues& cfg);
   Status Psync(int fd, bool* continued);
@@ -94,7 +93,7 @@ class ReplClient {
   ConfigSnapshotFn config_;
   Callbacks cb_;
   Options options_;
-  std::string host_;
+  std::string host_;  // set by Start before the thread exists; read only by the thread
   uint16_t port_ = 0;
 
   // Client thread only.

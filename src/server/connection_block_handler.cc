@@ -3,6 +3,8 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 
 namespace tideskv {
 
@@ -21,8 +23,12 @@ void ConnectionBlockHandler::Block(const BlockRequest& request) {
   copy.blocked.reset();
   auto client = std::make_shared<BlockedClient>(registry_, std::move(copy), argv_, request.type, request.keys,
                                                 deadline);
-  registry_.Add(client);
   session_.blocked = client;
+  std::string refusal;
+  if (!registry_.AddIfCurrent(client, epoch_, &refusal)) {
+    client->UnblockAndClose(std::move(refusal));  // delivered like any unblock, after this command
+    return;
+  }
   for (const std::string& k : client->keys()) ready_.push_back({client->db(), k});
 }
 

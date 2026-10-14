@@ -77,7 +77,7 @@ class ReplicationManager final : public Replication {
   void AttachReplica(uint64_t pending_id, int fd, std::string unread) override;
   void OnReplconf(Session& s, const ReplconfOptions& o) override;
   bool BecomeReplica(const std::string& host, uint16_t port) override;
-  void BecomeMaster() override;
+  Status BecomeMaster() override;
   RoleInfo Role() const override;
 
   // Stops every sender (demotion, promotion: sub-replicas must resync, Redis disconnectSlaves; shutdown).
@@ -101,7 +101,8 @@ class ReplicationManager final : public Replication {
   std::chrono::milliseconds Timeout() const;
   std::shared_ptr<ReplClient> TakeClient();  // detaches the client (under mu_); the caller stops it
   std::shared_ptr<ReplClient> MakeClient();
-  Status PersistAndPublish(const ReplIdentity& id);  // the client thread's persist_identity
+  void StartClient(const std::string& host, uint16_t port);  // a new client, published under mu_
+  Status PersistAndPublish(const ReplIdentity& id);          // the client thread's persist_identity
   bool SameMaster(const std::string& host, uint16_t port) const;
   void SetReplicaOf(const std::string& value);
 

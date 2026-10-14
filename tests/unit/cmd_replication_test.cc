@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -300,7 +301,9 @@ struct RoleHarness : CommandHarness {
     o.role.stop_reaper = [this] { reaper_running = false; };
     o.role.start_reaper = [this] { reaper_running = true; };
     o.role.disconnect_blocked = [this](std::string_view e) { services.blocking_.DisconnectAll(e); };
-    o.role.reinit_oids = [this] { return services.oids_.Init(); };
+    o.role.reinit_oids = [this] {
+      return fail_reinit ? Status::IOError("injected oid failure") : services.oids_.Init();
+    };
     o.role.set_replicaof = [this](const std::string& v) {
       EXPECT_TRUE(services.config_.Set("replicaof", v.empty() ? "no one" : v, false).ok());
     };
@@ -311,8 +314,48 @@ struct RoleHarness : CommandHarness {
   ~RoleHarness() { manager->Shutdown(); }
 
   bool reaper_running = true;
+  std::atomic<bool> fail_reinit{false};
   std::unique_ptr<repl::ReplicationManager> manager;
 };
+
+// Fix round 1: a promotion that cannot persist its identity or reload the oid hwm leaves the node a
+// fenced replica of the same master, and REPLICAOF NO ONE answers the storage error.
+void ExpectStillAReplica(RoleHarness& h) {
+  EXPECT_EQ(h.Run({"SET", "a", "2"}), Err("READONLY You can't write against a read only replica."));
+  EXPECT_EQ(h.Run({"ROLE"}).substr(0, 14), "*5\r\n$5\r\nslave\r");
+  EXPECT_TRUE(h.services.repl_log_.fenced());
+  EXPECT_FALSE(h.reaper_running);
+  EXPECT_EQ(h.services.config_.Snapshot().replicaof, "127.0.0.1 1");
+  const RoleInfo r = h.manager->Role();
+  EXPECT_EQ(r.host, "127.0.0.1");
+  EXPECT_EQ(r.port, 1);
+}
+
+TEST(RoleChange, APromotionWhoseIdentityCannotBePersistedStaysAReplica) {
+  RoleHarness h;
+  const std::string old_id = h.manager->replid();
+  EXPECT_EQ(h.Run({"REPLICAOF", "127.0.0.1", "1"}), kOk);
+  h.services.storage_.fail_commit_in = 1;  // PersistIdentity's commit
+  const std::string reply = h.Run({"REPLICAOF", "NO", "ONE"});
+  EXPECT_TRUE(reply.starts_with("-ERR REPLICAOF NO ONE failed, still a replica: ")) << reply;
+  EXPECT_NE(reply.find("injected commit failure"), std::string::npos) << reply;
+  ExpectStillAReplica(h);
+  EXPECT_EQ(h.manager->replid(), old_id);
+  EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE"}), kOk);  // the storage recovered: promotion now succeeds
+  EXPECT_EQ(h.Run({"SET", "a", "3"}), kOk);
+}
+
+TEST(RoleChange, APromotionThatCannotReloadTheOidHwmStaysAReplica) {
+  RoleHarness h;
+  EXPECT_EQ(h.Run({"REPLICAOF", "127.0.0.1", "1"}), kOk);
+  h.fail_reinit = true;
+  const std::string reply = h.Run({"REPLICAOF", "NO", "ONE"});
+  EXPECT_TRUE(reply.starts_with("-ERR REPLICAOF NO ONE failed, still a replica: ")) << reply;
+  EXPECT_NE(reply.find("injected oid failure"), std::string::npos) << reply;
+  ExpectStillAReplica(h);
+  h.fail_reinit = false;
+  EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE"}), kOk);
+}
 
 TEST(RoleChange, DemotionUnblocksBlockedClientsAndClosesThem) {
   RoleHarness h;

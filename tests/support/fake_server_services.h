@@ -58,10 +58,11 @@ class FakeReplication final : public Replication {
     set_role(ReplRole::kReplica);
     return true;
   }
-  void BecomeMaster() override {
+  Status BecomeMaster() override {
     ++become_master;
     role_info = RoleInfo{};
     set_role(ReplRole::kMaster);
+    return Status::Ok();
   }
   RoleInfo Role() const override {
     RoleInfo r = role_info;

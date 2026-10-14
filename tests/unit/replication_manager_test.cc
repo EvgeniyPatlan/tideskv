@@ -273,12 +273,12 @@ TEST_F(RoleTest, RoleReportsTheMasterAndALinkThatIsDown) {
 
 TEST_F(RoleTest, BecomeMasterPromotesTheIdentityThenUnfencesAndStartsTheReaper) {
   auto m = MakeWithHooks();
-  m->BecomeMaster();  // a no-op on a master
+  EXPECT_TRUE(m->BecomeMaster().ok());  // a no-op on a master
   EXPECT_TRUE(Take().empty());
   EXPECT_EQ(m->replid(), id.replid);
   m->BecomeReplica("h", 1);
   Take();
-  m->BecomeMaster();
+  EXPECT_TRUE(m->BecomeMaster().ok());
   EXPECT_EQ(Take(), (std::vector<std::string>{"reinit_oids fenced", "start_reaper", "replicaof="}));
   EXPECT_FALSE(log.fenced());
   EXPECT_EQ(m->role(), ReplRole::kMaster);
@@ -298,7 +298,7 @@ TEST_F(RoleTest, RoleChangesAfterShutdownStartNothing) {
   auto m = MakeWithHooks();
   m->Shutdown();
   m->BecomeReplica("h", 1);
-  m->BecomeMaster();
+  EXPECT_TRUE(m->BecomeMaster().ok());
   EXPECT_TRUE(Take().empty());
   EXPECT_FALSE(log.fenced());
 }

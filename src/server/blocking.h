@@ -77,25 +77,34 @@ class BlockingRegistry {
   // consistent and the connection's current wait is the one that can be served; the old wait is
   // orphaned (its later Remove is a no-op) and ends only by its own timeout or disconnect.
   void Add(const std::shared_ptr<BlockedClient>& client);
-  void Remove(const BlockedClient& client);  // idempotent
+  // Add, unless a DisconnectAll ran since `epoch` was read: a blocking command dispatched before a
+  // demotion must not start waiting after it. Then nothing is registered, *refusal gets DisconnectAll's
+  // reply bytes, and false is returned.
+  bool AddIfCurrent(const std::shared_ptr<BlockedClient>& client, uint64_t epoch, std::string* refusal);
+  uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }  // read before dispatch
+  void Remove(const BlockedClient& client);                                  // idempotent
   // Cheap when nobody is blocked anywhere (one atomic load).
   bool HasWaiters(uint8_t db, std::string_view key) const;
   // The clients blocked on (db, key), in the order they blocked.
   std::vector<std::shared_ptr<BlockedClient>> WaitersOn(uint8_t db, std::string_view key) const;
   std::shared_ptr<BlockedClient> Find(uint64_t client_id) const;
   // Ends every wait with the error `error` (text without the leading '-') and closes each of those
-  // connections after the reply (Redis disconnectAllBlockedClients; M6a D14). Returns how many it ended.
+  // connections after the reply (Redis disconnectAllBlockedClients; M6a D14), and starts a new epoch so
+  // that AddIfCurrent refuses commands dispatched before it. Returns how many waits it ended.
   size_t DisconnectAll(std::string_view error);
   size_t blocked_clients() const { return count_.load(); }
   size_t blocking_keys() const;  // distinct (db, key) with at least one waiter
 
  private:
-  void EraseKeysLocked(const BlockedClient& client);  // drops client from by_key_ (mu_ held)
+  void AddLocked(const std::shared_ptr<BlockedClient>& client);  // mu_ held
+  void EraseKeysLocked(const BlockedClient& client);             // drops client from by_key_ (mu_ held)
 
   mutable std::mutex mu_;
   std::map<std::string, std::list<std::shared_ptr<BlockedClient>>> by_key_;  // [db byte][key] -> FIFO
   std::unordered_map<uint64_t, std::shared_ptr<BlockedClient>> by_client_;
   std::atomic<size_t> count_{0};
+  std::atomic<uint64_t> epoch_{0};  // written under mu_
+  std::string refusal_;             // guarded by mu_: the last DisconnectAll's reply
 };
 
 }  // namespace tideskv

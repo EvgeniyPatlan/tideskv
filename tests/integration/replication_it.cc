@@ -122,11 +122,23 @@ TEST_F(ReplicationIT, ReplicaHidesExpiredKeysButKeepsThemUntilMasterDeletes) {
   Follow(*replica);
   auto m = Client(master);
   auto r = Client(*replica);
-  const auto set_at = std::chrono::steady_clock::now();
-  ASSERT_EQ(m->Command({"SET", "e", "v", "PX", "500"}).str, "OK");
-  ASSERT_TRUE(Synced(*m, *r));
-  master.Pause();  // freezes the master's reaper: no DEL can be replicated
-  std::this_thread::sleep_until(set_at + 800ms);
+  // The master must be paused while `e` is still live there, or its reaper's DEL could reach the replica
+  // first. A sync slower than the margin (a loaded machine) retries with a fresh key once the old one
+  // is gone from both nodes.
+  constexpr auto kTtl = 1000ms;
+  constexpr auto kMargin = 600ms;  // pause no later than this after the SET
+  bool paused = false;
+  for (int attempt = 0; attempt < 5 && !paused; ++attempt) {
+    ASSERT_TRUE(WaitFor([&] { return r->Command({"DBSIZE"}).integer == 0; }, 10s));
+    const auto set_at = std::chrono::steady_clock::now();
+    ASSERT_EQ(m->Command({"SET", "e", "v", "PX", std::to_string(kTtl.count())}).str, "OK");
+    ASSERT_TRUE(Synced(*m, *r));
+    if (std::chrono::steady_clock::now() - set_at > kMargin) continue;
+    master.Pause();  // freezes the master's reaper: no DEL can be replicated
+    paused = true;
+    std::this_thread::sleep_until(set_at + kTtl + 300ms);
+  }
+  ASSERT_TRUE(paused) << "the replica never synced within " << kMargin.count() << " ms";
   EXPECT_EQ(r->Command({"GET", "e"}).type, Type::kNull);
   EXPECT_EQ(r->Command({"EXISTS", "e"}).integer, 0);
   EXPECT_EQ(r->Command({"DBSIZE"}).integer, 1);  // still stored: the replica's reaper does not run

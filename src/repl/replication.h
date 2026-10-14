@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/status.h"
 #include "repl/repl_state.h"
 #include "server/session.h"
 
@@ -93,7 +94,9 @@ class Replication {
   // Engine gate (inside EXEC they run after the batch).
   // REPLICAOF host port. False when already replicating that exact master (case-insensitive host).
   virtual bool BecomeReplica(const std::string& host, uint16_t port) = 0;
-  virtual void BecomeMaster() = 0;  // REPLICAOF NO ONE; a no-op on a master
+  // REPLICAOF NO ONE; a no-op on a master. A storage error (persisting the new identity, reloading the
+  // oid high-water mark) is returned and leaves the node a fenced replica of the same master.
+  virtual Status BecomeMaster() = 0;
   virtual RoleInfo Role() const = 0;
 };
 

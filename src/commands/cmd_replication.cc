@@ -116,7 +116,12 @@ void RunRoleChange(ExecContext& ctx, std::function<void()> change) {
 void Replicaof(ExecContext& ctx, const ArgList& argv) {
   Replication& repl = ctx.server.replication();
   if (EqualsIgnoreCase(argv[1], "no") && EqualsIgnoreCase(argv[2], "one")) {
-    RunRoleChange(ctx, [&repl] { repl.BecomeMaster(); });  // a no-op on a master, still +OK
+    if (ctx.after_batch != nullptr) {  // EXEC already answered +OK; BecomeMaster logs a failure
+      ctx.after_batch->push_back([&repl] { (void)repl.BecomeMaster(); });
+      return ctx.reply.SimpleString("OK");
+    }
+    const Status st = repl.BecomeMaster();  // a no-op on a master, still +OK
+    if (!st.ok()) return ctx.reply.Error(std::string(kErrPromotionFailed) + st.message());
     return ctx.reply.SimpleString("OK");
   }
   if (ctx.session.is_replica_link) return ctx.reply.Error(kErrReplicaofFromReplica);

@@ -65,6 +65,30 @@ TEST(BlockingRegistry, DisconnectAllEndsEveryWaitAndClosesTheConnections) {
   EXPECT_TRUE(la->Take().empty());
 }
 
+// Fix round 1: a blocking command dispatched before a demotion's DisconnectAll that registers only after
+// it (it passed the replica check while the node was still a master) is refused, not left waiting.
+TEST(BlockingRegistry, ABlockStartedBeforeDisconnectAllIsRefusedAndClosed) {
+  BlockingRegistry r;
+  Session s;
+  s.id = 9;
+  auto link = std::make_shared<test::FakeLink>();
+  s.link = link;
+  std::vector<std::string> argv{"blpop", "k", "0"};
+  ReadyKeys ready;
+  ConnectionBlockHandler before(r, s, argv, ready);     // the command is dispatched...
+  EXPECT_EQ(r.DisconnectAll("UNBLOCKED demoted"), 0u);  // ...the node is demoted...
+  before.Block({ValueType::kList, {"k"}, 0});           // ...then it tries to block
+  EXPECT_EQ(r.blocked_clients(), 0u);
+  EXPECT_EQ(link->Take(), (std::vector<std::string>{"-UNBLOCKED demoted\r\n"}));
+  EXPECT_EQ(link->closes(), 1);
+  EXPECT_TRUE(ready.empty());
+  s.blocked.reset();
+  ConnectionBlockHandler after(r, s, argv, ready);  // dispatched after the demotion: blocks normally
+  after.Block({ValueType::kList, {"k"}, 0});
+  EXPECT_EQ(r.blocked_clients(), 1u);
+  EXPECT_TRUE(link->Take().empty());
+}
+
 TEST(BlockingRegistry, AddingADuplicateClientIdReplacesTheOldEntry) {
   BlockingRegistry r;
   auto link = std::make_shared<test::FakeLink>();

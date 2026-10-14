@@ -109,57 +109,75 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
   }
   const RoleHooks& hooks = options_.role;
   log_.FenceLocalWrites(true);  // a barrier: once it returns no local commit can take a seq (CF1)
-  role_.store(ReplRole::kReplica, std::memory_order_release);
-  if (hooks.stop_reaper) hooks.stop_reaper();
-  if (hooks.disconnect_blocked) hooks.disconnect_blocked(kErrUnblockedRoleChange);
-  DropAllReplicas();
-  if (auto old = TakeClient()) old->Stop();  // shutdown + join: the only committer is gone
-  SetReplicaOf(host + " " + std::to_string(port));
-  std::shared_ptr<ReplClient> client = MakeClient();
+  std::shared_ptr<ReplClient> old;
   {
-    std::lock_guard lock(mu_);
+    std::lock_guard lock(mu_);  // Role() sees the role, the master and (no) client change together
+    old = std::exchange(client_, nullptr);
     master_host_ = host;
     master_port_ = port;
-    client_ = client;
+    role_.store(ReplRole::kReplica, std::memory_order_release);
   }
-  if (client) client->Start(host, port);
+  if (hooks.stop_reaper) hooks.stop_reaper();
+  // A blocking command dispatched before this point either registered already (and is ended here) or
+  // registers later and is refused: DisconnectAll moves the registry to a new epoch (fix round 1).
+  if (hooks.disconnect_blocked) hooks.disconnect_blocked(kErrUnblockedRoleChange);
+  DropAllReplicas();
+  if (old) old->Stop();  // shutdown + join: the only committer is gone
+  SetReplicaOf(host + " " + std::to_string(port));
+  StartClient(host, port);
   spdlog::info("REPLICAOF {}:{}: this node is now a replica", host, port);
   return true;
 }
 
-// REPLICAOF NO ONE (D7): stop the client, then promote the identity on this thread. With the client
-// joined nothing applies concurrently, so this thread is the replica's only committer.
-void ReplicationManager::BecomeMaster() {
-  std::lock_guard role_lock(role_mu_);
-  if (role() == ReplRole::kMaster) return;
+void ReplicationManager::StartClient(const std::string& host, uint16_t port) {
+  std::shared_ptr<ReplClient> client = MakeClient();
+  if (!client) return;
   {
     std::lock_guard lock(mu_);
-    if (shut_down_) return;
+    client_ = client;
+  }
+  client->Start(host, port);
+}
+
+// REPLICAOF NO ONE (D7): stop the client, then reload the oid hwm and persist the promoted identity on
+// this thread. With the client joined nothing applies concurrently, so this thread is the replica's only
+// committer, and the fence is still up. If either step fails the node stays a fenced replica of the same
+// master (its client restarted) and the error is returned; only then does it unfence and act as a master.
+Status ReplicationManager::BecomeMaster() {
+  std::lock_guard role_lock(role_mu_);
+  if (role() == ReplRole::kMaster) return Status::Ok();
+  std::string host;
+  uint16_t port = 0;
+  {
+    std::lock_guard lock(mu_);
+    if (shut_down_) return Status::Ok();
+    host = master_host_;
+    port = master_port_;
   }
   if (auto old = TakeClient()) old->Stop();
   const uint64_t last = log_.last();
   const ReplIdentity promoted = Promote(identity(), last);
-  if (Status st = PersistIdentity(storage_, promoted); !st.ok()) {
-    spdlog::error("cannot persist the promoted replication id: {}", st.ToString());
+  Status st = options_.role.reinit_oids ? options_.role.reinit_oids() : Status::Ok();  // CF7
+  if (st.ok()) st = PersistIdentity(storage_, promoted);
+  if (!st.ok()) {
+    spdlog::error("REPLICAOF NO ONE failed, still a replica of {}:{}: {}", host, port, st.ToString());
+    StartClient(host, port);
+    return st;
   }
-  const RoleHooks& hooks = options_.role;
-  if (hooks.reinit_oids) {  // CF7: leases continue above the hwm applied from the master
-    if (Status st = hooks.reinit_oids(); !st.ok())
-      spdlog::error("cannot reload the oid hwm: {}", st.ToString());
-  }
+  log_.FenceLocalWrites(false);
   {
     std::lock_guard lock(mu_);
     identity_ = promoted;
     master_host_.clear();
     master_port_ = 0;
+    role_.store(ReplRole::kMaster, std::memory_order_release);
   }
-  log_.FenceLocalWrites(false);
-  role_.store(ReplRole::kMaster, std::memory_order_release);
-  if (hooks.start_reaper) hooks.start_reaper();
+  if (options_.role.start_reaper) options_.role.start_reaper();
   DropAllReplicas();  // sub-replicas must learn the new replid (Redis disconnectSlaves)
   SetReplicaOf("");
   spdlog::info("REPLICAOF NO ONE: this node is now a master, replication id {} from seq {}", promoted.replid,
                last + 1);
+  return Status::Ok();
 }
 
 RoleInfo ReplicationManager::Role() const {

@@ -60,6 +60,9 @@ inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of
 
 inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
 inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";
+// REPLICAOF NO ONE that could not persist the promotion (TidesKV; + the storage error). The node stays a
+// replica of the same master.
+inline constexpr std::string_view kErrPromotionFailed = "ERR REPLICAOF NO ONE failed, still a replica: ";
 // Every blocked client gets this when the node becomes a replica (blocked.c disconnectAllBlockedClients).
 inline constexpr std::string_view kErrUnblockedRoleChange =
     "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";

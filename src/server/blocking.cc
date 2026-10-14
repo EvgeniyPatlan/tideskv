@@ -82,6 +82,10 @@ void BlockedClient::Deliver(std::string reply, bool close_after) {
 
 void BlockingRegistry::Add(const std::shared_ptr<BlockedClient>& client) {
   std::lock_guard lock(mu_);
+  AddLocked(client);
+}
+
+void BlockingRegistry::AddLocked(const std::shared_ptr<BlockedClient>& client) {
   auto& slot = by_client_[client->client_id()];
   if (slot) {
     EraseKeysLocked(*slot);  // a duplicate id replaces the old entry (see the header)
@@ -90,6 +94,17 @@ void BlockingRegistry::Add(const std::shared_ptr<BlockedClient>& client) {
   }
   slot = client;
   for (const std::string& k : client->keys()) by_key_[KeyOf(client->db(), k)].push_back(client);
+}
+
+bool BlockingRegistry::AddIfCurrent(const std::shared_ptr<BlockedClient>& client, uint64_t epoch,
+                                    std::string* refusal) {
+  std::lock_guard lock(mu_);  // the check and the insert are one step for DisconnectAll's snapshot
+  if (epoch != epoch_.load(std::memory_order_relaxed)) {
+    *refusal = refusal_;
+    return false;
+  }
+  AddLocked(client);
+  return true;
 }
 
 void BlockingRegistry::Remove(const BlockedClient& client) {
@@ -131,14 +146,16 @@ std::shared_ptr<BlockedClient> BlockingRegistry::Find(uint64_t client_id) const 
 }
 
 size_t BlockingRegistry::DisconnectAll(std::string_view error) {
+  const std::string reply = "-" + std::string(error) + "\r\n";
   std::vector<std::shared_ptr<BlockedClient>> clients;
   {
     std::lock_guard lock(mu_);
     clients.reserve(by_client_.size());
     for (const auto& [id, client] : by_client_) clients.push_back(client);
+    refusal_ = reply;
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
   }
   // Outside mu_: ending a wait takes BlockedClient::mu_, then mu_ (Remove).
-  const std::string reply = "-" + std::string(error) + "\r\n";
   size_t ended = 0;
   for (const auto& client : clients) {
     if (client->UnblockAndClose(reply)) ++ended;

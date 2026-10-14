@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,7 @@ class ConnectionBlockHandler final : public BlockHandler {
  public:
   ConnectionBlockHandler(BlockingRegistry& registry, Session& session, const std::vector<std::string>& argv,
                          ReadyKeys& ready)
-      : registry_(registry), session_(session), argv_(argv), ready_(ready) {}
+      : registry_(registry), session_(session), argv_(argv), ready_(ready), epoch_(registry.epoch()) {}
 
   void Block(const BlockRequest& request) override;
 
@@ -23,6 +24,9 @@ class ConnectionBlockHandler final : public BlockHandler {
   Session& session_;
   const std::vector<std::string>& argv_;
   ReadyKeys& ready_;
+  // Read when the command is dispatched, before it checks the role: a demotion's DisconnectAll after
+  // this point makes Block refuse (UNBLOCKED, then close) instead of waiting on a replica forever.
+  const uint64_t epoch_;
 };
 
 }  // namespace tideskv
