@@ -27,6 +27,13 @@ Status ApplyOp(WriteTxn& txn, const encoding::ReplOp& op) {
 
 }  // namespace
 
+Status ApplyReplOps(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) {
+  for (const encoding::ReplOp& op : ops) {
+    if (Status st = ApplyOp(txn, op); !st.ok()) return st;
+  }
+  return Status::Ok();
+}
+
 Status ReplLog::RecoverLast(ReadView& view, uint64_t* last, uint64_t* cum) {
   *last = 0;
   *cum = 0;
@@ -103,9 +110,7 @@ Status ReplLog::CommitStandalone(const std::vector<encoding::ReplOp>& ops) {
   if (fenced() && !ops.empty()) return Status::UserError(std::string(kErrReadOnlyReplica));
   auto txn = storage_.BeginWrite();
   if (!txn.ok()) return txn.status();
-  for (const encoding::ReplOp& op : ops) {
-    if (Status st = ApplyOp(**txn, op); !st.ok()) return st;
-  }
+  if (Status st = ApplyReplOps(**txn, ops); !st.ok()) return st;
   return Commit(**txn, ops);
 }
 
@@ -120,6 +125,14 @@ Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view p
   if (seq != expected) {
     return Status::Internal("replicated seq " + std::to_string(seq) + " is not the next seq " +
                             std::to_string(expected));
+  }
+  // CF2: the master's stream must continue ours byte for byte. No exception for an empty replica
+  // (last() == 0): only seq 1 is then accepted, and seq 1's cum_bytes is always its own size (every
+  // log starts at 0), so an empty replica's baseline of 0 is exact. A full sync that installs another
+  // baseline sets last/cum itself rather than trusting a batch's header.
+  if (cum != cum_ + payload.size()) {
+    return Status::Corruption("replicated batch " + std::to_string(seq) + " has cum_bytes " +
+                              std::to_string(cum) + ", expected " + std::to_string(cum_ + payload.size()));
   }
   return AppendAndCommit(txn, seq, payload, cum);
 }

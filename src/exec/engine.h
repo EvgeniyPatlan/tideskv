@@ -53,6 +53,20 @@ class Engine {
 
   ReplLog* repl_log() const { return repl_log_; }  // may be null: nothing is logged
 
+  // Replica apply (M6a D11): applies one master batch atomically as replog[seq] (its ops and the
+  // verbatim payload in one transaction), then reports range deletes (listener) and modified keys
+  // (observer: every meta key it put or deleted, and the watched keys of a db it flushed) like a
+  // local write. Waits through a busy script, as Redis applies the master stream after one.
+  // kInternal if seq != repl_log()->last()+1, the engine has no ReplLog, or this thread is in a
+  // batch; kCorruption for a bad payload or a cum_bytes that does not continue ours. On failure
+  // nothing is applied. Never fenced: FenceLocalWrites refuses only local writers.
+  //
+  // Gate choice: shared, with no key stripes. That is safe because a replica has no other writer:
+  // the fenced ReplLog refuses every local commit (commands, the reaper, oid leases), and an EXEC
+  // or script on the replica holds the gate exclusively, so its reads stay isolated from applies.
+  // Applies must come from one thread, in seq order.
+  Status ApplyReplicated(uint64_t seq, std::string_view payload);
+
   // For parse-time work only (turning a relative EX/PX into a deadline, as Redis does at
   // command start); never for an expiry decision, which uses the fn's now_ms.
   int64_t NowMs() const;

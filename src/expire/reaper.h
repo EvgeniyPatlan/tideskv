@@ -19,7 +19,8 @@ namespace tideskv {
 // like any write command. Reads already hide expired objects; this reclaims them.
 // An index entry is trusted only if it still matches meta (same expire_ms and oid);
 // otherwise it is stale (spec §4.5: harmless by design) and only the entry is dropped.
-// M6: runs on the master only.
+// M6: runs on the master only. While the Engine's ReplLog fences local writes (a replica), RunOnce
+// does nothing: expired keys go when the master's DEL is applied, as Redis replicas do.
 //
 // M2 simplifications:
 //  - A db whose batch came back full is simply processed again until the cycle budget is
@@ -68,6 +69,8 @@ class ExpireReaper {
   Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped);
   Result<size_t> DeleteDue(uint8_t db, std::span<const Due> due);
   void Loop();
+  bool Fenced() const;                 // the Engine's ReplLog refuses local writes (a replica)
+  bool Quiet(const Status& st) const;  // a refusal the loop retries without logging
 
   Engine& engine_;
   Options options_;

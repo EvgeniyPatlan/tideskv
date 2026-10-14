@@ -305,5 +305,24 @@ TEST_F(ReaperTest, OnlyTheBusyAnswerIsQuiet) {
   EXPECT_FALSE(log.Contains("expire reaper"));
 }
 
+// M6a: a replica waits for the master's DEL (Redis runs activeExpireCycle on masters only). The fenced
+// ReplLog would refuse the reaper's writes with READONLY; the reaper must neither delete nor log.
+TEST_F(ReaperTest, AFencedReplicaReapsNothingAndStaysQuiet) {
+  EXPECT_EQ(Run({"SET", "due", "v", "PX", "10"}), kOk);
+  h.clock().Advance(100);
+  h.services.repl_log_.FenceLocalWrites(true);
+  auto n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok()) << n.status().ToString();
+  EXPECT_EQ(*n, 0u);
+  LogCapture log;
+  reaper.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // about 10 cycles
+  reaper.Stop();
+  EXPECT_FALSE(log.Contains("expire reaper"));
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).size(), 1u);
+  h.services.repl_log_.FenceLocalWrites(false);  // promoted: reaping resumes
+  EXPECT_EQ(*reaper.RunOnce(), 1u);
+}
+
 }  // namespace
 }  // namespace tideskv

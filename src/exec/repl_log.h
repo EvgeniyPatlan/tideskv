@@ -14,6 +14,9 @@
 
 namespace tideskv {
 
+// Applies `ops` to txn in order, exactly as recorded (M6a D5/D11). Stops at the first failure.
+Status ApplyReplOps(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
+
 // The replication log (M6a D3): the only writer of the replog CF. Commit() serialises
 // "seq = last+1 → put replog[seq] → commit → publish" so seq order is commit order and the
 // watermark (last committed seq) has no gaps. Lock order: taken after the gate, key stripes,
@@ -31,7 +34,9 @@ class ReplLog {
   // OidAllocator and other standalone writers: one small txn of `ops` through Commit.
   Status CommitStandalone(const std::vector<encoding::ReplOp>& ops);
   // Replica apply (D11): txn already holds the batch's ops; puts replog[seq] = payload verbatim and
-  // commits. kInternal unless seq == last()+1; kCorruption if payload has no valid header. Never fenced.
+  // commits. kInternal unless seq == last()+1; kCorruption if payload has no valid header or its
+  // cum_bytes is not cum_bytes() + payload.size() (the master's stream does not continue ours).
+  // On failure nothing is consumed and txn is left uncommitted. Never fenced.
   Status CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view payload);
   uint64_t last() const { return last_.load(std::memory_order_acquire); }             // watermark
   uint64_t first_retained() const { return first_.load(std::memory_order_acquire); }  // 1 if nothing trimmed

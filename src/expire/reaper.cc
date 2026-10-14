@@ -8,6 +8,7 @@
 
 #include "common/coding.h"
 #include "encoding/key_codec.h"
+#include "types/errors.h"
 #include "types/object_store.h"
 
 namespace tideskv {
@@ -73,7 +74,13 @@ Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full, s
   return deleted;
 }
 
+bool ExpireReaper::Fenced() const {
+  const ReplLog* log = engine_.repl_log();
+  return log != nullptr && log->fenced();
+}
+
 Result<size_t> ExpireReaper::RunOnce() {
+  if (Fenced()) return size_t{0};  // a replica: expired keys go when the master's DEL arrives
   const auto deadline = std::chrono::steady_clock::now() + options_.cycle_budget;
   const int64_t now = engine_.NowMs();  // selects candidates; each is re-checked under its lock
   size_t total = 0;
@@ -94,6 +101,11 @@ Result<size_t> ExpireReaper::RunOnce() {
   if (skipped > 0) spdlog::warn("expire reaper: skipped {} undecodable expire entries", skipped);
   if (!first_error.ok()) return first_error;  // committed deletes are already counted
   return total;
+}
+
+bool ExpireReaper::Quiet(const Status& st) const {
+  if (engine_.IsBusyAnswer(st)) return true;
+  return Fenced() && st.code() == StatusCode::kUserError && st.message() == kErrReadOnlyReplica;
 }
 
 void ExpireReaper::Start() {
@@ -118,9 +130,9 @@ void ExpireReaper::Loop() {
     lock.unlock();
     try {  // an exception escaping this thread would std::terminate the server
       auto n = RunOnce();
-      // The Engine's BUSY answer while a script is timed out: retry next cycle, quietly.
-      if (!n.ok() && !engine_.IsBusyAnswer(n.status()))
-        spdlog::error("expire reaper: {}", n.status().ToString());
+      // Retried next cycle, quietly: the Engine's BUSY answer while a script is timed out, and the
+      // READONLY refusal of a cycle that began just before this server became a replica.
+      if (!n.ok() && !Quiet(n.status())) spdlog::error("expire reaper: {}", n.status().ToString());
     } catch (const std::exception& e) {
       spdlog::error("expire reaper: {}", e.what());
     }

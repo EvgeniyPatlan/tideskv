@@ -232,6 +232,39 @@ TEST(ReplLogTest, CommitReplicatedRequiresTheNextSeqAndStoresPayloadVerbatim) {
   EXPECT_EQ(log.cum_bytes(), payload.size());
 }
 
+// CF2: the master's cum_bytes must continue ours (cum_ + payload size), from the very first batch.
+TEST(ReplLogTest, CommitReplicatedRefusesAMisalignedCumBytes) {
+  InMemoryStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  const auto refused = [&](uint64_t seq, const std::string& payload) {
+    auto txn = s.BeginWrite();
+    EXPECT_TRUE((*txn)->Put(ColumnFamily::kMeta, "x", "v").ok());
+    const Status st = log.CommitReplicated(**txn, seq, payload);
+    EXPECT_EQ(st.code(), StatusCode::kCorruption) << st.ToString();
+  };
+  refused(1, encoding::EncodeReplogBatch(MetaPut("a"), 1, 7));  // an empty replica starts at 0
+  EXPECT_EQ(log.last(), 0u);
+  EXPECT_EQ(log.cum_bytes(), 0u);
+  EXPECT_FALSE(ReplogAt(s, 1).ok());
+  const std::string first = encoding::EncodeReplogBatch(MetaPut("a"), 1, 0);
+  {
+    auto txn = s.BeginWrite();
+    ASSERT_TRUE(log.CommitReplicated(**txn, 1, first).ok());
+  }
+  refused(2, encoding::EncodeReplogBatch(MetaPut("b"), 2, first.size() + 1));
+  refused(2, encoding::EncodeReplogBatch(MetaPut("b"), 2, first.size() - 1));
+  EXPECT_EQ(log.last(), 1u);
+  EXPECT_EQ(log.cum_bytes(), first.size());
+  auto view = s.BeginRead();
+  EXPECT_TRUE((*view)->Get(ColumnFamily::kMeta, "x").status().IsNotFound());  // refused txns not committed
+  auto txn = s.BeginWrite();
+  const std::string second = encoding::EncodeReplogBatch(MetaPut("b"), 2, first.size());
+  ASSERT_TRUE(log.CommitReplicated(**txn, 2, second).ok());
+  EXPECT_EQ(log.cum_bytes(), first.size() + second.size());
+}
+
 TEST(ReplLogTest, WaitBeyondWakesOnCommitAndTimesOut) {
   InMemoryStorage s;
   FakeClock clock;

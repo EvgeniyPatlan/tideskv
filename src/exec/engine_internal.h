@@ -6,6 +6,8 @@
 #include <string_view>
 #include <vector>
 
+#include "encoding/key_codec.h"
+#include "encoding/replog_codec.h"
 #include "exec/engine.h"
 #include "exec/recording_txn.h"
 
@@ -54,6 +56,26 @@ inline std::vector<DbKey> ModifiedBy(bool wrote, std::span<const DbKey> meta_key
   }
   std::sort(out.begin(), out.end());
   out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+// True iff `op` deletes the whole meta range of `db` (a FLUSHDB or FLUSHALL on the master).
+inline bool DeletesDb(const encoding::ReplOp& op, uint8_t db) {
+  if (op.cf != ColumnFamily::kMeta) return false;
+  const std::string lo = encoding::DbPrefix(db);
+  if (op.type == encoding::ReplOpType::kDeletePrefix) return lo.starts_with(op.key);
+  if (op.type != encoding::ReplOpType::kDeleteRange) return false;
+  return op.key <= lo && (op.value.empty() || encoding::DbPrefix(static_cast<uint8_t>(db + 1)) <= op.value);
+}
+
+// Replica apply (M6a D11): the dbs a master batch flushes, so their watched keys are reported as a
+// local flush's are (Redis touchAllWatchedKeysInDb). Sorted, unique.
+inline std::vector<uint8_t> FlushedDbs(const std::vector<encoding::ReplOp>& ops) {
+  std::vector<uint8_t> out;
+  for (uint8_t db = 0; db < encoding::kNumDatabases; ++db) {
+    if (std::any_of(ops.begin(), ops.end(), [db](const encoding::ReplOp& op) { return DeletesDb(op, db); }))
+      out.push_back(db);
+  }
   return out;
 }
 

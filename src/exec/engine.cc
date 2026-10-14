@@ -5,7 +5,9 @@
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
+#include <vector>
 
+#include "encoding/replog_codec.h"
 #include "exec/engine_internal.h"
 #include "exec/recording_txn.h"
 
@@ -141,6 +143,30 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
     spdlog::warn("commit conflict, attempt {}/{}: {}", attempt, kMaxCommitAttempts, st.message());
   }
   return st;
+}
+
+Status Engine::ApplyReplicated(uint64_t seq, std::string_view payload) {
+  if (repl_log_ == nullptr) return Status::Internal("apply without a replication log");
+  if (ActiveBatch() != nullptr) return Status::Internal("apply inside a batch");
+  auto batch = encoding::DecodeReplogBatch(payload);
+  if (!batch.ok()) return batch.status();
+  const std::vector<uint8_t> flushed_dbs = engine_internal::FlushedDbs(batch->ops);
+  const WriteScope scope{0, nullptr, nullptr, &flushed_dbs};
+  const WaitThroughBusyScope wait_for_scripts;
+  [[maybe_unused]] const ReentryCheck reentry;
+  if (!AcquireShared()) return BusyStatus();  // unreachable inside the scope; kept for symmetry
+  std::shared_lock gate(gate_, std::adopt_lock);
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  RecordingTxn recorder(**txn);  // capture off: the master's payload is stored verbatim
+  std::vector<DbKey> flushed;
+  if (Status st = CollectFlushed(recorder, scope, &flushed); !st.ok()) return st;
+  // A failure below leaves the txn uncommitted; destroying it rolls it back.
+  if (Status st = ApplyReplOps(recorder, batch->ops); !st.ok()) return st;
+  if (Status st = repl_log_->CommitReplicated(**txn, seq, payload); !st.ok()) return st;
+  if (listener_ != nullptr && !recorder.deletes().empty()) listener_->OnCommitted(recorder.deletes());
+  if (Observing()) Report(ModifiedBy(recorder.writes() > 0, recorder.meta_keys(), scope, std::move(flushed)));
+  return Status::Ok();
 }
 
 Result<uint64_t> Engine::BatchMark() {
