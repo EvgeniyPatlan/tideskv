@@ -50,6 +50,10 @@ class ReplicationManager final : public Replication {
   };
   struct Options {
     std::function<std::chrono::milliseconds()> repl_timeout;  // null = 60 s
+    // F4: live replica links and pending hand-offs count against maxclients together with the server's
+    // client connections (a PSYNC caller is still one). Either null = no limit.
+    std::function<uint64_t()> maxclients;
+    std::function<uint64_t()> connected_clients;
     RoleHooks role;
     ReplClient::Options client;
   };
@@ -111,6 +115,7 @@ class ReplicationManager final : public Replication {
     std::chrono::steady_clock::time_point created;
   };
 
+  uint64_t LinksLocked() const;  // requires mu_: live senders plus pending hand-offs (F4)
   void TickLoop();
   void Reap();
   std::chrono::milliseconds Timeout() const;

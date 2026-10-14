@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "support/it_helpers.h"
 #include "support/test_server.h"
@@ -87,6 +89,31 @@ TEST_F(ReplicationMasterIT, FullResyncClosesTheLink) {
   EXPECT_EQ(r.str.rfind("FULLRESYNC ", 0), 0u);
   EXPECT_TRUE(c->WaitForClose());
   EXPECT_EQ(Client()->Command({"PING"}).str, "PONG");
+}
+
+// F4: replica links count against maxclients like the clients they were: once the limit is reached,
+// PSYNC gets the server's maxclients error before any hand-off, and a dropped link frees its slot.
+TEST(ReplicationLimitIT, ReplicaLinksCountAgainstMaxclients) {
+  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = {"--maxclients", "2"}});
+  std::vector<std::unique_ptr<RespClient>> links;
+  for (int i = 0; i < 2; ++i) {
+    auto link = s.Connect();
+    ASSERT_NE(link, nullptr);
+    const RespValue r = link->Command({"PSYNC", "?", "1"});
+    ASSERT_EQ(r.str.rfind("CONTINUE ", 0), 0u) << i << ": " << r.str;
+    links.push_back(std::move(link));
+  }
+  std::unique_ptr<RespClient> c;
+  ASSERT_TRUE(WaitFor([&] {  // both hand-offs done: their connections are gone
+    c = s.Connect();
+    return c != nullptr && InfoField(*c, "clients", "connected_clients") == 1;
+  }));
+  const RespValue refused = c->Command({"PSYNC", "?", "1"});
+  EXPECT_EQ(refused.type, Type::kError);
+  EXPECT_EQ(refused.str, "ERR max number of clients reached");
+  EXPECT_EQ(InfoField(*c, "stats", "sync_partial_ok"), 2);
+  links.pop_back();
+  EXPECT_TRUE(WaitFor([&] { return c->Command({"PSYNC", "?", "1"}).str.rfind("CONTINUE ", 0) == 0; }));
 }
 
 }  // namespace

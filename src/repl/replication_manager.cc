@@ -56,8 +56,14 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
 
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
   const LogBounds bounds{log_.first_retained(), log_.last()};
+  const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
+  const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   std::lock_guard lock(mu_);
   PsyncResult r;
+  if (clients + LinksLocked() > maxclients) {  // F4: this caller's link would exceed maxclients
+    r.error = std::string(kErrMaxClients);
+    return r;
+  }
   r.replid = identity_.replid;
   r.seq = bounds.last;
   r.decision = DecidePsync(identity_, bounds, req);
@@ -338,6 +344,11 @@ std::vector<ReplicationManager::ReplicaInfo> ReplicationManager::Replicas() cons
     out.push_back({s->peer_ip(), s->listening_port(), s->acked(), s->last_ack_ms(), s->alive()});
   }
   return out;
+}
+
+uint64_t ReplicationManager::LinksLocked() const {
+  const auto live = std::count_if(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); });
+  return static_cast<uint64_t>(live) + pending_.size();
 }
 
 size_t ReplicationManager::pending_count() const {

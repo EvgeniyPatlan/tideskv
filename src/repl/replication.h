@@ -62,6 +62,7 @@ struct PsyncResult {
   std::string replid;       // this node's replid
   uint64_t seq = 0;         // kFullResync: the master's last seq
   uint64_t pending_id = 0;  // kContinue: pass to AttachReplica
+  std::string error;        // non-empty: PSYNC is refused with this reply; no decision was taken
 };
 
 // One REPLCONF call's options, after validation (redis72-replication §6).

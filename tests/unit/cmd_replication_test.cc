@@ -130,6 +130,17 @@ TEST(PsyncCmd, PassesTheReplconfStateAsThePeer) {
   EXPECT_EQ(h2.services.replication_.last_peer.listening_port, 7001);
 }
 
+// F4 / F8: a refused PSYNC (maxclients, a replica) answers the error and keeps an ordinary client.
+TEST(PsyncCmd, ARefusalRepliesTheErrorWithoutAHandOff) {
+  ReplHarness h;
+  h.services.replication_.psync_error = "ERR max number of clients reached";
+  EXPECT_EQ(h.Run({"PSYNC", h.myid(), "1"}), Err("ERR max number of clients reached"));
+  EXPECT_FALSE(h.session.takeover);
+  EXPECT_FALSE(h.session.is_replica_link);
+  EXPECT_FALSE(h.session.close_after_reply);
+  EXPECT_EQ(h.Run({"PING"}), "+PONG\r\n");
+}
+
 TEST(SyncCmd, IsNotSupported) {
   ReplHarness h;
   EXPECT_EQ(h.Run({"SYNC"}), Err("ERR SYNC is not supported, use PSYNC"));

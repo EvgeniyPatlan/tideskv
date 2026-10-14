@@ -3,7 +3,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <string>
 #include <utility>
+
+#include "types/errors.h"
 
 namespace tideskv::net {
 
@@ -96,7 +99,8 @@ void Server::OnAcceptError(const std::error_code& ec) {
 void Server::OnAccept(asio::ip::tcp::socket socket, Worker& worker) {
   std::error_code ec;
   if (stats_->connected.load() >= static_cast<uint64_t>(options_.maxclients())) {
-    asio::write(socket, asio::buffer(std::string_view("-ERR max number of clients reached\r\n")), ec);
+    const std::string reply = "-" + std::string(kErrMaxClients) + "\r\n";
+    asio::write(socket, asio::buffer(reply), ec);
     socket.close(ec);
     return;
   }

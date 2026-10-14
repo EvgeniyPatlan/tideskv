@@ -39,8 +39,13 @@ class FakeReplication final : public Replication {
   PsyncResult HandlePsync(const repl::PsyncRequest& req, const ReplicaPeer& peer) override {
     psyncs.push_back(req);
     last_peer = peer;
+    if (!psync_error.empty()) {
+      PsyncResult refused;
+      refused.error = psync_error;
+      return refused;
+    }
     const repl::LogBounds bounds{log->first_retained(), log->last()};
-    PsyncResult r{repl::DecidePsync(identity, bounds, req), identity.replid, bounds.last, 0};
+    PsyncResult r{repl::DecidePsync(identity, bounds, req), identity.replid, bounds.last, 0, {}};
     if (r.decision == repl::PsyncDecision::kContinue) r.pending_id = last_pending_id = ++next_pending_id_;
     return r;
   }
@@ -75,6 +80,7 @@ class FakeReplication final : public Replication {
   repl::ReplIdentity identity{std::string(repl::kReplIdLength, 'c'), {}};
   const ReplLog* log = nullptr;  // set by FakeServerServices
   std::vector<repl::PsyncRequest> psyncs;
+  std::string psync_error;  // non-empty: HandlePsync refuses with it
   ReplicaPeer last_peer;
   uint64_t last_pending_id = 0;
   std::vector<Attached> attached;

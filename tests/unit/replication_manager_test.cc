@@ -18,6 +18,7 @@
 #include "repl/socket_io.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
+#include "types/errors.h"
 
 namespace tideskv::repl {
 namespace {
@@ -68,6 +69,9 @@ struct ManagerTest : ::testing::Test {
   std::unique_ptr<ReplicationManager> Make(std::chrono::milliseconds timeout = 60s) {
     ReplicationManager::Options o;
     o.repl_timeout = [timeout] { return timeout; };
+    return Make(std::move(o));
+  }
+  std::unique_ptr<ReplicationManager> Make(ReplicationManager::Options o) {
     auto m = std::make_unique<ReplicationManager>(storage, log, id, std::move(o));
     m->Start();
     return m;
@@ -205,6 +209,27 @@ TEST_F(ManagerTest, DestructorShutsDown) {
   Fd r1 = Attach(*m, 4);
   m.reset();
   EXPECT_TRUE(PeerClosed(r1.get()));
+}
+
+// F4: live replica links and pending hand-offs count against maxclients with the PSYNC caller; PSYNC
+// beyond the limit gets the server's maxclients error, with no decision taken and nothing registered.
+TEST_F(ManagerTest, ReplicaLinksCountAgainstMaxclients) {
+  ReplicationManager::Options o;
+  o.maxclients = [] { return uint64_t{2}; };
+  o.connected_clients = [] { return uint64_t{1}; };  // the PSYNC caller itself
+  auto m = Make(std::move(o));
+  Fd first = Attach(*m, 4);                                       // 1 client + 0 links
+  const PsyncResult second = m->HandlePsync({id.replid, 4}, {});  // 1 client + 1 link
+  EXPECT_EQ(second.decision, PsyncDecision::kContinue);
+  EXPECT_TRUE(second.error.empty());
+  const PsyncResult refused = m->HandlePsync({id.replid, 4}, {});  // 1 client + 1 link + 1 pending
+  EXPECT_EQ(refused.error, kErrMaxClients);
+  EXPECT_EQ(refused.pending_id, 0u);
+  EXPECT_EQ(m->pending_count(), 1u);
+  EXPECT_EQ(m->counters().sync_partial_ok, 2u);
+  EXPECT_EQ(m->counters().sync_full, 0u);
+  first = Fd();  // a dropped link frees its slot at once, before it is reaped
+  EXPECT_TRUE(WaitFor([&] { return m->HandlePsync({id.replid, 4}, {}).error.empty(); }));
 }
 
 // Task 14: what the backlog trimmer may not delete, and the drop of replicas beyond the limits.

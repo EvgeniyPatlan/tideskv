@@ -116,6 +116,8 @@ Status App::CreateReplication() {
   }
   repl::ReplicationManager::Options o;
   o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
+  o.maxclients = [this] { return static_cast<uint64_t>(config_->Snapshot().maxclients); };
+  o.connected_clients = [this] { return server_->counters().connected; };
   repl::ReplicationManager::RoleHooks& h = o.role;
   h.engine = engine_.get();
   h.config = [this] { return config_->Snapshot(); };
