@@ -1,5 +1,7 @@
 #include "script/rand48.h"
 
+#include <cstdint>
+
 namespace tideskv {
 namespace {
 
