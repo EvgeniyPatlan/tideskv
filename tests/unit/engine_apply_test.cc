@@ -118,6 +118,19 @@ TEST_F(EngineApplyTest, ApplyWithoutAReplLogIsAnInternalError) {
   EXPECT_FALSE(ReplicaHas(0, "a"));
 }
 
+// CF9: the apply's shared gate with no key stripes is safe only while the fence keeps every local writer
+// out, so an apply on an unfenced ReplLog is refused and applies nothing.
+TEST_F(EngineApplyTest, ApplyRequiresTheFenceRaised) {
+  Run({"SET", "a", "1"});
+  replica.log.FenceLocalWrites(false);
+  EXPECT_EQ(replica.engine.ApplyReplicated(1, Payload(1)).code(), StatusCode::kInternal);
+  EXPECT_EQ(replica.log.last(), 0u);
+  EXPECT_FALSE(ReplicaHas(0, "a"));
+  replica.log.FenceLocalWrites(true);
+  EXPECT_TRUE(replica.engine.ApplyReplicated(1, Payload(1)).ok());
+  EXPECT_TRUE(ReplicaHas(0, "a"));
+}
+
 TEST_F(EngineApplyTest, ApplyInvalidatesWatchesOnTheReplica) {
   auto client = std::make_shared<WatchClient>();
   replica.watches.Watch(client, 0, "k", false);

@@ -57,9 +57,10 @@ class Engine {
   // verbatim payload in one transaction), then reports range deletes (listener) and modified keys
   // (observer: every meta key it put or deleted, and the watched keys of a db it flushed) like a
   // local write. Waits through a busy script, as Redis applies the master stream after one.
-  // kInternal if seq != repl_log()->last()+1, the engine has no ReplLog, or this thread is in a
-  // batch; kCorruption for a bad payload or a cum_bytes that does not continue ours. On failure
-  // nothing is applied. Never fenced: FenceLocalWrites refuses only local writers.
+  // kInternal if seq != repl_log()->last()+1, the engine has no ReplLog, its local writes are not
+  // fenced, or this thread is in a batch; kCorruption for a bad payload or a cum_bytes that does not
+  // continue ours. On failure nothing is applied. The apply itself bypasses the fence (FenceLocalWrites
+  // refuses only local writers) but requires it raised: the gate choice below depends on it.
   //
   // Gate choice: shared, with no key stripes. That is safe because a replica has no other writer:
   // the fenced ReplLog refuses every local commit (commands, the reaper, oid leases), and an EXEC

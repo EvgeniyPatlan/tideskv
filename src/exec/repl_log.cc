@@ -97,16 +97,23 @@ Status ReplLog::AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view re
 
 Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) {
   if (ops.empty()) return txn.Commit();
-  // Fenced (replica): refuse without touching txn; the caller's failure path rolls it back as for
-  // any failed commit (RunTxn destroys it, Batch::Commit calls Rollback).
-  if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
   std::lock_guard lock(mu_);
+  // Fenced (replica): refuse without touching txn; the caller's failure path rolls it back as for
+  // any failed commit (RunTxn destroys it, Batch::Commit calls Rollback). Checked under mu_ so that
+  // FenceLocalWrites(true) is a barrier (CF1).
+  if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
   const uint64_t seq = last_.load(std::memory_order_relaxed) + 1;
   const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
   return AppendAndCommit(txn, seq, record, cum_ + record.size());
 }
 
+void ReplLog::FenceLocalWrites(bool fenced) {
+  std::lock_guard lock(mu_);  // waits for an in-flight commit section to finish
+  fenced_.store(fenced, std::memory_order_release);
+}
+
 Status ReplLog::CommitStandalone(const std::vector<encoding::ReplOp>& ops) {
+  // A cheap early refusal; Commit re-checks under mu_.
   if (fenced() && !ops.empty()) return Status::UserError(std::string(kErrReadOnlyReplica));
   auto txn = storage_.BeginWrite();
   if (!txn.ok()) return txn.status();

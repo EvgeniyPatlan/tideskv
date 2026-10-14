@@ -147,6 +147,7 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
 
 Status Engine::ApplyReplicated(uint64_t seq, std::string_view payload) {
   if (repl_log_ == nullptr) return Status::Internal("apply without a replication log");
+  if (!repl_log_->fenced()) return Status::Internal("apply while local writes are not fenced");
   if (ActiveBatch() != nullptr) return Status::Internal("apply inside a batch");
   auto batch = encoding::DecodeReplogBatch(payload);
   if (!batch.ok()) return batch.status();

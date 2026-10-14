@@ -36,14 +36,17 @@ class ReplLog {
   // Replica apply (D11): txn already holds the batch's ops; puts replog[seq] = payload verbatim and
   // commits. kInternal unless seq == last()+1; kCorruption if payload has no valid header or its
   // cum_bytes is not cum_bytes() + payload.size() (the master's stream does not continue ours).
-  // On failure nothing is consumed and txn is left uncommitted. Never fenced.
+  // On failure nothing is consumed and txn is left uncommitted. Not refused by the fence: it is the
+  // replica's one writer (Engine::ApplyReplicated requires the fence raised).
   Status CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view payload);
   uint64_t last() const { return last_.load(std::memory_order_acquire); }             // watermark
   uint64_t first_retained() const { return first_.load(std::memory_order_acquire); }  // 1 if nothing trimmed
   uint64_t cum_bytes() const;  // cum_bytes of last(); 0 if empty
   // Blocks until last() > seq or the timeout passes; returns last().
   uint64_t WaitBeyond(uint64_t seq, std::chrono::milliseconds timeout) const;
-  void FenceLocalWrites(bool fenced) { fenced_.store(fenced, std::memory_order_release); }
+  // Raising the fence is a barrier (CF1): it waits out a local commit already inside the commit section,
+  // and Commit checks the fence under the same lock, so once this returns no local commit takes a seq.
+  void FenceLocalWrites(bool fenced);
   bool fenced() const { return fenced_.load(std::memory_order_acquire); }
   // Backlog trimming (Task 14) updates first_retained after its own trim txn commits.
   void SetFirstRetained(uint64_t first);

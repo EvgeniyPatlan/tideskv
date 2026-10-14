@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <random>
 #include <string>
@@ -359,6 +361,116 @@ TEST(ReplLogTest, CommitStandaloneFencedIsRefusedAndWritesNothing) {
   EXPECT_EQ(log.CommitStandalone(MetaPut("a")).code(), StatusCode::kUserError);
   auto view = s.BeginRead();
   EXPECT_TRUE((*view)->Get(ColumnFamily::kMeta, "a").status().IsNotFound());
+}
+
+}  // namespace
+}  // namespace tideskv
+
+namespace tideskv {
+namespace {
+
+// InMemoryStorage whose transactions park in Commit() while `hold` is set, so a test can freeze a
+// local commit inside ReplLog's commit section.
+class ParkingStorage final : public Storage {
+ public:
+  std::atomic<bool> hold{false};
+  std::atomic<int> parked{0};
+
+  Result<std::unique_ptr<WriteTxn>> BeginWrite() override {
+    auto txn = inner_.BeginWrite();
+    if (!txn.ok()) return txn.status();
+    return std::unique_ptr<WriteTxn>(std::make_unique<Txn>(std::move(txn).value(), *this));
+  }
+  Result<std::unique_ptr<ReadView>> BeginRead() override { return inner_.BeginRead(); }
+  Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+
+ private:
+  class Txn final : public WriteTxn {
+   public:
+    Txn(std::unique_ptr<WriteTxn> inner, ParkingStorage& owner) : inner_(std::move(inner)), owner_(owner) {}
+    Result<std::string> Get(ColumnFamily cf, std::string_view k) override { return inner_->Get(cf, k); }
+    Result<std::unique_ptr<Iterator>> NewIterator(ColumnFamily cf, IterOptions o) override {
+      return inner_->NewIterator(cf, std::move(o));
+    }
+    Status Put(ColumnFamily cf, std::string_view k, std::string_view v) override {
+      return inner_->Put(cf, k, v);
+    }
+    Status Delete(ColumnFamily cf, std::string_view k) override { return inner_->Delete(cf, k); }
+    Status DeletePrefix(ColumnFamily cf, std::string_view p) override { return inner_->DeletePrefix(cf, p); }
+    Status DeleteRange(ColumnFamily cf, std::string_view lo, std::string_view hi) override {
+      return inner_->DeleteRange(cf, lo, hi);
+    }
+    Status Savepoint(std::string_view n) override { return inner_->Savepoint(n); }
+    Status RollbackToSavepoint(std::string_view n) override { return inner_->RollbackToSavepoint(n); }
+    Status ReleaseSavepoint(std::string_view n) override { return inner_->ReleaseSavepoint(n); }
+    Status Commit() override {
+      ++owner_.parked;
+      while (owner_.hold.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return inner_->Commit();
+    }
+    Status Rollback() override { return inner_->Rollback(); }
+
+   private:
+    std::unique_ptr<WriteTxn> inner_;
+    ParkingStorage& owner_;
+  };
+
+  InMemoryStorage inner_;
+};
+
+// CF1: once FenceLocalWrites(true) returns, no local commit can take a seq, so the first replicated
+// apply always finds seq == last()+1. A commit already inside the commit section finishes first.
+TEST(ReplLogTest, RaisingTheFenceWaitsForAnInFlightLocalCommit) {
+  ParkingStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  s.hold = true;
+  auto local = std::async(std::launch::async, [&] { return CommitPuts(s, log, MetaPut("a")); });
+  while (s.parked.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  std::atomic<bool> fenced{false};
+  std::thread fencer([&] {
+    log.FenceLocalWrites(true);
+    fenced = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(fenced.load()) << "the fence returned while a local commit was in flight";
+  s.hold = false;
+  fencer.join();
+  EXPECT_TRUE(local.get().ok());
+  EXPECT_EQ(log.last(), 1u);
+  const Status after = CommitPuts(s, log, MetaPut("b"));
+  EXPECT_EQ(after.code(), StatusCode::kUserError);
+  EXPECT_EQ(log.last(), 1u);
+}
+
+// CF1: a local commit that passed every unlocked check before the fence rose, and now waits for the
+// commit section, must not take a seq once FenceLocalWrites(true) has returned.
+TEST(ReplLogTest, NoLocalCommitLandsAfterTheFenceReturns) {
+  for (int round = 0; round < 20; ++round) {
+    ParkingStorage s;
+    FakeClock clock;
+    ReplLog log(s, clock);
+    ASSERT_TRUE(log.Recover().ok());
+    s.hold = true;
+    auto first = std::async(std::launch::async, [&] { return CommitPuts(s, log, MetaPut("a")); });
+    while (s.parked.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto second = std::async(std::launch::async, [&] { return CommitPuts(s, log, MetaPut("b")); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));  // second now waits for the section
+    std::atomic<uint64_t> last_at_fence{UINT64_MAX};
+    std::thread fencer([&] {
+      log.FenceLocalWrites(true);
+      last_at_fence = log.last();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    s.hold = false;
+    fencer.join();
+    EXPECT_TRUE(first.get().ok());
+    const Status st = second.get();
+    EXPECT_TRUE(st.ok() || st.code() == StatusCode::kUserError) << st.ToString();
+    EXPECT_EQ(log.last(), last_at_fence.load()) << "a local commit landed after the fence returned";
+    EXPECT_EQ(CommitPuts(s, log, MetaPut("c")).code(), StatusCode::kUserError);
+  }
 }
 
 }  // namespace
