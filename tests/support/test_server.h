@@ -45,17 +45,27 @@ class TestServer {
   // thaws it. Terminate and the destructor resume a paused server first.
   void Pause();
   void Resume();
+  // Starts the server again on the same dir and port (after Kill9 or Terminate, or stopping it first),
+  // with the original options or with `extra_args` replacing them; waits until it is ready.
+  void Restart();
+  void Restart(std::vector<std::string> extra_args);
   pid_t pid() const { return pid_; }
   bool IsRunning();
-  std::string Stderr() const;
+  std::string Stderr() const;  // every run's log, Restart included
+  // Stderr() from the latest (re)start on: a restarted server's log lines, without its predecessors'.
+  std::string StderrSinceStart() const;
 
  private:
   static int DecodeStatus(int status);
   void Spawn(const std::string& binary, const Options& options);
   bool WaitReady(std::chrono::milliseconds timeout);
+  void SpawnUntilReady();
   static uint16_t FreePort();
 
   TempDir log_dir_{"tideskv-it-log"};
+  std::string binary_;
+  Options options_;
+  size_t log_start_ = 0;  // Stderr() offset where the latest run's log begins
   std::unique_ptr<TempDir> owned_dir_;
   std::string dir_;
   uint16_t port_ = 0;

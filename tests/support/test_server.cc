@@ -45,27 +45,49 @@ constexpr int kSpawnAttempts = 5;
 constexpr int kExitPortInUse = 3;  // tideskv-server: the port is taken (ServerIT.PortInUseExitsWithCode3)
 }  // namespace
 
-TestServer::TestServer(std::string binary, Options options) {
-  if (options.dir.empty()) {
+TestServer::TestServer(std::string binary, Options options)
+    : binary_(std::move(binary)), options_(std::move(options)) {
+  if (options_.dir.empty()) {
     owned_dir_ = std::make_unique<TempDir>("tideskv-it");
     dir_ = owned_dir_->str();
   } else {
-    dir_ = options.dir;
+    dir_ = options_.dir;
   }
+  SpawnUntilReady();
+}
+
+void TestServer::SpawnUntilReady() {
   for (int attempt = 1;; ++attempt) {
-    port_ = options.port != 0 ? options.port : FreePort();
-    Spawn(binary, options);
-    if (!options.wait_ready || WaitReady(std::chrono::seconds(10))) return;
-    // FreePort() closes its probe socket, so a parallel test may bind the port first (G6). Only then retry.
-    const bool lost_port_race = options.port == 0 && !IsRunning() && exit_code_ == kExitPortInUse;
-    if (!lost_port_race || attempt == kSpawnAttempts) {
+    port_ = options_.port != 0 ? options_.port : FreePort();
+    log_start_ = Stderr().size();
+    Spawn(binary_, options_);
+    if (!options_.wait_ready || WaitReady(std::chrono::seconds(10))) return;
+    // FreePort() closes its probe socket, so a parallel test may bind the port first (G6); a restart's
+    // fixed port may still be held for a moment by the killed predecessor. Only then retry.
+    const bool port_busy = !IsRunning() && exit_code_ == kExitPortInUse;
+    if (!port_busy || attempt == kSpawnAttempts) {
       // A child that already exited is reported here; the destructor must not report it again.
       if (!IsRunning()) exit_consumed_ = true;
-      ADD_FAILURE() << "tideskv-server did not become ready; stderr:\n" << Stderr();
+      ADD_FAILURE() << "tideskv-server did not become ready; stderr:\n" << StderrSinceStart();
       return;
     }
     exit_code_.reset();  // this attempt's exit is handled, not a test failure
+    if (options_.port != 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
+}
+
+void TestServer::Restart() {
+  if (IsRunning() && Terminate() != 0) ADD_FAILURE() << "tideskv-server did not stop cleanly before Restart";
+  options_.port = port_;  // the same port: replicas and clients find it again
+  exit_code_.reset();
+  exit_consumed_ = false;
+  paused_ = false;
+  SpawnUntilReady();
+}
+
+void TestServer::Restart(std::vector<std::string> extra_args) {
+  options_.extra_args = std::move(extra_args);
+  Restart();
 }
 
 void TestServer::Spawn(const std::string& binary, const Options& options) {
@@ -121,12 +143,12 @@ TestServer::~TestServer() {
 
 bool TestServer::WaitReady(std::chrono::milliseconds timeout) {
   // Only our child writes our log, so this line proves *it* owns port_ (G6); a PING alone may reach
-  // another test's server on a reused port.
+  // another test's server on a reused port. A restart looks only at its own run's lines.
   const std::string ready = "ready to accept connections on port " + std::to_string(port_);
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     if (!IsRunning()) return false;
-    if (Stderr().find(ready) != std::string::npos) {
+    if (StderrSinceStart().find(ready) != std::string::npos) {
       if (auto c = RespClient::Connect(port_, std::chrono::milliseconds(500))) {
         if (c->Send({"PING"}) && c->Read().has_value()) return true;  // PONG or NOAUTH: both mean "up"
       }
@@ -194,6 +216,11 @@ std::string TestServer::Stderr() const {
   std::stringstream ss;
   ss << in.rdbuf();
   return ss.str();
+}
+
+std::string TestServer::StderrSinceStart() const {
+  const std::string all = Stderr();
+  return log_start_ <= all.size() ? all.substr(log_start_) : all;
 }
 
 }  // namespace tideskv::test
