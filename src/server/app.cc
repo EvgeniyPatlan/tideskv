@@ -207,9 +207,10 @@ void App::RequestShutdown() {
 void App::Stop() {
   if (stopped_) return;
   stopped_ = true;
+  // First: a running script holds the gate, and a replica's applier waits for it (F3), as do workers.
+  scripts_.KillForShutdown();
   if (trimmer_) trimmer_->Stop();              // it calls into replication_ and trims the replog
   if (replication_) replication_->Shutdown();  // replica links first: senders read the replog (M6a)
-  scripts_.KillForShutdown();                  // a running script must not hold up the worker threads
   server_->Stop();                             // no command can touch storage after this
   reaper_.reset();                             // joins the reaper thread; it writes through engine_
   engine_.reset();                             // references storage_, so it goes first

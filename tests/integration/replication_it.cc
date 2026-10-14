@@ -359,5 +359,23 @@ TEST_F(ReplicationIT, ReplicaAheadOfARestartedMasterGetsFullResync) {
   EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), replica_seq);  // nothing was applied
 }
 
+// F3: a replica whose applier waits for the gate behind a busy no-writes script still shuts down
+// promptly: the script is killed before the replication link is joined.
+TEST_F(ReplicationIT, ReplicaShutdownIsNotHeldUpByABusyScript) {
+  Follow(*replica);
+  auto m = Client(master);
+  auto r = Client(*replica);
+  ASSERT_EQ(m->Command({"SET", "before", "v"}).str, "OK");
+  ASSERT_TRUE(Synced(*m, *r));
+  auto busy = Client(*replica);
+  ASSERT_TRUE(busy->Send({"EVAL", "local i = 0 while true do i = i + 1 end", "0"}));
+  std::this_thread::sleep_for(200ms);  // the script holds the gate
+  ASSERT_EQ(m->Command({"SET", "during", "v"}).str, "OK");
+  std::this_thread::sleep_for(300ms);  // the applier now waits for the gate
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(replica->Terminate(), 0) << replica->Stderr();
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+}
+
 }  // namespace
 }  // namespace tideskv::test
