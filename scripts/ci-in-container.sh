@@ -32,8 +32,9 @@ run boundary scripts/check_engine_boundary.sh
 run tidy bash -c "cmake -S . -B build/tidy -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 && cmake --build build/tidy -j$J && \
   run-clang-tidy-18 -p build/tidy -quiet '^/work/src/'"
-run fuzz bash -c "cmake --preset fuzz -DTIDESKV_WERROR=ON && cmake --build --preset fuzz -j$J --target resp_parser_fuzz && \
-  mkdir -p corpus && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=$FUZZ_SECONDS -max_len=65536"
+run fuzz bash -c "cmake --preset fuzz -DTIDESKV_WERROR=ON && cmake --build --preset fuzz -j$J --target resp_parser_fuzz replog_codec_fuzz && \
+  mkdir -p corpus corpus_replog && build/fuzz/tests/resp_parser_fuzz corpus -max_total_time=$FUZZ_SECONDS -max_len=65536 && \
+  build/fuzz/tests/replog_codec_fuzz corpus_replog -max_total_time=$FUZZ_SECONDS -max_len=65536"
 if [[ "$JOBS" == *" compat "* && ! -x build/release/src/tideskv-server ]]; then
   JOBS+="compat-build "
   run compat-build bash -c "cmake --preset release -DTIDESKV_WERROR=ON && cmake --build --preset release -j$J --target tideskv-server"

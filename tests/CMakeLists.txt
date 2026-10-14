@@ -46,6 +46,12 @@ if(TIDESKV_FUZZ)
   target_link_options(resp_parser_fuzz PRIVATE -fsanitize=fuzzer)
   target_link_libraries(resp_parser_fuzz PRIVATE tideskv_core)
   tideskv_defaults(resp_parser_fuzz)
+
+  add_executable(replog_codec_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/replog_codec_fuzz.cc)
+  target_compile_options(replog_codec_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_options(replog_codec_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_libraries(replog_codec_fuzz PRIVATE tideskv_core)
+  tideskv_defaults(replog_codec_fuzz)
 endif()
 
 add_test(NAME engine_boundary
