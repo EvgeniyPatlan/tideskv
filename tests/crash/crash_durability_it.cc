@@ -67,10 +67,9 @@ void RunCrashRound(const std::string& sync_mode, int round) {
   TestServer again(TIDESKV_SERVER_BIN, {.extra_args = {"--sync-mode", sync_mode}, .dir = dir.str()});
   auto c = again.Connect();
   ASSERT_NE(c, nullptr);
-  {
-    size_t n = 0;
-    for (auto& a : acked) n += a.size();
-  }
+  size_t n_acked = 0;
+  for (auto& a : acked) n_acked += a.size();
+  ASSERT_GT(n_acked, 0u) << sync_mode << " round " << round << ": no write was acknowledged before the kill";
   for (size_t w = 0; w < acked.size(); ++w) {
     for (int i : acked[w]) {
       std::vector<std::string> exists = {"EXISTS"};
