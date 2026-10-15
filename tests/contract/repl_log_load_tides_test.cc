@@ -14,6 +14,7 @@
 #include "storage/tides_storage.h"
 #include "support/fake_clock.h"
 #include "support/paced_writers.h"
+#include "support/snapshot_cut.h"
 #include "support/temp_dir.h"
 
 namespace tideskv::test {
@@ -70,30 +71,15 @@ uint64_t CountCf(ReadView& v, ColumnFamily cf) {
   return n;
 }
 
-// A cheap check of one cut's boundary: replog[seq] (with its keyspace writes) is in the view, replog[seq+1]
-// is not. Returns false on a mismatch.
-bool CutBoundaryHolds(const SyncSnapshot& snap) {
-  ReadView& v = *snap.view;
-  if (!v.Get(ColumnFamily::kReplog, encoding::ReplogKey(snap.seq + 1)).status().IsNotFound()) return false;
-  if (snap.seq == 0) return true;
-  auto record = v.Get(ColumnFamily::kReplog, encoding::ReplogKey(snap.seq));
-  if (!record.ok()) return false;
-  auto batch = encoding::DecodeReplogBatch(*record);
-  if (!batch.ok()) return false;
-  for (const ReplOp& op : batch->ops) {
-    if (!v.Get(op.cf, op.key).ok()) return false;
-  }
-  return true;
-}
-
-// Probes cuts until last() reaches `until` (at most kProbes of them), counting good and bad boundaries.
+// Probes cuts until last() reaches `until` (at most kProbes of them), counting good and bad boundaries,
+// then waits for `until`. Fatal failures: call it under ASSERT_NO_FATAL_FAILURE.
 void ProbeUntil(ReplLog& log, uint64_t until, int* good, int* bad) {
   for (int i = 0; i < kProbes && log.last() < until; ++i) {
     auto probe = log.SnapshotAtLast();
     ASSERT_TRUE(probe.ok()) << probe.status().ToString();
     ++(CutBoundaryHolds(*probe) ? *good : *bad);
   }
-  log.WaitBeyond(until - 1, 30s);
+  ASSERT_GE(log.WaitBeyond(until - 1, 30s), until) << "writers stalled before " << until;
 }
 
 TEST(ReplLogSnapshotCutTides, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) {
@@ -113,9 +99,10 @@ TEST(ReplLogSnapshotCutTides, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) 
   for (uint64_t round = 0; round < kRounds; ++round) {
     const uint64_t half = round * kStep + kStep / 2;
     writers.Grant(half);  // first half: cheap boundary probes while these commits land
-    ProbeUntil(log, half, &probes, &bad_probes);
+    ASSERT_NO_FATAL_FAILURE(ProbeUntil(log, half, &probes, &bad_probes));
     writers.Grant((round + 1) * kStep);  // second half: one full-scan cut amid these commits
-    log.WaitBeyond(half + kStep / 4, 30s);
+    ASSERT_GT(log.WaitBeyond(half + kStep / 4, 30s), half + kStep / 4)
+        << "writers stalled in round " << round;
     auto snap = log.SnapshotAtLast();
     ASSERT_TRUE(snap.ok()) << snap.status().ToString();
     EXPECT_EQ(CountCf(*snap->view, ColumnFamily::kReplog), snap->seq) << "round " << round;

@@ -12,12 +12,14 @@
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 #include "support/paced_writers.h"
+#include "support/snapshot_cut.h"
 
 namespace tideskv {
 namespace {
 
 using encoding::ReplOp;
 using encoding::ReplOpType;
+using test::CutBoundaryHolds;
 using test::FakeClock;
 
 Status CommitKey(ReplLog& log, Storage& s, const std::string& key) {
@@ -35,22 +37,6 @@ size_t CountCf(ReadView& v, ColumnFamily cf) {
   size_t n = 0;
   for (Status st = (*it)->SeekToFirst(); st.ok() && (*it)->Valid(); st = (*it)->Next()) ++n;
   return n;
-}
-
-// A cheap check of one cut's boundary: replog[seq] (with its keyspace writes) is in the view, replog[seq+1]
-// is not. Returns false on a mismatch.
-bool CutBoundaryHolds(const SyncSnapshot& snap) {
-  ReadView& v = *snap.view;
-  if (!v.Get(ColumnFamily::kReplog, encoding::ReplogKey(snap.seq + 1)).status().IsNotFound()) return false;
-  if (snap.seq == 0) return true;
-  auto record = v.Get(ColumnFamily::kReplog, encoding::ReplogKey(snap.seq));
-  if (!record.ok()) return false;
-  auto batch = encoding::DecodeReplogBatch(*record);
-  if (!batch.ok()) return false;
-  for (const ReplOp& op : batch->ops) {
-    if (!v.Get(op.cf, op.key).ok()) return false;
-  }
-  return true;
 }
 
 struct LoadLog : ::testing::Test {
@@ -78,7 +64,8 @@ TEST_F(LoadLog, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) {
   int bad_probes = 0;
   for (uint64_t round = 0; round < 50; ++round) {
     writers.Grant((round + 1) * kStep);
-    log.WaitBeyond(round * kStep + kStep / 2, std::chrono::seconds(30));  // cut while commits are in flight
+    const uint64_t mid = round * kStep + kStep / 2;  // cut while commits are in flight
+    ASSERT_GT(log.WaitBeyond(mid, std::chrono::seconds(30)), mid) << "writers stalled in round " << round;
     for (int i = 0; i < 100 && log.last() < (round + 1) * kStep; ++i) {
       auto probe = log.SnapshotAtLast();
       ASSERT_TRUE(probe.ok());
