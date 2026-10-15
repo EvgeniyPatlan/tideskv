@@ -16,7 +16,7 @@ class Replication;
 class ScriptEngine;
 class WatchRegistry;
 
-// One attached replica as INFO lists it (state is always "online": only streaming replicas are tracked).
+// One attached replica as INFO lists it: "send_bulk" while a full sync transfers its snapshot, then "online".
 struct ReplicaLine {
   std::string ip;
   int port = 0;
