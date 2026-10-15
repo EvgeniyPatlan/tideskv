@@ -15,14 +15,14 @@
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
 // F5: a data directory written before M6a has keys but no replication log. Its log does not describe its
-// data, so it never takes part in a partial resynchronisation from seq 1, as a master or as a replica.
+// data, so it never takes part in a partial resynchronisation from seq 1, as a master or as a replica: it
+// is fully synchronised instead (M6b), which makes its baseline known.
 namespace tideskv::test {
 namespace {
 
 using Type = RespValue::Type;
 using namespace std::chrono_literals;
 
-constexpr const char* kFullResyncLog = "is required; it is implemented in M6b";
 constexpr const char* kBaselineWarning = "predates the replication log";
 
 // Fills `dir` through a real server, then strips what M6a added (the replog and the replication keys in
@@ -88,14 +88,34 @@ TEST(ReplicationBaselineIT, APreReplicationReplicaIsNeverStreamedOntoItsOldKeys)
       TIDESKV_SERVER_BIN,
       {.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())}, .dir = dir.str()});
   EXPECT_NE(replica.Stderr().find(kBaselineWarning), std::string::npos) << replica.Stderr();
-  EXPECT_TRUE(WaitFor([&] { return replica.Stderr().find(kFullResyncLog) != std::string::npos; }, 10s))
+  auto r = replica.Connect();
+  ASSERT_NE(r, nullptr);
+  ASSERT_TRUE(WaitFor([&] { return r->Command({"EXISTS", "theirs"}).integer == 1; }, 30s))
       << replica.Stderr();
   EXPECT_GE(InfoField(*m, "stats", "sync_full"), 1);
   EXPECT_EQ(InfoField(*m, "stats", "sync_partial_ok"), 0);
+  EXPECT_EQ(r->Command({"EXISTS", "old"}).integer, 0);  // the pre-M6a keys were replaced by the master's
+  r.reset();
+  ASSERT_EQ(replica.Terminate(), 0);  // R13's flag was cleared by the load: no warning at the next start
+  replica.Restart();
+  EXPECT_EQ(replica.StderrSinceStart().find(kBaselineWarning), std::string::npos)
+      << replica.StderrSinceStart();
+}
+
+TEST(ReplicationBaselineIT, APreReplicationMasterFullySyncsAReplicaWithItsOldKeys) {
+  TempDir dir("tideskv-it-prem6a");
+  MakePreReplicationDir(dir);
+  if (HasFatalFailure()) return;
+  TestServer master(TIDESKV_SERVER_BIN, {.dir = dir.str()});
+  TestServer replica(TIDESKV_SERVER_BIN,
+                     {.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())}});
   auto r = replica.Connect();
   ASSERT_NE(r, nullptr);
-  EXPECT_EQ(r->Command({"EXISTS", "theirs"}).integer, 0);
-  EXPECT_EQ(r->Command({"GET", "old"}).str, "v");
+  ASSERT_TRUE(WaitFor([&] { return r->Command({"GET", "old"}).str == "v"; }, 30s)) << replica.Stderr();
+  EXPECT_EQ(r->Command({"HGET", "oldhash", "f"}).str, "v");
+  auto m = master.Connect();
+  ASSERT_NE(m, nullptr);
+  EXPECT_EQ(r->Command({"DEBUG", "DIGEST"}).str, m->Command({"DEBUG", "DIGEST"}).str);
 }
 
 }  // namespace

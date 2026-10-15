@@ -246,29 +246,23 @@ TEST_F(ReplicationIT, ReplicaRestartResumesWithPartialSync) {
       << master.Stderr();
 }
 
-TEST_F(ReplicationIT, ReplicaWithForeignDataGetsFullResyncAndStaysDown) {
+TEST_F(ReplicationIT, ReplicaWithForeignDataIsFullySyncedAndLosesItsOwnKeys) {
   auto r = Client(*replica);
   for (int i = 0; i < 3; ++i) ASSERT_EQ(r->Command({"SET", "own" + std::to_string(i), "v"}).str, "OK");
-  const std::string digest = Digest(*r);
   auto m = Client(master);
   ASSERT_EQ(m->Command({"SET", "theirs", "v"}).str, "OK");
   Follow(*replica);
-  EXPECT_TRUE(WaitFor(
-      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
-      10s))
-      << replica->Stderr();
-  const auto until = std::chrono::steady_clock::now() + 1500ms;
-  while (std::chrono::steady_clock::now() < until) {
-    EXPECT_NE(LinkState(*r), "connected");
-    std::this_thread::sleep_for(50ms);
-  }
-  EXPECT_EQ(RoleOffset(*r), -1);
-  EXPECT_EQ(Digest(*r), digest);
-  EXPECT_EQ(r->Command({"EXISTS", "theirs"}).integer, 0);
+  ASSERT_TRUE(Synced(*m, *r)) << replica->Stderr();
+  EXPECT_EQ(InfoField(*m, "stats", "sync_full"), 1);
+  EXPECT_EQ(r->Command({"EXISTS", "own0", "own1", "own2"}).integer, 0);
+  EXPECT_EQ(r->Command({"GET", "theirs"}).str, "v");
+  EXPECT_EQ(Digest(*r), Digest(*m));
+  EXPECT_EQ(InfoString(*r, "replication", "master_replid"), InfoString(*m, "replication", "master_replid"));
+  EXPECT_EQ(InfoString(*r, "replication", "master_replid2"), std::string(40, '0'));
 }
 
 // D18: a master whose backlog was trimmed past what a stopped replica holds answers its PSYNC with
-// +FULLRESYNC; M6a has no full sync, so the replica stays down, logs the M6b line and applies nothing.
+// +FULLRESYNC, and the replica loads the master's snapshot (M6b).
 TEST_F(ReplicationIT, TrimmedBacklogForcesFullResyncForAFarBehindReplica) {
   TempDir dir("tideskv-it-replica");
   TestServer::Options o;
@@ -297,13 +291,9 @@ TEST_F(ReplicationIT, TrimmedBacklogForcesFullResyncForAFarBehindReplica) {
   o.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())};
   replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
   auto r = Client(*replica);
-  EXPECT_TRUE(WaitFor(
-      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
-      10s))
-      << replica->Stderr();
-  EXPECT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") > full_before; }, 5s));
-  EXPECT_NE(LinkState(*r), "connected");
-  EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), applied);  // nothing was applied
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") > full_before; }, 10s));
+  ASSERT_TRUE(Synced(*m, *r, 30s)) << replica->Stderr();
+  EXPECT_EQ(Digest(*r), Digest(*m));
 }
 
 // R12 (F1): a master takes a fresh replid at every start; the old one stays valid up to its last seq.
@@ -347,7 +337,8 @@ TEST_F(ReplicationIT, ReplicaContinuesAfterTheMasterRestarts) {
 
 // R12 (F1): a master that lost a tail its replica had applied (an OS crash under sync-mode interval;
 // simulated by restoring an older copy of its data dir) re-issues those seqs with other writes. Its
-// replid rotated when it restarted, so the replica's id is unknown to it: FULLRESYNC, never CONTINUE.
+// replid rotated when it restarted, so the replica's id is unknown to it: FULLRESYNC, never CONTINUE, and
+// the replica loads the master's data (M6b).
 TEST_F(ReplicationIT, ReplicaAheadOfARestartedMasterGetsFullResync) {
   namespace fs = std::filesystem;
   TempDir replica_dir("tideskv-it-replica");
@@ -381,14 +372,11 @@ TEST_F(ReplicationIT, ReplicaAheadOfARestartedMasterGetsFullResync) {
   }
   o.extra_args = {"--replicaof", "127.0.0.1 " + std::to_string(master.port())};
   replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
-  EXPECT_TRUE(WaitFor(
-      [&] { return replica->Stderr().find("is required; it is implemented in M6b") != std::string::npos; },
-      10s))
-      << replica->Stderr();
-  EXPECT_GE(InfoField(*m, "stats", "sync_full"), 1);
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") >= 1; }, 10s));
   EXPECT_EQ(InfoField(*m, "stats", "sync_partial_ok"), 0);
   r = Client(*replica);
-  EXPECT_EQ(InfoField(*r, "keyspace", "sequence"), replica_seq);  // nothing was applied
+  ASSERT_TRUE(Synced(*m, *r, 30s)) << replica->Stderr();
+  EXPECT_EQ(Digest(*r), Digest(*m));  // the seqs it applied beyond the lost tail are gone
 }
 
 // F3: a replica whose applier waits for the gate behind a busy no-writes script still shuts down

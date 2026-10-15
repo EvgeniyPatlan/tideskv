@@ -13,63 +13,19 @@
 
 // L5 (M6a exit criterion): promotion, demotion and repointing follow the PSYNC rule (D8) through the
 // replid history (D7): a node at or behind the new master continues, one ahead of it gets FULLRESYNC
-// (implemented in M6b, so it stays down) and is never merged.
+// and is never merged: it loads the new master's data instead (M6b).
 namespace tideskv::test {
 namespace {
 
 using namespace multinode;
 
 constexpr int kClients = 4;
-constexpr const char* kFullResyncLog = "is required; it is implemented in M6b";
-
-// A FULLRESYNC leaves an M6a replica down: it logs the M6b line, never connects, applies nothing.
-void ExpectStaysDown(TestServer& replica, size_t log_mark, int64_t seq) {
-  EXPECT_TRUE(
-      WaitFor([&] { return replica.Stderr().find(kFullResyncLog, log_mark) != std::string::npos; }, 10s))
-      << replica.Stderr().substr(log_mark);
-  auto c = Client(replica);
-  bool connected = false;
-  const auto until = std::chrono::steady_clock::now() + 1500ms;
-  while (!connected && std::chrono::steady_clock::now() < until) {
-    connected = LinkState(*c) == "connected";
-    std::this_thread::sleep_for(50ms);
-  }
-  EXPECT_FALSE(connected) << "the replica's link came up after a FULLRESYNC";
-  EXPECT_EQ(Sequence(*c), seq);
-}
-
-TEST(Failover, PromoteReplicaThenDemoteOldMasterPartialSyncs) {
-  const uint32_t seed = Seed();
-  SCOPED_TRACE("seed " + std::to_string(seed));
-  TestServer a(TIDESKV_SERVER_BIN);
-  TestServer b(TIDESKV_SERVER_BIN, {.extra_args = ReplicaOfArgs(a)});
-  ASSERT_TRUE(WaitConnected(b));
-  {
-    // No TTLs: the old master's reaper must not write between the promotion and its demotion, or its
-    // seq would pass the new master's history end_seq and FULLRESYNC would be the correct answer.
-    Workload load(a.port(), seed, kClients, Workload::Mix::kNoExpiry);
-    load.Start();
-    std::this_thread::sleep_for(3s);
-    load.Stop();
-    ExpectHealthyLoad(load);
-  }
-  ExpectConverged(a, {&b});
-  auto ac = Client(a);
-  auto bc = Client(b);
-  ASSERT_EQ(bc->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
-  const int64_t partial_before = InfoField(*bc, "stats", "sync_partial_ok");
-  ASSERT_EQ(ac->Command({"REPLICAOF", "127.0.0.1", std::to_string(b.port())}).str, "OK");
-  ASSERT_TRUE(WaitConnected(a)) << a.Stderr();
-  EXPECT_TRUE(WaitFor([&] { return InfoField(*bc, "stats", "sync_partial_ok") > partial_before; }));
-  EXPECT_EQ(InfoField(*bc, "stats", "sync_full"), 0);
-  {
-    Workload load(b.port(), seed + 1, kClients);
-    load.Start();
-    std::this_thread::sleep_for(3s);
-    load.Stop();
-    ExpectHealthyLoad(load);
-  }
-  ExpectConverged(b, {&a});
+// A FULLRESYNC now loads the master's snapshot (M6b): the node converges to the master.
+void ExpectFullSyncedFrom(const TestServer& master, const TestServer& replica, int64_t full_before) {
+  auto m = Client(master);
+  ASSERT_TRUE(WaitFor([&] { return InfoField(*m, "stats", "sync_full") > full_before; }, 30s));
+  ASSERT_TRUE(WaitConnected(replica));
+  ExpectConverged(master, {&replica});
 }
 
 // The master dies under load; replica A is promoted and B is pointed at it. D8 via A's history decides:
@@ -109,8 +65,7 @@ TEST(Failover, PromoteUnderLoadThenRepointSecondReplica) {
     EXPECT_EQ(InfoField(*ac, "stats", "sync_full"), 0);
     ExpectConverged(a, {&b});
   } else {
-    ExpectStaysDown(b, log_mark, b_seq);
-    EXPECT_GE(InfoField(*ac, "stats", "sync_full"), 1);
+    ExpectFullSyncedFrom(a, b, 0);
     EXPECT_EQ(InfoField(*ac, "stats", "sync_partial_ok"), 0);
   }
 }
@@ -164,8 +119,9 @@ TEST(Failover, PromoteThenRepointASecondReplicaThatIsBehind) {
 }
 
 // Review Focus #3: writes the old master took while its replica was cut off are never merged into the
-// promoted replica; the old master, ahead of the new master's history, gets FULLRESYNC and stays down.
-TEST(Failover, OldMasterWithUnreplicatedWritesNeverMerges) {
+// promoted replica; the old master, ahead of the new master's history, gets FULLRESYNC and loses them,
+// as in Redis.
+TEST(Failover, OldMasterWithUnreplicatedWritesIsResynced) {
   TestServer m(TIDESKV_SERVER_BIN);
   TestServer r(TIDESKV_SERVER_BIN, {.extra_args = ReplicaOfArgs(m)});
   ASSERT_TRUE(WaitConnected(r));
@@ -193,13 +149,11 @@ TEST(Failover, OldMasterWithUnreplicatedWritesNeverMerges) {
   ASSERT_EQ(mc->Command({"CONFIG", "SET", "requirepass", ""}).str, "OK");
   EXPECT_EQ(rc->Command(exists_lost).integer, 0);
   ASSERT_LT(Sequence(*rc), m_seq);
-  const size_t log_mark = m.Stderr().size();
   ASSERT_EQ(mc->Command({"REPLICAOF", "127.0.0.1", std::to_string(r.port())}).str, "OK");
-  ExpectStaysDown(m, log_mark, m_seq);
-  EXPECT_GE(InfoField(*rc, "stats", "sync_full"), 1);
-  EXPECT_EQ(Digest(*mc), m_digest);  // the old master's keys are unchanged
-  EXPECT_EQ(mc->Command(exists_lost).integer, 5);
+  ExpectFullSyncedFrom(r, m, 0);
+  EXPECT_EQ(mc->Command(exists_lost).integer, 0);  // its unreplicated writes are gone, as in Redis
   EXPECT_EQ(rc->Command(exists_lost).integer, 0);  // and the new master never got them
+  EXPECT_NE(Digest(*mc), m_digest);
 }
 
 }  // namespace

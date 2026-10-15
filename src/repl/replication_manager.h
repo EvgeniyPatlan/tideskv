@@ -57,7 +57,8 @@ class ReplicationManager final : public Replication {
     std::function<uint64_t()> maxclients;
     std::function<uint64_t()> connected_clients;
     // F5: this node's log does not describe its data (LoadOrDetectBaselineUnknown). As a master it never
-    // continues a "?" request; as a replica its client never sends "?".
+    // continues a "?" request; as a replica its client never sends "?". The initial value: a full sync
+    // clears it (M6b D5).
     bool baseline_unknown = false;
     RoleHooks role;
     ReplClient::Options client;
@@ -114,6 +115,16 @@ class ReplicationManager final : public Replication {
     int64_t link_down_since_ms = -1;  // -1 = never up, 0 = up
   };
   LinkTimes Link() const;
+  // A replica's full-sync progress, for INFO (M6b D11). Zeros without a client.
+  struct SyncProgress {
+    bool in_progress = false;  // the client is in kSync
+    uint64_t read_bytes = 0;
+    int64_t last_io_ms = 0;
+    int64_t loading_start_ms = 0;
+    uint64_t loaded_bytes = 0;
+  };
+  SyncProgress Sync() const;
+  bool baseline_unknown() const { return baseline_unknown_.load(std::memory_order_acquire); }
 
   std::string replid() const;
   ReplIdentity identity() const;
@@ -167,6 +178,7 @@ class ReplicationManager final : public Replication {
   std::atomic<bool> serve_stale_{true};                                   // replica-serve-stale-data
   std::atomic<int> key_save_delay_us_{0};                                 // rdb-key-save-delay (D14)
   std::atomic<ReplicaLinkState> link_state_{ReplicaLinkState::kConnect};  // mirrored from the client
+  std::atomic<bool> baseline_unknown_;  // F5: from Options; a replica's full sync clears it (M6b D5)
 
   std::mutex role_mu_;  // serialises BecomeReplica / BecomeMaster / Shutdown's client stop
 

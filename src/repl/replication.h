@@ -13,8 +13,9 @@ namespace tideskv {
 
 enum class ReplRole : uint8_t { kMaster, kReplica };
 
-// A replica's link to its master (M6a D19), as ROLE names it (redis72-replication §2).
-enum class ReplicaLinkState : uint8_t { kConnect, kConnecting, kHandshake, kConnected };
+// A replica's link to its master (M6a D19), as ROLE names it (redis72-replication §2). kSync: loading a
+// full synchronisation (M6b D5), between the handshake and the connected stream.
+enum class ReplicaLinkState : uint8_t { kConnect, kConnecting, kHandshake, kSync, kConnected };
 inline std::string_view LinkStateName(ReplicaLinkState s) {
   switch (s) {
     case ReplicaLinkState::kConnect:
@@ -23,6 +24,8 @@ inline std::string_view LinkStateName(ReplicaLinkState s) {
       return "connecting";
     case ReplicaLinkState::kHandshake:
       return "handshake";
+    case ReplicaLinkState::kSync:
+      return "sync";
     case ReplicaLinkState::kConnected:
       return "connected";
   }

@@ -22,7 +22,11 @@ ReplicationManager::ReplicationManager(Storage& storage, ReplLog& log, ReplIdent
     : ReplicationManager(storage, log, std::move(identity), Options{}) {}
 
 ReplicationManager::ReplicationManager(Storage& storage, ReplLog& log, ReplIdentity identity, Options options)
-    : storage_(storage), log_(log), options_(std::move(options)), identity_(std::move(identity)) {}
+    : storage_(storage),
+      log_(log),
+      options_(std::move(options)),
+      identity_(std::move(identity)),
+      baseline_unknown_(options_.baseline_unknown) {}
 
 ReplicationManager::~ReplicationManager() { Shutdown(); }
 
@@ -69,7 +73,8 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
 }
 
 PsyncResult ReplicationManager::Decide(const PsyncRequest& req, const ReplicaPeer& peer) {
-  const LogBounds bounds{log_.first_retained(), log_.last(), options_.baseline_unknown};
+  const LogBounds bounds{log_.first_retained(), log_.last(),
+                         baseline_unknown_.load(std::memory_order_acquire)};
   const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
   std::lock_guard lock(mu_);
   // Read under mu_ with the senders: a hand-off attaching meanwhile is then seen as a connection, not
@@ -267,6 +272,17 @@ ReplicationManager::LinkTimes ReplicationManager::Link() const {
   return {client->last_io_ms(), client->link_down_since_ms()};
 }
 
+ReplicationManager::SyncProgress ReplicationManager::Sync() const {
+  std::shared_ptr<ReplClient> client;
+  {
+    std::lock_guard lock(mu_);
+    client = client_;
+  }
+  if (!client) return {};
+  return {client->state() == ReplicaLinkState::kSync, client->sync_read_bytes(), client->sync_last_io_ms(),
+          client->loading_start_ms(), client->loaded_bytes()};
+}
+
 bool ReplicationManager::SameMaster(const std::string& host, uint16_t port) const {
   std::lock_guard lock(mu_);
   return role() == ReplRole::kReplica && EqualsIgnoreCase(host, master_host_) && port == master_port_;
@@ -299,10 +315,15 @@ std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
   cb.persist_identity = [this](const ReplIdentity& id) { return PersistAndPublish(id); };
   cb.trim_backlog = options_.role.trim_backlog;
   cb.on_state = [this](ReplicaLinkState s) { link_state_.store(s, std::memory_order_release); };
+  cb.publish_identity = [this](const ReplIdentity& id) {  // the load txn persisted it (M6b D5)
+    std::lock_guard lock(mu_);
+    identity_ = id;
+  };
+  cb.on_baseline_known = [this] { baseline_unknown_.store(false, std::memory_order_release); };
   ReplClient::ConfigSnapshotFn config = options_.role.config;
   if (!config) config = [] { return ConfigValues{}; };
   ReplClient::Options client_options = options_.client;
-  client_options.baseline_unknown = options_.baseline_unknown;
+  client_options.baseline_unknown = baseline_unknown_.load(std::memory_order_acquire);
   return std::make_shared<ReplClient>(*options_.role.engine, log_, std::move(config), std::move(cb),
                                       client_options);
 }

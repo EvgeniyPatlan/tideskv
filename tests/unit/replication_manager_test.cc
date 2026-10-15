@@ -1,6 +1,8 @@
 #include "repl/replication_manager.h"
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <chrono>
@@ -15,10 +17,15 @@
 #include "encoding/replog_codec.h"
 #include "exec/repl_log.h"
 #include "repl/backlog_trimmer.h"
+#include "repl/full_sync_frames.h"
 #include "repl/socket_io.h"
+#include "resp/request_parser.h"
 #include "server/config.h"
 #include "storage/memory_storage.h"
+#include "support/command_harness.h"
 #include "support/fake_clock.h"
+#include "support/replica_stack.h"
+#include "support/snapshot_frames.h"
 #include "types/errors.h"
 
 namespace tideskv::repl {
@@ -483,6 +490,91 @@ TEST(ReplicationManagerStale, ConcurrentConfigSetsLeaveTheFinalValue) {
     for (auto& th : threads) th.join();
     ASSERT_EQ(m.StaleRefusing(), !c.Snapshot().replica_serve_stale_data) << "round " << round;
   }
+}
+
+// A one-shot master on 127.0.0.1: accepts the replica, answers its handshake up to PSYNC.
+class OneLinkMaster {
+ public:
+  OneLinkMaster() {
+    listen_ = Fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    EXPECT_EQ(::bind(listen_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    EXPECT_EQ(::listen(listen_.get(), 4), 0);
+    EXPECT_EQ(::getsockname(listen_.get(), reinterpret_cast<sockaddr*>(&addr), &len), 0);
+    port_ = ntohs(addr.sin_port);
+  }
+  uint16_t port() const { return port_; }
+  // Accepts, then replies +PONG / +OK until PSYNC, which gets `psync_reply`. False on a timeout.
+  bool Serve(const std::string& psync_reply) {
+    pollfd p{listen_.get(), POLLIN, 0};
+    if (::poll(&p, 1, 3000) != 1) return false;
+    link_ = Fd(::accept4(listen_.get(), nullptr, nullptr, SOCK_CLOEXEC));
+    std::string in;
+    resp::RequestParser parser;
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      size_t consumed = 0;
+      const auto ps = parser.Parse(in, &consumed);
+      in.erase(0, consumed);
+      if (ps == resp::ParseStatus::kCommand) {
+        const std::string name = parser.args()[0];
+        if (name == "PSYNC") return Send("+" + psync_reply + "\r\n");
+        Send(name == "PING" ? "+PONG\r\n" : "+OK\r\n");
+        continue;
+      }
+      const Status st = ReadSome(link_.get(), &in, 20ms);
+      if (!st.ok() && st.code() != StatusCode::kTimedOut) return false;
+    }
+    return false;
+  }
+  bool Send(std::string_view bytes) { return WriteAll(link_.get(), bytes, 2s).ok(); }
+
+ private:
+  Fd listen_;
+  Fd link_;
+  uint16_t port_ = 0;
+};
+
+// M6b D5, D11: the manager's client loads a full sync: Sync() and ROLE report it while it runs; the load
+// publishes the master's replid and clears an unknown baseline.
+TEST(ReplicationManagerFullSync, ReportsTheLoadAndAdoptsItsResult) {
+  test::CommandHarness master;
+  for (int i = 0; i < 20; ++i) ASSERT_EQ(master.Run({"SET", "k" + std::to_string(i), "v"}), "+OK\r\n");
+  const std::string master_id = master.services.replication_.identity.replid;
+  InMemoryStorage storage;
+  test::ReplicaStack replica(storage);
+  ReplicationManager::Options o;
+  o.baseline_unknown = true;
+  o.role.engine = &replica.engine;
+  ReplicationManager m(storage, replica.log, ReplIdentity{std::string(kReplIdLength, 'a'), {}}, std::move(o));
+  EXPECT_EQ(m.Sync().loading_start_ms, 0);  // no client yet
+  OneLinkMaster fake;
+  ASSERT_TRUE(m.BecomeReplica("127.0.0.1", fake.port()));
+  ASSERT_TRUE(fake.Serve("FULLRESYNC " + master_id + " " + std::to_string(master.services.repl_log_.last())));
+  const test::SnapshotStream snap = test::SnapshotFrames(master.services.repl_log_);
+  std::string chunks;
+  for (size_t i = 0; i + 1 < snap.frames.size(); ++i) chunks += LoadFrame(snap.frames[i][1]);
+  ASSERT_TRUE(fake.Send(chunks));
+  ASSERT_TRUE(WaitFor([&] { return m.Sync().loaded_bytes > 0; }));
+  const ReplicationManager::SyncProgress p = m.Sync();
+  EXPECT_TRUE(p.in_progress);
+  EXPECT_GT(p.read_bytes, 0u);
+  EXPECT_GT(p.last_io_ms, 0);
+  EXPECT_GT(p.loading_start_ms, 0);
+  EXPECT_EQ(m.Role().state, ReplicaLinkState::kSync);
+  EXPECT_EQ(m.Role().offset_or_minus1, -1);
+  EXPECT_FALSE(m.baseline_unknown());  // the start txn deleted the flag
+  EXPECT_TRUE(m.identity().history.empty());
+  ASSERT_TRUE(fake.Send(LoadEndFrame(snap.seq, snap.frames.back()[2], std::stoull(snap.frames.back()[3]))));
+  ASSERT_TRUE(WaitFor([&] { return m.Role().state == ReplicaLinkState::kConnected; }));
+  EXPECT_FALSE(m.Sync().in_progress);
+  EXPECT_EQ(m.Sync().loaded_bytes, 0u);
+  EXPECT_EQ(m.replid(), master_id);
+  EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
+  m.Shutdown();
 }
 
 }  // namespace

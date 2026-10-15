@@ -19,6 +19,7 @@
 
 #include "common/string_util.h"
 #include "repl/backlog_trimmer.h"
+#include "repl/full_sync_frames.h"
 #include "repl/repl_sender.h"
 #include "repl/repl_state.h"
 #include "repl/socket_io.h"
@@ -28,6 +29,7 @@
 #include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "support/resp_client.h"
+#include "support/snapshot_frames.h"
 
 namespace tideskv::repl {
 namespace {
@@ -143,6 +145,11 @@ struct ReplClientTest : ::testing::Test {
       std::lock_guard lock(mu);
       adopted.push_back(id);
     };
+    cb.publish_identity = [this](const ReplIdentity& id) {
+      std::lock_guard lock(mu);
+      identity = id;
+    };
+    cb.on_baseline_known = [] {};
     cb.trim_backlog = trim_hook;
     cb.on_state = [this](ReplicaLinkState s) {
       std::lock_guard lock(mu);
@@ -199,6 +206,12 @@ struct ReplClientTest : ::testing::Test {
         return true;
     }
     return false;
+  }
+  // Sends what a master sends after +FULLRESYNC: the snapshot's LOAD frames and LOADEND. Returns S.
+  uint64_t SendSnapshot(Link& l) {
+    const test::SnapshotStream s = test::SnapshotFrames(master.services.repl_log_);
+    l.Send(s.Wire());
+    return s.seq;
   }
   bool SawState(ReplicaLinkState s) {
     std::lock_guard lock(mu);
@@ -335,24 +348,6 @@ TEST_F(ReplClientTest, AnInvalidMasterReplidIsAProtocolError) {  // CF5
     EXPECT_FALSE(SawState(ReplicaLinkState::kConnected)) << reply;
     client.reset();
   }
-}
-
-TEST_F(ReplClientTest, FullResyncGoesToBackoffWithoutTouchingData) {
-  for (int i = 0; i < 3; ++i) Write({"SET", "k" + std::to_string(i), "v"});
-  ASSERT_TRUE(test::ShipAll(master.services.storage_, 3, replica.engine).ok());
-  const std::string digest = test::DigestOf(replica.engine);
-  StartClient();
-  Link l = AcceptLink();
-  Handshake(l, "FULLRESYNC " + std::string(kReplIdLength, 'd') + " 99");
-  EXPECT_TRUE(l.Closed());
-  EXPECT_TRUE(WaitFor([&] { return client->state() != ReplicaLinkState::kHandshake; }));
-  EXPECT_FALSE(SawState(ReplicaLinkState::kConnected));
-  EXPECT_EQ(client->link_down_since_ms(), -1);  // never connected
-  EXPECT_EQ(replica.log.last(), 3u);
-  EXPECT_EQ(test::DigestOf(replica.engine), digest);
-  EXPECT_EQ(Identity().replid, std::string(kReplIdLength, 'a'));
-  Link again = AcceptLink();  // it retries after the backoff
-  EXPECT_EQ(again.Next(), (Args{"PING"}));
 }
 
 TEST_F(ReplClientTest, ARefusedPsyncGoesToBackoff) {
@@ -500,7 +495,7 @@ TEST_F(ReplClientTest, StopIsPromptDuringConnectAndBackoff) {
   slow.backoff_initial = 30s;
   StartClient(slow);
   Link l = AcceptLink();
-  Handshake(l, "FULLRESYNC " + master_id() + " 0");  // now waiting 30 s before retrying
+  ASSERT_EQ(Handshake(l, "").size(), 4u);  // an unreadable PSYNC answer: now waiting 30 s before retrying
   ASSERT_TRUE(l.Closed());
   start = std::chrono::steady_clock::now();
   client->Stop();
@@ -545,10 +540,168 @@ TEST_F(ReplClientTest, ReplicaTrimsBetweenBatchesWithoutConcurrentCommits) {
   EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
 }
 
+TEST_F(ReplClientTest, FullResyncLoadsTheSnapshotThenStreamsOnTheSameLink) {
+  for (int i = 0; i < 30; ++i) Write({"HSET", "h" + std::to_string(i % 3), "f" + std::to_string(i), "v"});
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  const uint64_t s = SendSnapshot(l);
+  Write({"SET", "after", "1"});
+  SendBatches(l, s + 1, master_last());
+  EXPECT_TRUE(WaitAck(l, master_last()));
+  EXPECT_EQ(replica.log.last(), master_last());
+  EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
+  EXPECT_TRUE(SawState(ReplicaLinkState::kSync));
+  EXPECT_TRUE(WaitFor([&] { return client->state() == ReplicaLinkState::kConnected; }));
+  EXPECT_EQ(Identity().replid, master_id());
+  EXPECT_TRUE(Identity().history.empty());
+  EXPECT_EQ(client->loading_start_ms(), 0);
+  EXPECT_EQ(client->sync_read_bytes(), 0u);
+  EXPECT_EQ(client->loaded_bytes(), 0u);
+}
+
+// D11: the progress counters move while the load runs and are all zero outside it.
+TEST_F(ReplClientTest, SyncProgressIsReportedDuringTheLoadOnly) {
+  for (int i = 0; i < 30; ++i) Write({"SET", "k" + std::to_string(i), "v"});
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  const test::SnapshotStream snap = test::SnapshotFrames(master.services.repl_log_);
+  std::string chunks;
+  uint64_t payload = 0;
+  for (size_t i = 0; i + 1 < snap.frames.size(); ++i) {
+    chunks += LoadFrame(snap.frames[i][1]);
+    payload += snap.frames[i][1].size();
+  }
+  const int64_t before = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+  l.Send(chunks);  // no LOADEND yet: the load stays open
+  ASSERT_TRUE(WaitFor([&] { return client->loaded_bytes() == payload; }));
+  EXPECT_EQ(client->state(), ReplicaLinkState::kSync);
+  EXPECT_TRUE(replica.engine.loading());
+  EXPECT_GE(client->sync_read_bytes(), chunks.size());
+  EXPECT_GE(client->loading_start_ms(), before);
+  EXPECT_GE(client->sync_last_io_ms(), before);
+  l.Send(LoadEndFrame(snap.seq, snap.frames.back()[2], std::stoull(snap.frames.back()[3])));
+  ASSERT_TRUE(WaitAck(l, snap.seq));
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_EQ(client->sync_read_bytes(), 0u);
+  EXPECT_EQ(client->sync_last_io_ms(), 0);
+  EXPECT_EQ(client->loading_start_ms(), 0);
+  EXPECT_EQ(client->loaded_bytes(), 0u);
+}
+
+TEST_F(ReplClientTest, AfterAFullSyncAReconnectAsksToContinueFromTheBaseline) {
+  Write({"SET", "a", "1"});
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  const uint64_t s = SendSnapshot(l);
+  ASSERT_TRUE(WaitAck(l, s));
+  client->Stop();
+  client.reset();
+  StartClient();
+  Link again = AcceptLink();
+  const auto seen = Handshake(again, "CONTINUE " + master_id());
+  ASSERT_FALSE(seen.empty());
+  EXPECT_EQ(seen.back(), (Args{"PSYNC", master_id(), std::to_string(s + 1)}));
+}
+
+TEST_F(ReplClientTest, ALinkThatDropsMidLoadLeavesAnEmptyReplicaAndRetries) {
+  for (int i = 0; i < 30; ++i) Write({"SET", "k" + std::to_string(i), "v"});
+  StartClient();
+  {
+    Link l = AcceptLink();
+    Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+    l.Send(LoadFrame(encoding::EncodeReplogBatch(
+        {{encoding::ReplOpType::kPut, ColumnFamily::kMeta, std::string("\0\0\0x", 4), "v"}}, 1, 0)));
+    EXPECT_TRUE(WaitFor([&] { return client->loaded_bytes() > 0; }));
+    EXPECT_TRUE(replica.engine.loading());
+  }  // the master's end closes
+  EXPECT_TRUE(WaitFor([&] { return !replica.engine.loading(); }));
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(test::DigestOf(replica.engine), std::string(40, '0'));
+  Link again = AcceptLink();  // retried after the backoff
+  EXPECT_EQ(again.Next(), (Args{"PING"}));
+}
+
+// CF-M6b-4: a BATCH is applied only after LOADEND; one that comes during the load drops the link.
+TEST_F(ReplClientTest, AnUnexpectedFrameDuringTheLoadAbortsIt) {
+  Write({"SET", "a", "1"});
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  l.Send(BatchFrame(1, Payload(1)));
+  EXPECT_TRUE(l.Closed());
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_EQ(replica.log.last(), 0u);
+  EXPECT_FALSE(SawState(ReplicaLinkState::kConnected));
+}
+
+TEST_F(ReplClientTest, AMasterSilentDuringTheLoadTimesOut) {
+  {
+    std::lock_guard lock(mu);
+    cfg.repl_timeout = 1;
+  }
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " 0");
+  ASSERT_TRUE(WaitFor([&] { return replica.engine.loading(); }));
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_TRUE(l.Closed(4s));
+  EXPECT_GE(std::chrono::steady_clock::now() - t0, 800ms);
+  EXPECT_TRUE(WaitFor([&] { return !replica.engine.loading(); }));
+}
+
+// PF12: the flag is set before the sync (PSYNC names our own id over an empty log) and cleared by it
+// (the same client, reconnecting over a still-empty log at S = 0, asks with "?").
+TEST_F(ReplClientTest, AFullSyncClearsAnUnknownBaseline) {
+  ReplClient::Options o = Fast();
+  o.baseline_unknown = true;
+  StartClient(o);
+  const std::string own = Identity().replid;
+  {
+    Link l = AcceptLink();
+    const auto first = Handshake(l, "FULLRESYNC " + master_id() + " 0");
+    ASSERT_FALSE(first.empty());
+    EXPECT_EQ(first.back(), (Args{"PSYNC", own, "1"}));
+    ASSERT_EQ(SendSnapshot(l), 0u);
+    ASSERT_TRUE(WaitAck(l, 0));
+    EXPECT_EQ(Identity().replid, master_id());
+  }  // the master's end closes: the client reconnects
+  Link again = AcceptLink();
+  const auto seen = Handshake(again, "CONTINUE " + master_id());
+  ASSERT_FALSE(seen.empty());
+  EXPECT_EQ(seen.back(), (Args{"PSYNC", "?", "1"}));
+}
+
+// PF14: Stop cuts a key-load-delay short; the partial load is discarded.
+TEST_F(ReplClientTest, StopIsPromptDuringALoad) {
+  for (int i = 0; i < 30; ++i) Write({"SET", "k" + std::to_string(i), "v"});
+  {
+    std::lock_guard lock(mu);
+    cfg.key_load_delay = 200000;  // 0.2 s per key: the load would take seconds
+  }
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  SendSnapshot(l);
+  ASSERT_TRUE(WaitFor([&] { return replica.engine.loading(); }));
+  std::this_thread::sleep_for(300ms);  // inside the per-key delay
+  const auto start = std::chrono::steady_clock::now();
+  client->Stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(test::DigestOf(replica.engine), std::string(40, '0'));
+}
+
 TEST(ReplicaLinkStateNames, MatchRole) {
   EXPECT_EQ(LinkStateName(ReplicaLinkState::kConnect), "connect");
   EXPECT_EQ(LinkStateName(ReplicaLinkState::kConnecting), "connecting");
   EXPECT_EQ(LinkStateName(ReplicaLinkState::kHandshake), "handshake");
+  EXPECT_EQ(LinkStateName(ReplicaLinkState::kSync), "sync");
   EXPECT_EQ(LinkStateName(ReplicaLinkState::kConnected), "connected");
 }
 

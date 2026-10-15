@@ -20,7 +20,8 @@ constexpr size_t kMaxReplyLine = size_t{64} * 1024;
 // a bigger frame is a protocol error and drops the link, so a hostile or broken master cannot make the
 // replica buffer (or decode) more than this. What may sit unparsed: one maximal frame plus its header.
 constexpr size_t kMaxInput = encoding::kMaxReplBatchBytes + size_t{64} * 1024;
-// The master sends only BATCH <seq> <payload> and PING (D9).
+// The master sends only BATCH <seq> <payload> and PING (D9), and before them, after +FULLRESYNC,
+// LOAD <chunk> and LOADEND <seq> <record> <ops> (M6b D4).
 constexpr resp::ParserLimits kMasterStreamLimits{/*max_bulk_len=*/encoding::kMaxReplBatchBytes,
                                                  /*max_multibulk_len=*/8, /*max_inline_len=*/1024};
 
@@ -51,7 +52,8 @@ ReplClient::ReplClient(Engine& engine, ReplLog& log, ConfigSnapshotFn config, Ca
       config_(std::move(config)),
       cb_(std::move(cb)),
       options_(options),
-      parser_(kMasterStreamLimits) {}
+      parser_(kMasterStreamLimits),
+      baseline_unknown_(options.baseline_unknown) {}
 
 ReplClient::~ReplClient() { Stop(); }
 
@@ -91,8 +93,8 @@ void ReplClient::WaitBackoff(std::chrono::milliseconds d) {
   backoff_cv_.wait_for(lock, d, [this] { return stopping(); });
 }
 
-// Connects, streams until the link drops, then waits 1, 2, 4 ... 30 s (D19); a link that got +CONTINUE
-// starts the backoff over.
+// Connects, streams until the link drops, then waits 1, 2, 4 ... 30 s (D19); a link that got +CONTINUE,
+// or completed a full sync (M6b D17), starts the backoff over.
 void ReplClient::Run() {
   auto backoff = options_.backoff_initial;
   while (!stopping()) {
@@ -111,6 +113,7 @@ void ReplClient::Run() {
 Status ReplClient::RunLink(bool* continued) {
   const ConfigValues cfg = config_();
   timeout_ = ReplTimeout(cfg);
+  key_load_delay_.store(cfg.key_load_delay, std::memory_order_relaxed);
   in_.clear();
   parser_ = resp::RequestParser(kMasterStreamLimits);
   SetState(ReplicaLinkState::kConnecting);
@@ -123,9 +126,15 @@ Status ReplClient::RunLink(bool* continued) {
   } const unpublish{this};
   SetState(ReplicaLinkState::kHandshake);
   if (Status st = Handshake(fd->get(), cfg); !st.ok()) return st;
-  if (Status st = Psync(fd->get(), continued); !st.ok()) return st;
+  PsyncOutcome psync;
+  if (Status st = Psync(fd->get(), &psync); !st.ok()) return st;
+  if (psync.full) {
+    if (Status st = FullSync(fd->get(), psync); !st.ok()) return st;
+  }
+  *continued = true;  // CONTINUE or a completed full sync resets the backoff (D17)
   SetState(ReplicaLinkState::kConnected);
-  spdlog::info("replicating from {}:{}: partial resynchronisation accepted at seq {}", host_, port_,
+  spdlog::info("replicating from {}:{}: {} at seq {}", host_, port_,
+               psync.full ? "full resynchronisation loaded, streaming" : "partial resynchronisation accepted",
                log_.last() + 1);
   return Stream(fd->get());
 }
@@ -174,29 +183,112 @@ Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
   return Status::Ok();
 }
 
-// PSYNC <replid|?> <last+1> (D8). OK only for +CONTINUE: *continued is set and streaming may begin.
-Status ReplClient::Psync(int fd, bool* continued) {
+// PSYNC <replid|?> <last+1> (D8). OK for +CONTINUE (the replid adopted) and for a valid
+// +FULLRESYNC <replid> <seq> (out->full; the load follows on this link, M6b D4).
+Status ReplClient::Psync(int fd, PsyncOutcome* out) {
   const uint64_t last = log_.last();
-  const std::string replid = last == 0 && !options_.baseline_unknown ? "?" : cb_.identity().replid;  // F5
+  const bool unknown = baseline_unknown_.load(std::memory_order_acquire);
+  const std::string replid = last == 0 && !unknown ? "?" : cb_.identity().replid;  // F5
   const std::string next = std::to_string(last + 1);
   auto r = Command(fd, {"PSYNC", replid, next});
   if (!r.ok()) return r.status();
   if (r->type == ReplyNode::Type::kError) return Status::IOError("the master refused PSYNC: -" + r->str);
   const std::string_view reply = r->str;
   if (r->type == ReplyNode::Type::kStatus && reply.starts_with("CONTINUE ")) {
-    if (Status st = AdoptReplid(reply.substr(9)); !st.ok()) return st;
-    *continued = true;
-    return Status::Ok();
+    return AdoptReplid(reply.substr(9));
   }
   if (r->type == ReplyNode::Type::kStatus && reply.starts_with("FULLRESYNC ")) {
     const std::string_view rest = reply.substr(11);
-    if (!IsValidReplId(rest.substr(0, rest.find(' ')))) {
+    const size_t space = rest.find(' ');
+    if (space == std::string_view::npos || !IsValidReplId(rest.substr(0, space))) {
       return Status::IOError("protocol error: invalid replid in +FULLRESYNC");
     }
-    spdlog::warn("full resynchronisation from {}:{} is required; it is implemented in M6b", host_, port_);
-    return Status::IOError("the master requires a full resynchronisation");
+    if (!ParseUint64(rest.substr(space + 1), &out->seq)) {
+      return Status::IOError("protocol error: invalid seq in +FULLRESYNC");
+    }
+    out->full = true;
+    out->replid = std::string(rest.substr(0, space));
+    return Status::Ok();
   }
   return Status::IOError("protocol error: unexpected PSYNC reply");
+}
+
+// +FULLRESYNC (M6b D4, D5): loads the snapshot that follows on this link, in place. Any failure (the
+// link dropping, a protocol error, Stop) destroys the loader, which discards the partial load.
+Status ReplClient::FullSync(int fd, const PsyncOutcome& o) {
+  SetState(ReplicaLinkState::kSync);
+  spdlog::info("full resynchronisation from {}:{} at seq {}", host_, port_, o.seq);
+  sync_read_bytes_.store(in_.size(), std::memory_order_release);  // what followed the +FULLRESYNC line
+  sync_last_io_ms_.store(UnixMs(), std::memory_order_release);
+  struct EndProgress {
+    ReplClient* c;
+    ~EndProgress() { c->ResetSyncProgress(); }
+  } const end_progress{this};
+  FullSyncLoader loader(engine_, o.replid, o.seq, LoaderHooks());
+  if (Status st = loader.Begin(); !st.ok()) return st;
+  loading_start_ms_.store(UnixMs(), std::memory_order_release);
+  if (Status st = LoadUntilDone(fd, loader); !st.ok()) return st;
+  spdlog::info("full resynchronisation from {}:{} loaded: {} bytes, seq {}", host_, port_,
+               loader.loaded_bytes(), o.seq);
+  return Status::Ok();
+}
+
+// Reads and loads until LOADEND committed. The master PINGs an idle link, so repl-timeout of silence drops
+// it (D10). The bytes after LOADEND stay in in_ for Stream.
+Status ReplClient::LoadUntilDone(int fd, FullSyncLoader& loader) {
+  bool done = false;
+  if (Status st = ParseLoadFrames(loader, &done); !st.ok()) return st;
+  auto last_io = SteadyClock::now();
+  while (!done) {
+    if (stopping()) return Status::IOError("stopped");
+    const size_t before = in_.size();
+    Status st = ReadSome(fd, &in_, std::min(options_.ack_interval, timeout_));
+    const auto now = SteadyClock::now();
+    if (st.ok()) {
+      last_io = now;
+      sync_read_bytes_.fetch_add(in_.size() - before, std::memory_order_acq_rel);
+      sync_last_io_ms_.store(UnixMs(), std::memory_order_release);
+      if (Status parsed = ParseLoadFrames(loader, &done); !parsed.ok()) return parsed;
+      continue;
+    }
+    if (st.code() != StatusCode::kTimedOut) return st;
+    if (now - last_io >= timeout_) {
+      return Status::TimedOut("no data from the master within repl-timeout during a full sync");
+    }
+  }
+  return Status::Ok();
+}
+
+Status ReplClient::ParseLoadFrames(FullSyncLoader& loader, bool* done) {
+  const auto handle = [&](const std::vector<std::string>& args) {
+    if (stopping()) return Status::IOError("stopped");  // a delayed load stops between frames too (PF14)
+    return loader.HandleFrame(args, done);
+  };
+  const Status st = DrainFrames(handle, done);
+  loaded_bytes_.store(loader.loaded_bytes(), std::memory_order_release);
+  return st;
+}
+
+FullSyncLoader::Hooks ReplClient::LoaderHooks() {
+  FullSyncLoader::Hooks h;
+  h.identity = cb_.identity;
+  h.publish_identity = [this](const ReplIdentity& id) {
+    if (cb_.publish_identity) cb_.publish_identity(id);
+  };
+  h.on_baseline_known = [this] {
+    baseline_unknown_.store(false, std::memory_order_release);
+    if (cb_.on_baseline_known) cb_.on_baseline_known();
+  };
+  h.key_load_delay_us = [this] { return key_load_delay_.load(std::memory_order_relaxed); };
+  h.stopping = [this] { return stopping(); };
+  return h;
+}
+
+void ReplClient::ResetSyncProgress() {
+  sync_read_bytes_.store(0, std::memory_order_release);
+  sync_last_io_ms_.store(0, std::memory_order_release);
+  loading_start_ms_.store(0, std::memory_order_release);
+  loaded_bytes_.store(0, std::memory_order_release);
 }
 
 // +CONTINUE <id> (D7, CF5): an id that differs from ours is validated, then adopted and persisted here,
@@ -262,19 +354,28 @@ Status ReplClient::Stream(int fd) {
   return Status::Ok();
 }
 
-Status ReplClient::ParseFrames() {
+Status ReplClient::DrainFrames(const FrameHandler& handle, const bool* stop) {
   size_t offset = 0;
-  for (;;) {
+  while (stop == nullptr || !*stop) {
     size_t consumed = 0;
     const resp::ParseStatus ps = parser_.Parse(std::string_view(in_).substr(offset), &consumed);
     offset += consumed;
     if (ps == resp::ParseStatus::kNeedMore) break;
     if (ps == resp::ParseStatus::kError)
       return Status::IOError("protocol error from master: " + parser_.error());
-    if (Status st = HandleFrame(parser_.args()); !st.ok()) return st;
+    if (Status st = handle(parser_.args()); !st.ok()) return st;
   }
   in_.erase(0, offset);
   if (in_.size() + parser_.buffered_bytes() > kMaxInput) return Status::IOError("master input too large");
+  return Status::Ok();
+}
+
+Status ReplClient::ParseFrames() {
+  if (Status st =
+          DrainFrames([this](const std::vector<std::string>& args) { return HandleFrame(args); }, nullptr);
+      !st.ok()) {
+    return st;
+  }
   const bool drained = in_.empty() && parser_.buffered_bytes() == 0;
   if (drained && log_.last() != acked_) ack_due_ = true;  // caught up: acknowledge right away
   return Status::Ok();
