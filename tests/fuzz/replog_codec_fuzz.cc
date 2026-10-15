@@ -6,6 +6,7 @@
 #include "common/coding.h"
 #include "common/crc32c.h"
 #include "encoding/replog_codec.h"
+#include "repl/full_sync_frames.h"
 
 namespace {
 
@@ -24,6 +25,7 @@ void CheckCanonical(std::string_view input) {
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   const std::string_view input(reinterpret_cast<const char*>(data), size);
   CheckCanonical(input);
+  (void)tideskv::repl::DecodeLoadChunk(input);
   // Random bytes almost never carry a valid CRC, which would hide the op parser from the fuzzer:
   // also feed the input with its trailing CRC recomputed.
   if (size >= 4) {
