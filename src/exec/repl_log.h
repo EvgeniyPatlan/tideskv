@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -14,18 +15,30 @@
 
 namespace tideskv {
 
+// sys/repl_load_incomplete: present from the first to the last transaction of a replica's full-sync load
+// (M6b D5); node-local. Recover() reports it so that startup discards the partial keyspace.
+inline constexpr std::string_view kSysReplLoadIncomplete = "repl_load_incomplete";
+
+// A frozen view of the whole store and the watermark it holds exactly (M6b D2).
+struct SyncSnapshot {
+  std::unique_ptr<ReadView> view;
+  uint64_t seq = 0;
+};
+
 // Applies `ops` to txn in order, exactly as recorded (M6a D5/D11). Stops at the first failure.
 Status ApplyReplOps(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
 
 // The replication log (M6a D3): the only writer of the replog CF. Commit() serialises
 // "seq = last+1 → put replog[seq] → commit → publish" so seq order is commit order and the
 // watermark (last committed seq) has no gaps. Lock order: taken after the gate, key stripes,
-// ScriptEngine::mu_ and WatchRegistry shards; it takes only the storage commit mutex beneath it.
+// ScriptEngine::mu_ and WatchRegistry shards; it takes only the storage commit mutex beneath it
+// (SnapshotAtLast also creates a storage snapshot under it, M6b D2).
 // Never call into ReplLog while holding the storage commit mutex.
 class ReplLog {
  public:
   ReplLog(Storage& storage, const Clock& clock) : storage_(storage), clock_(clock) {}
-  // Reads the last replog entry (seq, cum_bytes) and sys/repl_first. Call once before use.
+  // Reads the last replog entry (seq, cum_bytes), sys/repl_first and sys/repl_load_incomplete. Call once
+  // before use.
   Status Recover();
   // Commits txn; if ops is non-empty first appends replog[last+1] = their batch. kUserError with
   // the READONLY text while local writes are fenced (replica), and with kErrTooLargeToReplicate when the
@@ -66,12 +79,33 @@ class ReplLog {
   // nothing is written and *trimmed is false. Once FenceLocalWrites(true) returns, no such trim commits.
   Status TrimUnlessFenced(uint64_t up_to, bool* trimmed);
 
+  // Takes BeginSnapshot() and last() together under mu_: no commit section runs in between, so the view
+  // holds exactly the commits <= seq (spike s_snapcut).
+  Result<SyncSnapshot> SnapshotAtLast();
+  bool load_incomplete() const { return load_incomplete_.load(std::memory_order_acquire); }
+  // A replica's full-sync load (M6b D5). Each commits `txn` (already holding that step's keyspace writes)
+  // under mu_. Start and End require the fence (kInternal otherwise).
+  // Start: + DeleteRange(the whole replog), Delete(sys/repl_first), Delete(sys/repl_baseline_unknown),
+  // Put(the marker). Then last = cum = 0, first = 1.
+  Status CommitLoadStart(WriteTxn& txn);
+  // End: seq == 0 requires an empty record; otherwise the record must decode as a batch (CRC included),
+  // then Put(replog[seq] = record), Put(sys/repl_first = seq). Deletes the marker. Then last = seq,
+  // cum = the record's cum_bytes (0 when seq == 0), first = seq (1 when seq == 0). Corruption on a bad
+  // record, with nothing committed.
+  Status CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view record);
+  // Abort, and startup recovery of an interrupted load: deletes the marker (the caller's txn wipes the
+  // keyspace). Not fence-checked: startup runs it before any role is taken.
+  Status CommitLoadAbort(WriteTxn& txn);
+
  private:
   // Requires mu_: puts replog[seq] = record on txn, commits it and publishes seq.
   Status AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum);
   Status RecoverLast(ReadView& view, uint64_t* last, uint64_t* cum);
   Status RecoverFirst(ReadView& view, uint64_t last, uint64_t* first);
+  Status RecoverLoadMarker(ReadView& view, bool* incomplete);
   Status TrimLocked(uint64_t up_to);  // requires mu_
+  // Requires mu_: the in-memory log after a load step committed.
+  void SetBaselineLocked(uint64_t last, uint64_t cum, uint64_t first);
 
   Storage& storage_;
   const Clock& clock_;
@@ -81,6 +115,7 @@ class ReplLog {
   std::atomic<uint64_t> first_{1};
   uint64_t cum_ = 0;  // guarded by mu_
   std::atomic<bool> fenced_{false};
+  std::atomic<bool> load_incomplete_{false};
   std::atomic<size_t> max_batch_bytes_{encoding::kMaxReplBatchBytes};
 };
 

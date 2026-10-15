@@ -1,6 +1,7 @@
 #include "exec/repl_log.h"
 
 #include <string>
+#include <utility>
 
 #include "common/coding.h"
 #include "types/errors.h"
@@ -10,6 +11,10 @@ namespace {
 
 // sys/repl_first: 8-byte BE seq of the oldest retained replog entry (written by trimming).
 constexpr std::string_view kReplFirstKey = "repl_first";
+// = repl::kSysReplBaselineUnknown (repl/ is not included here: exec -> repl would be a cycle).
+constexpr std::string_view kBaselineUnknownKey = "repl_baseline_unknown";
+// With an empty hi (= to the end): every key of a CF.
+constexpr std::string_view kWholeCfLo("\x00", 1);
 
 Status ApplyOp(WriteTxn& txn, const encoding::ReplOp& op) {
   switch (op.type) {
@@ -71,14 +76,23 @@ Status ReplLog::RecoverFirst(ReadView& view, uint64_t last, uint64_t* first) {
   return Status::Ok();
 }
 
+Status ReplLog::RecoverLoadMarker(ReadView& view, bool* incomplete) {
+  auto raw = view.Get(ColumnFamily::kSys, kSysReplLoadIncomplete);
+  *incomplete = raw.ok();
+  if (raw.ok() || raw.status().IsNotFound()) return Status::Ok();
+  return raw.status();
+}
+
 Status ReplLog::Recover() {
   auto view = storage_.BeginRead();
   if (!view.ok()) return view.status();
   uint64_t last = 0;
   uint64_t cum = 0;
   uint64_t first = 1;
+  bool incomplete = false;
   if (Status st = RecoverLast(**view, &last, &cum); !st.ok()) return st;
   if (Status st = RecoverFirst(**view, last, &first); !st.ok()) return st;
+  if (Status st = RecoverLoadMarker(**view, &incomplete); !st.ok()) return st;
   // CF3: trimming keeps the newest batch, so first <= last; last + 1 means everything up to last is
   // gone (a full sync's baseline, M6b). Anything else is a damaged sys/repl_first.
   if (first == 0 || first > last + 1) {
@@ -89,6 +103,7 @@ Status ReplLog::Recover() {
   cum_ = cum;
   first_.store(first, std::memory_order_release);
   last_.store(last, std::memory_order_release);
+  load_incomplete_.store(incomplete, std::memory_order_release);
   return Status::Ok();
 }
 
@@ -202,6 +217,64 @@ Status ReplLog::TrimUnlessFenced(uint64_t up_to, bool* trimmed) {
   if (fenced()) return Status::Ok();
   if (Status st = TrimLocked(up_to); !st.ok()) return st;
   *trimmed = true;
+  return Status::Ok();
+}
+
+Result<SyncSnapshot> ReplLog::SnapshotAtLast() {
+  std::lock_guard lock(mu_);
+  auto view = storage_.BeginSnapshot();
+  if (!view.ok()) return view.status();
+  return SyncSnapshot{std::move(view).value(), last_.load(std::memory_order_relaxed)};
+}
+
+void ReplLog::SetBaselineLocked(uint64_t last, uint64_t cum, uint64_t first) {
+  cum_ = cum;
+  first_.store(first, std::memory_order_release);
+  last_.store(last, std::memory_order_release);
+  advanced_.notify_all();
+}
+
+Status ReplLog::CommitLoadStart(WriteTxn& txn) {
+  std::lock_guard lock(mu_);
+  if (!fenced()) return Status::Internal("full-sync load while local writes are not fenced");
+  if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kBaselineUnknownKey); !st.ok()) return st;
+  if (Status st = txn.Put(ColumnFamily::kSys, kSysReplLoadIncomplete, "1"); !st.ok()) return st;
+  if (Status st = txn.Commit(); !st.ok()) return st;
+  SetBaselineLocked(0, 0, 1);
+  load_incomplete_.store(true, std::memory_order_release);
+  return Status::Ok();
+}
+
+Status ReplLog::CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view record) {
+  uint64_t cum = 0;
+  if (seq == 0 && !record.empty()) return Status::Corruption("full-sync baseline: a record for seq 0");
+  if (seq > 0) {
+    auto batch = encoding::DecodeReplogBatch(record);
+    if (!batch.ok()) return Status::Corruption("full-sync baseline record: " + batch.status().message());
+    cum = batch->cum_bytes;
+  }
+  std::lock_guard lock(mu_);
+  if (!fenced()) return Status::Internal("full-sync load while local writes are not fenced");
+  if (seq > 0) {
+    std::string first;
+    coding::PutFixed64BE(&first, seq);
+    if (Status st = txn.Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), record); !st.ok()) return st;
+    if (Status st = txn.Put(ColumnFamily::kSys, kReplFirstKey, first); !st.ok()) return st;
+  }
+  if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplLoadIncomplete); !st.ok()) return st;
+  if (Status st = txn.Commit(); !st.ok()) return st;
+  SetBaselineLocked(seq, cum, seq == 0 ? 1 : seq);
+  load_incomplete_.store(false, std::memory_order_release);
+  return Status::Ok();
+}
+
+Status ReplLog::CommitLoadAbort(WriteTxn& txn) {
+  std::lock_guard lock(mu_);
+  if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplLoadIncomplete); !st.ok()) return st;
+  if (Status st = txn.Commit(); !st.ok()) return st;
+  load_incomplete_.store(false, std::memory_order_release);
   return Status::Ok();
 }
 
