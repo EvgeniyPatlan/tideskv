@@ -173,12 +173,15 @@ void Role(ExecContext& ctx, const ArgList& /*argv*/) {
 }  // namespace
 
 void RegisterReplicationCommands(CommandRegistry& r) {
-  r.Register({"psync", -3, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Psync});
-  r.Register({"sync", 1, kCmdAdmin | kCmdNoScript | kCmdNoMulti, 0, 0, 0, &Sync});
-  r.Register({"replconf", -1, kCmdAdmin | kCmdNoScript | kCmdAllowBusy, 0, 0, 0, &Replconf});
-  r.Register({"replicaof", 3, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Replicaof});
-  r.Register({"slaveof", 3, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Replicaof});
-  r.Register({"role", 1, kCmdNoScript | kCmdFast, 0, 0, 0, &Role});
+  r.Register({"psync", -3, kCmdAdmin | kCmdNoScript | kCmdNoMulti | kCmdLoading, 0, 0, 0, &Psync});
+  r.Register({"sync", 1, kCmdAdmin | kCmdNoScript | kCmdNoMulti | kCmdLoading, 0, 0, 0, &Sync});
+  r.Register({"replconf", -1, kCmdAdmin | kCmdNoScript | kCmdAllowBusy | kCmdLoading | kCmdStale, 0, 0, 0,
+              &Replconf});
+  r.Register({"replicaof", 3, kCmdAdmin | kCmdNoScript | kCmdLoading | kCmdStale, 0, 0, 0,
+              &Replicaof});  // loading: TidesKV divergence (M6b D7)
+  r.Register({"slaveof", 3, kCmdAdmin | kCmdNoScript | kCmdLoading | kCmdStale, 0, 0, 0,
+              &Replicaof});  // loading: TidesKV divergence (M6b D7)
+  r.Register({"role", 1, kCmdNoScript | kCmdFast | kCmdLoading | kCmdStale, 0, 0, 0, &Role});
 }
 
 }  // namespace tideskv

@@ -62,7 +62,7 @@ void Debug(ExecContext& ctx, const ArgList& argv) {
 }  // namespace
 
 void RegisterDebugCommands(CommandRegistry& r) {
-  r.Register({"debug", -2, kCmdAdmin | kCmdNoScript, 0, 0, 0, &Debug});
+  r.Register({"debug", -2, kCmdAdmin | kCmdNoScript | kCmdLoading | kCmdStale, 0, 0, 0, &Debug});
 }
 
 }  // namespace tideskv

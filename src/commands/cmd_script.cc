@@ -179,10 +179,10 @@ std::string ScriptSubcommandError(const ArgList& argv) {
 }
 
 void RegisterScriptCommands(CommandRegistry& r) {
-  r.Register({"eval", -3, kCmdNoScript, 0, 0, 0, &Eval});
-  r.Register({"evalsha", -3, kCmdNoScript, 0, 0, 0, &EvalSha});
-  r.Register({"eval_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalRo});
-  r.Register({"evalsha_ro", -3, kCmdNoScript | kCmdReadOnly, 0, 0, 0, &EvalShaRo});
+  r.Register({"eval", -3, kCmdNoScript | kCmdStale, 0, 0, 0, &Eval});
+  r.Register({"evalsha", -3, kCmdNoScript | kCmdStale, 0, 0, 0, &EvalSha});
+  r.Register({"eval_ro", -3, kCmdNoScript | kCmdReadOnly | kCmdStale, 0, 0, 0, &EvalRo});
+  r.Register({"evalsha_ro", -3, kCmdNoScript | kCmdReadOnly | kCmdStale, 0, 0, 0, &EvalShaRo});
   r.Register({"script", -2, kCmdNoScript | kCmdAllowBusy, 0, 0, 0, &Script});
 }
 

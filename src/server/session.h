@@ -25,9 +25,11 @@ class ClientLink {
 
 // MULTI state (M5a plan G3).
 struct MultiState {
-  bool active = false;      // between MULTI and EXEC/DISCARD (Redis CLIENT_MULTI)
-  bool dirty_exec = false;  // a command was rejected while queueing: EXEC aborts (CLIENT_DIRTY_EXEC)
-  bool has_write = false;   // a queued command has the write flag (Redis mstate.cmd_flags)
+  bool active = false;           // between MULTI and EXEC/DISCARD (Redis CLIENT_MULTI)
+  bool dirty_exec = false;       // a command was rejected while queueing: EXEC aborts (CLIENT_DIRTY_EXEC)
+  bool has_write = false;        // a queued command has the write flag (Redis mstate.cmd_flags)
+  bool has_non_stale = false;    // a queued command lacks the stale flag
+  bool has_non_loading = false;  // a queued command lacks the loading flag
   std::vector<std::vector<std::string>> queued;
 };
 

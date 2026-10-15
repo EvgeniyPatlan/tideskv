@@ -51,8 +51,10 @@ class ScriptEngine {
   Result<std::string> Load(std::string_view body);                       // SCRIPT LOAD: the sha
   std::vector<bool> Exists(const std::vector<std::string>& shas) const;  // case-insensitive
   void Flush();  // SCRIPT FLUSH: empty cache, fresh Lua state; the caller holds the gate
-  // Redis evalGetCommandFlags: true if the script has a shebang without no-writes (it counts as a write
-  // command). An unknown sha, a bad shebang, or a running script (mu_ busy) answer false.
+  // Flags of a cached script, else (EVAL bodies only) of its parsed shebang; nullopt for an unknown sha, a
+  // bad shebang, or while a script runs (mu_ busy: the BUSY check answers).
+  std::optional<ScriptFlags> PeekFlags(std::string_view script, bool by_sha) const;
+  // Redis evalGetCommandFlags: true if the script has a shebang without no-writes (it counts as a write).
   bool DeclaresWrites(std::string_view script, bool by_sha) const;
   bool TimedOut() const noexcept;   // a script runs past busy_threshold_ms (BUSY)
   bool Kill() noexcept;             // SCRIPT KILL: false = NOTBUSY

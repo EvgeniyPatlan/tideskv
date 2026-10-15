@@ -161,17 +161,20 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
   return {r.killed};
 }
 
-bool ScriptEngine::DeclaresWrites(std::string_view script, bool by_sha) const {
+std::optional<ScriptFlags> ScriptEngine::PeekFlags(std::string_view script, bool by_sha) const {
   std::unique_lock<std::mutex> lock(mu_, std::try_to_lock);
-  if (!lock.owns_lock()) return false;  // a script is running: the BUSY check answers
-  if (by_sha) {
-    const auto it = scripts_.find(Lower(script));
-    return it != scripts_.end() && it->second.flags.shebang && !it->second.flags.no_writes;
-  }
-  const auto it = scripts_.find(Sha1Hex(script));
-  if (it != scripts_.end()) return it->second.flags.shebang && !it->second.flags.no_writes;
+  if (!lock.owns_lock()) return std::nullopt;  // a script is running: the BUSY check answers
+  const auto it = scripts_.find(by_sha ? Lower(script) : Sha1Hex(script));
+  if (it != scripts_.end()) return it->second.flags;
+  if (by_sha) return std::nullopt;
   const Result<ParsedScript> parsed = ParseShebang(script);
-  return parsed.ok() && parsed->flags.shebang && !parsed->flags.no_writes;
+  if (!parsed.ok()) return std::nullopt;
+  return parsed->flags;
+}
+
+bool ScriptEngine::DeclaresWrites(std::string_view script, bool by_sha) const {
+  const std::optional<ScriptFlags> f = PeekFlags(script, by_sha);
+  return f && f->shebang && !f->no_writes;
 }
 
 Result<std::string> ScriptEngine::Load(std::string_view body) {

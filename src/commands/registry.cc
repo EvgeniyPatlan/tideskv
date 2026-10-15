@@ -1,6 +1,7 @@
 #include "commands/registry.h"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -58,16 +59,19 @@ void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
   ctx.reply.Error(error);
 }
 
-// Redis command flags as processCommand sees them: EVAL-family commands with a shebang script that
-// lacks no-writes count as writes (evalGetCommandFlags).
-bool IsWrite(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
-  if ((spec.flags & kCmdWrite) != 0) return true;
-  const std::string_view n = spec.name;
-  if (n != "eval" && n != "evalsha" && n != "eval_ro" && n != "evalsha_ro") return false;
-  return argv.size() >= 2 && ctx.server.scripts().DeclaresWrites(argv[1], n.starts_with("evalsha"));
+bool IsEvalFamily(std::string_view n) {
+  return n == "eval" || n == "evalsha" || n == "eval_ro" || n == "evalsha_ro";
 }
 
-void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
+uint32_t ScriptSubcommandFlags(uint32_t base, const ArgList& argv) {
+  if (argv.size() < 2) return base;
+  const std::string sub = ToLower(argv[1]);
+  if (sub == "help") return base | kCmdLoading | kCmdStale;
+  if (sub == "load") return base | kCmdStale;
+  return base;
+}
+
+void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv, uint32_t flags) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
   if (spec.name == "script") {  // subcommand lookup precedes queueing in Redis processCommand
     if (std::string err = ScriptSubcommandError(argv); !err.empty()) return Reject(ctx, &spec, err);
@@ -76,7 +80,9 @@ void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   const bool doomed = ctx.session.multi.dirty_exec || (w != nullptr && w->dirty());
   if (!doomed) {  // multi.c:67
     ctx.session.multi.queued.push_back(argv);
-    ctx.session.multi.has_write |= IsWrite(ctx, spec, argv);
+    ctx.session.multi.has_write |= (flags & kCmdWrite) != 0;
+    ctx.session.multi.has_non_stale |= (flags & kCmdStale) == 0;
+    ctx.session.multi.has_non_loading |= (flags & kCmdLoading) == 0;
   }
   ctx.reply.SimpleString("QUEUED");
 }
@@ -98,8 +104,8 @@ const CommandSpec* CommandRegistry::Find(std::string_view name) const {
 
 std::vector<std::string_view> FlagNames(uint32_t flags) {
   static constexpr std::pair<CommandFlag, std::string_view> kNames[] = {
-      {kCmdWrite, "write"},      {kCmdReadOnly, "readonly"},   {kCmdAdmin, "admin"},
-      {kCmdFast, "fast"},        {kCmdNoAuth, "no-auth"},      {kCmdNoScript, "noscript"},
+      {kCmdWrite, "write"},      {kCmdReadOnly, "readonly"},   {kCmdAdmin, "admin"},     {kCmdFast, "fast"},
+      {kCmdNoAuth, "no-auth"},   {kCmdNoScript, "noscript"},   {kCmdLoading, "loading"}, {kCmdStale, "stale"},
       {kCmdNoMulti, "no_multi"}, {kCmdAllowBusy, "allow_busy"}};
   std::vector<std::string_view> out;
   for (const auto& [flag, name] : kNames) {
@@ -113,6 +119,27 @@ bool ArityOk(int arity, size_t argc) {
   return arity >= 0 ? n == arity : n >= -arity;
 }
 
+uint32_t EffectiveFlags(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
+  if (spec.name == "script") return ScriptSubcommandFlags(spec.flags, argv);
+  if (!IsEvalFamily(spec.name) || argv.size() < 2) return spec.flags;
+  const std::optional<ScriptFlags> f =
+      ctx.server.scripts().PeekFlags(argv[1], spec.name.starts_with("evalsha"));
+  if (!f) return spec.flags;                             // unknown sha / bad shebang / busy: as registered
+  if (!f->shebang) return spec.flags & ~kCmdStale;       // compat mode: MASTERDOWN on 7.2.5 (live)
+  uint32_t out = spec.flags & ~(kCmdStale | kCmdWrite);  // scriptFlagsToCmdFlags (script.c:111)
+  if (!f->no_writes) out |= kCmdWrite;
+  if (f->allow_stale) out |= kCmdStale;
+  return out;
+}
+
+CallFlags DeriveCallFlags(const Session& session, const CommandSpec& spec, uint32_t flags) {
+  const bool exec = spec.name == "exec";
+  const MultiState& m = session.multi;
+  return {(flags & kCmdWrite) != 0 || (exec && m.has_write),
+          (flags & kCmdStale) == 0 || (exec && m.has_non_stale),
+          (flags & kCmdLoading) == 0 || (exec && m.has_non_loading)};
+}
+
 void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
   if (argv.empty()) return;
   const CommandSpec* spec = registry.Find(argv[0]);
@@ -121,13 +148,15 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, ArityError(spec->name));
   }
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
-  if (ctx.server.replication().IsReplica() && IsWrite(ctx, *spec, argv)) {
+  const uint32_t flags = EffectiveFlags(ctx, *spec, argv);
+  const CallFlags call = DeriveCallFlags(ctx.session, *spec, flags);
+  if (call.is_write && ctx.server.replication().IsReplica()) {
     return Reject(ctx, spec, kErrReadOnlyReplica);  // sv:4060, before BUSY; MULTI -> dirty
   }
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }
-  if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv);
+  if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv, flags);
   spec->handler(ctx, argv);
 }
 

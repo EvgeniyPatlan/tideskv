@@ -54,6 +54,8 @@ enum CommandFlag : uint32_t {
   kCmdNoScript = 1u << 5,
   kCmdNoMulti = 1u << 6,    // refused inside MULTI (Redis CMD_NO_MULTI)
   kCmdAllowBusy = 1u << 7,  // runs while a script is busy (Redis CMD_ALLOW_BUSY)
+  kCmdLoading = 1u << 8,    // allowed while a full sync loads (Redis CMD_LOADING; M6b D6)
+  kCmdStale = 1u << 9,      // allowed on a stale replica (Redis CMD_STALE; M6b D8)
 };
 
 using ArgList = std::vector<std::string>;
@@ -82,6 +84,21 @@ class CommandRegistry {
 
 std::vector<std::string_view> FlagNames(uint32_t flags);
 bool ArityOk(int arity, size_t argc);
+
+// What processCommand sees for this call (Redis getCommandFlags, server.c:3812): a shebang EVAL-family
+// script drops the command's write/stale flags, is a write unless no-writes and stale only with
+// allow-stale; a compat-mode script is not stale (live redis:7.2.5); SCRIPT HELP is loading+stale and
+// SCRIPT LOAD stale. Everything else: spec.flags.
+uint32_t EffectiveFlags(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv);
+
+// The state checks' inputs (server.c:3900): EXEC inherits its queue's write flag and denies stale/loading
+// if any queued command lacks that flag.
+struct CallFlags {
+  bool is_write = false;
+  bool deny_stale = false;
+  bool deny_loading = false;
+};
+CallFlags DeriveCallFlags(const Session& session, const CommandSpec& spec, uint32_t effective_flags);
 
 // Validates (unknown → arity → auth → busy script, Redis 7 order), queues inside MULTI (M5a G3), and runs one
 // command.

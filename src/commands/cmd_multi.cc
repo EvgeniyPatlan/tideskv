@@ -154,12 +154,17 @@ void Reset(ExecContext& ctx, const ArgList&) {
 }  // namespace
 
 void RegisterMultiCommands(CommandRegistry& r) {
-  r.Register({"watch", -2, kCmdNoScript | kCmdFast | kCmdAllowBusy, 1, -1, 1, &Watch});
-  r.Register({"multi", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy, 0, 0, 0, &Multi});
-  r.Register({"exec", 1, kCmdNoScript, 0, 0, 0, &Exec});
-  r.Register({"discard", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy, 0, 0, 0, &Discard});
-  r.Register({"unwatch", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy, 0, 0, 0, &Unwatch});
-  r.Register({"reset", 1, kCmdNoAuth | kCmdNoScript | kCmdFast | kCmdAllowBusy, 0, 0, 0, &Reset});
+  r.Register(
+      {"watch", -2, kCmdNoScript | kCmdFast | kCmdAllowBusy | kCmdLoading | kCmdStale, 1, -1, 1, &Watch});
+  r.Register(
+      {"multi", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy | kCmdLoading | kCmdStale, 0, 0, 0, &Multi});
+  r.Register({"exec", 1, kCmdNoScript | kCmdLoading | kCmdStale, 0, 0, 0, &Exec});
+  r.Register(
+      {"discard", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy | kCmdLoading | kCmdStale, 0, 0, 0, &Discard});
+  r.Register(
+      {"unwatch", 1, kCmdNoScript | kCmdFast | kCmdAllowBusy | kCmdLoading | kCmdStale, 0, 0, 0, &Unwatch});
+  r.Register({"reset", 1, kCmdNoAuth | kCmdNoScript | kCmdFast | kCmdAllowBusy | kCmdLoading | kCmdStale, 0,
+              0, 0, &Reset});
 }
 
 }  // namespace tideskv

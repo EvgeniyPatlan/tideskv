@@ -218,10 +218,12 @@ std::string FormatInfo(const ServerStats& stats, const std::vector<std::string>&
 }
 
 void RegisterServerCommands(CommandRegistry& r) {
-  r.Register({"info", -1, 0, 0, 0, 0, &Info});
-  r.Register({"config", -2, kCmdAdmin | kCmdNoScript, 0, 0, 0, &ConfigCmd});
-  r.Register({"command", -1, 0, 0, 0, 0, &CommandCmd});
-  r.Register({"shutdown", -1, kCmdAdmin | kCmdNoScript | kCmdNoMulti | kCmdAllowBusy, 0, 0, 0, &Shutdown});
+  r.Register({"info", -1, kCmdLoading | kCmdStale, 0, 0, 0, &Info});
+  r.Register({"config", -2, kCmdAdmin | kCmdNoScript | kCmdLoading | kCmdStale, 0, 0, 0, &ConfigCmd});
+  r.Register({"command", -1, kCmdLoading | kCmdStale, 0, 0, 0, &CommandCmd});
+  r.Register({"shutdown", -1,
+              kCmdAdmin | kCmdNoScript | kCmdNoMulti | kCmdAllowBusy | kCmdLoading | kCmdStale, 0, 0, 0,
+              &Shutdown});
 }
 
 }  // namespace tideskv

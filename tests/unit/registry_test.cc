@@ -2,8 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
 #include <stdexcept>
 
+#include "support/command_harness.h"
 #include "support/fake_server_services.h"
 
 namespace tideskv {
@@ -109,6 +111,73 @@ TEST(Registry, FlagNamesAndArity) {
   EXPECT_FALSE(ArityOk(2, 3));
   EXPECT_TRUE(ArityOk(-2, 5));
   EXPECT_FALSE(ArityOk(-2, 1));
+}
+
+// COMMAND INFO on live redis:7.2.5 (M6b plan "Sources"); TidesKV adds loading to replicaof/slaveof (D7).
+TEST(RegistryFlags, LoadingAndStaleMatchRedis72) {
+  CommandRegistry r;
+  RegisterAllCommands(r);
+  const std::set<std::string> loading = {"auth",     "client",   "command",   "config",  "debug", "discard",
+                                         "echo",     "exec",     "hello",     "info",    "multi", "psync",
+                                         "quit",     "replconf", "replicaof", "reset",   "role",  "select",
+                                         "shutdown", "slaveof",  "sync",      "unwatch", "watch"};
+  const std::set<std::string> stale = {
+      "auth",    "client",     "command", "config",   "debug",   "discard", "echo", "eval",     "eval_ro",
+      "evalsha", "evalsha_ro", "exec",    "hello",    "info",    "multi",   "quit", "replconf", "replicaof",
+      "reset",   "role",       "select",  "shutdown", "slaveof", "unwatch", "watch"};
+  for (const auto& [name, spec] : r.all()) {
+    EXPECT_EQ((spec.flags & kCmdLoading) != 0, loading.contains(name)) << name;
+    EXPECT_EQ((spec.flags & kCmdStale) != 0, stale.contains(name)) << name;
+  }
+}
+
+TEST(RegistryFlags, EffectiveFlagsOfScriptsAndScriptSubcommands) {
+  test::CommandHarness h;
+  resp::ReplyBuilder reply(2);
+  ExecContext ctx{h.session, reply, h.services};
+  const auto flags = [&](const ArgList& argv) {
+    return EffectiveFlags(ctx, *h.services.registry().Find(argv[0]), argv);
+  };
+  EXPECT_EQ(flags({"EVAL", "return 1", "0"}) & (kCmdStale | kCmdWrite), 0u);  // compat: not stale (live)
+  EXPECT_EQ(flags({"EVAL", "#!lua\nreturn 1", "0"}) & (kCmdStale | kCmdWrite), kCmdWrite);
+  EXPECT_EQ(flags({"EVAL", "#!lua flags=no-writes,allow-stale\nreturn 1", "0"}) & (kCmdStale | kCmdWrite),
+            kCmdStale);
+  EXPECT_NE(flags({"EVALSHA", std::string(40, 'f'), "0"}) & kCmdStale, 0u);  // unknown sha: as registered
+  EXPECT_EQ(flags({"SCRIPT", "HELP"}) & (kCmdLoading | kCmdStale), kCmdLoading | kCmdStale);
+  EXPECT_EQ(flags({"SCRIPT", "LOAD", "return 1"}) & (kCmdLoading | kCmdStale), kCmdStale);
+  EXPECT_EQ(flags({"SCRIPT", "EXISTS", "x"}) & (kCmdLoading | kCmdStale), 0u);
+}
+
+TEST(RegistryFlags, ExecInheritsItsQueue) {
+  test::CommandHarness h;
+  const CommandSpec& exec = *h.services.registry().Find("exec");
+  EXPECT_EQ(h.Run({"MULTI"}), test::kOk);
+  EXPECT_EQ(h.Run({"PING"}), "+QUEUED\r\n");
+  CallFlags f = DeriveCallFlags(h.session, exec, exec.flags);
+  EXPECT_FALSE(f.is_write);
+  EXPECT_TRUE(f.deny_stale);    // PING is not STALE
+  EXPECT_TRUE(f.deny_loading);  // nor LOADING
+  EXPECT_EQ(h.Run({"DISCARD"}), test::kOk);
+  EXPECT_EQ(h.Run({"MULTI"}), test::kOk);
+  EXPECT_EQ(h.Run({"INFO", "server"}), "+QUEUED\r\n");
+  f = DeriveCallFlags(h.session, exec, exec.flags);
+  EXPECT_FALSE(f.deny_stale);
+  EXPECT_FALSE(f.deny_loading);
+  EXPECT_EQ(h.Run({"SET", "k", "v"}), "+QUEUED\r\n");
+  f = DeriveCallFlags(h.session, exec, exec.flags);
+  EXPECT_TRUE(f.is_write);
+  EXPECT_TRUE(f.deny_stale);
+  EXPECT_EQ(h.Run({"DISCARD"}), test::kOk);
+  EXPECT_FALSE(h.session.multi.has_non_stale);
+  EXPECT_FALSE(h.session.multi.has_non_loading);
+}
+
+TEST(RegistryFlags, CommandInfoShowsLoadingAndStale) {
+  test::CommandHarness h;
+  const std::string info = h.Run({"COMMAND", "INFO", "info"});
+  EXPECT_NE(info.find("loading"), std::string::npos) << info;
+  EXPECT_NE(info.find("stale"), std::string::npos) << info;
+  EXPECT_EQ(h.Run({"COMMAND", "INFO", "get"}).find("loading"), std::string::npos);
 }
 
 }  // namespace

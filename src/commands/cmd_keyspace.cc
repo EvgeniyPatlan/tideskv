@@ -124,7 +124,7 @@ void RegisterKeyspaceCommands(CommandRegistry& r) {
   r.Register({"unlink", -2, kCmdWrite | kCmdFast, 1, -1, 1, &Del});
   r.Register({"exists", -2, kCmdReadOnly | kCmdFast, 1, -1, 1, &Exists});
   r.Register({"type", 2, kCmdReadOnly | kCmdFast, 1, 1, 1, &Type});
-  r.Register({"select", 2, kCmdFast, 0, 0, 0, &Select});
+  r.Register({"select", 2, kCmdFast | kCmdLoading | kCmdStale, 0, 0, 0, &Select});
   r.Register({"dbsize", 1, kCmdReadOnly | kCmdFast, 0, 0, 0, &DbSize});
   r.Register({"flushdb", -1, kCmdWrite, 0, 0, 0, &FlushDbCmd});
   r.Register({"flushall", -1, kCmdWrite, 0, 0, 0, &FlushAllCmd});
