@@ -67,7 +67,10 @@ std::string WithChildTsanOptions(std::string_view base) {
 }
 
 // The child's environment: ours, minus the overridden names, plus the overrides; TSAN_OPTIONS always
-// carries WithChildTsanOptions (ignored by binaries built without TSan).
+// carries WithChildTsanOptions (ignored by binaries built without TSan). DEBUGINFOD_URLS is cleared unless
+// overridden: Ubuntu sets it, and llvm-symbolizer then downloads debug info for system libraries in the
+// middle of a sanitizer report, while the reporting thread holds the server's locks (a TSan child hung
+// for minutes holding the gate and ReplLog::mu_).
 std::vector<std::string> ChildEnv(const std::vector<std::pair<std::string, std::string>>& overrides) {
   const auto overridden = [&](std::string_view name) {
     return std::any_of(overrides.begin(), overrides.end(), [&](const auto& kv) { return kv.first == name; });
@@ -79,7 +82,7 @@ std::vector<std::string> ChildEnv(const std::vector<std::pair<std::string, std::
     const size_t eq = entry.find('=');
     const std::string_view name = entry.substr(0, eq);
     if (name == "TSAN_OPTIONS" && eq != std::string_view::npos) tsan = entry.substr(eq + 1);
-    if (!overridden(name) && name != "TSAN_OPTIONS") env.emplace_back(entry);
+    if (!overridden(name) && name != "TSAN_OPTIONS" && name != "DEBUGINFOD_URLS") env.emplace_back(entry);
   }
   for (const auto& [k, v] : overrides) {
     if (k == "TSAN_OPTIONS") {
@@ -89,6 +92,7 @@ std::vector<std::string> ChildEnv(const std::vector<std::pair<std::string, std::
     }
   }
   env.push_back("TSAN_OPTIONS=" + WithChildTsanOptions(tsan));
+  if (!overridden("DEBUGINFOD_URLS")) env.emplace_back("DEBUGINFOD_URLS=");
   return env;
 }
 }  // namespace

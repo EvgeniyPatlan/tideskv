@@ -110,14 +110,18 @@ TEST(TestServerIT, KilledChildWithASanitizerReportStillFailsTheTest) {
 
 // CF-M6b-11: TSan's deadlock detector aborts a thread holding more than 64 mutexes (an MSET of ~100 keys
 // takes ~100 key stripes), so child servers run with detect_deadlocks=0; the inherited options are kept.
+// The harness also clears DEBUGINFOD_URLS.
 TEST(TestServerIT, ChildRunsWithTheHarnessSanitizerOptions) {
   TempDir dir("tideskv-fake-server");
-  g_fake_server = WriteFakeServer(dir, "echo \"tsan=[$TSAN_OPTIONS]\" >&2");
+  g_fake_server =
+      WriteFakeServer(dir, "echo \"tsan=[$TSAN_OPTIONS] debuginfod=[${DEBUGINFOD_URLS-unset}]\" >&2");
   TestServer s(g_fake_server, {.wait_ready = false, .env = {{"TSAN_OPTIONS", "verbosity=0"}}});
   ASSERT_TRUE(WaitForLog(s, "tsan=["));
   const std::string log = s.Stderr();
   EXPECT_NE(log.find("tsan=[verbosity=0:"), std::string::npos) << log;
   EXPECT_NE(log.find("detect_deadlocks=0"), std::string::npos) << log;
+  // A symbolizer must never wait on the network mid-report (with the gate held): no debuginfod.
+  EXPECT_NE(log.find("debuginfod=[]"), std::string::npos) << log;
 }
 
 // The real server, started and stopped cleanly, leaves no sanitizer report (in the asan and tsan builds).
