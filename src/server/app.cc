@@ -158,10 +158,11 @@ Status App::CreateReplication() {
   trimmer_ = std::make_unique<repl::BacklogTrimmer>(*storage_, *repl_log_, storage_.get(), clock_,
                                                     std::move(th), repl::BacklogTrimmer::Options{});
   replication_->OnConfig(config_->Snapshot());
-  // Hook calls from concurrent SetMany are not serialised (CF-M6b-1), so re-read the current values
-  // instead of trusting the order of the calls. replication_ outlives every CONFIG SET: it is destroyed
-  // with the App, after server_ stopped.
-  config_->SetOnChange([this](const ConfigValues&) { replication_->OnConfig(config_->Snapshot()); });
+  // Hook calls from concurrent SetMany are not ordered (CF-M6b-1): RefreshConfig snapshots and stores
+  // under one mutex. replication_ outlives every CONFIG SET: it is destroyed with the App, after
+  // server_ stopped.
+  config_->SetOnChange(
+      [this](const ConfigValues&) { replication_->RefreshConfig([this] { return config_->Snapshot(); }); });
   return Status::Ok();
 }
 

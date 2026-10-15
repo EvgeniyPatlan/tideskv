@@ -49,6 +49,13 @@ TEST(StaleReplica, AllowStaleScriptCallingANonStaleCommandFails) {  // script.c:
                                             Sha1Hex(body) + ", on @user_script:2."));
 }
 
+TEST(StaleReplica, StaleCheckPrecedesTheWriteChecksInAScript) {  // scriptCall order, script.c:504 first
+  StaleHarness h;
+  const std::string body = "#!lua flags=no-writes,allow-stale\nreturn redis.call('set','k','w')";
+  EXPECT_EQ(h.Run({"EVAL", body, "0"}), Err("ERR Can not execute the command on a stale replica script: " +
+                                            Sha1Hex(body) + ", on @user_script:2."));
+}
+
 TEST(StaleReplica, MultiRefusesAtQueueTimeAndExecInheritsTheQueue) {
   StaleHarness h;
   EXPECT_EQ(h.Run({"MULTI"}), kOk);

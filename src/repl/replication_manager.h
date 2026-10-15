@@ -91,9 +91,13 @@ class ReplicationManager final : public Replication {
   Status BecomeMaster() override;
   RoleInfo Role() const override;
   bool StaleRefusing() const override;
-  // Takes the config values that matter to replication. Hook calls are not serialised (CF-M6b-1), so
-  // callers pass a fresh snapshot; this only stores it.
+  // Stores the config values that matter to replication. Only the single-threaded startup call and
+  // RefreshConfig may use it: concurrent callers could store in the wrong order.
   void OnConfig(const ConfigValues& v);
+  // The Config::SetOnChange path (CF-M6b-1): hook calls from concurrent Set/SetMany are not ordered, so
+  // the snapshot is taken and stored under config_mu_. The last caller to get the lock snapshots after
+  // every completed Set, so the stored values always end equal to Config's.
+  void RefreshConfig(const std::function<ConfigValues()>& snapshot);
 
   // Stops every sender (demotion, promotion: sub-replicas must resync, Redis disconnectSlaves; shutdown).
   void DropAllReplicas();
@@ -139,6 +143,7 @@ class ReplicationManager final : public Replication {
   ReplLog& log_;
   Options options_;
 
+  std::mutex config_mu_;  // RefreshConfig only; never held with another lock
   mutable std::mutex mu_;
   std::condition_variable tick_cv_;
   ReplIdentity identity_;                             // guarded by mu_

@@ -16,6 +16,7 @@
 #include "exec/repl_log.h"
 #include "repl/backlog_trimmer.h"
 #include "repl/socket_io.h"
+#include "server/config.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
 #include "types/errors.h"
@@ -420,6 +421,29 @@ TEST(ReplicationManagerStale, RefusesOnlyAsADisconnectedReplicaWithServeStaleNo)
   v.replica_serve_stale_data = true;
   m.OnConfig(v);
   EXPECT_FALSE(m.StaleRefusing());
+}
+
+TEST(ReplicationManagerStale, ConcurrentConfigSetsLeaveTheFinalValue) {
+  InMemoryStorage s;
+  test::FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  ReplicationManager m(s, log, ReplIdentity{std::string(kReplIdLength, 'a'), {}});
+  ASSERT_TRUE(m.BecomeReplica("127.0.0.1", 1));
+  Config c;
+  c.SetOnChange([&](const ConfigValues&) { m.RefreshConfig([&] { return c.Snapshot(); }); });
+  for (int round = 0; round < 200; ++round) {
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+      threads.emplace_back([&, t] {
+        for (int i = 0; i < 20; ++i) {
+          ASSERT_TRUE(c.Set("replica-serve-stale-data", ((t + i) % 2 == 0) ? "no" : "yes", true).ok());
+        }
+      });
+    }
+    for (auto& th : threads) th.join();
+    ASSERT_EQ(m.StaleRefusing(), !c.Snapshot().replica_serve_stale_data) << "round " << round;
+  }
 }
 
 }  // namespace

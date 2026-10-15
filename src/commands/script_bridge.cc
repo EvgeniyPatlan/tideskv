@@ -33,6 +33,10 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
     *error = std::string(kScriptErrNoScript);
     return std::nullopt;
   }
+  if ((spec->flags & kCmdStale) == 0 && caller_.server.replication().StaleRefusing()) {
+    *error = std::string(kScriptErrStaleReplica);  // script.c:504, after the NOSCRIPT check
+    return std::nullopt;
+  }
   const bool is_write = (spec->flags & kCmdWrite) != 0;
   if (read_only_ && is_write) {  // the *_ro rule wins over the replica refusal
     *error = std::string(kScriptErrWriteInRo);
@@ -40,10 +44,6 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
   }
   if (is_write && caller_.server.replication().IsReplica()) {
     *error = "-" + std::string(kErrReadOnlyReplica);
-    return std::nullopt;
-  }
-  if ((spec->flags & kCmdStale) == 0 && caller_.server.replication().StaleRefusing()) {
-    *error = std::string(kScriptErrStaleReplica);  // script.c:504, after the NOSCRIPT check
     return std::nullopt;
   }
   session_.protocol = resp;

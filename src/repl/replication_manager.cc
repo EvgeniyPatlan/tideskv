@@ -128,7 +128,6 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
     master_host_ = host;
     master_port_ = port;
     role_.store(ReplRole::kReplica, std::memory_order_release);
-    link_state_.store(ReplicaLinkState::kConnect, std::memory_order_release);
     pending_.clear();  // F8: a replica serves no replica; a hand-off still in flight is refused
   }
   if (hooks.stop_reaper) hooks.stop_reaper();
@@ -137,6 +136,8 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
   if (hooks.disconnect_blocked) hooks.disconnect_blocked(kErrUnblockedRoleChange);
   DropAllReplicas();
   if (old) old->Stop();  // shutdown + join: the only committer is gone
+  // After the old client's last on_state, so a final callback of it cannot hide a down link.
+  link_state_.store(ReplicaLinkState::kConnect, std::memory_order_release);
   SetReplicaOf(host + " " + std::to_string(port));
   StartClient(host, port);
   spdlog::info("REPLICAOF {}:{}: this node is now a replica", host, port);
@@ -241,6 +242,11 @@ bool ReplicationManager::StaleRefusing() const {
 
 void ReplicationManager::OnConfig(const ConfigValues& v) {
   serve_stale_.store(v.replica_serve_stale_data, std::memory_order_release);
+}
+
+void ReplicationManager::RefreshConfig(const std::function<ConfigValues()>& snapshot) {
+  std::lock_guard lock(config_mu_);
+  OnConfig(snapshot());
 }
 
 std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
