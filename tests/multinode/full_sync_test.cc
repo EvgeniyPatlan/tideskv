@@ -54,11 +54,8 @@ bool LoadStarted(RespClient& c) {
   return Loading(c) && InfoField(c, "persistence", "loading_start_time") > 0;
 }
 
-void ExpectNoSanitizerReport(const TestServer& s) {
-  const std::string log = s.Stderr();
-  EXPECT_EQ(log.find("WARNING: ThreadSanitizer"), std::string::npos) << log;
-  EXPECT_EQ(log.find("ERROR: AddressSanitizer"), std::string::npos) << log;
-}
+// TestServer's destructor checks every server too (R17); this checks at a point mid-test as well.
+void ExpectNoSanitizerReport(const TestServer& s) { EXPECT_EQ(s.SanitizerReport(), ""); }
 
 // kill -9 of the replica, the master frozen, the replica restarted: what it serves is what it recovered,
 // since it cannot reload from a stopped master. The caller resumes the master.

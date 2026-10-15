@@ -43,6 +43,54 @@ TestServer::TestServer(std::string binary) : TestServer(std::move(binary), Optio
 namespace {
 constexpr int kSpawnAttempts = 5;
 constexpr int kExitPortInUse = 3;  // tideskv-server: the port is taken (ServerIT.PortInUseExitsWithCode3)
+
+// R17: what a sanitizer prints when it finds something. TSan keeps running (halt_on_error=0) and a
+// killed child never reaches its exit code, so the log, not the exit status, is what proves a clean run.
+constexpr std::string_view kSanitizerMarkers[] = {
+    "WARNING: ThreadSanitizer",             // data race, lock-order inversion, signal-unsafe call, ...
+    "ERROR: AddressSanitizer",              // heap/stack misuse
+    "ERROR: LeakSanitizer",                 // leaks at exit (asan build)
+    "SUMMARY: UndefinedBehaviorSanitizer",  // asan build: -fsanitize=undefined, -fno-sanitize-recover
+    "Sanitizer: CHECK failed",              // a sanitizer runtime aborting on its own limits
+};
+constexpr size_t kMaxReportBytes = 64 * 1024;
+
+// TSan options the harness adds for every child server, after the inherited (or overridden) ones.
+// detect_deadlocks=0 (CF-M6b-11): TSan's deadlock detector CHECK-fails once a thread holds more than 64
+// mutexes, and a multi-key command takes one key stripe per distinct key (an MSET of ~100 keys aborts the
+// server). That is a tool limit, not a race; data-race detection stays on, and lock-order inversions are
+// still checked in-process by unit_tests, which drive the same LockManager, Engine and ReplLog locks.
+std::string WithChildTsanOptions(std::string_view base) {
+  std::string out(base);
+  if (!out.empty()) out += ':';
+  return out.append("detect_deadlocks=0");
+}
+
+// The child's environment: ours, minus the overridden names, plus the overrides; TSAN_OPTIONS always
+// carries WithChildTsanOptions (ignored by binaries built without TSan).
+std::vector<std::string> ChildEnv(const std::vector<std::pair<std::string, std::string>>& overrides) {
+  const auto overridden = [&](std::string_view name) {
+    return std::any_of(overrides.begin(), overrides.end(), [&](const auto& kv) { return kv.first == name; });
+  };
+  std::vector<std::string> env;
+  std::string tsan;
+  for (char** e = environ; *e != nullptr; ++e) {
+    const std::string_view entry(*e);
+    const size_t eq = entry.find('=');
+    const std::string_view name = entry.substr(0, eq);
+    if (name == "TSAN_OPTIONS" && eq != std::string_view::npos) tsan = entry.substr(eq + 1);
+    if (!overridden(name) && name != "TSAN_OPTIONS") env.emplace_back(entry);
+  }
+  for (const auto& [k, v] : overrides) {
+    if (k == "TSAN_OPTIONS") {
+      tsan = v;
+    } else {
+      env.push_back(std::string(k).append("=").append(v));
+    }
+  }
+  env.push_back("TSAN_OPTIONS=" + WithChildTsanOptions(tsan));
+  return env;
+}
 }  // namespace
 
 TestServer::TestServer(std::string binary, Options options)
@@ -101,15 +149,7 @@ void TestServer::Spawn(const std::string& binary, const Options& options) {
   cargs.push_back(nullptr);
 
   // Build the child's environment before fork(): the child may only make async-signal-safe calls.
-  std::vector<std::string> env_strings;
-  for (char** e = environ; *e != nullptr; ++e) {
-    const std::string_view entry(*e);
-    const std::string_view name = entry.substr(0, entry.find('='));
-    const bool overridden =
-        std::any_of(options.env.begin(), options.env.end(), [&](const auto& kv) { return kv.first == name; });
-    if (!overridden) env_strings.emplace_back(entry);
-  }
-  for (const auto& [k, v] : options.env) env_strings.push_back(std::string(k).append("=").append(v));
+  std::vector<std::string> env_strings = ChildEnv(options.env);
   std::vector<char*> envp;
   envp.reserve(env_strings.size() + 1);
   for (auto& e : env_strings) envp.push_back(e.data());
@@ -138,6 +178,11 @@ TestServer::~TestServer() {
     }
   } else if (exit_code_ && !exit_consumed_ && *exit_code_ != 0) {
     ADD_FAILURE() << "tideskv-server exited unexpectedly with " << *exit_code_ << "; stderr:\n" << Stderr();
+  }
+  // Every run's log (Restart included), however the child ended: SIGTERM, kill -9, or its own exit.
+  if (const std::string report = SanitizerReport(); !report.empty()) {
+    ADD_FAILURE() << "sanitizer report in tideskv-server (port " << port_ << ", dir " << dir_ << "):\n"
+                  << report;
   }
 }
 
@@ -221,6 +266,16 @@ std::string TestServer::Stderr() const {
 std::string TestServer::StderrSinceStart() const {
   const std::string all = Stderr();
   return log_start_ <= all.size() ? all.substr(log_start_) : all;
+}
+
+std::string TestServer::SanitizerReport() const {
+  const std::string log = Stderr();
+  size_t first = std::string::npos;
+  for (std::string_view marker : kSanitizerMarkers) first = std::min(first, log.find(marker));
+  if (first == std::string::npos) return "";
+  const size_t line = log.rfind('\n', first);
+  const size_t begin = line == std::string::npos ? 0 : line + 1;
+  return log.substr(begin, kMaxReportBytes);
 }
 
 }  // namespace tideskv::test

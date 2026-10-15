@@ -54,6 +54,8 @@ class TestServer {
   std::string Stderr() const;  // every run's log, Restart included
   // Stderr() from the latest (re)start on: a restarted server's log lines, without its predecessors'.
   std::string StderrSinceStart() const;
+  // The first sanitizer report in Stderr(), from its first line on (at most 64 KiB), or "".
+  std::string SanitizerReport() const;
 
  private:
   static int DecodeStatus(int status);
