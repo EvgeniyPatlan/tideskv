@@ -33,6 +33,9 @@ class WriteObserver {
   virtual void OnModified(const std::vector<DbKey>& keys, const CommittedViewFn& committed) = 0;
   // Before a flush of `db` runs: the watched keys of `db` that exist in `view` (the flushing txn).
   virtual std::vector<std::string> ExistingWatched(uint8_t db, ReadView& view) = 0;
+  // The whole dataset was replaced (a replica's full-sync load, M6b D5): every watcher is dirty. Called
+  // even when Idle(), under the gate like the others.
+  virtual void OnDatasetReplaced() {}
 };
 
 }  // namespace tideskv

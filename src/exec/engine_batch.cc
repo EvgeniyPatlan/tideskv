@@ -6,6 +6,7 @@
 
 #include "exec/engine.h"
 #include "exec/engine_internal.h"
+#include "types/errors.h"
 
 namespace tideskv {
 
@@ -31,11 +32,14 @@ void Engine::Batch::Unroute() {
 
 Status Engine::Batch::RunRead(const ReadFn& fn) {
   [[maybe_unused]] const ReentryCheck reentry;
+  // PF7: the batch itself runs while loading (an EXEC touching no data); its keyspace access does not.
+  if (engine_.LoadingRefuses(/*read=*/true)) return Status::UserError(std::string(kErrLoading));
   return fn(recorder_, now_ms_);
 }
 
 Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
   [[maybe_unused]] const ReentryCheck reentry;
+  if (engine_.LoadingRefuses(/*read=*/false)) return Status::UserError(std::string(kErrLoading));
   if (!broken_.ok()) return broken_;
   const std::string savepoint = "exec" + std::to_string(next_savepoint_++);
   if (Status st = recorder_.Savepoint(savepoint); !st.ok()) return st;

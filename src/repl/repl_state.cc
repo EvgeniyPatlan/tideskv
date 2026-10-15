@@ -4,6 +4,7 @@
 #include <random>
 
 #include "common/coding.h"
+#include "exec/repl_log.h"
 
 namespace tideskv::repl {
 namespace {
@@ -81,12 +82,16 @@ Result<std::vector<HistoryEntry>> DecodeHistory(std::string_view raw) {
   return out;
 }
 
+std::vector<encoding::ReplOp> IdentityOps(const ReplIdentity& id) {
+  return {{encoding::ReplOpType::kPut, ColumnFamily::kSys, std::string(kSysReplId), id.replid},
+          {encoding::ReplOpType::kPut, ColumnFamily::kSys, std::string(kSysReplHistory),
+           EncodeHistory(id.history)}};
+}
+
 Status PersistIdentity(Storage& storage, const ReplIdentity& id) {
   auto txn = storage.BeginWrite();
   if (!txn.ok()) return txn.status();
-  if (Status st = (*txn)->Put(ColumnFamily::kSys, kSysReplId, id.replid); !st.ok()) return st;
-  if (Status st = (*txn)->Put(ColumnFamily::kSys, kSysReplHistory, EncodeHistory(id.history)); !st.ok())
-    return st;
+  if (Status st = ApplyReplOps(**txn, IdentityOps(id)); !st.ok()) return st;
   return (*txn)->Commit();
 }
 

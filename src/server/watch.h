@@ -49,6 +49,7 @@ class WatchRegistry final : public WriteObserver {
   bool Idle() const override { return entries_.load() == 0; }
   void OnModified(const std::vector<DbKey>& keys, const CommittedViewFn& committed) override;
   std::vector<std::string> ExistingWatched(uint8_t db, ReadView& view) override;
+  void OnDatasetReplaced() override;
 
  private:
   struct Entry {

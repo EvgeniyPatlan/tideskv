@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "encoding/replog_codec.h"
 #include "storage/storage.h"
 
 // Replication identity (M6a D7) and the PSYNC decision rule (D8).
@@ -39,6 +40,9 @@ Result<std::vector<HistoryEntry>> DecodeHistory(std::string_view raw);  // Corru
 // Loads repl_id/repl_history from sys; when absent creates a fresh id and persists it (no replog: sys
 // identity is node-local). Must run before ReplLog fences or accepts writes.
 Result<ReplIdentity> LoadOrCreateIdentity(Storage& storage);
+// The two sys PUTs that persist `id` (repl_id, repl_history), for a transaction that also does other work
+// (a full-sync load, M6b D5). PersistIdentity commits exactly these.
+std::vector<encoding::ReplOp> IdentityOps(const ReplIdentity& id);
 // One raw transaction, both keys; deliberately not routed through ReplLog (identity is node-local and
 // must not be replicated). On a replica this runs only on the applier thread or at startup, never
 // concurrently with an apply.

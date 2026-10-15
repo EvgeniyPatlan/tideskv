@@ -10,6 +10,7 @@
 #include "encoding/replog_codec.h"
 #include "exec/engine_internal.h"
 #include "exec/recording_txn.h"
+#include "types/errors.h"
 
 namespace tideskv {
 
@@ -32,6 +33,11 @@ Engine::WaitThroughBusyScope::WaitThroughBusyScope()
     : previous_(std::exchange(engine_internal::t_wait_through_busy, true)) {}
 
 Engine::WaitThroughBusyScope::~WaitThroughBusyScope() { engine_internal::t_wait_through_busy = previous_; }
+
+// M6b D6: BeginLoad raises loading_ under the exclusive gate, so a call that holds the gate sees it.
+bool Engine::LoadingRefuses(bool read) const {
+  return loading_.load(std::memory_order_acquire) && !(read && engine_internal::t_loading_read);
+}
 
 bool Engine::BusyGuarded() const { return busy_ && !engine_internal::t_wait_through_busy; }
 
@@ -61,6 +67,7 @@ Status Engine::Read(const ReadFn& fn) {
   [[maybe_unused]] const ReentryCheck reentry;
   if (!AcquireShared()) return BusyStatus();
   std::shared_lock gate(gate_, std::adopt_lock);
+  if (LoadingRefuses(/*read=*/true)) return Status::UserError(std::string(kErrLoading));
   auto view = storage_.BeginRead();
   if (!view.ok()) return view.status();
   return fn(**view, clock_.NowMs());
@@ -71,6 +78,7 @@ Status Engine::Snapshot(const ReadFn& fn) {
   [[maybe_unused]] const ReentryCheck reentry;
   if (!AcquireShared()) return BusyStatus();
   std::shared_lock gate(gate_, std::adopt_lock);
+  if (LoadingRefuses(/*read=*/true)) return Status::UserError(std::string(kErrLoading));
   auto view = storage_.BeginSnapshot();
   if (!view.ok()) return view.status();
   return fn(**view, clock_.NowMs());
@@ -82,6 +90,7 @@ Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, cons
   [[maybe_unused]] const ReentryCheck reentry;
   if (!AcquireShared()) return BusyStatus();
   std::shared_lock gate(gate_, std::adopt_lock);
+  if (LoadingRefuses(/*read=*/false)) return Status::UserError(std::string(kErrLoading));
   const LockManager::Guard guard = locks_.Lock(db, keys);
   return RunTxn(fn, WriteScope{db, &keys, also_modified, nullptr});
 }
@@ -91,6 +100,7 @@ Status Engine::WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flu
   [[maybe_unused]] const ReentryCheck reentry;
   if (!AcquireExclusive()) return BusyStatus();
   std::unique_lock gate(gate_, std::adopt_lock);
+  if (LoadingRefuses(/*read=*/false)) return Status::UserError(std::string(kErrLoading));
   return RunTxn(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
 }
 

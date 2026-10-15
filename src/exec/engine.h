@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -167,7 +168,51 @@ class Engine {
     bool previous_;
   };
 
+  // ---- A replica's full-sync load (M6b D5, D6) ----
+  // True from BeginLoad until EndLoad/AbortLoad. Meanwhile Read/Snapshot/Write/WriteExclusive answer
+  // UserError(kErrLoading), checked once the gate is held (so a command that passed dispatch just before
+  // the load started is still refused), except Read/Snapshot on a thread inside a LoadingReadScope.
+  // BeginBatch is not refused (PF7, as Redis runs an EXEC whose queue touches no data); the batch's own
+  // keyspace access is, under its exclusive gate. The steps are the replica's one committer's (its client
+  // thread), in order: BeginLoad, LoadChunk*, then EndLoad or AbortLoad.
+  bool loading() const { return loading_.load(std::memory_order_acquire); }
+  // Raises loading while holding the gate exclusively (every command already holding it finishes first),
+  // then commits one txn: the keyspace wipe + `extra` (the node's identity) through
+  // ReplLog::CommitLoadStart; tells the observer the dataset is replaced. kInternal unless the ReplLog is
+  // fenced, this thread has no batch and no load is running. On failure loading is cleared and nothing
+  // changed.
+  Status BeginLoad(const std::vector<encoding::ReplOp>& extra);
+  // One txn of `ops` (puts from the master's snapshot), committed directly: no replog entry. kInternal
+  // unless loading.
+  Status LoadChunk(const std::vector<encoding::ReplOp>& ops);
+  // The last txn: `extra` + ReplLog::CommitLoadEnd(seq, record). Then reports the wipe's range deletes to
+  // the listener, tells the observer, and clears loading. kInternal unless a BeginLoad succeeded and no
+  // EndLoad/AbortLoad followed (CF-M6b-2). On failure loading stays set (AbortLoad next).
+  Status EndLoad(uint64_t seq, std::string_view record, const std::vector<encoding::ReplOp>& extra);
+  // Discards whatever was loaded: one txn of the keyspace wipe + ReplLog::CommitLoadAbort; reports,
+  // tells the observer, clears loading. Also run at startup when ReplLog::load_incomplete(). kInternal
+  // when there is nothing to discard (neither loading nor load_incomplete()): it never wipes a dataset.
+  Status AbortLoad();
+  // DEBUG (CF6): Read/Snapshot on this thread are not refused while loading. Scopes nest.
+  class LoadingReadScope {
+   public:
+    LoadingReadScope();
+    ~LoadingReadScope();
+    LoadingReadScope(const LoadingReadScope&) = delete;
+    LoadingReadScope& operator=(const LoadingReadScope&) = delete;
+
+   private:
+    bool previous_;
+  };
+
  private:
+  // M6b D6: whether a call that now holds the gate is refused because a load runs.
+  bool LoadingRefuses(bool read) const;
+  // One load txn under the shared gate: `ops` in order, committed by `commit`; on success `committed`
+  // runs still under the gate (listener/observer contracts).
+  Status RunLoadTxn(const std::vector<encoding::ReplOp>& ops, const std::function<Status(WriteTxn&)>& commit,
+                    const std::function<void()>& committed);
+  void FinishLoad();         // under the gate, after EndLoad/AbortLoad committed
   bool AcquireShared();      // false: gave up because busy_
   bool AcquireExclusive();   // false: gave up because busy_
   bool BusyGuarded() const;  // busy_ is set and no WaitThroughBusyScope is alive on this thread
@@ -186,7 +231,8 @@ class Engine {
   WriteObserver* observer_;   // may be null; told which keys each commit modified
   ReplLog* repl_log_;         // may be null; sequences every commit into the replog
   Gate gate_;
-  std::function<bool()> busy_;  // empty: plain gate waits
+  std::atomic<bool> loading_{false};  // M6b D6: raised under the exclusive gate
+  std::function<bool()> busy_;        // empty: plain gate waits
   std::string busy_reply_;
 };
 

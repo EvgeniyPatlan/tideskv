@@ -133,4 +133,13 @@ std::vector<std::string> WatchRegistry::ExistingWatched(uint8_t db, ReadView& vi
   return out;
 }
 
+void WatchRegistry::OnDatasetReplaced() {  // M6b D5: Redis invalidates every WATCH on a full-sync load
+  for (Shard& s : shards_) {
+    std::lock_guard lock(s.mu);
+    for (const auto& [mk, entries] : s.by_key) {
+      for (const Entry& e : entries) e.client->MarkDirty();
+    }
+  }
+}
+
 }  // namespace tideskv

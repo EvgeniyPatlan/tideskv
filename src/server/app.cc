@@ -71,7 +71,11 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
   std::unique_ptr<App> app(new App(std::move(config), std::move(storage).value()));
   if (Status st = app->repl_log_->Recover(); !st.ok()) return st;  // before any commit (the oid lease)
-  if (Status st = app->CreateReplication(); !st.ok()) return st;   // before any commit, like Recover
+  if (app->repl_log_->load_incomplete()) {  // M6b D5: never serve a half-loaded keyspace
+    spdlog::warn("an interrupted full synchronisation left a partial dataset; it is discarded");
+    if (Status st = app->engine_->AbortLoad(); !st.ok()) return st;  // before the identity and baseline
+  }
+  if (Status st = app->CreateReplication(); !st.ok()) return st;  // before any commit, like Recover
   if (Status st = app->oids_->Init(); !st.ok()) return st;
   return app;
 }
