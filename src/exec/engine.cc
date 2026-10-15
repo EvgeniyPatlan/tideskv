@@ -158,6 +158,9 @@ Status Engine::RunTxn(const WriteFn& fn, const WriteScope& scope) {
 Status Engine::ApplyReplicated(uint64_t seq, std::string_view payload) {
   if (repl_log_ == nullptr) return Status::Internal("apply without a replication log");
   if (!repl_log_->fenced()) return Status::Internal("apply while local writes are not fenced");
+  // G1: never onto a partial keyspace (CF-M6b-4 enforced here, not by caller discipline). ReplLog
+  // re-checks the marker under its mutex.
+  if (loading() || repl_log_->load_incomplete()) return Status::Internal("apply during a full-sync load");
   if (ActiveBatch() != nullptr) return Status::Internal("apply inside a batch");
   auto batch = encoding::DecodeReplogBatch(payload);
   if (!batch.ok()) return batch.status();

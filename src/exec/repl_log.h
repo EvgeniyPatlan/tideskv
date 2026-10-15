@@ -51,7 +51,8 @@ class ReplLog {
   // commits. kInternal unless seq == last()+1; kCorruption if payload has no valid header or its
   // cum_bytes is not cum_bytes() + payload.size() (the master's stream does not continue ours).
   // On failure nothing is consumed and txn is left uncommitted. Not refused by the fence: it is the
-  // replica's one writer (Engine::ApplyReplicated requires the fence raised).
+  // replica's one writer (Engine::ApplyReplicated requires the fence raised). kInternal while
+  // load_incomplete() (checked under mu_): batches never extend a log over a partial load (G1).
   Status CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view payload);
   uint64_t last() const { return last_.load(std::memory_order_acquire); }             // watermark
   uint64_t first_retained() const { return first_.load(std::memory_order_acquire); }  // 1 if nothing trimmed
@@ -93,8 +94,10 @@ class ReplLog {
   // cum = the record's cum_bytes (0 when seq == 0), first = seq (1 when seq == 0). Corruption on a bad
   // record, with nothing committed.
   Status CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view record);
-  // Abort, and startup recovery of an interrupted load: deletes the marker (the caller's txn wipes the
-  // keyspace). Not fence-checked: startup runs it before any role is taken.
+  // Abort, and startup recovery of an interrupted load (the caller's txn wipes the keyspace): the start
+  // txn's log reset whatever the log holds now: DeleteRange(the whole replog), Delete(sys/repl_first),
+  // Delete(sys/repl_baseline_unknown), and Delete(the marker). Then last = cum = 0, first = 1 (G1).
+  // Not fence-checked: startup runs it before any role is taken.
   Status CommitLoadAbort(WriteTxn& txn);
 
  private:

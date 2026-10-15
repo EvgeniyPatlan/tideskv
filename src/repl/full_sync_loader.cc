@@ -17,7 +17,8 @@ FullSyncLoader::FullSyncLoader(Engine& engine, std::string master_replid, uint64
 FullSyncLoader::~FullSyncLoader() {
   if (!begun_ || finished_) return;
   if (Status st = engine_.AbortLoad(); !st.ok()) {
-    spdlog::error("cannot discard a partial full-sync load: {}", st.ToString());  // startup retries (marker)
+    // ReplClient retries before it reconnects, and startup discards a marked load (G1).
+    spdlog::error("cannot discard a partial full-sync load: {}", st.ToString());
   }
 }
 

@@ -94,7 +94,9 @@ class ReplClient {
 
   void Run();
   Status RunLink(bool* continued);  // one connection, from connect to the link dropping
-  bool Publish(int fd);             // false when Stop() came first
+  // True when no full-sync load is left unfinished (AbortLoad, if needed, committed); false to retry (G1).
+  bool DiscardUnfinishedLoad(std::chrono::milliseconds retry_in);
+  bool Publish(int fd);  // false when Stop() came first
   void Unpublish();
   Status Handshake(int fd, const ConfigValues& cfg);
   Status Psync(int fd, PsyncOutcome* out);

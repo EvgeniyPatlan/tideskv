@@ -626,6 +626,32 @@ TEST_F(ReplClientTest, ALinkThatDropsMidLoadLeavesAnEmptyReplicaAndRetries) {
   EXPECT_EQ(again.Next(), (Args{"PING"}));
 }
 
+// G1 (final review #1): an abort that fails is retried before the next connection. Until it commits the
+// node stays LOADING and sends no PSYNC: a "PSYNC ? 1" answered +CONTINUE would stream batches onto the
+// partial keyspace, and a restart's discard would then leave a log that no longer describes the data.
+TEST_F(ReplClientTest, AFailedAbortIsRetriedBeforeTheNextPsync) {
+  for (int i = 0; i < 30; ++i) Write({"SET", "k" + std::to_string(i), "v"});
+  StartClient();
+  {
+    Link l = AcceptLink();
+    Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+    l.Send(LoadFrame(encoding::EncodeReplogBatch(
+        {{encoding::ReplOpType::kPut, ColumnFamily::kMeta, std::string("\0\0\0x", 4), "v"}}, 1, 0)));
+    ASSERT_TRUE(WaitFor([&] { return client->loaded_bytes() > 0; }));
+    replica_storage.fail_commit_in = 1;  // the next commit is the loader's abort
+  }  // the master's end closes
+  Link again = AcceptLink();
+  ASSERT_EQ(again.Next(), (Args{"PING"}));
+  EXPECT_EQ(replica_storage.fail_commit_in.load(), -1);  // the injected failure did happen
+  EXPECT_FALSE(replica.engine.loading());                // ... and was retried before reconnecting
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(test::DigestOf(replica.engine), std::string(40, '0'));
+  again.Send("+PONG\r\n");
+  const auto seen = Handshake(again, "CONTINUE " + master_id());
+  ASSERT_FALSE(seen.empty());
+  EXPECT_EQ(seen.back(), (Args{"PSYNC", "?", "1"}));
+}
+
 // CF-M6b-4: a BATCH is applied only after LOADEND; one that comes during the load drops the link.
 TEST_F(ReplClientTest, AnUnexpectedFrameDuringTheLoadAbortsIt) {
   Write({"SET", "a", "1"});

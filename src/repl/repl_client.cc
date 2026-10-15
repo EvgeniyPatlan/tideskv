@@ -98,6 +98,11 @@ void ReplClient::WaitBackoff(std::chrono::milliseconds d) {
 void ReplClient::Run() {
   auto backoff = options_.backoff_initial;
   while (!stopping()) {
+    if (!DiscardUnfinishedLoad(backoff)) {
+      WaitBackoff(backoff);
+      backoff = std::min(backoff * 2, options_.backoff_max);
+      continue;
+    }
     bool continued = false;
     const Status st = RunLink(&continued);
     SetState(ReplicaLinkState::kConnect);
@@ -108,6 +113,22 @@ void ReplClient::Run() {
     WaitBackoff(backoff);
     backoff = std::min(backoff * 2, options_.backoff_max);
   }
+}
+
+// G1 (M6b final review #1): the loader only logs a failed abort, which leaves the node LOADING with the
+// marker set. No PSYNC may follow: "PSYNC ? 1" answered +CONTINUE would stream batches onto the partial
+// keyspace. So the abort is retried here, with the backoff, before any reconnect; meanwhile the node
+// stays LOADING.
+bool ReplClient::DiscardUnfinishedLoad(std::chrono::milliseconds retry_in) {
+  if (!engine_.loading() && !log_.load_incomplete()) return true;
+  const Status st = engine_.AbortLoad();
+  if (st.ok()) {
+    spdlog::warn("a partial full-sync load from {}:{} is discarded", host_, port_);
+    return true;
+  }
+  spdlog::error("cannot discard a partial full-sync load: {}; retrying in {} ms before reconnecting",
+                st.ToString(), retry_in.count());
+  return false;
 }
 
 Status ReplClient::RunLink(bool* continued) {

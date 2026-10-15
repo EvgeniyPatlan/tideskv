@@ -154,6 +154,8 @@ Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view p
     return Status::Corruption("replicated batch has no valid header");
   }
   std::lock_guard lock(mu_);
+  // G1: a partial load's keyspace is no base for the stream (the abort, or a full load, comes first).
+  if (load_incomplete()) return Status::Internal("replicated batch during an unfinished full-sync load");
   const uint64_t expected = last_.load(std::memory_order_relaxed) + 1;
   if (seq != expected) {
     return Status::Internal("replicated seq " + std::to_string(seq) + " is not the next seq " +
@@ -273,10 +275,17 @@ Status ReplLog::CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view reco
   return Status::Ok();
 }
 
+// G1 (M6b final review #1): the same log the start txn leaves, whatever happened since (a failed abort
+// followed by applied batches, or a restart), so "marker => discard to a consistent seq-0 node" holds
+// unconditionally and a discarded node can never ask to continue a history its keyspace lost.
 Status ReplLog::CommitLoadAbort(WriteTxn& txn) {
   std::lock_guard lock(mu_);
+  if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kBaselineUnknownKey); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplLoadIncomplete); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
+  SetBaselineLocked(0, 0, 1);
   load_incomplete_.store(false, std::memory_order_release);
   return Status::Ok();
 }

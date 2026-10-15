@@ -11,6 +11,7 @@
 #include "repl/repl_state.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
+#include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "types/errors.h"
 #include "types/oid_allocator.h"
@@ -261,6 +262,82 @@ TEST_F(EngineLoadTest, StartupDiscardsAnInterruptedLoad) {
   ReplLog again(replica_storage, restarted.clock);
   ASSERT_TRUE(again.Recover().ok());
   EXPECT_FALSE(again.load_incomplete());
+}
+
+// G1 (final review #1): a batch is never applied onto a partial keyspace, whether the load is running
+// (loading) or only its marker survived (a failed abort, or a restart before the startup discard).
+TEST_F(EngineLoadTest, ApplyReplicatedIsRefusedWhileLoadingOrMarked) {
+  auto first = ReplogEntry(master.services.storage_, 1);
+  ASSERT_TRUE(first.ok());
+  {
+    ReplicaStack crashed(replica_storage);
+    ASSERT_TRUE(crashed.engine.BeginLoad({}).ok());
+    EXPECT_EQ(crashed.engine.ApplyReplicated(1, *first).code(), StatusCode::kInternal);
+    EXPECT_EQ(crashed.log.last(), 0u);
+  }
+  ReplicaStack restarted(replica_storage);
+  ASSERT_TRUE(restarted.log.load_incomplete());
+  ASSERT_FALSE(restarted.engine.loading());
+  EXPECT_EQ(restarted.engine.ApplyReplicated(1, *first).code(), StatusCode::kInternal);
+  EXPECT_EQ(restarted.log.last(), 0u);
+  ASSERT_TRUE(restarted.engine.AbortLoad().ok());
+  EXPECT_TRUE(restarted.engine.ApplyReplicated(1, *first).ok());
+}
+
+// G1: an abort whose commit fails changes nothing (still loading, marker kept, applies refused); the
+// retry discards.
+TEST(EngineLoadAbort, AFailedAbortKeepsTheLoadAndARetryDiscardsIt) {
+  FaultyStorage storage;
+  ReplicaStack replica(storage);
+  ASSERT_TRUE(replica.engine.BeginLoad({}).ok());
+  ASSERT_TRUE(
+      replica.engine.LoadChunk({{ReplOpType::kPut, ColumnFamily::kMeta, std::string("\0\0\0k", 4), "x"}})
+          .ok());
+  storage.fail_commit_in = 1;
+  EXPECT_EQ(replica.engine.AbortLoad().code(), StatusCode::kIOError);
+  EXPECT_TRUE(replica.engine.loading());
+  EXPECT_TRUE(replica.log.load_incomplete());
+  ASSERT_TRUE(replica.engine.AbortLoad().ok());
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(DigestOf(replica.engine), kEmptyDigest);
+}
+
+// G1: the startup discard of a marked node whose log batches had extended (the pre-fix failure chain:
+// failed abort, PSYNC ? 1, +CONTINUE, batches 1..N onto the partial keyspace, restart) yields a seq-0
+// node: an empty keyspace and an empty log, so its next PSYNC cannot be answered +CONTINUE from N+1.
+TEST_F(EngineLoadTest, RestartAfterAnAbortLeavesASeqZeroNode) {
+  {
+    ReplicaStack crashed(replica_storage);
+    ASSERT_TRUE(crashed.engine.BeginLoad({}).ok());
+    auto snap = master.services.repl_log_.SnapshotAtLast();
+    ASSERT_TRUE(snap.ok());
+    const std::vector<ReplOp> puts = SnapshotPuts(*snap->view);
+    ASSERT_TRUE(crashed.engine.LoadChunk({puts.begin(), puts.begin() + 3}).ok());
+    auto txn = replica_storage.BeginWrite();  // what the unguarded applies wrote: replog[1..N]
+    ASSERT_TRUE(txn.ok());
+    for (uint64_t seq = 1; seq <= MasterLast(); ++seq) {
+      auto payload = ReplogEntry(master.services.storage_, seq);
+      ASSERT_TRUE(payload.ok());
+      ASSERT_TRUE((*txn)->Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), *payload).ok());
+    }
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  ReplicaStack restarted(replica_storage);
+  ASSERT_TRUE(restarted.log.load_incomplete());
+  ASSERT_EQ(restarted.log.last(), MasterLast());
+  ASSERT_TRUE(restarted.engine.AbortLoad().ok());  // App::Create's startup discard
+  EXPECT_EQ(restarted.log.last(), 0u);
+  EXPECT_EQ(restarted.log.first_retained(), 1u);
+  EXPECT_EQ(restarted.log.cum_bytes(), 0u);
+  EXPECT_EQ(DigestOf(restarted.engine), kEmptyDigest);
+  ReplLog again(replica_storage, restarted.clock);
+  ASSERT_TRUE(again.Recover().ok());
+  EXPECT_FALSE(again.load_incomplete());
+  EXPECT_EQ(again.last(), 0u);
+  EXPECT_EQ(again.first_retained(), 1u);
+  ASSERT_TRUE(ShipAll(master.services.storage_, MasterLast(), restarted.engine).ok());  // streams from 1
+  EXPECT_EQ(DigestOf(restarted.engine), MasterDigest());
 }
 
 }  // namespace
