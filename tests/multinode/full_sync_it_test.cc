@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -89,12 +90,19 @@ void WriteEveryType(RespClient& mc) {
 TEST(FullSyncIT, FullSyncCopiesEveryTypeDbAndTtl) {  // Review Focus #3
   TestServer m(TIDESKV_SERVER_BIN);
   auto mc = Client(m);
+  const auto write_start = std::chrono::steady_clock::now();
   WriteEveryType(*mc);
   if (HasFatalFailure()) return;
+  // G7: "soon" must outlive the sync and the convergence checks, which move the same data the writes
+  // did, so the TTL scales with the measured write time (a TSan build or a loaded runner is slower at
+  // both) on top of the 10 s that suffices on an idle machine.
+  const auto write_time =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - write_start);
+  const std::chrono::milliseconds ttl = 10s + 5 * write_time;
   TestServer r(TIDESKV_SERVER_BIN);
   auto rc = Client(r);
   ASSERT_TRUE(ForceFullSync(*rc));
-  ASSERT_EQ(mc->Command({"SET", "soon", "v", "PX", "10000"}).str, "OK");  // expires after the sync
+  ASSERT_EQ(mc->Command({"SET", "soon", "v", "PX", std::to_string(ttl.count())}).str, "OK");
   Follow(r, m);
   ASSERT_TRUE(WaitConnected(r, 60s));
   ExpectConverged(m, {&r});
@@ -109,10 +117,12 @@ TEST(FullSyncIT, FullSyncCopiesEveryTypeDbAndTtl) {  // Review Focus #3
   EXPECT_EQ(rc->Command({"STRLEN", "big"}).integer, 8 << 20);
   // The snapshot carries the expiry index, not only the TTLs: promoted before "soon" expires (the master
   // gone, so no DEL comes), the replica's own reaper removes it.
-  ASSERT_EQ(InfoField(*mc, "stats", "expired_keys"), 0) << "\"soon\" expired before the master stopped";
+  ASSERT_EQ(InfoField(*mc, "stats", "expired_keys"), 0)
+      << "\"soon\" (PX " << ttl.count() << ") expired before the master stopped";
+  ASSERT_GT(rc->Command({"PTTL", "soon"}).integer, 0);  // still to expire on the replica
   ASSERT_EQ(m.Terminate(), 0);
   ASSERT_EQ(rc->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
-  EXPECT_TRUE(WaitFor([&] { return InfoField(*rc, "stats", "expired_keys") >= 1; }, 20s));
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*rc, "stats", "expired_keys") >= 1; }, ttl + 20s));
   EXPECT_EQ(rc->Command({"EXISTS", "soon"}).integer, 0);
 }
 
