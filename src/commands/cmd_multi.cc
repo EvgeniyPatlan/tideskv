@@ -31,6 +31,7 @@ void Watch(ExecContext& ctx, const ArgList& argv) {
   for (size_t i = 1; i < argv.size(); ++i)
     fresh[i] = ctx.server.watches().Watch(s.watch, s.db, argv[i], false) ? 1 : 0;
   std::vector<char> expired(argv.size(), 0);
+  const Engine::LoadingReadScope during_load;  // WATCH is loading-flagged; EndLoad dirties every watcher
   const Status st = ctx.server.engine().Read([&](ReadView& view, int64_t now_ms) {
     for (size_t i = 1; i < argv.size(); ++i) {
       if (!fresh[i]) continue;

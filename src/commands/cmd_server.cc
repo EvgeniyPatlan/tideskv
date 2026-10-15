@@ -27,6 +27,31 @@ std::string Section(const std::string& title, const Fields& fields) {
   return out;
 }
 
+// loading, async_loading, the TidesKV fields, then (only while loading) the progress fields
+// (server.c:5754, 5859-5870). total_bytes and rdb_used_mem are 0 on a stream: the percentage is 0.00.
+Fields PersistenceFields(const ServerStats& s) {
+  Fields f = {{"loading", s.loading ? "1" : "0"},
+              {"async_loading", "0"},
+              {"storage_engine", "tidesdb"},
+              {"dir", s.data_dir},
+              {"sync_mode", s.sync_mode},
+              {"compression", s.storage_compression},
+              {"sstable_keys", std::to_string(s.storage_keys)},
+              {"tombstones", std::to_string(s.storage_tombstones)},
+              {"flushes", std::to_string(s.storage_flushes)},
+              {"compactions", std::to_string(s.storage_compactions)},
+              {"background_compactions", std::to_string(s.background_compactions)},
+              {"background_compaction_failures", std::to_string(s.background_compaction_failures)}};
+  if (!s.loading) return f;
+  f.insert(f.end(), {{"loading_start_time", std::to_string(s.loading_start_time)},
+                     {"loading_total_bytes", "0"},
+                     {"loading_rdb_used_mem", "0"},
+                     {"loading_loaded_bytes", std::to_string(s.loading_loaded_bytes)},
+                     {"loading_loaded_perc", "0.00"},
+                     {"loading_eta_seconds", std::to_string(s.loading_eta_seconds)}});
+  return f;
+}
+
 std::string RenderSection(const std::string& name, const ServerStats& s) {
   if (name == "server") {
     return Section("Server", {{"redis_version", std::string(kRedisCompatVersion)},
@@ -57,20 +82,7 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                              {"sync_partial_ok", std::to_string(s.repl.sync_partial_ok)},
                              {"sync_partial_err", std::to_string(s.repl.sync_partial_err)}});
   }
-  if (name == "persistence") {
-    return Section("Persistence",
-                   {{"loading", "0"},
-                    {"storage_engine", "tidesdb"},
-                    {"dir", s.data_dir},
-                    {"sync_mode", s.sync_mode},
-                    {"compression", s.storage_compression},
-                    {"sstable_keys", std::to_string(s.storage_keys)},
-                    {"tombstones", std::to_string(s.storage_tombstones)},
-                    {"flushes", std::to_string(s.storage_flushes)},
-                    {"compactions", std::to_string(s.storage_compactions)},
-                    {"background_compactions", std::to_string(s.background_compactions)},
-                    {"background_compaction_failures", std::to_string(s.background_compaction_failures)}});
-  }
+  if (name == "persistence") return Section("Persistence", PersistenceFields(s));
   if (name == "replication") return FormatReplicationSection(s.repl);
   if (name == "keyspace") return Section("Keyspace", {{"sequence", std::to_string(s.repl.applied_seq)}});
   return "";

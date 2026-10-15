@@ -30,6 +30,7 @@ void DebugHelp(ExecContext& ctx) {
 
 void DebugDigest(ExecContext& ctx) {
   Digest20 d{};
+  const Engine::LoadingReadScope during_load;  // CF6: DEBUG works while a full sync loads
   const Status st =
       ctx.server.engine().Snapshot([&d](ReadView& v, int64_t) { return MoveInto(DatasetDigest(v), &d); });
   if (!st.ok()) return ReplyError(ctx, st);
@@ -39,6 +40,7 @@ void DebugDigest(ExecContext& ctx) {
 // Each key from a raw read of its meta record: logically expired keys are included, as Redis's dictFind.
 void DebugDigestValue(ExecContext& ctx, const ArgList& argv) {
   std::vector<Digest20> digests(argv.size() - 2);
+  const Engine::LoadingReadScope during_load;  // CF6
   const uint8_t db = ctx.session.db;
   const Status st = ctx.server.engine().Snapshot([&](ReadView& v, int64_t) {
     for (size_t i = 2; i < argv.size(); ++i) {

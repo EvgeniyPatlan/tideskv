@@ -12,6 +12,7 @@
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "exec/engine.h"
 #include "repl/replication.h"
 #include "script/script_engine.h"
 #include "server/watch.h"
@@ -140,12 +141,13 @@ CallFlags DeriveCallFlags(const Session& session, const CommandSpec& spec, uint3
           (flags & kCmdLoading) == 0 || (exec && m.has_non_loading)};
 }
 
-// The first state-based refusal in Redis order (server.c:4060 READONLY, then 4097 MASTERDOWN), or empty.
-// MULTI -> dirty is Reject's job; later tasks add LOADING after and NOREPLICAS before.
+// The first state-based refusal in Redis order (server.c:4060 READONLY, 4097 MASTERDOWN, 4104 LOADING), or
+// empty. MULTI -> dirty is Reject's job; NOREPLICAS comes before these, BUSY after.
 std::string_view StateRefusal(ExecContext& ctx, const CallFlags& call) {
   const Replication& repl = ctx.server.replication();
   if (call.is_write && repl.IsReplica()) return kErrReadOnlyReplica;
   if (call.deny_stale && repl.StaleRefusing()) return kErrMasterDown;
+  if (call.deny_loading && ctx.server.engine().loading()) return kErrLoading;  // server.c:4104, before BUSY
   return {};
 }
 

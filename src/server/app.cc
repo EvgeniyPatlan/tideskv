@@ -250,6 +250,16 @@ void App::Stop() {
   storage_.reset();    // flushes and closes TidesDB
 }
 
+namespace {
+
+int64_t NowUnixMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
+
 ServerStats App::Stats() const {
   const ConfigValues v = config_->Snapshot();
   const net::ServerCounters k = server_->counters();
@@ -276,6 +286,15 @@ ServerStats App::Stats() const {
   s.lua_memory = scripts_.lua_memory();
   s.cached_scripts = scripts_.cached_scripts();
   FillReplStats(s, v);
+  s.loading = engine_->loading();
+  if (s.loading) {
+    const auto sync = replication_->Sync();
+    const int64_t now_s = NowUnixMs() / 1000;
+    s.loading_start_time = sync.loading_start_ms / 1000;
+    s.loading_loaded_bytes = sync.loaded_bytes;
+    const int64_t elapsed = now_s - s.loading_start_time;  // server.c:5850: remaining_bytes is 1
+    s.loading_eta_seconds = elapsed == 0 ? 1 : elapsed / static_cast<int64_t>(s.loading_loaded_bytes + 1);
+  }
   return s;
 }
 
@@ -292,12 +311,6 @@ void App::FillStorageStats(ServerStats& s) const {
 }
 
 namespace {
-
-int64_t NowUnixMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
 
 // Whole seconds since a unix-ms stamp; -1 when the stamp is unset (<= 0).
 int64_t SecondsSince(int64_t unix_ms, int64_t now_ms) {

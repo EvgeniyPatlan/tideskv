@@ -74,7 +74,11 @@ struct ServerStats {
   uint64_t blocked_clients = 0;                 // clients waiting in a blocking command
   uint64_t lua_memory = 0;                      // bytes held by the Lua VM
   uint64_t cached_scripts = 0;
-  uint64_t blocking_keys = 0;  // distinct keys with at least one blocked client
+  uint64_t blocking_keys = 0;         // distinct keys with at least one blocked client
+  bool loading = false;               // INFO loading (M6b D11)
+  int64_t loading_start_time = 0;     // unix seconds
+  uint64_t loading_loaded_bytes = 0;  // LOAD payload bytes applied
+  int64_t loading_eta_seconds = 0;    // Redis's formula (server.c:5850), computed in App::Stats
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and

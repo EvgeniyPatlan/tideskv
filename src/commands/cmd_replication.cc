@@ -8,6 +8,7 @@
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "exec/engine.h"
 #include "repl/repl_errors.h"
 #include "repl/replication.h"
 #include "types/errors.h"
@@ -117,6 +118,7 @@ void RunRoleChange(ExecContext& ctx, std::function<void()> change) {
 void Replicaof(ExecContext& ctx, const ArgList& argv) {
   Replication& repl = ctx.server.replication();
   if (EqualsIgnoreCase(argv[1], "no") && EqualsIgnoreCase(argv[2], "one")) {
+    if (ctx.server.engine().loading()) return ctx.reply.Error(kErrLoading);  // D7: Redis's answer
     if (ctx.after_batch != nullptr) {  // EXEC already answered +OK; BecomeMaster logs a failure
       ctx.after_batch->push_back([&repl] { (void)repl.BecomeMaster(); });
       return ctx.reply.SimpleString("OK");
