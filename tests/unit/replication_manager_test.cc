@@ -18,6 +18,7 @@
 #include "exec/repl_log.h"
 #include "repl/backlog_trimmer.h"
 #include "repl/full_sync_frames.h"
+#include "repl/repl_errors.h"
 #include "repl/socket_io.h"
 #include "resp/request_parser.h"
 #include "server/config.h"
@@ -212,6 +213,17 @@ TEST_F(ManagerTest, ShutdownIsPromptAndIdempotent) {
   m->AttachReplica(r.pending_id, fds[0], "");
   EXPECT_TRUE(PeerClosed(replica.get()));
   EXPECT_TRUE(m->Replicas().empty());
+}
+
+// G5 (Task 7 minor): a shut-down master registers no hand-off for a FULLRESYNC, so it must not answer
+// +FULLRESYNC (the replica would wipe its data for a snapshot that never comes): PSYNC is refused.
+TEST_F(ManagerTest, AShutDownMasterRefusesAFullResync) {
+  auto m = Make();
+  m->Shutdown();
+  const PsyncResult r = m->HandlePsync({std::string(40, 'a'), 2}, {});
+  EXPECT_EQ(r.error, kErrPsyncShuttingDown);
+  EXPECT_EQ(r.pending_id, 0u);
+  EXPECT_EQ(m->counters().sync_full, 0u);
 }
 
 TEST_F(ManagerTest, DestructorShutsDown) {

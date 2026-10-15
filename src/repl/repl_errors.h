@@ -20,4 +20,8 @@ inline constexpr std::string_view kErrReplicaofFromReplica =
 inline constexpr std::string_view kReplyAlreadyConnected =
     "OK Already connected to specified master";  // status
 
+// TidesKV-only (G5): a PSYNC that would need a full resynchronisation while the node shuts down; no
+// snapshot is streamed, so the replica keeps its data and retries elsewhere or later.
+inline constexpr std::string_view kErrPsyncShuttingDown = "ERR PSYNC refused: this node is shutting down";
+
 }  // namespace tideskv

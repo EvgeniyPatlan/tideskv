@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "common/string_util.h"
+#include "repl/repl_errors.h"
 #include "types/errors.h"
 
 namespace tideskv::repl {
@@ -101,7 +102,8 @@ PsyncResult ReplicationManager::Decide(const PsyncRequest& req, const ReplicaPee
 }
 
 // The snapshot was taken without mu_, so the role may have changed meanwhile: a demoted node refuses
-// (F8), a shut-down one registers nothing (the hand-off is then refused by AttachReplica).
+// (F8), and so does a shut-down one (G5): it would register no hand-off, and a +FULLRESYNC with no
+// snapshot behind it would only make the replica wipe its data. The refused replica's link closes.
 PsyncResult ReplicationManager::RegisterFullSync(PsyncResult r, SyncSnapshot snap, const PsyncRequest& req,
                                                  const ReplicaPeer& peer) {
   std::lock_guard lock(mu_);
@@ -109,7 +111,10 @@ PsyncResult ReplicationManager::RegisterFullSync(PsyncResult r, SyncSnapshot sna
     r.error = std::string(kErrPsyncOnReplica);
     return r;
   }
-  if (shut_down_) return r;
+  if (shut_down_) {
+    r.error = std::string(kErrPsyncShuttingDown);
+    return r;
+  }
   r.seq = snap.seq;
   r.pending_id = next_pending_id_++;
   const uint64_t next_seq = snap.seq + 1;
