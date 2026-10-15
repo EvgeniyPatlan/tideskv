@@ -28,6 +28,40 @@ void ExpectFullSyncedFrom(const TestServer& master, const TestServer& replica, i
   ExpectConverged(master, {&replica});
 }
 
+TEST(Failover, PromoteReplicaThenDemoteOldMasterPartialSyncs) {
+  const uint32_t seed = Seed();
+  SCOPED_TRACE("seed " + std::to_string(seed));
+  TestServer a(TIDESKV_SERVER_BIN);
+  TestServer b(TIDESKV_SERVER_BIN, {.extra_args = ReplicaOfArgs(a)});
+  ASSERT_TRUE(WaitConnected(b));
+  {
+    // No TTLs: the old master's reaper must not write between the promotion and its demotion, or its
+    // seq would pass the new master's history end_seq and FULLRESYNC would be the correct answer.
+    Workload load(a.port(), seed, kClients, Workload::Mix::kNoExpiry);
+    load.Start();
+    std::this_thread::sleep_for(3s);
+    load.Stop();
+    ExpectHealthyLoad(load);
+  }
+  ExpectConverged(a, {&b});
+  auto ac = Client(a);
+  auto bc = Client(b);
+  ASSERT_EQ(bc->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
+  const int64_t partial_before = InfoField(*bc, "stats", "sync_partial_ok");
+  ASSERT_EQ(ac->Command({"REPLICAOF", "127.0.0.1", std::to_string(b.port())}).str, "OK");
+  ASSERT_TRUE(WaitConnected(a)) << a.Stderr();
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*bc, "stats", "sync_partial_ok") > partial_before; }));
+  EXPECT_EQ(InfoField(*bc, "stats", "sync_full"), 0);
+  {
+    Workload load(b.port(), seed + 1, kClients);
+    load.Start();
+    std::this_thread::sleep_for(3s);
+    load.Stop();
+    ExpectHealthyLoad(load);
+  }
+  ExpectConverged(b, {&a});
+}
+
 // The master dies under load; replica A is promoted and B is pointed at it. D8 via A's history decides:
 // B continues iff it is at or behind A (and within A's backlog), else FULLRESYNC.
 TEST(Failover, PromoteUnderLoadThenRepointSecondReplica) {

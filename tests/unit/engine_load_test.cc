@@ -215,8 +215,33 @@ TEST_F(EngineLoadTest, AbortLoadDiscardsAPartialLoad) {
   ASSERT_TRUE(replica.engine.AbortLoad().ok());
   EXPECT_FALSE(replica.engine.loading());
   EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(replica.log.last(), 0u);  // D5: an aborted load leaves an empty replica, log included
   EXPECT_EQ(DigestOf(replica.engine), kEmptyDigest);
   EXPECT_FALSE(replica.listener.seen.empty());  // the wipe's range deletes go to compaction
+}
+
+// Task 8 review: the loader's destructor aborts after a failed EndLoad. EndLoad's txn rolled back and
+// loading stays set, so AbortLoad still discards; the log is empty (last 0) in memory and after Recover.
+TEST_F(EngineLoadTest, AbortLoadAfterAFailedEndLoadEmptiesTheReplica) {
+  ASSERT_TRUE(ShipAll(master.services.storage_, MasterLast(), replica.engine).ok());
+  ASSERT_GT(replica.log.last(), 0u);
+  ASSERT_TRUE(replica.engine.BeginLoad({}).ok());
+  ASSERT_TRUE(
+      replica.engine.LoadChunk({{ReplOpType::kPut, ColumnFamily::kMeta, std::string("\0\0\0k", 4), "x"}})
+          .ok());
+  EXPECT_EQ(replica.engine.EndLoad(7, "not a replog record", {}).code(), StatusCode::kCorruption);
+  EXPECT_TRUE(replica.engine.loading());
+  EXPECT_TRUE(replica.log.load_incomplete());
+  ASSERT_TRUE(replica.engine.AbortLoad().ok());
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(replica.log.last(), 0u);
+  EXPECT_EQ(replica.log.first_retained(), 1u);
+  EXPECT_EQ(DigestOf(replica.engine), kEmptyDigest);
+  ReplLog again(replica_storage, replica.clock);
+  ASSERT_TRUE(again.Recover().ok());
+  EXPECT_EQ(again.last(), 0u);
+  EXPECT_FALSE(again.load_incomplete());
 }
 
 TEST_F(EngineLoadTest, StartupDiscardsAnInterruptedLoad) {

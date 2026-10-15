@@ -88,7 +88,32 @@ TEST_F(LoaderTest, DestroyingAnUnfinishedLoaderAbortsTheLoad) {
   }
   EXPECT_FALSE(replica.engine.loading());
   EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(replica.log.last(), 0u);
   EXPECT_EQ(test::DigestOf(replica.engine), std::string(40, '0'));
+}
+
+// A LOADEND whose record does not commit (EndLoad fails, loading stays set) is still discarded when the
+// loader goes away: the destructor's AbortLoad runs after a failed EndLoad.
+TEST_F(LoaderTest, AFailedEndIsAbortedByTheDestructor) {
+  uint64_t seq = 0;
+  const auto frames = Stream(&seq);
+  ASSERT_GT(seq, 0u);
+  {
+    FullSyncLoader loader(replica.engine, std::string(40, 'a'), seq, Hooks());
+    ASSERT_TRUE(loader.Begin().ok());
+    bool done = false;
+    for (size_t i = 0; i + 1 < frames.size(); ++i) ASSERT_TRUE(loader.HandleFrame(frames[i], &done).ok());
+    Args bad_record = frames.back();
+    bad_record[2] = "not a replog record";
+    EXPECT_EQ(loader.HandleFrame(bad_record, &done).code(), StatusCode::kCorruption);
+    EXPECT_FALSE(done);
+    EXPECT_TRUE(replica.engine.loading());
+  }
+  EXPECT_FALSE(replica.engine.loading());
+  EXPECT_FALSE(replica.log.load_incomplete());
+  EXPECT_EQ(replica.log.last(), 0u);
+  EXPECT_EQ(test::DigestOf(replica.engine), std::string(40, '0'));
+  ASSERT_EQ(published.size(), 1u);  // only the start's identity: the master's replid was never adopted
 }
 
 TEST_F(LoaderTest, ProtocolViolationsAreErrors) {
