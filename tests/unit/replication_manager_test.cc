@@ -405,5 +405,22 @@ TEST_F(RoleTest, RoleChangesAfterShutdownStartNothing) {
   EXPECT_FALSE(log.fenced());
 }
 
+TEST(ReplicationManagerStale, RefusesOnlyAsADisconnectedReplicaWithServeStaleNo) {
+  InMemoryStorage s;
+  test::FakeClock clock;
+  ReplLog log(s, clock);
+  ASSERT_TRUE(log.Recover().ok());
+  ReplicationManager m(s, log, ReplIdentity{std::string(kReplIdLength, 'a'), {}});
+  ConfigValues v;
+  v.replica_serve_stale_data = false;
+  m.OnConfig(v);
+  EXPECT_FALSE(m.StaleRefusing());               // a master is never stale
+  ASSERT_TRUE(m.BecomeReplica("127.0.0.1", 1));  // no engine hook: no client starts, the link stays down
+  EXPECT_TRUE(m.StaleRefusing());
+  v.replica_serve_stale_data = true;
+  m.OnConfig(v);
+  EXPECT_FALSE(m.StaleRefusing());
+}
+
 }  // namespace
 }  // namespace tideskv::repl

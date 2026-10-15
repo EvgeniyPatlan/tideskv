@@ -90,6 +90,10 @@ class ReplicationManager final : public Replication {
   bool BecomeReplica(const std::string& host, uint16_t port) override;
   Status BecomeMaster() override;
   RoleInfo Role() const override;
+  bool StaleRefusing() const override;
+  // Takes the config values that matter to replication. Hook calls are not serialised (CF-M6b-1), so
+  // callers pass a fresh snapshot; this only stores it.
+  void OnConfig(const ConfigValues& v);
 
   // Stops every sender (demotion, promotion: sub-replicas must resync, Redis disconnectSlaves; shutdown).
   void DropAllReplicas();
@@ -146,6 +150,8 @@ class ReplicationManager final : public Replication {
   uint16_t master_port_ = 0;                          // guarded by mu_
   std::shared_ptr<ReplClient> client_;                // guarded by mu_; shared so Role() may read it
   std::atomic<ReplRole> role_{ReplRole::kMaster};
+  std::atomic<bool> serve_stale_{true};                                   // replica-serve-stale-data
+  std::atomic<ReplicaLinkState> link_state_{ReplicaLinkState::kConnect};  // mirrored from the client
 
   std::mutex role_mu_;  // serialises BecomeReplica / BecomeMaster / Shutdown's client stop
 

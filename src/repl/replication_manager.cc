@@ -128,6 +128,7 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
     master_host_ = host;
     master_port_ = port;
     role_.store(ReplRole::kReplica, std::memory_order_release);
+    link_state_.store(ReplicaLinkState::kConnect, std::memory_order_release);
     pending_.clear();  // F8: a replica serves no replica; a hand-off still in flight is refused
   }
   if (hooks.stop_reaper) hooks.stop_reaper();
@@ -233,12 +234,22 @@ std::shared_ptr<ReplClient> ReplicationManager::TakeClient() {
   return std::exchange(client_, nullptr);
 }
 
+bool ReplicationManager::StaleRefusing() const {
+  return role() == ReplRole::kReplica && !serve_stale_.load(std::memory_order_acquire) &&
+         link_state_.load(std::memory_order_acquire) != ReplicaLinkState::kConnected;
+}
+
+void ReplicationManager::OnConfig(const ConfigValues& v) {
+  serve_stale_.store(v.replica_serve_stale_data, std::memory_order_release);
+}
+
 std::shared_ptr<ReplClient> ReplicationManager::MakeClient() {
   if (options_.role.engine == nullptr) return nullptr;  // no engine to apply through (unit tests)
   ReplClient::Callbacks cb;
   cb.identity = [this] { return identity(); };
   cb.persist_identity = [this](const ReplIdentity& id) { return PersistAndPublish(id); };
   cb.trim_backlog = options_.role.trim_backlog;
+  cb.on_state = [this](ReplicaLinkState s) { link_state_.store(s, std::memory_order_release); };
   ReplClient::ConfigSnapshotFn config = options_.role.config;
   if (!config) config = [] { return ConfigValues{}; };
   ReplClient::Options client_options = options_.client;

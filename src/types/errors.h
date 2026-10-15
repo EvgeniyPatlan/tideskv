@@ -121,6 +121,9 @@ inline constexpr std::string_view kErrBusyScript =
 inline constexpr std::string_view kErrNotBusy = "NOTBUSY No scripts in execution right now.";
 inline constexpr std::string_view kErrReadOnlyReplica =
     "READONLY You can't write against a read only replica.";
+// server.c:1862 (shared.masterdownerr); verified on redis:7.2.5.
+inline constexpr std::string_view kErrMasterDown =
+    "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.";
 inline constexpr std::string_view kErrScriptFlushOption = "ERR SCRIPT FLUSH only support SYNC|ASYNC option";
 inline constexpr std::string_view kErrScriptDebugOption = "ERR Use SCRIPT DEBUG YES/SYNC/NO";
 inline constexpr std::string_view kErrScriptDebugUnsupported = "ERR SCRIPT DEBUG YES/SYNC is not supported";
@@ -133,6 +136,8 @@ inline constexpr std::string_view kErrCompilingScript = "ERR Error compiling scr
 // Raised inside scripts (no code: luaPushErrorBuff prefixes "ERR ").
 inline constexpr std::string_view kScriptErrUnknownCommand = "Unknown Redis command called from script";
 inline constexpr std::string_view kScriptErrArity = "Wrong number of args calling Redis command from script";
+// script.c:504: a script calls a non-STALE command on a stale replica (gets the script suffix).
+inline constexpr std::string_view kScriptErrStaleReplica = "Can not execute the command on a stale replica";
 inline constexpr std::string_view kScriptErrNoScript = "This Redis command is not allowed from script";
 inline constexpr std::string_view kScriptErrWriteInRo =
     "Write commands are not allowed from read-only scripts.";

@@ -140,6 +140,15 @@ CallFlags DeriveCallFlags(const Session& session, const CommandSpec& spec, uint3
           (flags & kCmdLoading) == 0 || (exec && m.has_non_loading)};
 }
 
+// The first state-based refusal in Redis order (server.c:4060 READONLY, then 4097 MASTERDOWN), or empty.
+// MULTI -> dirty is Reject's job; later tasks add LOADING after and NOREPLICAS before.
+std::string_view StateRefusal(ExecContext& ctx, const CallFlags& call) {
+  const Replication& repl = ctx.server.replication();
+  if (call.is_write && repl.IsReplica()) return kErrReadOnlyReplica;
+  if (call.deny_stale && repl.StaleRefusing()) return kErrMasterDown;
+  return {};
+}
+
 void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
   if (argv.empty()) return;
   const CommandSpec* spec = registry.Find(argv[0]);
@@ -150,9 +159,7 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
   const uint32_t flags = EffectiveFlags(ctx, *spec, argv);
   const CallFlags call = DeriveCallFlags(ctx.session, *spec, flags);
-  if (call.is_write && ctx.server.replication().IsReplica()) {
-    return Reject(ctx, spec, kErrReadOnlyReplica);  // sv:4060, before BUSY; MULTI -> dirty
-  }
+  if (std::string_view e = StateRefusal(ctx, call); !e.empty()) return Reject(ctx, spec, e);
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }

@@ -100,6 +100,9 @@ class Replication {
   // oid high-water mark) is returned and leaves the node a fenced replica of the same master.
   virtual Status BecomeMaster() = 0;
   virtual RoleInfo Role() const = 0;
+  // MASTERDOWN (M6b D8): a replica whose link is not connected (sync included) while
+  // replica-serve-stale-data is no. Lock-free.
+  virtual bool StaleRefusing() const = 0;
 };
 
 }  // namespace tideskv

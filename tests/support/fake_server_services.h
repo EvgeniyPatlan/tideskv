@@ -34,6 +34,8 @@ class FakeReplication final : public Replication {
     std::string unread;
   };
 
+  std::atomic<bool> stale_refusing{false};
+  bool StaleRefusing() const override { return stale_refusing.load(); }
   ReplRole role() const override { return role_.load(); }
   void set_role(ReplRole r) { role_.store(r); }
   PsyncResult HandlePsync(const repl::PsyncRequest& req, const ReplicaPeer& peer) override {

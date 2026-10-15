@@ -42,6 +42,10 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
     *error = "-" + std::string(kErrReadOnlyReplica);
     return std::nullopt;
   }
+  if ((spec->flags & kCmdStale) == 0 && caller_.server.replication().StaleRefusing()) {
+    *error = std::string(kScriptErrStaleReplica);  // script.c:504, after the NOSCRIPT check
+    return std::nullopt;
+  }
   session_.protocol = resp;
   resp::ReplyBuilder reply(resp);
   ExecContext ctx{session_, reply, caller_.server, nullptr, caller_.ready, caller_.after_batch};
