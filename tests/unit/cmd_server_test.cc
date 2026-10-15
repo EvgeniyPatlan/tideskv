@@ -310,6 +310,41 @@ TEST(InfoReplication, StatsHasSyncCounters) {
   EXPECT_NE(info.find("sync_full:3\r\nsync_partial_ok:2\r\nsync_partial_err:1\r\n"), std::string::npos);
 }
 
+TEST(InfoReplication, ReplicaDuringAFullSyncShowsTheTransferFields) {  // server.c:6026-6062
+  ReplicationStats r;
+  r.replica = true;
+  r.master_host = "10.0.0.1";
+  r.master_port = 7000;
+  r.link_up = false;
+  r.last_io_seconds_ago = -1;
+  r.link_down_since_seconds = -1;
+  r.sync_in_progress = true;
+  r.sync_total_bytes = 0;
+  r.sync_read_bytes = 1234;
+  r.sync_last_io_seconds_ago = 0;
+  r.replid = std::string(40, 'a');
+  const std::string out = FormatReplicationSection(r);
+  EXPECT_NE(
+      out.find("master_link_status:down\r\nmaster_last_io_seconds_ago:-1\r\nmaster_sync_in_progress:1\r\n"
+               "slave_read_repl_offset:0\r\nslave_repl_offset:0\r\nmaster_sync_total_bytes:0\r\n"
+               "master_sync_read_bytes:1234\r\nmaster_sync_left_bytes:-1234\r\nmaster_sync_perc:0.00\r\n"
+               "master_sync_last_io_seconds_ago:0\r\nmaster_link_down_since_seconds:-1\r\n"),
+      std::string::npos)
+      << out;
+}
+
+TEST(InfoReplication, AReplicaReceivingItsSnapshotIsSendBulk) {
+  ReplicationStats r;
+  r.replid = std::string(40, 'a');
+  r.replicas.push_back({"10.0.0.2", 7001, 0, 0, "send_bulk"});
+  r.replicas.push_back({"10.0.0.3", 7002, 9, 1, "online"});
+  const std::string out = FormatReplicationSection(r);
+  EXPECT_NE(out.find("connected_slaves:2\r\nslave0:ip=10.0.0.2,port=7001,state=send_bulk,offset=0,lag=0\r\n"
+                     "slave1:ip=10.0.0.3,port=7002,state=online,offset=9,lag=1\r\n"),
+            std::string::npos)
+      << out;
+}
+
 TEST(Hello, RoleFollowsReplication) {
   CommandHarness h;
   EXPECT_NE(h.Run({"HELLO", "3"}).find("role\r\n$6\r\nmaster\r\n"), std::string::npos);

@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "support/full_sync.h"
 #include "support/it_helpers.h"
 #include "support/temp_dir.h"
 #include "support/test_server.h"
@@ -395,6 +396,33 @@ TEST_F(ReplicationIT, ReplicaShutdownIsNotHeldUpByABusyScript) {
   const auto start = std::chrono::steady_clock::now();
   EXPECT_EQ(replica->Terminate(), 0) << replica->Stderr();
   EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+}
+
+// D11: while a full sync loads, ROLE says "sync" with offset -1, INFO shows the transfer, and the
+// master lists the replica as send_bulk; afterwards both sides show a connected, online link.
+TEST_F(ReplicationIT, InfoAndRoleDuringAFullSync) {
+  auto m = Client(master);
+  ASSERT_TRUE(FillKeys(*m, 5000));
+  auto r = Client(*replica);
+  ASSERT_TRUE(ForceFullSync(*r));
+  ASSERT_EQ(r->Command({"CONFIG", "SET", "key-load-delay", "400"}).str, "OK");
+  Follow(*replica);
+  ASSERT_TRUE(WaitFor([&] { return LinkState(*r) == "sync"; }, 10s));
+  EXPECT_EQ(RoleOffset(*r), -1);
+  EXPECT_EQ(InfoField(*r, "replication", "master_sync_in_progress"), 1);
+  EXPECT_EQ(InfoString(*r, "replication", "master_link_status"), "down");
+  EXPECT_EQ(InfoField(*r, "replication", "master_last_io_seconds_ago"), -1);
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*r, "replication", "master_sync_read_bytes") > 0; }));
+  EXPECT_NE(InfoString(*m, "replication", "slave0").find("state=send_bulk"), std::string::npos);
+  ASSERT_EQ(r->Command({"CONFIG", "SET", "key-load-delay", "0"}).str, "OK");
+  ASSERT_TRUE(Synced(*m, *r, 60s));
+  EXPECT_EQ(InfoField(*r, "replication", "master_sync_in_progress"), 0);
+  EXPECT_EQ(InfoString(*r, "replication", "master_sync_read_bytes"), "");
+  // The sender goes online on the replica's first ACK, which can trail the replica's link coming up.
+  const auto online = [&] {
+    return InfoString(*m, "replication", "slave0").find("state=online") != std::string::npos;
+  };
+  EXPECT_TRUE(WaitFor(online, 5s)) << InfoString(*m, "replication", "slave0");
 }
 
 }  // namespace

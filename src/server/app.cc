@@ -331,14 +331,19 @@ void App::FillReplStats(ServerStats& s, const ConfigValues& v) const {
   r.link_up = r.replica && role.state == ReplicaLinkState::kConnected;
   if (r.replica) {
     const auto link = replication_->Link();
-    r.last_io_seconds_ago = SecondsSince(link.last_io_ms, now);
+    r.last_io_seconds_ago = r.link_up ? SecondsSince(link.last_io_ms, now) : -1;
     r.link_down_since_seconds =
         link.link_down_since_ms > 0 ? SecondsSince(link.link_down_since_ms, now) : link.link_down_since_ms;
+    const auto sync = replication_->Sync();
+    r.sync_in_progress = sync.in_progress;
+    r.sync_read_bytes = static_cast<int64_t>(sync.read_bytes);
+    r.sync_last_io_seconds_ago = std::max<int64_t>(0, SecondsSince(sync.last_io_ms, now));
   }
   for (const ReplicaInfo& i : role.replicas) {
     if (!i.alive) continue;  // F9: as ROLE, a link that dropped is not listed while it awaits the reaper
-    r.replicas.push_back(
-        {i.ip, i.listening_port, i.acked, std::max<int64_t>(0, SecondsSince(i.last_ack_ms, now))});
+    r.replicas.push_back({i.ip, i.listening_port, i.online ? i.acked : 0,
+                          i.online ? std::max<int64_t>(0, SecondsSince(i.last_ack_ms, now)) : 0,
+                          i.online ? "online" : "send_bulk"});
   }
   const repl::ReplIdentity id = replication_->identity();
   r.replid = id.replid;

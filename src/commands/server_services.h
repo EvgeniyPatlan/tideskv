@@ -20,8 +20,9 @@ class WatchRegistry;
 struct ReplicaLine {
   std::string ip;
   int port = 0;
-  uint64_t offset = 0;      // last REPLCONF ACK (a seq)
-  int64_t lag_seconds = 0;  // now - last ACK
+  uint64_t offset = 0;           // last REPLCONF ACK (a seq)
+  int64_t lag_seconds = 0;       // now - last ACK
+  std::string state = "online";  // "send_bulk" until the sender is online (offset and lag 0 then)
 };
 
 // What INFO's Replication, Keyspace `sequence` and sync counters show (M6a D16). Offsets are TidesKV seqs.
@@ -32,6 +33,10 @@ struct ReplicationStats {
   bool link_up = false;
   int64_t last_io_seconds_ago = -1;
   int64_t link_down_since_seconds = -1;  // -1 = never connected since REPLICAOF
+  bool sync_in_progress = false;         // a full sync is being received (M6b D11)
+  int64_t sync_total_bytes = 0;          // always 0: the snapshot size is unknown (server.c:6045)
+  int64_t sync_read_bytes = 0;
+  int64_t sync_last_io_seconds_ago = 0;
   uint64_t applied_seq = 0;
   uint64_t read_seq = 0;
   int replica_priority = 100;
