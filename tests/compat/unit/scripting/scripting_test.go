@@ -526,7 +526,7 @@ math.randomseed(ARGV[1]); return tostring(math.random())
 }
 
 func TestScriptingMasterSlave(t *testing.T) {
-	t.Skip("tideskv: replication is not implemented (and the SlaveOf/WaitForSync helpers do not exist)")
+	t.Skip("tideskv: the script cache is node-local; Redis 7.2.5 does not replicate SCRIPT LOAD either (checked live)")
 }
 
 func TestScriptingWithRESP3(t *testing.T) {

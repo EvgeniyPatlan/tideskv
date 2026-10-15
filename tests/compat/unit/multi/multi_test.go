@@ -144,7 +144,7 @@ func TestMulti(t *testing.T) {
 	})
 
 	t.Run("MULTI-EXEC used in redis-sentinel for failover", func(t *testing.T) {
-		t.Skip("tideskv: replication, CLIENT KILL and CONFIG REWRITE are not in M5")
+		t.Skip("tideskv: CLIENT KILL TYPE and CONFIG REWRITE inside MULTI are not implemented")
 	})
 
 	t.Run("WATCH inside MULTI is not allowed", func(t *testing.T) {

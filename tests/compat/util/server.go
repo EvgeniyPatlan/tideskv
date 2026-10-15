@@ -24,7 +24,12 @@ var binPath = flag.String("binPath", "", "path to the tideskv-server binary")
 type KvrocksServerConfigs = map[string]string
 
 // Config keys tideskv understands; anything else from an upstream test is ignored (logged).
-var supportedConfigs = map[string]bool{"requirepass": true, "maxclients": true, "workers": true}
+var supportedConfigs = map[string]bool{
+	"requirepass": true, "maxclients": true, "workers": true,
+	"replica-announce-ip": true, "replica-announce-port": true, "masterauth": true, "repl-timeout": true,
+	"repl-backlog-size": true, "replica-serve-stale-data": true, "min-replicas-to-write": true,
+	"min-replicas-max-lag": true, "key-load-delay": true, "rdb-key-save-delay": true,
+} // tideskv: replication knobs added in M6b
 
 type KvrocksServer struct {
 	t    testing.TB
@@ -78,6 +83,10 @@ func (s *KvrocksServer) waitReady() {
 }
 
 func (s *KvrocksServer) HostPort() string { return s.addr.String() }
+
+func (s *KvrocksServer) Host() string { return s.addr.IP.String() }
+
+func (s *KvrocksServer) Port() uint64 { return uint64(s.addr.Port) }
 
 func (s *KvrocksServer) NewClient() *redis.Client { return s.NewClientWithOption(&redis.Options{}) }
 
