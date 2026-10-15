@@ -81,6 +81,7 @@ Status SetBacklogSize(ConfigValues& c, std::string_view v) {
 }
 
 constexpr int64_t kIntMax = std::numeric_limits<int32_t>::max();
+constexpr int64_t kIntMin = std::numeric_limits<int32_t>::min();
 
 const std::vector<Option> BuildReplOptions() {
   std::vector<Option> opts = {
@@ -110,6 +111,25 @@ const std::vector<Option> BuildReplOptions() {
       {"replica-read-only", true, SetReadOnly,
        [](const ConfigValues& c) { return std::string(c.replica_read_only ? "yes" : "no"); }},
       {"replicaof", false, SetReplicaOf, [](const ConfigValues& c) { return c.replicaof; }, false, true},
+      {"replica-serve-stale-data", true,
+       [](ConfigValues& c, std::string_view v) { return ParseYesNo(v, &c.replica_serve_stale_data); },
+       [](const ConfigValues& c) { return std::string(c.replica_serve_stale_data ? "yes" : "no"); }},
+      {"min-replicas-to-write", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetBounded(v, 0, kIntMax, &c.min_replicas_to_write);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.min_replicas_to_write); }},
+      {"min-replicas-max-lag", true,
+       [](ConfigValues& c, std::string_view v) { return SetBounded(v, 0, kIntMax, &c.min_replicas_max_lag); },
+       [](const ConfigValues& c) { return std::to_string(c.min_replicas_max_lag); }},
+      {"key-load-delay", true,
+       [](ConfigValues& c, std::string_view v) { return SetBounded(v, kIntMin, kIntMax, &c.key_load_delay); },
+       [](const ConfigValues& c) { return std::to_string(c.key_load_delay); }, false, false, true},
+      {"rdb-key-save-delay", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetBounded(v, kIntMin, kIntMax, &c.rdb_key_save_delay);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.rdb_key_save_delay); }, false, false, true},
   };
   static constexpr std::pair<std::string_view, std::string_view> kAliases[] = {
       {"slaveof", "replicaof"},
@@ -117,6 +137,9 @@ const std::vector<Option> BuildReplOptions() {
       {"slave-announce-ip", "replica-announce-ip"},
       {"slave-announce-port", "replica-announce-port"},
       {"slave-priority", "replica-priority"},
+      {"slave-serve-stale-data", "replica-serve-stale-data"},
+      {"min-slaves-to-write", "min-replicas-to-write"},
+      {"min-slaves-max-lag", "min-replicas-max-lag"},
   };
   const size_t base = opts.size();
   for (const auto& [alias, target] : kAliases) {

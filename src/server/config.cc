@@ -240,7 +240,16 @@ bool SplitLine(std::string_view line, std::string* name, std::string* value) {
 Status Config::LoadFile(const std::string& path) {
   std::ifstream in(path);
   if (!in) return Status::IOError("cannot open config file " + path);
-  std::unique_lock lock(mu_);
+  ConfigValues applied;
+  {
+    std::unique_lock lock(mu_);
+    if (Status st = LoadLocked(in, path, &applied); !st.ok()) return st;
+  }
+  if (on_change_) on_change_(applied);
+  return Status::Ok();
+}
+
+Status Config::LoadLocked(std::istream& in, const std::string& path, ConfigValues* applied) {
   ConfigValues next = values_;
   std::string raw;
   for (int line_no = 1; std::getline(in, raw); ++line_no) {
@@ -255,6 +264,7 @@ Status Config::LoadFile(const std::string& path) {
   }
   values_ = std::move(next);
   file_path_ = path;
+  *applied = values_;
   return Status::Ok();
 }
 
@@ -292,23 +302,30 @@ Status Config::Set(std::string_view name, std::string_view value, bool at_runtim
 }
 
 Status Config::SetMany(const Pairs& pairs, bool at_runtime, std::string* failed_name) {
-  std::unique_lock lock(mu_);
-  ConfigValues next = values_;
-  for (const auto& [name, value] : pairs) {
-    if (Status st = ApplyOne(next, name, value, at_runtime); !st.ok()) {
-      if (failed_name != nullptr) *failed_name = name;
-      return st;
+  ConfigValues applied;
+  {
+    std::unique_lock lock(mu_);
+    ConfigValues next = values_;
+    for (const auto& [name, value] : pairs) {
+      if (Status st = ApplyOne(next, name, value, at_runtime); !st.ok()) {
+        if (failed_name != nullptr) *failed_name = name;
+        return st;
+      }
     }
+    values_ = std::move(next);
+    applied = values_;
   }
-  values_ = std::move(next);
+  if (on_change_) on_change_(applied);
   return Status::Ok();
 }
 
 Config::Pairs Config::Get(std::string_view pattern) const {
   std::shared_lock lock(mu_);
   Pairs out;
-  for (const Option& o : Options()) {  // Options() is sorted by name
-    if (GlobMatch(pattern, o.name, /*nocase=*/true)) out.emplace_back(std::string(o.name), o.get(values_));
+  for (const Option& o : Options()) {
+    const bool match =
+        o.hidden ? EqualsIgnoreCase(pattern, o.name) : GlobMatch(pattern, o.name, /*nocase=*/true);
+    if (match) out.emplace_back(std::string(o.name), o.get(values_));
   }
   return out;
 }
@@ -359,7 +376,7 @@ Status Config::Rewrite() const {
     if (file_path_.empty()) return Status::InvalidArgument("The server is running without a config file");
     path = file_path_;
     for (const Option& o : Options()) {
-      if (o.alias) continue;
+      if (o.alias || o.hidden) continue;
       const std::string value = o.get(values_);
       if (o.multi_arg && value.empty()) continue;  // e.g. a master has no replicaof line
       lines.emplace_back(std::string(o.name), o.multi_arg ? value : QuoteIfNeeded(value));

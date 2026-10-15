@@ -17,6 +17,7 @@ struct Option {
   bool alias = false;      // legacy name of another option: readable/settable, never rewritten
   bool multi_arg = false;  // value is several words, written to the file unquoted ("replicaof h p");
                            // an empty value is not written at all
+  bool hidden = false;  // a test knob (Redis HIDDEN_CONFIG): CONFIG GET by exact name only, never rewritten
 };
 
 // Replication parameters (Redis 7.2 names, aliases, ranges and error texts).

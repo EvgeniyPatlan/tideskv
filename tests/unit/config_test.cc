@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string_view>
@@ -122,7 +123,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 32u);
+  EXPECT_EQ(c.Get("*").size(), 38u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -425,6 +426,87 @@ TEST(ConfigRepl, MasterauthNeverLogged) {
   EXPECT_FALSE(results[4].ok());
   EXPECT_EQ(results[4].message().find(kSecret), std::string::npos) << results[4].message();
   EXPECT_EQ(captured.str().find(kSecret), std::string::npos) << captured.str();
+}
+
+TEST(ConfigRepl, M6bDefaults) {
+  const ConfigValues v = Config().Snapshot();
+  EXPECT_TRUE(v.replica_serve_stale_data);
+  EXPECT_EQ(v.min_replicas_to_write, 0);
+  EXPECT_EQ(v.min_replicas_max_lag, 10);
+  EXPECT_EQ(v.key_load_delay, 0);
+  EXPECT_EQ(v.rdb_key_save_delay, 0);
+  Config c;
+  EXPECT_EQ(GetOne(c, "replica-serve-stale-data"), "yes");
+  EXPECT_EQ(GetOne(c, "min-replicas-max-lag"), "10");
+}
+
+TEST(ConfigRepl, M6bKeysRoundTripWithAliases) {
+  Config c;
+  ASSERT_TRUE(c.Set("slave-serve-stale-data", "no", true).ok());
+  ASSERT_TRUE(c.Set("min-slaves-to-write", "2", true).ok());
+  ASSERT_TRUE(c.Set("min-slaves-max-lag", "3", true).ok());
+  ASSERT_TRUE(c.Set("key-load-delay", "-10", true).ok());
+  ASSERT_TRUE(c.Set("rdb-key-save-delay", "250", true).ok());
+  const ConfigValues v = c.Snapshot();
+  EXPECT_FALSE(v.replica_serve_stale_data);
+  EXPECT_EQ(v.min_replicas_to_write, 2);
+  EXPECT_EQ(v.min_replicas_max_lag, 3);
+  EXPECT_EQ(v.key_load_delay, -10);
+  EXPECT_EQ(v.rdb_key_save_delay, 250);
+  EXPECT_EQ(GetOne(c, "replica-serve-stale-data"), "no");
+  EXPECT_EQ(GetOne(c, "slave-serve-stale-data"), "no");
+  EXPECT_EQ(GetOne(c, "min-replicas-to-write"), "2");
+}
+
+TEST(ConfigRepl, M6bBoundsErrorTexts) {  // live redis:7.2.5
+  Config c;
+  EXPECT_EQ(c.Set("replica-serve-stale-data", "maybe", true).message(), "argument must be 'yes' or 'no'");
+  EXPECT_EQ(c.Set("min-replicas-max-lag", "-1", true).message(),
+            "argument must be between 0 and 2147483647 inclusive");
+  EXPECT_EQ(c.Set("min-replicas-to-write", "2147483648", true).message(),
+            "argument must be between 0 and 2147483647 inclusive");
+  EXPECT_EQ(c.Set("key-load-delay", "2147483648", true).message(),
+            "argument must be between -2147483648 and 2147483647 inclusive");
+}
+
+TEST(ConfigRepl, HiddenOptionsMatchOnlyByExactName) {  // Redis HIDDEN_CONFIG, live redis:7.2.5
+  Config c;
+  ASSERT_TRUE(c.Set("key-load-delay", "5", true).ok());
+  EXPECT_EQ(c.Get("key-load-delay"), (Config::Pairs{{"key-load-delay", "5"}}));
+  EXPECT_EQ(c.Get("KEY-LOAD-DELAY"), (Config::Pairs{{"key-load-delay", "5"}}));
+  EXPECT_TRUE(c.Get("key-load*").empty());
+  for (const auto& [name, value] : c.Get("*")) {
+    EXPECT_NE(name, "key-load-delay");
+    EXPECT_NE(name, "rdb-key-save-delay");
+  }
+}
+
+TEST(ConfigRepl, HiddenOptionsAreNeverRewritten) {
+  test::TempDir dir;
+  Config c;
+  const std::string path = WriteFile(dir, "port 7000\n");
+  ASSERT_TRUE(c.LoadFile(path).ok());
+  ASSERT_TRUE(c.Set("rdb-key-save-delay", "100", true).ok());
+  ASSERT_TRUE(c.Rewrite().ok());
+  std::ifstream in(path);
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(text.find("rdb-key-save-delay"), std::string::npos) << text;
+  EXPECT_EQ(text.find("key-load-delay"), std::string::npos) << text;
+  EXPECT_NE(text.find("\nreplica-serve-stale-data yes\n"), std::string::npos) << text;
+}
+
+TEST(ConfigRepl, ChangeHookSeesEverySuccessfulSetAndNoFailedOne) {
+  Config c;
+  std::vector<ConfigValues> seen;
+  c.SetOnChange([&](const ConfigValues& v) { seen.push_back(v); });
+  ASSERT_TRUE(c.Set("min-replicas-to-write", "1", true).ok());
+  ASSERT_FALSE(c.Set("min-replicas-to-write", "x", true).ok());
+  ASSERT_TRUE(
+      c.SetMany({{"replica-serve-stale-data", "no"}, {"min-replicas-max-lag", "4"}}, true, nullptr).ok());
+  ASSERT_EQ(seen.size(), 2u);
+  EXPECT_EQ(seen[0].min_replicas_to_write, 1);
+  EXPECT_FALSE(seen[1].replica_serve_stale_data);
+  EXPECT_EQ(seen[1].min_replicas_max_lag, 4);
 }
 
 }  // namespace

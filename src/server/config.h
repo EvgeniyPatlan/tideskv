@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <istream>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -44,6 +45,12 @@ struct ConfigValues {
   std::string replica_announce_ip;  // REPLCONF ip-address
   int replica_announce_port = 0;    // 0 = use port
   int replica_priority = 100;       // shown in INFO only
+  // Replication, M6b.
+  bool replica_serve_stale_data = true;  // replica-serve-stale-data (M6b D8)
+  int min_replicas_to_write = 0;         // min-replicas-to-write (D12)
+  int min_replicas_max_lag = 10;         // min-replicas-max-lag, seconds (D12)
+  int key_load_delay = 0;                // hidden test knob: us per key a replica loads (D14)
+  int rdb_key_save_delay = 0;            // hidden test knob: us per key a master streams (D14)
 };
 
 class Config {
@@ -64,8 +71,13 @@ class Config {
   Status Rewrite() const;                     // rewrites the loaded file with current values
   ConfigValues Snapshot() const;
   std::string file_path() const;
+  // M6b D13: called after every successful Set/SetMany/LoadFile, outside the lock, with the new values.
+  // Never called on failure. Set it before the Config is shared between threads.
+  void SetOnChange(std::function<void(const ConfigValues&)> fn) { on_change_ = std::move(fn); }
 
  private:
+  Status LoadLocked(std::istream& in, const std::string& path, ConfigValues* applied);
+  std::function<void(const ConfigValues&)> on_change_;
   mutable std::shared_mutex mu_;
   mutable std::mutex rewrite_mu_;
   ConfigValues values_;
