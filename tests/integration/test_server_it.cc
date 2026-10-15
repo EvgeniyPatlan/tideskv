@@ -83,7 +83,11 @@ TEST(TestServerIT, SanitizerReportInTheChildLogFailsTheTest) {
                              "ERROR: AddressSanitizer: heap-use-after-free on address 0x1",
                              "ERROR: LeakSanitizer: detected memory leaks",
                              "SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior x.cc:1:1",
-                             "ThreadSanitizer: CHECK failed: sanitizer_deadlock_detector.h:67"}) {
+                             "ThreadSanitizer: CHECK failed: sanitizer_deadlock_detector.h:67",
+                             // G6: TSan's own errors and fatal stops, and UBSan's per-site line
+                             "ERROR: ThreadSanitizer: SEGV on unknown address 0x000000000000",
+                             "FATAL: ThreadSanitizer: unexpected memory mapping 0x7f0000000000",
+                             "src/x.cc:1:1: runtime error: signed integer overflow"}) {
     g_marker = marker;
     g_fake_server = WriteFakeServer(dir, "echo '" + g_marker + "' >&2");
     EXPECT_NONFATAL_FAILURE(

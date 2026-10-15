@@ -48,9 +48,12 @@ constexpr int kExitPortInUse = 3;  // tideskv-server: the port is taken (ServerI
 // killed child never reaches its exit code, so the log, not the exit status, is what proves a clean run.
 constexpr std::string_view kSanitizerMarkers[] = {
     "WARNING: ThreadSanitizer",             // data race, lock-order inversion, signal-unsafe call, ...
+    "ERROR: ThreadSanitizer",               // G6: SEGV and other errors TSan reports, then stops
+    "FATAL: ThreadSanitizer",               // G6: TSan's runtime giving up (memory mapping, ...)
     "ERROR: AddressSanitizer",              // heap/stack misuse
     "ERROR: LeakSanitizer",                 // leaks at exit (asan build)
     "SUMMARY: UndefinedBehaviorSanitizer",  // asan build: -fsanitize=undefined, -fno-sanitize-recover
+    "runtime error:",                       // G6: UBSan's per-site line, also when no SUMMARY follows
     "Sanitizer: CHECK failed",              // a sanitizer runtime aborting on its own limits
 };
 constexpr size_t kMaxReportBytes = 64 * 1024;
