@@ -285,6 +285,62 @@ TEST_F(ManagerTest, FullResyncTakesTheSnapshotAndPinsTheBacklogAtIt) {
   EXPECT_TRUE(WaitFor([&] { return m->Replicas()[0].online; }));
 }
 
+// A parked WAIT client for the manager's tests: its replies land in `link`.
+std::shared_ptr<BlockedClient> WaitClient(BlockingRegistry& reg, const std::shared_ptr<test::FakeLink>& link,
+                                          uint64_t id) {
+  Session s;
+  s.id = id;
+  s.link = link;
+  auto c =
+      std::make_shared<BlockedClient>(reg, s, std::vector<std::string>{"WAIT"}, encoding::ValueType::kList,
+                                      std::vector<std::string>{}, std::nullopt);
+  reg.Add(c);
+  return c;
+}
+
+// D9: an ACK answers the WAIT clients it satisfies, with the count; a waiter added after the ACK arrived
+// is answered by AddWaiter itself.
+TEST_F(ManagerTest, AnAckAnswersTheWaitClientsItSatisfies) {
+  auto m = Make();
+  Fd replica = Attach(*m, 4);
+  EXPECT_EQ(m->CountAcked(0), 1);  // a partial-sync link is online at once
+  EXPECT_EQ(m->CountAcked(3), 0);
+  BlockingRegistry reg;
+  auto link = std::make_shared<test::FakeLink>();
+  auto two = WaitClient(reg, link, 1);
+  auto one = WaitClient(reg, link, 2);
+  m->AddWaiter(two, 3, 2);
+  m->AddWaiter(one, 3, 1);
+  EXPECT_FALSE(one->ended());
+  ASSERT_TRUE(WriteAll(replica.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());
+  ASSERT_TRUE(WaitFor([&] { return one->ended(); }));
+  EXPECT_EQ(link->Take(), std::vector<std::string>{":1\r\n"});
+  EXPECT_FALSE(two->ended());  // one replica of the two it asked for
+  EXPECT_EQ(m->CountAcked(3), 1);
+  ASSERT_TRUE(WriteAll(replica.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());  // CF-M6b-7
+  auto late = WaitClient(reg, link, 3);
+  m->AddWaiter(late, 3, 1);
+  EXPECT_TRUE(late->ended());
+  EXPECT_EQ(link->Take(), std::vector<std::string>{":1\r\n"});
+  ASSERT_TRUE(two->Cancel());  // its timeout; the tick prunes it
+  EXPECT_EQ(reg.blocked_clients(), 0u);
+}
+
+// D10: a full-sync link counts for WAIT only from its first ACK after LOADEND.
+TEST_F(ManagerTest, AFullSyncLinkIsNotCountedUntilItAcks) {
+  auto m = Make();
+  const PsyncResult full = m->HandlePsync({"?", 0}, {});
+  ASSERT_EQ(full.decision, PsyncDecision::kFullResync);
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  m->AttachReplica(full.pending_id, fds[0], "");
+  Fd replica(fds[1]);
+  ASSERT_NE(ReadUntil(replica.get(), "$7\r\nLOADEND\r\n").find("LOADEND"), std::string::npos);
+  EXPECT_EQ(m->CountAcked(0), 0);
+  ASSERT_TRUE(WriteAll(replica.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());
+  EXPECT_TRUE(WaitFor([&] { return m->CountAcked(3) == 1; }));
+}
+
 // D14: rdb-key-save-delay (OnConfig) slows every key a full-sync sender streams.
 TEST_F(ManagerTest, KeySaveDelayThrottlesTheSnapshotStream) {
   auto m = Make();

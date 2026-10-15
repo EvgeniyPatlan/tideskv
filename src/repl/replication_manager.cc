@@ -134,6 +134,7 @@ void ReplicationManager::AttachReplica(uint64_t pending_id, int fd, std::string 
   ReplSender::Callbacks cb;
   cb.repl_timeout = [this] { return Timeout(); };
   cb.key_save_delay_us = [this] { return key_save_delay_us_.load(std::memory_order_relaxed); };
+  cb.on_ack = [this] { OnAck(); };  // WAIT (D9)
   auto sender = std::make_unique<ReplSender>(storage_, log_, std::move(owned), p.next_seq, std::move(cb));
   sender->SetPeer(p.peer.ip, p.peer.listening_port);
   sender->SetUnread(std::move(unread));
@@ -405,6 +406,30 @@ void ReplicationManager::Reap() {
     expired = TakePendingLocked([&](const Pending& p) { return now - p.created > timeout; });
   }
   for (auto& s : dead) s->Stop();
+  waits_.Prune();  // WAIT clients that timed out, were unblocked or went away
+}
+
+int64_t ReplicationManager::CountAcked(uint64_t seq) const { return CountAtLeast(OnlineAcks(), seq); }
+
+std::vector<uint64_t> ReplicationManager::OnlineAcks() const {
+  std::lock_guard lock(mu_);
+  std::vector<uint64_t> acks;
+  for (const auto& s : senders_) {
+    if (s->alive() && s->online()) acks.push_back(s->acked());
+  }
+  return acks;
+}
+
+void ReplicationManager::AddWaiter(std::shared_ptr<BlockedClient> client, uint64_t seq, int64_t numreplicas) {
+  waits_.Add(std::move(client), seq, numreplicas);
+  OnAck();  // an ACK may have arrived between the caller's count and the Add
+}
+
+void ReplicationManager::OnAck() {
+  if (waits_.size() == 0) return;
+  for (auto& ready : waits_.Release(OnlineAcks())) {
+    ready.client->Unblock(":" + std::to_string(ready.count) + "\r\n");  // outside mu_ and the list's lock
+  }
 }
 
 std::string ReplicationManager::replid() const {

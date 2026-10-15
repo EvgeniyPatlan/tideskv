@@ -22,7 +22,7 @@ void ConnectionBlockHandler::Block(const BlockRequest& request) {
   Session copy = session_;
   copy.blocked.reset();
   auto client = std::make_shared<BlockedClient>(registry_, std::move(copy), argv_, request.type, request.keys,
-                                                deadline);
+                                                deadline, request.timeout_reply);
   session_.blocked = client;
   std::string refusal;
   if (!registry_.AddIfCurrent(client, epoch_, &refusal)) {

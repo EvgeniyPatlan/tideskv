@@ -19,6 +19,8 @@ struct BlockRequest {
   encoding::ValueType type = encoding::ValueType::kList;  // kList or kZSet
   std::vector<std::string> keys;                          // in argument order (duplicates allowed)
   int64_t timeout_ms = 0;                                 // relative; 0 = forever
+  // The encoded reply on timeout / CLIENT UNBLOCK TIMEOUT, built when the wait ends; empty = a null array.
+  std::function<std::string()> timeout_reply;
 };
 
 class BlockHandler {

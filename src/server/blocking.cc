@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "exec/thread_commit_seq.h"
+
 namespace tideskv {
 namespace {
 
@@ -24,19 +26,32 @@ std::vector<std::string> Dedupe(std::vector<std::string> keys) {
 
 BlockedClient::BlockedClient(BlockingRegistry& registry, Session session, std::vector<std::string> argv,
                              encoding::ValueType type, std::vector<std::string> keys,
-                             std::optional<Clock::time_point> deadline)
+                             std::optional<Clock::time_point> deadline,
+                             std::function<std::string()> timeout_reply)
     : registry_(registry),
       session_(std::move(session)),
       argv_(std::move(argv)),
       type_(type),
       keys_(Dedupe(std::move(keys))),
-      deadline_(deadline) {}
+      deadline_(deadline),
+      timeout_reply_(std::move(timeout_reply)) {}
+
+std::string BlockedClient::TimeoutReply() const { return timeout_reply_ ? timeout_reply_() : std::string(); }
+
+bool BlockedClient::ended() const {
+  std::lock_guard lock(mu_);
+  return done_;
+}
 
 BlockedClient::ServeResult BlockedClient::TryServe(const Attempt& attempt) {
   std::lock_guard lock(mu_);
   if (done_) return ServeResult::kGone;
+  const uint64_t before = ThreadLastCommitSeq();
   std::optional<std::string> reply = attempt();
   if (!reply) return ServeResult::kStillBlocked;
+  if (const uint64_t after = ThreadLastCommitSeq(); after != before) {
+    served_seq_.store(after, std::memory_order_release);  // published before Deliver posts the reply
+  }
   EndLocked();
   Deliver(std::move(*reply), false);
   return ServeResult::kServed;

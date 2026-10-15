@@ -13,6 +13,7 @@
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "exec/engine.h"
+#include "exec/thread_commit_seq.h"
 #include "repl/replication.h"
 #include "script/script_engine.h"
 #include "server/watch.h"
@@ -166,7 +167,9 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }
   if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv, flags);
+  const uint64_t before = ThreadLastCommitSeq();
   spec->handler(ctx, argv);
+  if (const uint64_t after = ThreadLastCommitSeq(); after != before) ctx.session.woff = after;  // WAIT (D9)
 }
 
 }  // namespace tideskv

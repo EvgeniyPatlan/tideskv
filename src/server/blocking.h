@@ -32,9 +32,10 @@ class BlockedClient {
   using Attempt = std::function<std::optional<std::string>()>;
 
   // `session` is a copy of the connection's session at the time it blocked (protocol, db, link ...).
+  // `timeout_reply` builds the reply for a timeout or CLIENT UNBLOCK TIMEOUT (WAIT); none = a null array.
   BlockedClient(BlockingRegistry& registry, Session session, std::vector<std::string> argv,
                 encoding::ValueType type, std::vector<std::string> keys,
-                std::optional<Clock::time_point> deadline);
+                std::optional<Clock::time_point> deadline, std::function<std::string()> timeout_reply = {});
   BlockedClient(const BlockedClient&) = delete;
   BlockedClient& operator=(const BlockedClient&) = delete;
 
@@ -55,6 +56,12 @@ class BlockedClient {
   const std::vector<std::string>& argv() const { return argv_; }
   const Session& session() const { return session_; }
   std::optional<Clock::time_point> deadline() const { return deadline_; }
+  // The encoded timeout reply; empty when the command has none (the caller replies a null array).
+  std::string TimeoutReply() const;
+  // The seq TryServe's attempt committed on the serving thread (0: it wrote nothing). Read by the client's
+  // connection once the served reply arrives, so its next WAIT counts that write (M6b D9).
+  uint64_t served_seq() const { return served_seq_.load(std::memory_order_acquire); }
+  bool ended() const;  // the wait ended (served, timed out, unblocked or cancelled)
 
  private:
   void EndLocked();
@@ -66,7 +73,9 @@ class BlockedClient {
   const encoding::ValueType type_;
   const std::vector<std::string> keys_;
   const std::optional<Clock::time_point> deadline_;
-  std::mutex mu_;
+  const std::function<std::string()> timeout_reply_;
+  std::atomic<uint64_t> served_seq_{0};
+  mutable std::mutex mu_;
   bool done_ = false;  // guarded by mu_
 };
 

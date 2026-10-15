@@ -179,6 +179,8 @@ void ClientUnblock(ExecContext& ctx, const ArgList& argv) {
   resp::ReplyBuilder r(target->session().protocol);
   if (error) {
     r.Error(kErrUnblockedByClient);
+  } else if (std::string t = target->TimeoutReply(); !t.empty()) {
+    r.Raw(t);  // WAIT replies its count (D9)
   } else {
     r.NullArray();
   }

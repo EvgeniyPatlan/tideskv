@@ -59,6 +59,7 @@ struct Session {
   // calls this with the fd and the unread input after PSYNC, then dies without touching the socket again.
   std::function<void(int fd, std::string unread)> takeover;
   bool is_replica_link = false;  // PSYNC succeeded: further PSYNC/SYNC are ignored (Redis CLIENT_SLAVE)
+  uint64_t woff = 0;             // Redis c->woff: the seq of this client's last write (WAIT, M6b D9)
 };
 
 }  // namespace tideskv

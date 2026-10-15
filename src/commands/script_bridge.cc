@@ -15,7 +15,8 @@ ScriptBridge::ScriptBridge(ExecContext& caller) : caller_(caller) {
   session_.peer = caller.session.peer;
   session_.name = caller.session.name;
   session_.db = caller.session.db;
-  session_.authenticated = true;  // the script runs as its caller
+  session_.woff = caller.session.woff;  // WAIT inside the script counts the caller's last write (D9)
+  session_.authenticated = true;        // the script runs as its caller
 }
 
 std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& argv, int resp,

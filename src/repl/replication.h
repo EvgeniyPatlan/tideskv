@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -10,6 +11,8 @@
 #include "server/session.h"
 
 namespace tideskv {
+
+class BlockedClient;  // server/blocking.h
 
 enum class ReplRole : uint8_t { kMaster, kReplica };
 
@@ -109,6 +112,12 @@ class Replication {
   // MASTERDOWN (M6b D8): a replica whose link is not connected (sync included) while
   // replica-serve-stale-data is no. Lock-free.
   virtual bool StaleRefusing() const = 0;
+
+  // WAIT (M6b D9): how many online replicas (past their full sync) last acknowledged a seq >= `seq`.
+  virtual int64_t CountAcked(uint64_t seq) const = 0;
+  // Parks `client` (already registered in the BlockingRegistry) until CountAcked(seq) >= numreplicas; it
+  // is then answered `:<count>` from the ACK path. A timeout, CLIENT UNBLOCK or disconnect ends it first.
+  virtual void AddWaiter(std::shared_ptr<BlockedClient> client, uint64_t seq, int64_t numreplicas) = 0;
 };
 
 }  // namespace tideskv

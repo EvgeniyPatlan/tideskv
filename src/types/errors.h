@@ -57,6 +57,14 @@ inline constexpr size_t kMaxStringSize = 512ULL * 1024 * 1024;  // proto-max-bul
 inline constexpr std::string_view kErrTimeoutNotFloat = "ERR timeout is not a float or out of range";
 inline constexpr std::string_view kErrTimeoutNegative = "ERR timeout is negative";
 inline constexpr std::string_view kErrTimeoutOutOfRange = "ERR timeout is out of range";
+// getTimeoutFromObjectOrReply(UNIT_MILLISECONDS) (timeout.c:165-196; WAIT, verified on redis:7.2.5). The
+// negative and out-of-range texts are the two above.
+inline constexpr std::string_view kErrTimeoutNotInteger = "ERR timeout is not an integer or out of range";
+// replication.c:3543 (waitCommand), checked before argument parsing.
+inline constexpr std::string_view kErrWaitOnReplica =
+    "ERR WAIT cannot be used with replica instances. Please also note that since Redis 4.0 if a replica is "
+    "configured to be writable (which is not the default) writes to replicas are just local and are not "
+    "propagated.";
 
 inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
 inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";

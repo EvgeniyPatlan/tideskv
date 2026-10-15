@@ -20,6 +20,7 @@
 #include "repl/repl_sender.h"
 #include "repl/repl_state.h"
 #include "repl/replication.h"
+#include "repl/wait_list.h"
 #include "server/config.h"
 #include "storage/storage.h"
 
@@ -92,6 +93,8 @@ class ReplicationManager final : public Replication {
   Status BecomeMaster() override;
   RoleInfo Role() const override;
   bool StaleRefusing() const override;
+  int64_t CountAcked(uint64_t seq) const override;
+  void AddWaiter(std::shared_ptr<BlockedClient> client, uint64_t seq, int64_t numreplicas) override;
   // Stores the config values that matter to replication. Only the single-threaded startup call and
   // RefreshConfig may use it: concurrent callers could store in the wrong order.
   void OnConfig(const ConfigValues& v);
@@ -148,7 +151,11 @@ class ReplicationManager final : public Replication {
   // releasing mu_: they may hold a storage snapshot.
   std::vector<Pending> TakePendingLocked(const std::function<bool(const Pending&)>& pred);
 
-  uint64_t LiveSendersLocked() const;  // requires mu_
+  uint64_t LiveSendersLocked() const;        // requires mu_
+  std::vector<uint64_t> OnlineAcks() const;  // the alive, online senders' ACKs (takes mu_)
+  // A sender's on_ack (its thread) and AddWaiter: answers the WAIT clients the ACKs now satisfy, outside
+  // every manager lock (they take BlockedClient::mu_).
+  void OnAck();
   void TickLoop();
   void Reap();
   std::chrono::milliseconds Timeout() const;
@@ -174,6 +181,7 @@ class ReplicationManager final : public Replication {
   std::string master_host_;                           // guarded by mu_; set while a replica
   uint16_t master_port_ = 0;                          // guarded by mu_
   std::shared_ptr<ReplClient> client_;                // guarded by mu_; shared so Role() may read it
+  WaitList waits_;                                    // WAIT clients (D9); its own lock, never with mu_
   std::atomic<ReplRole> role_{ReplRole::kMaster};
   std::atomic<bool> serve_stale_{true};                                   // replica-serve-stale-data
   std::atomic<int> key_save_delay_us_{0};                                 // rdb-key-save-delay (D14)

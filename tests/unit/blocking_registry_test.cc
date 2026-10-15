@@ -77,14 +77,14 @@ TEST(BlockingRegistry, ABlockStartedBeforeDisconnectAllIsRefusedAndClosed) {
   ReadyKeys ready;
   ConnectionBlockHandler before(r, s, argv, ready);     // the command is dispatched...
   EXPECT_EQ(r.DisconnectAll("UNBLOCKED demoted"), 0u);  // ...the node is demoted...
-  before.Block({ValueType::kList, {"k"}, 0});           // ...then it tries to block
+  before.Block({ValueType::kList, {"k"}, 0, {}});       // ...then it tries to block
   EXPECT_EQ(r.blocked_clients(), 0u);
   EXPECT_EQ(link->Take(), (std::vector<std::string>{"-UNBLOCKED demoted\r\n"}));
   EXPECT_EQ(link->closes(), 1);
   EXPECT_TRUE(ready.empty());
   s.blocked.reset();
   ConnectionBlockHandler after(r, s, argv, ready);  // dispatched after the demotion: blocks normally
-  after.Block({ValueType::kList, {"k"}, 0});
+  after.Block({ValueType::kList, {"k"}, 0, {}});
   EXPECT_EQ(r.blocked_clients(), 1u);
   EXPECT_TRUE(link->Take().empty());
 }
@@ -193,7 +193,7 @@ TEST(ConnectionBlockHandler, HugeTimeoutBlocksForeverAndNormalOneHasADeadline) {
   ReadyKeys ready;
   const std::vector<std::string> argv{"blpop", "k", "10000000000"};
   ConnectionBlockHandler handler(r, s, argv, ready);
-  handler.Block({ValueType::kList, {"k"}, 10'000'000'000'000});
+  handler.Block({ValueType::kList, {"k"}, 10'000'000'000'000, {}});
   ASSERT_NE(s.blocked, nullptr);
   EXPECT_EQ(s.blocked->deadline(), std::nullopt);
   EXPECT_TRUE(s.blocked->Cancel());
@@ -202,7 +202,7 @@ TEST(ConnectionBlockHandler, HugeTimeoutBlocksForeverAndNormalOneHasADeadline) {
   s2.id = 2;
   ConnectionBlockHandler handler2(r, s2, argv, ready);
   const auto before = BlockedClient::Clock::now();
-  handler2.Block({ValueType::kList, {"k"}, 200});
+  handler2.Block({ValueType::kList, {"k"}, 200, {}});
   ASSERT_NE(s2.blocked, nullptr);
   ASSERT_TRUE(s2.blocked->deadline().has_value());
   EXPECT_GE(*s2.blocked->deadline(), before + std::chrono::milliseconds(200));

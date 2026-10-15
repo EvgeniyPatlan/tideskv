@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "common/coding.h"
+#include "exec/thread_commit_seq.h"
 #include "types/errors.h"
 
 namespace tideskv {
@@ -127,7 +128,9 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
   const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
   // R12: a batch no replica would accept is refused like a fenced commit: nothing taken, nothing written.
   if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
-  return AppendAndCommit(txn, seq, record, cum_ + record.size());
+  if (Status st = AppendAndCommit(txn, seq, record, cum_ + record.size()); !st.ok()) return st;
+  engine_internal::t_last_commit_seq = seq;  // this thread's write, for WAIT (M6b D9)
+  return Status::Ok();
 }
 
 void ReplLog::FenceLocalWrites(bool fenced) {

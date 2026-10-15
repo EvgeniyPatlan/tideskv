@@ -285,7 +285,7 @@ std::unique_ptr<Server> StartBlockingServer(BlockingRegistry& registry) {
     if (argv[0] == "BLOCK") {
       ReadyKeys ready;
       ConnectionBlockHandler block(registry, s, argv, ready);
-      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1])});
+      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1]), {}});
     } else if (argv[0] == "WAKE") {
       auto c = registry.Find(std::stoull(argv[1]));
       r.Integer(c != nullptr && c->Unblock("+" + argv[2] + "\r\n") ? 1 : 0);
@@ -469,7 +469,7 @@ std::unique_ptr<Server> StartTakeoverServer(Takeover& t, BlockingRegistry& regis
     } else if (argv[0] == "BLOCK") {
       ReadyKeys ready;
       ConnectionBlockHandler block(registry, s, argv, ready);
-      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1])});
+      block.Block({encoding::ValueType::kList, {"k"}, std::stoll(argv[1]), {}});
     } else {
       r.Bulk(argv[0]);
     }

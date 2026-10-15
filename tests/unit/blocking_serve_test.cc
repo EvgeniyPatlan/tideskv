@@ -32,7 +32,7 @@ bool g_rerun = false;  // TTHROW: the next run is a re-run
 void TBPop(ExecContext& ctx, const ArgList& argv) {
   if (std::exchange(g_pretend_empty, false) && ctx.block != nullptr) {
     return ctx.block->Block(
-        {encoding::ValueType::kList, std::vector<std::string>(argv.begin() + 1, argv.end()), 0});
+        {encoding::ValueType::kList, std::vector<std::string>(argv.begin() + 1, argv.end()), 0, {}});
   }
   const auto keys = ArgsFrom(argv, 1);
   std::optional<PoppedFrom> popped;
@@ -42,7 +42,8 @@ void TBPop(ExecContext& ctx, const ArgList& argv) {
   if (!st.ok()) return ReplyError(ctx, st);
   if (popped) return ctx.reply.Bulk(popped->values.front());
   if (ctx.block == nullptr) return ctx.reply.NullArray();
-  ctx.block->Block({encoding::ValueType::kList, std::vector<std::string>(argv.begin() + 1, argv.end()), 0});
+  ctx.block->Block(
+      {encoding::ValueType::kList, std::vector<std::string>(argv.begin() + 1, argv.end()), 0, {}});
 }
 
 void TPush(ExecContext& ctx, const ArgList& argv) {
@@ -60,7 +61,7 @@ void TPush(ExecContext& ctx, const ArgList& argv) {
 // TTHROW key: blocks on key the first time it runs; every re-run throws (a command bug on the serve path).
 void TThrow(ExecContext& ctx, const ArgList& argv) {
   if (!std::exchange(g_rerun, true)) {
-    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0});
+    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0, {}});
   }
   throw std::runtime_error("tthrow re-run");
 }
@@ -226,7 +227,7 @@ std::unique_ptr<TimedOutScript> g_script;
 // between the serve's type check and the re-run's own Engine call.
 void TBusyPop(ExecContext& ctx, const ArgList& argv) {
   if (!std::exchange(g_rerun, true)) {
-    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0});
+    return ctx.block->Block({encoding::ValueType::kList, {std::string(argv[1])}, 0, {}});
   }
   g_script = std::make_unique<TimedOutScript>(dynamic_cast<ServerServices&>(ctx.server),
                                               std::chrono::milliseconds(100));

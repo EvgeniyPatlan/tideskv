@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <string_view>
 #include <utility>
 
@@ -138,6 +139,7 @@ void Connection::UnblockAndClose(std::string reply) {
 // current wait; nothing here has to tell a stale reply from a fresh one.
 void Connection::OnUnblocked(const std::string& reply, bool close_after) {
   if (closed_ || !session_.blocked) return;
+  session_.woff = std::max(session_.woff, session_.blocked->served_seq());  // a served pop wrote (D9)
   reply_.Raw(reply);
   if (close_after) session_.close_after_reply = true;  // the pipeline does not run; Close after the write
   ResumeAfterBlock();
@@ -157,7 +159,12 @@ void Connection::ArmBlockTimer() {
   block_timer_.async_wait([self = shared_from_this(), blocked = session_.blocked](std::error_code ec) {
     if (ec || self->closed_ || self->session_.blocked != blocked) return;  // cancelled or superseded
     if (!blocked->Cancel()) return;  // served concurrently: that reply is already posted to us
-    self->reply_.NullArray();        // Redis replyToBlockedClientTimedOut for list/zset (F5)
+    // Redis replyToBlockedClientTimedOut: WAIT's count (D9), else a null array for list/zset (F5).
+    if (std::string r = blocked->TimeoutReply(); !r.empty()) {
+      self->reply_.Raw(r);
+    } else {
+      self->reply_.NullArray();
+    }
     self->ResumeAfterBlock();
   });
 }

@@ -34,7 +34,7 @@ void BlockingPop(ExecContext& ctx, const std::vector<std::string_view>& keys, Li
     return ctx.reply.Bulk(popped->values.front());
   }
   if (ctx.block == nullptr) return ctx.reply.NullArray();
-  ctx.block->Block({encoding::ValueType::kList, Owned(keys), timeout_ms});
+  ctx.block->Block({encoding::ValueType::kList, Owned(keys), timeout_ms, {}});
 }
 
 // BLPOP/BRPOP key [key ...] timeout: the timeout is parsed first.
@@ -77,7 +77,7 @@ void BlockingMove(ExecContext& ctx, const ArgList& argv, ListEnd from, ListEnd t
     return ctx.reply.Bulk(*moved);
   }
   if (ctx.block == nullptr) return ctx.reply.Null();  // a null bulk here (t_list.c:1292), not an array
-  ctx.block->Block({encoding::ValueType::kList, {argv[1]}, timeout_ms});
+  ctx.block->Block({encoding::ValueType::kList, {argv[1]}, timeout_ms, {}});
 }
 
 void BLMove(ExecContext& ctx, const ArgList& argv) {

@@ -14,6 +14,7 @@
 #include "exec/lock_manager.h"
 #include "exec/repl_log.h"
 #include "repl/replication.h"
+#include "repl/wait_list.h"
 #include "script/script_engine.h"
 #include "server/blocking.h"
 #include "server/watch.h"
@@ -32,6 +33,11 @@ class FakeReplication final : public Replication {
   struct Attached {
     uint64_t pending_id = 0;
     std::string unread;
+  };
+  struct Waiter {
+    std::shared_ptr<BlockedClient> client;
+    uint64_t seq = 0;
+    int64_t numreplicas = 0;
   };
 
   std::atomic<bool> stale_refusing{false};
@@ -71,6 +77,10 @@ class FakeReplication final : public Replication {
     set_role(ReplRole::kMaster);
     return Status::Ok();
   }
+  int64_t CountAcked(uint64_t seq) const override { return repl::CountAtLeast(acks, seq); }
+  void AddWaiter(std::shared_ptr<BlockedClient> client, uint64_t seq, int64_t numreplicas) override {
+    waiters.push_back({std::move(client), seq, numreplicas});
+  }
   RoleInfo Role() const override {
     RoleInfo r = role_info;
     r.role = role();
@@ -90,6 +100,8 @@ class FakeReplication final : public Replication {
   RoleInfo role_info;  // what Role() reports (role and offset are filled in live)
   std::vector<std::pair<std::string, uint16_t>> become_replica;
   int become_master = 0;
+  std::vector<uint64_t> acks;   // the online replicas' ACKs CountAcked counts (WAIT)
+  std::vector<Waiter> waiters;  // AddWaiter calls
 
  private:
   uint64_t next_pending_id_ = 0;

@@ -32,7 +32,7 @@ void BlockingZPop(ExecContext& ctx, const std::vector<std::string_view>& keys, b
   }
   if (ctx.block == nullptr) return ctx.reply.NullArray();
   ctx.block->Block(
-      {encoding::ValueType::kZSet, std::vector<std::string>(keys.begin(), keys.end()), timeout_ms});
+      {encoding::ValueType::kZSet, std::vector<std::string>(keys.begin(), keys.end()), timeout_ms, {}});
 }
 
 // Parse order (Redis 7.2.5 blockingGenericZpopCommand): the timeout is the only argument parsed, before
