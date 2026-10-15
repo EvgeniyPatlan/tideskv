@@ -286,11 +286,11 @@ func TestWaitBlockExecutingCommand(t *testing.T) {
 func TestContinueExecutingCommandAfterWait(t *testing.T) {
 	// Start master server
 	masterSrv := util.StartServer(t, map[string]string{})
-	// defer masterSrv.Close()
+	defer masterSrv.Close() // tideskv: commented out upstream, which leaked both servers on every run
 
 	// Start slave server
 	slaveSrv := util.StartServer(t, map[string]string{})
-	// defer slaveSrv.Close()
+	defer slaveSrv.Close() // tideskv: commented out upstream, which leaked both servers on every run
 
 	masterRdb := masterSrv.NewClient()
 	defer func() { require.NoError(t, masterRdb.Close()) }()
