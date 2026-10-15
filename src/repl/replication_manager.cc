@@ -33,10 +33,11 @@ void ReplicationManager::Start() {
 }
 
 void ReplicationManager::Shutdown() {
+  std::vector<Pending> forgotten;  // dropped outside mu_: they may hold a storage snapshot
   {
     std::lock_guard lock(mu_);
     shut_down_ = true;
-    pending_.clear();
+    forgotten = TakePendingLocked([](const Pending&) { return true; });
   }
   tick_cv_.notify_all();
   {
@@ -54,7 +55,20 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
   return options_.repl_timeout ? options_.repl_timeout() : std::chrono::milliseconds(kDefaultTimeout);
 }
 
+// D8 under mu_, then (FULLRESYNC) the snapshot outside it (D2, CF-M6b-3), then the hand-off registered.
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
+  PsyncResult r = Decide(req, peer);  // refusals; a CONTINUE is registered and counted here
+  if (!r.error.empty() || r.decision == PsyncDecision::kContinue) return r;
+  auto snap = log_.SnapshotAtLast();  // S and the view together
+  if (!snap.ok()) {
+    spdlog::error("full resynchronisation snapshot failed: {}", snap.status().ToString());
+    r.error = std::string(kErrStorage);  // no engine detail in the reply
+    return r;
+  }
+  return RegisterFullSync(std::move(r), std::move(snap).value(), req, peer);
+}
+
+PsyncResult ReplicationManager::Decide(const PsyncRequest& req, const ReplicaPeer& peer) {
   const LogBounds bounds{log_.first_retained(), log_.last(), options_.baseline_unknown};
   const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
   std::lock_guard lock(mu_);
@@ -76,10 +90,27 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
   if (r.decision == PsyncDecision::kContinue) {
     sync_partial_ok_.fetch_add(1, std::memory_order_relaxed);
     r.pending_id = next_pending_id_++;
-    pending_[r.pending_id] = Pending{req.next_seq, peer, std::chrono::steady_clock::now()};
+    pending_[r.pending_id] = Pending{req.next_seq, peer, std::chrono::steady_clock::now(), nullptr};
+  }
+  return r;
+}
+
+// The snapshot was taken without mu_, so the role may have changed meanwhile: a demoted node refuses
+// (F8), a shut-down one registers nothing (the hand-off is then refused by AttachReplica).
+PsyncResult ReplicationManager::RegisterFullSync(PsyncResult r, SyncSnapshot snap, const PsyncRequest& req,
+                                                 const ReplicaPeer& peer) {
+  std::lock_guard lock(mu_);
+  if (role() == ReplRole::kReplica) {
+    r.error = std::string(kErrPsyncOnReplica);
     return r;
   }
-  sync_full_.fetch_add(1, std::memory_order_relaxed);  // M6b sends the data; M6a closes the link
+  if (shut_down_) return r;
+  r.seq = snap.seq;
+  r.pending_id = next_pending_id_++;
+  const uint64_t next_seq = snap.seq + 1;
+  pending_[r.pending_id] = Pending{next_seq, peer, std::chrono::steady_clock::now(),
+                                   std::make_unique<SyncSnapshot>(std::move(snap))};
+  sync_full_.fetch_add(1, std::memory_order_relaxed);
   if (req.replid != "?") sync_partial_err_.fetch_add(1, std::memory_order_relaxed);
   return r;
 }
@@ -93,15 +124,23 @@ void ReplicationManager::AttachReplica(uint64_t pending_id, int fd, std::string 
     spdlog::warn("replica hand-off {} refused: no pending PSYNC (expired?)", pending_id);
     return;
   }
-  const Pending p = std::move(it->second);
+  Pending p = std::move(it->second);
   pending_.erase(it);
   ReplSender::Callbacks cb;
   cb.repl_timeout = [this] { return Timeout(); };
+  cb.key_save_delay_us = [this] { return key_save_delay_us_.load(std::memory_order_relaxed); };
   auto sender = std::make_unique<ReplSender>(storage_, log_, std::move(owned), p.next_seq, std::move(cb));
   sender->SetPeer(p.peer.ip, p.peer.listening_port);
   sender->SetUnread(std::move(unread));
+  if (p.snapshot) {
+    sender->SetSnapshot(std::move(*p.snapshot));
+    spdlog::info("replica {}:{} attached, full synchronisation from seq {}", p.peer.ip, p.peer.listening_port,
+                 p.next_seq - 1);
+  } else {
+    spdlog::info("replica {}:{} attached, streaming from seq {}", p.peer.ip, p.peer.listening_port,
+                 p.next_seq);
+  }
   sender->Start();  // spawns the thread; never blocks
-  spdlog::info("replica {}:{} attached, streaming from seq {}", p.peer.ip, p.peer.listening_port, p.next_seq);
   senders_.push_back(std::move(sender));
 }
 
@@ -122,14 +161,17 @@ bool ReplicationManager::BecomeReplica(const std::string& host, uint16_t port) {
   const RoleHooks& hooks = options_.role;
   log_.FenceLocalWrites(true);  // a barrier: once it returns no local commit can take a seq (CF1)
   std::shared_ptr<ReplClient> old;
+  std::vector<Pending> forgotten;  // dropped outside mu_: they may hold a storage snapshot
   {
     std::lock_guard lock(mu_);  // Role() sees the role, the master and (no) client change together
     old = std::exchange(client_, nullptr);
     master_host_ = host;
     master_port_ = port;
     role_.store(ReplRole::kReplica, std::memory_order_release);
-    pending_.clear();  // F8: a replica serves no replica; a hand-off still in flight is refused
+    // F8: a replica serves no replica; a hand-off still in flight is refused
+    forgotten = TakePendingLocked([](const Pending&) { return true; });
   }
+  forgotten.clear();
   if (hooks.stop_reaper) hooks.stop_reaper();
   // A blocking command dispatched before this point either registered already (and is ended here) or
   // registers later and is refused: DisconnectAll moves the registry to a new epoch (fix round 1).
@@ -242,6 +284,7 @@ bool ReplicationManager::StaleRefusing() const {
 
 void ReplicationManager::OnConfig(const ConfigValues& v) {
   serve_stale_.store(v.replica_serve_stale_data, std::memory_order_release);
+  key_save_delay_us_.store(v.rdb_key_save_delay, std::memory_order_relaxed);
 }
 
 void ReplicationManager::RefreshConfig(const std::function<ConfigValues()>& snapshot) {
@@ -296,14 +339,15 @@ uint64_t ReplicationManager::OldestNeeded() const {
 
 void ReplicationManager::DropReplicasNeeding(uint64_t up_to) {
   std::vector<std::unique_ptr<ReplSender>> doomed;
+  std::vector<Pending> forgotten;  // dropped outside mu_
   {
     std::lock_guard lock(mu_);
     const auto split = std::stable_partition(senders_.begin(), senders_.end(),
                                              [&](const auto& s) { return s->oldest_needed() > up_to; });
     std::move(split, senders_.end(), std::back_inserter(doomed));
     senders_.erase(split, senders_.end());
-    std::erase_if(pending_,
-                  [&](const auto& kv) { return std::max<uint64_t>(kv.second.next_seq, 1) <= up_to; });
+    forgotten =
+        TakePendingLocked([&](const Pending& p) { return std::max<uint64_t>(p.next_seq, 1) <= up_to; });
   }
   for (auto& s : doomed) {  // outside mu_: joins
     spdlog::warn(
@@ -330,13 +374,14 @@ void ReplicationManager::Reap() {
   const auto timeout = Timeout();
   const auto now = std::chrono::steady_clock::now();
   std::vector<std::unique_ptr<ReplSender>> dead;
+  std::vector<Pending> expired;  // dropped outside mu_
   {
     std::lock_guard lock(mu_);
     const auto split =
         std::stable_partition(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); });
     std::move(split, senders_.end(), std::back_inserter(dead));
     senders_.erase(split, senders_.end());
-    std::erase_if(pending_, [&](const auto& kv) { return now - kv.second.created > timeout; });
+    expired = TakePendingLocked([&](const Pending& p) { return now - p.created > timeout; });
   }
   for (auto& s : dead) s->Stop();
 }
@@ -366,7 +411,7 @@ std::vector<ReplicationManager::ReplicaInfo> ReplicationManager::Replicas() cons
   std::vector<ReplicaInfo> out;
   out.reserve(senders_.size());
   for (const auto& s : senders_) {
-    out.push_back({s->peer_ip(), s->listening_port(), s->acked(), s->last_ack_ms(), s->alive()});
+    out.push_back({s->peer_ip(), s->listening_port(), s->acked(), s->last_ack_ms(), s->alive(), s->online()});
   }
   return out;
 }
@@ -374,6 +419,20 @@ std::vector<ReplicationManager::ReplicaInfo> ReplicationManager::Replicas() cons
 uint64_t ReplicationManager::LiveSendersLocked() const {
   return static_cast<uint64_t>(
       std::count_if(senders_.begin(), senders_.end(), [](const auto& s) { return s->alive(); }));
+}
+
+std::vector<ReplicationManager::Pending> ReplicationManager::TakePendingLocked(
+    const std::function<bool(const Pending&)>& pred) {
+  std::vector<Pending> out;
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (pred(it->second)) {
+      out.push_back(std::move(it->second));
+      it = pending_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return out;
 }
 
 size_t ReplicationManager::pending_count() const {

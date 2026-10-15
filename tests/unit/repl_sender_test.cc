@@ -13,6 +13,7 @@
 
 #include "encoding/replog_codec.h"
 #include "exec/repl_log.h"
+#include "repl/full_sync_frames.h"
 #include "repl/socket_io.h"
 #include "resp/request_parser.h"
 #include "storage/memory_storage.h"
@@ -344,6 +345,82 @@ TEST_F(SenderTest, ConcurrentCommitsArriveStrictlyConsecutive) {
   }
   ASSERT_EQ(seqs.size(), static_cast<size_t>(kCommits));
   for (size_t i = 0; i < seqs.size(); ++i) ASSERT_EQ(seqs[i], i + 1);
+}
+
+TEST_F(SenderTest, StreamsTheSnapshotThenTheLiveTail) {
+  Commit(5);
+  auto snap = log.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  ASSERT_EQ(snap->seq, 5u);
+  Commit(2);  // after the cut: only BATCH frames carry these
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  reader = std::make_unique<Reader>(Fd(fds[1]));
+  sender = std::make_unique<ReplSender>(storage, log, Fd(fds[0]), 6);
+  sender->SetSnapshot(std::move(snap).value());
+  sender->Start();
+  const auto frames = reader->Frames(4);  // LOAD, LOADEND, BATCH 6, BATCH 7
+  ASSERT_EQ(frames.size(), 4u);
+  ASSERT_EQ(frames[0][0], "LOAD");
+  auto ops = DecodeLoadChunk(frames[0][1]);
+  ASSERT_TRUE(ops.ok());
+  EXPECT_EQ(ops->size(), 5u);  // k1..k5, nothing written after the cut
+  EXPECT_EQ(frames[1], (std::vector<std::string>{"LOADEND", "5", ReplogAt(5), "5"}));
+  EXPECT_EQ(frames[2], Batch(6, ReplogAt(6)));
+  EXPECT_EQ(frames[3], Batch(7, ReplogAt(7)));
+  EXPECT_FALSE(sender->online());          // until the replica says it loaded
+  EXPECT_EQ(sender->oldest_needed(), 6u);  // pins the trim at the cut (D2)
+  reader->Send("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n5\r\n");
+  EXPECT_TRUE(WaitFor([&] { return sender->online(); }));
+}
+
+// PF9: at S = 0 the replica's first ACK is 0, which advances nothing but still means it loaded.
+TEST_F(SenderTest, SnapshotOfAnEmptyStoreIsAnEmptyLoadEnd) {
+  auto snap = log.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  reader = std::make_unique<Reader>(Fd(fds[1]));
+  std::atomic<int> acks{0};
+  ReplSender::Callbacks cb;
+  cb.on_ack = [&acks] { ++acks; };
+  sender = std::make_unique<ReplSender>(storage, log, Fd(fds[0]), 1, std::move(cb));
+  sender->SetSnapshot(std::move(snap).value());
+  sender->Start();
+  const auto frames = reader->Frames(1);
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0], (std::vector<std::string>{"LOADEND", "0", "", "0"}));
+  EXPECT_FALSE(sender->online());
+  reader->Send("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n");
+  EXPECT_TRUE(WaitFor([&] { return sender->online(); }));
+  EXPECT_EQ(acks.load(), 1);
+  EXPECT_EQ(sender->acked(), 0u);
+}
+
+TEST_F(SenderTest, ASenderWithoutASnapshotIsOnlineAtStart) {
+  Commit(1);
+  StartSender(2);
+  EXPECT_TRUE(sender->online());
+}
+
+TEST_F(SenderTest, SlowKeysAreKeptAliveWithPingAndStopIsPrompt) {
+  Commit(5);
+  auto snap = log.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  reader = std::make_unique<Reader>(Fd(fds[1]));
+  ReplSender::Callbacks cb;
+  cb.key_save_delay_us = [] { return 400000; };  // 0.4 s per key: the first chunk takes 2 s to build
+  sender = std::make_unique<ReplSender>(storage, log, Fd(fds[0]), 6, cb);
+  sender->SetSnapshot(std::move(snap).value());
+  sender->Start();
+  const auto frames = reader->For(1600ms);
+  ASSERT_FALSE(frames.empty());
+  EXPECT_EQ(frames[0], (std::vector<std::string>{"PING"}));
+  const auto t0 = std::chrono::steady_clock::now();
+  sender->Stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);  // checked between keys
 }
 
 }  // namespace

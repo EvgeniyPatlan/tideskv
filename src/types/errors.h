@@ -78,6 +78,9 @@ inline constexpr std::string_view kErrMaxClients = "ERR max number of clients re
 inline constexpr std::string_view kErrTooLargeToReplicate = "ERR transaction too large to replicate";
 // TidesKV-only: an exception escaped a command (the connection's catch-all, a blocked command's re-run).
 inline constexpr std::string_view kErrInternal = "ERR internal error";
+// TidesKV-only: a storage failure behind a command (reply_util.cc ReplyError; a FULLRESYNC whose
+// snapshot could not be taken). The detail is logged, never sent (spec §5.4).
+inline constexpr std::string_view kErrStorage = "ERR storage error";
 
 // M4 sorted sets (zslParseRange, zslParseLexRange, ZADD/ZINCRBY NaN, ZUNION WEIGHTS).
 inline constexpr std::string_view kErrMinMaxNotFloat = "ERR min or max is not a float";

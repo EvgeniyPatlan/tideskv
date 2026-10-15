@@ -36,6 +36,7 @@ struct ReplicaInfo {
   uint64_t acked = 0;
   int64_t last_ack_ms = 0;
   bool alive = false;
+  bool online = false;  // past its full sync (M6b D10): ROLE lists it, WAIT counts it
 };
 
 // ROLE's data (redis72-replication §2). A master fills offset and replicas; a replica fills host, port,
@@ -56,12 +57,13 @@ struct ReplicaPeer {
   uint16_t listening_port = 0;
 };
 
-// The outcome of PSYNC (D8). pending_id names the replica until its socket is handed over (kContinue).
+// The outcome of PSYNC (D8). pending_id names the replica until its socket is handed over (both
+// decisions: a FULLRESYNC link streams the snapshot, M6b D2).
 struct PsyncResult {
   repl::PsyncDecision decision = repl::PsyncDecision::kFullResync;
   std::string replid;       // this node's replid
-  uint64_t seq = 0;         // kFullResync: the master's last seq
-  uint64_t pending_id = 0;  // kContinue: pass to AttachReplica
+  uint64_t seq = 0;         // kFullResync: the snapshot's seq S (the master's last seq when it was taken)
+  uint64_t pending_id = 0;  // pass to AttachReplica
   std::string error;        // non-empty: PSYNC is refused with this reply; no decision was taken
 };
 
@@ -80,12 +82,13 @@ class Replication {
   virtual ~Replication() = default;
   virtual ReplRole role() const = 0;  // one atomic load
   bool IsReplica() const { return role() == ReplRole::kReplica; }
-  // Decides PSYNC (D8) and, on kContinue, registers a pending replica that AttachReplica completes.
+  // Decides PSYNC (D8) and registers a pending replica that AttachReplica completes (on kFullResync with
+  // the snapshot it streams first).
   // Refused with PsyncResult::error, and nothing decided, on a replica (F8) or beyond maxclients (F4).
   virtual PsyncResult HandlePsync(const repl::PsyncRequest& req, const ReplicaPeer& peer) = 0;
-  // Called by the connection once the +CONTINUE reply has been flushed and asio has released the socket:
-  // takes ownership of fd (closes it if pending_id is unknown or replication is shut down). unread holds
-  // the bytes the client sent after PSYNC; they belong to the replication stream.
+  // Called by the connection once the +CONTINUE / +FULLRESYNC reply has been flushed and asio has released
+  // the socket: takes ownership of fd (closes it if pending_id is unknown or replication is shut down).
+  // unread holds the bytes the client sent after PSYNC; they belong to the replication stream.
   virtual void AttachReplica(uint64_t pending_id, int fd, std::string unread) = 0;
   // A valid REPLCONF from session s (listening-port / ip-address / capa / getack), already recorded in
   // s.replica_handshake by the command.

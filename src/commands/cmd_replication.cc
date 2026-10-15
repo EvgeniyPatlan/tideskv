@@ -29,8 +29,9 @@ ReplicaPeer PeerOf(const Session& s) {
   return p;
 }
 
-// PSYNC <replid> <next_seq> [FAILOVER] (syncCommand, rp:940). +CONTINUE hands the socket to replication
-// once the reply is flushed; +FULLRESYNC closes the link in M6a (M6b sends the data).
+// PSYNC <replid> <next_seq> [FAILOVER] (syncCommand, rp:940). +CONTINUE and +FULLRESYNC both hand the
+// socket to replication once the reply is flushed; after FULLRESYNC the sender streams the snapshot first
+// (M6b D2, D4).
 void Psync(ExecContext& ctx, const ArgList& argv) {
   Session& s = ctx.session;
   if (s.is_replica_link) return;  // already a replica: ignored, no reply (CLIENT_SLAVE)
@@ -45,10 +46,9 @@ void Psync(ExecContext& ctx, const ArgList& argv) {
   if (!r.error.empty()) return ctx.reply.Error(r.error);  // maxclients (F4), a replica (F8): no hand-off
   if (r.decision == repl::PsyncDecision::kFullResync) {
     ctx.reply.SimpleString("FULLRESYNC " + r.replid + " " + std::to_string(r.seq));
-    s.close_after_reply = true;
-    return;
+  } else {
+    ctx.reply.SimpleString("CONTINUE " + r.replid);
   }
-  ctx.reply.SimpleString("CONTINUE " + r.replid);
   s.is_replica_link = true;
   s.takeover = [&repl, id = r.pending_id](int fd, std::string unread) {
     repl.AttachReplica(id, fd, std::move(unread));
@@ -141,8 +141,9 @@ void Replicaof(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.SimpleString(repl.BecomeReplica(host, p) ? std::string_view("OK") : kReplyAlreadyConnected);
 }
 
-// ROLE (roleCommand, redis72-replication §2): a master lists its live replicas, with port and offset as
-// bulk strings; a replica reports its link state and an offset of -1 while the link is down.
+// ROLE (roleCommand, redis72-replication §2): a master lists its live replicas past their full sync
+// (Redis lists only SLAVE_STATE_ONLINE), with port and offset as bulk strings; a replica reports its link
+// state and an offset of -1 while the link is down.
 void Role(ExecContext& ctx, const ArgList& /*argv*/) {
   const RoleInfo r = ctx.server.replication().Role();
   resp::ReplyBuilder& out = ctx.reply;
@@ -158,11 +159,10 @@ void Role(ExecContext& ctx, const ArgList& /*argv*/) {
   out.ArrayHeader(3);
   out.Bulk("master");
   out.Integer(static_cast<int64_t>(r.offset));
-  const auto live =
-      std::count_if(r.replicas.begin(), r.replicas.end(), [](const ReplicaInfo& i) { return i.alive; });
-  out.ArrayHeader(static_cast<size_t>(live));
+  const auto listed = [](const ReplicaInfo& i) { return i.alive && i.online; };
+  out.ArrayHeader(static_cast<size_t>(std::count_if(r.replicas.begin(), r.replicas.end(), listed)));
   for (const ReplicaInfo& i : r.replicas) {
-    if (!i.alive) continue;
+    if (!listed(i)) continue;
     out.ArrayHeader(3);
     out.Bulk(i.ip);
     out.Bulk(std::to_string(i.listening_port));

@@ -126,7 +126,16 @@ class ReplicationManager final : public Replication {
     uint64_t next_seq = 0;
     ReplicaPeer peer;
     std::chrono::steady_clock::time_point created;
+    std::unique_ptr<SyncSnapshot> snapshot;  // FULLRESYNC: what the sender streams first (D2)
   };
+
+  // PSYNC in two steps, so that ReplLog::SnapshotAtLast runs outside mu_ (CF-M6b-3).
+  PsyncResult Decide(const PsyncRequest& req, const ReplicaPeer& peer);
+  PsyncResult RegisterFullSync(PsyncResult r, SyncSnapshot snap, const PsyncRequest& req,
+                               const ReplicaPeer& peer);
+  // Moves the hand-offs matching pred out of pending_ (requires mu_). The caller drops them after
+  // releasing mu_: they may hold a storage snapshot.
+  std::vector<Pending> TakePendingLocked(const std::function<bool(const Pending&)>& pred);
 
   uint64_t LiveSendersLocked() const;  // requires mu_
   void TickLoop();
@@ -156,6 +165,7 @@ class ReplicationManager final : public Replication {
   std::shared_ptr<ReplClient> client_;                // guarded by mu_; shared so Role() may read it
   std::atomic<ReplRole> role_{ReplRole::kMaster};
   std::atomic<bool> serve_stale_{true};                                   // replica-serve-stale-data
+  std::atomic<int> key_save_delay_us_{0};                                 // rdb-key-save-delay (D14)
   std::atomic<ReplicaLinkState> link_state_{ReplicaLinkState::kConnect};  // mirrored from the client
 
   std::mutex role_mu_;  // serialises BecomeReplica / BecomeMaster / Shutdown's client stop

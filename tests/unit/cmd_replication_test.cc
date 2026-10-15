@@ -86,13 +86,14 @@ TEST(PsyncCmd, ContinueAtTheEndOfTheLogAndFromAnEmptyReplica) {
   EXPECT_EQ(h2.Run({"psync", "?", "1"}), "+CONTINUE " + h2.myid() + "\r\n");
 }
 
-TEST(PsyncCmd, FullResyncRepliesTheIdAndLastSeqThenCloses) {
+TEST(PsyncCmd, FullResyncRepliesTheIdAndSeqThenHandsTheSocketOver) {
   ReplHarness h;
   EXPECT_EQ(h.Run({"PSYNC", std::string(40, 'a'), "2"}),
             "+FULLRESYNC " + h.myid() + " " + std::to_string(h.last()) + "\r\n");
   EXPECT_EQ(h.last(), 3u);
-  EXPECT_TRUE(h.session.close_after_reply);
-  EXPECT_FALSE(h.session.takeover);
+  EXPECT_FALSE(h.session.close_after_reply);
+  EXPECT_TRUE(h.session.takeover);
+  EXPECT_TRUE(h.session.is_replica_link);
   ReplHarness h2;
   EXPECT_EQ(h2.Run({"PSYNC", "?", "-1"}), "+FULLRESYNC " + h2.myid() + " 3\r\n");  // redis-cli style
   ReplHarness h3;
@@ -278,9 +279,11 @@ TEST(RoleCmd, MasterShapes) {
   EXPECT_EQ(h.Run({"ROLE", "x"}), Err("ERR wrong number of arguments for 'role' command"));
   h.Run({"SET", "a", "1"});
   h.Run({"SET", "b", "2"});
-  h.services.replication_.role_info.replicas = {{"10.0.0.1", 7000, 2, 0, true},
-                                                {"10.0.0.2", 7001, 1, 0, false}};
-  // Only live replicas, with port and offset as bulk strings (addReplyBulkLongLong).
+  h.services.replication_.role_info.replicas = {{"10.0.0.1", 7000, 2, 0, true, true},
+                                                {"10.0.0.2", 7001, 1, 0, false, true},
+                                                {"10.0.0.3", 7002, 0, 0, true, false}};
+  // Only live replicas that finished their full sync (online), with port and offset as bulk strings
+  // (addReplyBulkLongLong).
   EXPECT_EQ(h.Run({"ROLE"}),
             "*3\r\n$6\r\nmaster\r\n:2\r\n*1\r\n*3\r\n$8\r\n10.0.0.1\r\n$4\r\n7000\r\n$1\r\n2\r\n");
   const CommandSpec* spec = h.services.registry().Find("role");

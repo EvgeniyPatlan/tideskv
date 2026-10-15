@@ -110,6 +110,8 @@ TEST_F(ManagerTest, HandlePsyncDecidesAndCounts) {
   EXPECT_EQ(full.decision, PsyncDecision::kFullResync);
   EXPECT_EQ(full.replid, id.replid);
   EXPECT_EQ(full.seq, 3u);
+  EXPECT_NE(full.pending_id, 0u);  // FULLRESYNC hands the socket over too (M6b)
+  EXPECT_NE(full.pending_id, cont.pending_id);
   const PsyncResult unknown = m->HandlePsync({"?", 0}, {});
   EXPECT_EQ(unknown.decision, PsyncDecision::kFullResync);
   const ReplicationManager::Counters c = m->counters();
@@ -253,6 +255,43 @@ TEST_F(ManagerTest, AnUnknownBaselineAnswersQuestionMarkWithFullResync) {
   EXPECT_EQ(m->HandlePsync({"?", 1}, {}).decision, PsyncDecision::kFullResync);
   EXPECT_EQ(m->HandlePsync({id.replid, 2}, {}).decision, PsyncDecision::kContinue);
   EXPECT_EQ(Make()->HandlePsync({"?", 1}, {}).decision, PsyncDecision::kContinue);
+}
+
+TEST_F(ManagerTest, FullResyncTakesTheSnapshotAndPinsTheBacklogAtIt) {
+  auto m = Make();
+  const PsyncResult full = m->HandlePsync({std::string(40, 'a'), 2}, {"10.0.0.8", 7008});
+  ASSERT_EQ(full.decision, PsyncDecision::kFullResync);
+  EXPECT_EQ(full.seq, 3u);
+  EXPECT_NE(full.pending_id, 0u);
+  EXPECT_EQ(m->OldestNeeded(), 4u);  // the hand-off needs S+1
+  ASSERT_TRUE(log.CommitStandalone({{ReplOpType::kPut, ColumnFamily::kMeta, "late", "v"}}).ok());
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  m->AttachReplica(full.pending_id, fds[0], "");
+  Fd replica(fds[1]);
+  const std::string got = ReadUntil(replica.get(), "$5\r\nBATCH\r\n$1\r\n4\r\n");
+  EXPECT_NE(got.find("$7\r\nLOADEND\r\n$1\r\n3\r\n"), std::string::npos);
+  ASSERT_EQ(m->Replicas().size(), 1u);
+  EXPECT_FALSE(m->Replicas()[0].online);
+  EXPECT_EQ(m->counters().sync_full, 1u);
+  ASSERT_TRUE(WriteAll(replica.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());
+  EXPECT_TRUE(WaitFor([&] { return m->Replicas()[0].online; }));
+}
+
+// D14: rdb-key-save-delay (OnConfig) slows every key a full-sync sender streams.
+TEST_F(ManagerTest, KeySaveDelayThrottlesTheSnapshotStream) {
+  auto m = Make();
+  ConfigValues v;
+  v.rdb_key_save_delay = 200000;  // 0.2 s per key, 3 keys
+  m->OnConfig(v);
+  const PsyncResult full = m->HandlePsync({"?", 0}, {});
+  ASSERT_EQ(full.decision, PsyncDecision::kFullResync);
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  m->AttachReplica(full.pending_id, fds[0], "");
+  Fd replica(fds[1]);
+  EXPECT_EQ(ReadUntil(replica.get(), "LOADEND", 300ms).find("LOADEND"), std::string::npos);
+  EXPECT_NE(ReadUntil(replica.get(), "LOADEND", 3s).find("LOADEND"), std::string::npos);
 }
 
 // Task 14: what the backlog trimmer may not delete, and the drop of replicas beyond the limits.

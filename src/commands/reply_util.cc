@@ -43,7 +43,7 @@ void ReplyError(ExecContext& ctx, const Status& st) {
       return ctx.reply.Error("ERR disk full, writes disabled");
     default:
       spdlog::error("command failed for client id={}: {}", ctx.session.id, st.ToString());
-      return ctx.reply.Error("ERR storage error");
+      return ctx.reply.Error(kErrStorage);
   }
 }
 

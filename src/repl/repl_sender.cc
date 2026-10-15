@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <utility>
 
+#include "common/debug_delay.h"
 #include "common/string_util.h"
 #include "encoding/replog_codec.h"
+#include "repl/full_sync_frames.h"
 
 namespace tideskv::repl {
 namespace {
@@ -29,6 +31,12 @@ int64_t UnixMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+// replog[S] from the snapshot's view; "" for an empty log (S = 0).
+Result<std::string> BaselineRecord(const SyncSnapshot& snap) {
+  if (snap.seq == 0) return std::string();
+  return snap.view->Get(ColumnFamily::kReplog, encoding::ReplogKey(snap.seq));
 }
 
 }  // namespace
@@ -61,7 +69,10 @@ void ReplSender::SetPeer(std::string ip, uint16_t listening_port) {
 
 void ReplSender::SetUnread(std::string bytes) { in_ = std::move(bytes); }
 
+void ReplSender::SetSnapshot(SyncSnapshot snapshot) { snapshot_ = std::move(snapshot); }
+
 void ReplSender::Start() {
+  online_.store(!snapshot_.has_value(), std::memory_order_release);
   last_ack_ms_.store(UnixMs(), std::memory_order_release);
   alive_.store(true, std::memory_order_release);
   thread_ = std::thread([this] { Run(); });
@@ -89,6 +100,9 @@ void ReplSender::Run() {
 
 Status ReplSender::Loop() {
   last_write_ = last_ack_ = SteadyClock::now();
+  if (snapshot_) {
+    if (Status st = StreamSnapshot(); !st.ok()) return st;
+  }
   if (Status st = ParseInput(); !st.ok()) return st;  // bytes that followed PSYNC
   while (!stop_.load(std::memory_order_acquire)) {
     if (next_ <= log_.last()) {
@@ -99,6 +113,48 @@ Status ReplSender::Loop() {
     if (Status st = PollInput(); !st.ok()) return st;
     if (Status st = CheckLiveness(); !st.ok()) return st;
   }
+  return Status::Ok();
+}
+
+// The full-sync phase (D2, D4, D10): the snapshot's keys as LOAD frames, then LOADEND with replog[S]
+// read from the same view. The replica sends nothing meanwhile, so the ACK clock restarts at the end; a
+// PING keeps the link alive while keys are slow to read.
+Status ReplSender::StreamSnapshot() {
+  if (!snapshot_ || !snapshot_->view) return Status::Ok();
+  const SyncSnapshot& snap = *snapshot_;
+  const Result<uint64_t> ops = StreamChunks(*snap.view);  // its chunker is gone before the view
+  if (!ops.ok()) return ops.status();
+  const Result<std::string> record = BaselineRecord(snap);
+  if (!record.ok()) return record.status();
+  const std::string end = LoadEndFrame(snap.seq, *record, *ops);
+  if (Status st = WriteAll(fd_.get(), end, Timeout()); !st.ok()) return st;
+  snapshot_.reset();  // releases the storage snapshot as soon as it is streamed
+  last_write_ = last_ack_ = SteadyClock::now();
+  return Status::Ok();
+}
+
+// Writes every LOAD frame; returns the number of ops they carried.
+Result<uint64_t> ReplSender::StreamChunks(ReadView& view) {
+  SnapshotChunker chunker(view, UnixMs());
+  const std::function<Status()> between_keys = [this] { return BetweenKeys(); };
+  for (;;) {
+    auto next = chunker.Next(between_keys);
+    if (!next.ok()) return next.status();
+    const std::optional<std::string>& chunk = *next;
+    if (!chunk.has_value()) return chunker.ops();
+    if (Status st = WriteAll(fd_.get(), LoadFrame(*chunk), Timeout()); !st.ok()) return st;
+    last_write_ = SteadyClock::now();
+  }
+}
+
+// Before each snapshot key: Stop() is noticed here, rdb-key-save-delay applies (D14), and a PING goes out
+// when nothing was written for kPingInterval.
+Status ReplSender::BetweenKeys() {
+  if (stop_.load(std::memory_order_acquire)) return Status::IOError("stopped");
+  DebugDelay(cb_.key_save_delay_us ? cb_.key_save_delay_us() : 0);
+  if (SteadyClock::now() - last_write_ < kPingInterval) return Status::Ok();
+  if (Status st = WriteAll(fd_.get(), kPingFrame, Timeout()); !st.ok()) return st;
+  last_write_ = SteadyClock::now();
   return Status::Ok();
 }
 
@@ -170,6 +226,10 @@ Status ReplSender::HandleFrame(const std::vector<std::string>& args) {
   if (seq > acked_.load(std::memory_order_relaxed)) acked_.store(seq, std::memory_order_release);
   last_ack_ = SteadyClock::now();
   last_ack_ms_.store(UnixMs(), std::memory_order_release);
+  // Frames are parsed only once LOADEND is written, so any valid ACK means the load is done (PF9: an
+  // ACK of 0 after a sync at S = 0 advances nothing but counts).
+  online_.store(true, std::memory_order_release);
+  if (cb_.on_ack) cb_.on_ack();
   return Status::Ok();
 }
 

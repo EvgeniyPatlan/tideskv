@@ -48,7 +48,7 @@ class FakeReplication final : public Replication {
     }
     const repl::LogBounds bounds{log->first_retained(), log->last(), false};
     PsyncResult r{repl::DecidePsync(identity, bounds, req), identity.replid, bounds.last, 0, {}};
-    if (r.decision == repl::PsyncDecision::kContinue) r.pending_id = last_pending_id = ++next_pending_id_;
+    r.pending_id = last_pending_id = ++next_pending_id_;  // both decisions hand the socket over (M6b)
     return r;
   }
   void AttachReplica(uint64_t pending_id, int fd, std::string unread) override {

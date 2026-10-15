@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "repl/full_sync_frames.h"
 #include "support/it_helpers.h"
 #include "support/test_server.h"
 
@@ -25,14 +28,7 @@ struct ReplicationMasterIT : ::testing::Test {
     EXPECT_NE(c, nullptr);
     return c;
   }
-  // The master's replid, from a FULLRESYNC (which closes that link in M6a).
-  std::string MasterReplid() {
-    auto c = Client();
-    const RespValue r = c->Command({"PSYNC", "?", "-1"});
-    EXPECT_EQ(r.type, Type::kSimple);
-    EXPECT_TRUE(c->WaitForClose());
-    return r.str.substr(std::string("FULLRESYNC ").size(), 40);
-  }
+  std::string MasterReplid() { return InfoString(*Client(), "replication", "master_replid"); }
 };
 
 // Reads frames until a BATCH arrives (PINGs may come first on an idle link).
@@ -50,9 +46,7 @@ TEST_F(ReplicationMasterIT, ContinueStreamsTheBacklogThenLiveBatches) {
   const std::string id = MasterReplid();
   ASSERT_EQ(id.size(), 40u);
   // Any seqs before these SETs (e.g. the oid lease) are skipped by asking from the current end.
-  const RespValue probe =
-      Client()->Command({"PSYNC", id, "999999"});  // beyond last+1: FULLRESYNC <id> <last>
-  const uint64_t last = std::stoull(probe.str.substr(probe.str.rfind(' ') + 1));
+  const auto last = static_cast<uint64_t>(InfoField(*Client(), "replication", "master_repl_offset"));
   EXPECT_EQ(writer->Command({"SET", "a", "1"}).str, "OK");
   EXPECT_EQ(writer->Command({"SET", "b", "2"}).str, "OK");
 
@@ -82,13 +76,41 @@ TEST_F(ReplicationMasterIT, ContinueStreamsTheBacklogThenLiveBatches) {
   EXPECT_TRUE(replica->WaitForClose());
 }
 
-TEST_F(ReplicationMasterIT, FullResyncClosesTheLink) {
-  auto c = Client();
-  const RespValue r = c->Command({"PSYNC", std::string(40, '0'), "1"});
-  EXPECT_EQ(r.type, Type::kSimple);
-  EXPECT_EQ(r.str.rfind("FULLRESYNC ", 0), 0u);
-  EXPECT_TRUE(c->WaitForClose());
-  EXPECT_EQ(Client()->Command({"PING"}).str, "PONG");
+// M6b D2, D4, D10: FULLRESYNC <id> <S>, the snapshot as LOAD frames, LOADEND S <replog[S]> <ops>, then
+// the tail from S+1. The replica is listed by ROLE only once it acknowledged the load. (INFO's
+// state=send_bulk/online is asserted with Task 10, which adds that field: PF2.)
+TEST_F(ReplicationMasterIT, FullResyncStreamsTheSnapshotThenTheTail) {
+  auto writer = Client();
+  for (int i = 0; i < 10; ++i) ASSERT_EQ(writer->Command({"SET", "k" + std::to_string(i), "v"}).str, "OK");
+  auto replica = Client();
+  ASSERT_TRUE(replica->Send({"REPLCONF", "listening-port", "7778"}));
+  ASSERT_EQ(replica->Read()->str, "OK");
+  ASSERT_TRUE(replica->Send({"PSYNC", std::string(40, '0'), "1"}));
+  const auto full = replica->Read();
+  ASSERT_TRUE(full.has_value());
+  ASSERT_EQ(full->str.rfind("FULLRESYNC ", 0), 0u) << full->str;
+  const std::string seq = full->str.substr(full->str.rfind(' ') + 1);
+  std::optional<RespValue> f = replica->Read();
+  uint64_t loaded = 0;
+  while (f.has_value() && f->elements.size() == 2 && f->elements[0].str == "LOAD") {
+    auto ops = repl::DecodeLoadChunk(f->elements[1].str);
+    ASSERT_TRUE(ops.ok());
+    loaded += ops->size();
+    f = replica->Read();
+  }
+  ASSERT_TRUE(f.has_value());
+  ASSERT_EQ(f->elements.size(), 4u);
+  EXPECT_EQ(f->elements[0].str, "LOADEND");
+  EXPECT_EQ(f->elements[1].str, seq);
+  EXPECT_EQ(f->elements[3].str, std::to_string(loaded));
+  EXPECT_GE(loaded, 10u);                                                // k0..k9 (and sys/oid_hwm)
+  EXPECT_EQ(writer->Command({"ROLE"}).elements[2].elements.size(), 0u);  // ROLE lists online replicas only
+  ASSERT_TRUE(replica->Send({"REPLCONF", "ACK", seq}));
+  EXPECT_TRUE(WaitFor([&] { return writer->Command({"ROLE"}).elements[2].elements.size() == 1u; }));
+  ASSERT_EQ(writer->Command({"SET", "after", "1"}).str, "OK");
+  auto batch = NextBatch(*replica);
+  ASSERT_TRUE(batch.has_value());
+  EXPECT_EQ(batch->elements[1].str, std::to_string(std::stoull(seq) + 1));
 }
 
 // F4: replica links count against maxclients like the clients they were: once the limit is reached,
