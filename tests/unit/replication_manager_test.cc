@@ -341,6 +341,24 @@ TEST_F(ManagerTest, AFullSyncLinkIsNotCountedUntilItAcks) {
   EXPECT_TRUE(WaitFor([&] { return m->CountAcked(3) == 1; }));
 }
 
+TEST_F(ManagerTest, GoodReplicasCountOnlineLinksWithinTheLag) {
+  auto m = Make();
+  ConfigValues v;
+  m->OnConfig(v);  // min-replicas-to-write 0: always fine
+  EXPECT_TRUE(m->GoodReplicasOk());
+  v.min_replicas_to_write = 1;
+  v.min_replicas_max_lag = 10;
+  m->OnConfig(v);
+  EXPECT_FALSE(m->GoodReplicasOk());
+  Fd replica = Attach(*m, 4);
+  ASSERT_TRUE(WriteAll(replica.get(), RespCommand({"REPLCONF", "ACK", "3"}), 1s).ok());
+  EXPECT_TRUE(WaitFor([&] { return m->GoodReplicasOk(); }));
+  EXPECT_EQ(m->GoodReplicaCount(), 1);
+  v.min_replicas_max_lag = 0;  // disabled
+  m->OnConfig(v);
+  EXPECT_TRUE(m->GoodReplicasOk());
+}
+
 // D14: rdb-key-save-delay (OnConfig) slows every key a full-sync sender streams.
 TEST_F(ManagerTest, KeySaveDelayThrottlesTheSnapshotStream) {
   auto m = Make();

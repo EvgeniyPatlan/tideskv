@@ -40,6 +40,8 @@ class FakeReplication final : public Replication {
     int64_t numreplicas = 0;
   };
 
+  std::atomic<bool> good_replicas_ok{true};
+  bool GoodReplicasOk() const override { return good_replicas_ok.load(); }
   std::atomic<bool> stale_refusing{false};
   bool StaleRefusing() const override { return stale_refusing.load(); }
   ReplRole role() const override { return role_.load(); }

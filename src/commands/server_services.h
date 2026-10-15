@@ -41,6 +41,8 @@ struct ReplicationStats {
   uint64_t read_seq = 0;
   int replica_priority = 100;
   bool read_only = true;
+  bool min_replicas_enabled = false;  // min-replicas-to-write and -max-lag both non-zero (D12)
+  int good_replicas = 0;
   std::vector<ReplicaLine> replicas;
   std::string replid;
   std::string replid2;         // empty = unset (shown as 40 zeros)

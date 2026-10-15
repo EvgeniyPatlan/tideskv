@@ -93,6 +93,9 @@ class ReplicationManager final : public Replication {
   Status BecomeMaster() override;
   RoleInfo Role() const override;
   bool StaleRefusing() const override;
+  bool GoodReplicasOk() const override;
+  // Online, alive links whose last ACK is within min-replicas-max-lag seconds.
+  int GoodReplicaCount() const;
   int64_t CountAcked(uint64_t seq) const override;
   void AddWaiter(std::shared_ptr<BlockedClient> client, uint64_t seq, int64_t numreplicas) override;
   // Stores the config values that matter to replication. Only the single-threaded startup call and
@@ -184,6 +187,8 @@ class ReplicationManager final : public Replication {
   WaitList waits_;                                    // WAIT clients (D9); its own lock, never with mu_
   std::atomic<ReplRole> role_{ReplRole::kMaster};
   std::atomic<bool> serve_stale_{true};                                   // replica-serve-stale-data
+  std::atomic<int> min_replicas_to_write_{0};                             // min-replicas-to-write (D12)
+  std::atomic<int> min_replicas_max_lag_{10};                             // min-replicas-max-lag, seconds
   std::atomic<int> key_save_delay_us_{0};                                 // rdb-key-save-delay (D14)
   std::atomic<ReplicaLinkState> link_state_{ReplicaLinkState::kConnect};  // mirrored from the client
   std::atomic<bool> baseline_unknown_;  // F5: from Options; a replica's full sync clears it (M6b D5)

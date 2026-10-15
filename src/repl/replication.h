@@ -113,6 +113,10 @@ class Replication {
   // replica-serve-stale-data is no. Lock-free.
   virtual bool StaleRefusing() const = 0;
 
+  // min-replicas-to-write (M6b D12): true on a replica, when either config is 0, or when at least
+  // min-replicas-to-write online replicas acknowledged within min-replicas-max-lag seconds.
+  virtual bool GoodReplicasOk() const = 0;
+
   // WAIT (M6b D9): how many online replicas (past their full sync) last acknowledged a seq >= `seq`.
   virtual int64_t CountAcked(uint64_t seq) const = 0;
   // Parks `client` (already registered in the BlockingRegistry) until CountAcked(seq) >= numreplicas; it

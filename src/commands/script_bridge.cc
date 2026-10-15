@@ -43,6 +43,10 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
     *error = std::string(kScriptErrWriteInRo);
     return std::nullopt;
   }
+  if (is_write && !wrote_ && !caller_.server.replication().GoodReplicasOk()) {  // script.c:388
+    *error = "-" + std::string(kErrNoReplicas);
+    return std::nullopt;
+  }
   if (is_write && caller_.server.replication().IsReplica()) {
     *error = "-" + std::string(kErrReadOnlyReplica);
     return std::nullopt;
@@ -52,6 +56,7 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
   ExecContext ctx{session_, reply, caller_.server, nullptr, caller_.ready, caller_.after_batch};
   try {
     spec->handler(ctx, argv);
+    if (is_write) wrote_ = true;
   } catch (const std::exception& e) {
     spdlog::error("command from script failed: {}", e.what());
     *error = "-" + std::string(kErrInternal);

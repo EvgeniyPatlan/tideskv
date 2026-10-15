@@ -42,6 +42,7 @@ std::string FormatReplicationSection(const ReplicationStats& r) {
   Add(out, "role", r.replica ? "slave" : "master");
   if (r.replica) AddReplicaFields(out, r);
   Add(out, "connected_slaves", std::to_string(r.replicas.size()));
+  if (r.min_replicas_enabled) Add(out, "min_slaves_good_slaves", std::to_string(r.good_replicas));
   for (size_t i = 0; i < r.replicas.size(); ++i) {
     const ReplicaLine& l = r.replicas[i];
     Add(out, "slave" + std::to_string(i),

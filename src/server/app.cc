@@ -339,6 +339,8 @@ void App::FillReplStats(ServerStats& s, const ConfigValues& v) const {
     r.sync_read_bytes = static_cast<int64_t>(sync.read_bytes);
     r.sync_last_io_seconds_ago = std::max<int64_t>(0, SecondsSince(sync.last_io_ms, now));
   }
+  r.min_replicas_enabled = v.min_replicas_to_write != 0 && v.min_replicas_max_lag != 0;
+  if (r.min_replicas_enabled) r.good_replicas = replication_->GoodReplicaCount();
   for (const ReplicaInfo& i : role.replicas) {
     if (!i.alive) continue;  // F9: as ROLE, a link that dropped is not listed while it awaits the reaper
     r.replicas.push_back({i.ip, i.listening_port, i.online ? i.acked : 0,

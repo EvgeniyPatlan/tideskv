@@ -135,6 +135,8 @@ inline constexpr std::string_view kErrReadOnlyReplica =
 // server.c:1862 (shared.masterdownerr); verified on redis:7.2.5.
 inline constexpr std::string_view kErrMasterDown =
     "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.";
+// server.c:1874 (shared.noreplicaserr).
+inline constexpr std::string_view kErrNoReplicas = "NOREPLICAS Not enough good replicas to write.";
 // server.c:1854 (shared.loadingerr).
 inline constexpr std::string_view kErrLoading = "LOADING Redis is loading the dataset in memory";
 inline constexpr std::string_view kErrScriptFlushOption = "ERR SCRIPT FLUSH only support SYNC|ASYNC option";

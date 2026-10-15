@@ -142,10 +142,11 @@ CallFlags DeriveCallFlags(const Session& session, const CommandSpec& spec, uint3
           (flags & kCmdLoading) == 0 || (exec && m.has_non_loading)};
 }
 
-// The first state-based refusal in Redis order (server.c:4060 READONLY, 4097 MASTERDOWN, 4104 LOADING), or
-// empty. MULTI -> dirty is Reject's job; NOREPLICAS comes before these, BUSY after.
+// The first state-based refusal in Redis order (server.c:4057 NOREPLICAS, server.c:4060 READONLY, 4097
+// MASTERDOWN, 4104 LOADING), or empty. MULTI -> dirty is Reject's job; BUSY after.
 std::string_view StateRefusal(ExecContext& ctx, const CallFlags& call) {
   const Replication& repl = ctx.server.replication();
+  if (call.is_write && !repl.GoodReplicasOk()) return kErrNoReplicas;  // server.c:4057, before READONLY
   if (call.is_write && repl.IsReplica()) return kErrReadOnlyReplica;
   if (call.deny_stale && repl.StaleRefusing()) return kErrMasterDown;
   if (call.deny_loading && ctx.server.engine().loading()) return kErrLoading;  // server.c:4104, before BUSY

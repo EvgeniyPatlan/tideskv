@@ -18,6 +18,7 @@ class ScriptBridge final : public ScriptCaller {
   ExecContext& caller_;
   Session session_;
   bool read_only_ = false;
+  bool wrote_ = false;  // a write command already ran (SCRIPT_WRITE_DIRTY)
 };
 
 }  // namespace tideskv

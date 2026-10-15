@@ -299,8 +299,33 @@ bool ReplicationManager::StaleRefusing() const {
          link_state_.load(std::memory_order_acquire) != ReplicaLinkState::kConnected;
 }
 
+// checkGoodReplicasStatus (replication.c:3460): replicas never refuse writes for lack of replicas.
+bool ReplicationManager::GoodReplicasOk() const {
+  const int need = min_replicas_to_write_.load(std::memory_order_acquire);
+  if (role() == ReplRole::kReplica || need == 0 ||
+      min_replicas_max_lag_.load(std::memory_order_acquire) == 0) {
+    return true;
+  }
+  return GoodReplicaCount() >= need;
+}
+
+int ReplicationManager::GoodReplicaCount() const {
+  const int64_t max_lag = min_replicas_max_lag_.load(std::memory_order_acquire);
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  std::lock_guard lock(mu_);
+  int good = 0;
+  for (const auto& s : senders_) {
+    if (s->alive() && s->online() && (now - s->last_ack_ms()) / 1000 <= max_lag) ++good;
+  }
+  return good;
+}
+
 void ReplicationManager::OnConfig(const ConfigValues& v) {
   serve_stale_.store(v.replica_serve_stale_data, std::memory_order_release);
+  min_replicas_to_write_.store(v.min_replicas_to_write, std::memory_order_release);
+  min_replicas_max_lag_.store(v.min_replicas_max_lag, std::memory_order_release);
   key_save_delay_us_.store(v.rdb_key_save_delay, std::memory_order_relaxed);
 }
 
