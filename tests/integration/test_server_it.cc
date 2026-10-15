@@ -110,7 +110,7 @@ TEST(TestServerIT, KilledChildWithASanitizerReportStillFailsTheTest) {
 
 // CF-M6b-11: TSan's deadlock detector aborts a thread holding more than 64 mutexes (an MSET of ~100 keys
 // takes ~100 key stripes), so child servers run with detect_deadlocks=0; the inherited options are kept.
-// The harness also clears DEBUGINFOD_URLS.
+// The harness also passes the narrow suppressions file and clears DEBUGINFOD_URLS.
 TEST(TestServerIT, ChildRunsWithTheHarnessSanitizerOptions) {
   TempDir dir("tideskv-fake-server");
   g_fake_server =
@@ -120,6 +120,10 @@ TEST(TestServerIT, ChildRunsWithTheHarnessSanitizerOptions) {
   const std::string log = s.Stderr();
   EXPECT_NE(log.find("tsan=[verbosity=0:"), std::string::npos) << log;
   EXPECT_NE(log.find("detect_deadlocks=0"), std::string::npos) << log;
+  // The narrow suppressions for third-party code (tests/sanitizers/tsan.supp), as an existing file.
+  const std::string supp = std::string("suppressions=") + TIDESKV_TSAN_SUPPRESSIONS;
+  EXPECT_NE(log.find(supp), std::string::npos) << log;
+  EXPECT_TRUE(std::filesystem::exists(TIDESKV_TSAN_SUPPRESSIONS));
   // A symbolizer must never wait on the network mid-report (with the gate held): no debuginfod.
   EXPECT_NE(log.find("debuginfod=[]"), std::string::npos) << log;
 }

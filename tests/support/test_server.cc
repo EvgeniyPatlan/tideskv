@@ -60,10 +60,11 @@ constexpr size_t kMaxReportBytes = 64 * 1024;
 // mutexes, and a multi-key command takes one key stripe per distinct key (an MSET of ~100 keys aborts the
 // server). That is a tool limit, not a race; data-race detection stays on, and lock-order inversions are
 // still checked in-process by unit_tests, which drive the same LockManager, Engine and ReplLog locks.
+// suppressions: third-party races judged benign, one by one, in tests/sanitizers/tsan.supp.
 std::string WithChildTsanOptions(std::string_view base) {
   std::string out(base);
   if (!out.empty()) out += ':';
-  return out.append("detect_deadlocks=0");
+  return out.append("detect_deadlocks=0:suppressions=").append(TIDESKV_TSAN_SUPPRESSIONS);
 }
 
 // The child's environment: ours, minus the overridden names, plus the overrides; TSAN_OPTIONS always

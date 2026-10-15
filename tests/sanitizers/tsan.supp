@@ -1,0 +1,13 @@
+# ThreadSanitizer suppressions for the tideskv-server children of the test harness (TestServer, R17).
+# Only third-party races judged benign belong here, each with its analysis; a TidesKV race is fixed.
+#
+# TidesDB 10.1.0 src/txn/registry.c (tidesdb_txn_registry_remove) and src/txn/txn.c:107
+# (tdb_txn_registry_shard). Leaving the live-transaction registry swaps the shard's last entry into the
+# freed slot and rewrites that moved transaction's (shard, index) under the shard lock. The moved
+# transaction's owner may at the same moment be leaving too, and reads its own registry_shard *before*
+# taking the lock. The write stores the value the field already holds (a transaction never changes
+# shard), and the index, which does change, is read only under the lock, so the owner always locks the
+# right shard and finds its slot. A formal C11 race, harmless in effect; seen once full sync frees a
+# snapshot (begun on a worker thread) on the sender thread, while that worker's write txn commits.
+# To be reported upstream (make registry_shard atomic, or read it under the lock).
+race:tdb_txn_registry_shard

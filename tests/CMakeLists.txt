@@ -7,6 +7,9 @@ if(SUPPORT_SOURCES)
   target_include_directories(test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(test_support PUBLIC tideskv_core GTest::gtest)
   tideskv_defaults(test_support)
+  # TestServer passes these to every child server's TSAN_OPTIONS (R17); public so tests can check it.
+  target_compile_definitions(test_support PUBLIC
+    TIDESKV_TSAN_SUPPRESSIONS="${CMAKE_CURRENT_SOURCE_DIR}/sanitizers/tsan.supp")
 else()
   add_library(test_support INTERFACE)
   target_include_directories(test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
