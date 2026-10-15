@@ -172,11 +172,6 @@ std::optional<ScriptFlags> ScriptEngine::PeekFlags(std::string_view script, bool
   return parsed->flags;
 }
 
-bool ScriptEngine::DeclaresWrites(std::string_view script, bool by_sha) const {
-  const std::optional<ScriptFlags> f = PeekFlags(script, by_sha);
-  return f && f->shebang && !f->no_writes;
-}
-
 Result<std::string> ScriptEngine::Load(std::string_view body) {
   std::lock_guard<std::mutex> lock(mu_);
   Result<std::string> sha = LookupOrCompile(body, false);

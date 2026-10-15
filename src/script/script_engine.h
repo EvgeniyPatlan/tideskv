@@ -54,8 +54,6 @@ class ScriptEngine {
   // Flags of a cached script, else (EVAL bodies only) of its parsed shebang; nullopt for an unknown sha, a
   // bad shebang, or while a script runs (mu_ busy: the BUSY check answers).
   std::optional<ScriptFlags> PeekFlags(std::string_view script, bool by_sha) const;
-  // Redis evalGetCommandFlags: true if the script has a shebang without no-writes (it counts as a write).
-  bool DeclaresWrites(std::string_view script, bool by_sha) const;
   bool TimedOut() const noexcept;   // a script runs past busy_threshold_ms (BUSY)
   bool Kill() noexcept;             // SCRIPT KILL: false = NOTBUSY
   void KillForShutdown() noexcept;  // SHUTDOWN NOSAVE / App::Stop: any running or later script dies
