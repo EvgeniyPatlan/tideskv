@@ -59,19 +59,30 @@ TEST(ClientPauseIT, AClientClosedWhileParkedIsForgotten) {
 }
 
 // D21: expiry pauses with the clients, so the master's sequence holds still while a controller compares
-// replica offsets.
+// replica offsets. Robust under load: the keys live 3 s and the pause lasts until UNPAUSE; if setting them up
+// took so long that the pause may have begun after they fell due, the test skips instead of failing.
 TEST(ClientPauseIT, TheReaperIsPausedToo) {
+  constexpr auto kTtl = 3000ms;
+  constexpr auto kMaxSetup = 2000ms;  // the pause must begin with at least 1 s of TTL left
   TestServer s(TIDESKV_SERVER_BIN);
   auto c = s.Connect();
-  for (int i = 0; i < 50; ++i)
-    ASSERT_EQ(c->Command({"SET", "e" + std::to_string(i), "v", "PX", "1000"}).str, "OK");
-  ASSERT_EQ(c->Command({"CLIENT", "PAUSE", "3000", "WRITE"}).str, "OK");
-  ASSERT_EQ(InfoField(*c, "stats", "expired_keys"), 0);  // nothing was reaped before the pause began
+  const auto start = std::chrono::steady_clock::now();  // every key's deadline is after start + kTtl
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_EQ(c->Command({"SET", "e" + std::to_string(i), "v", "PX", std::to_string(kTtl.count())}).str,
+              "OK");
+  }
+  ASSERT_EQ(c->Command({"CLIENT", "PAUSE", "60000", "WRITE"}).str, "OK");
+  if (std::chrono::steady_clock::now() - start > kMaxSetup) {
+    GTEST_SKIP() << "setup took over 2 s (loaded host): the pause may have begun after the keys fell due";
+  }
+  ASSERT_EQ(InfoField(*c, "stats", "expired_keys"), 0);
   const int64_t seq = InfoField(*c, "keyspace", "sequence");
-  std::this_thread::sleep_for(1500ms);  // the keys fall due during the pause; an unpaused reaper deletes them
+  std::this_thread::sleep_until(start + kTtl + 1000ms);  // every key is due; an unpaused reaper deletes them
   EXPECT_EQ(InfoField(*c, "keyspace", "sequence"), seq);
   EXPECT_EQ(InfoField(*c, "stats", "expired_keys"), 0);
-  EXPECT_TRUE(WaitFor([&] { return InfoField(*c, "keyspace", "sequence") > seq; }, 5s));
+  ASSERT_EQ(c->Command({"CLIENT", "UNPAUSE"}).str, "OK");
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*c, "stats", "expired_keys") == 50; }, 10s));
+  EXPECT_GT(InfoField(*c, "keyspace", "sequence"), seq);
 }
 
 }  // namespace
