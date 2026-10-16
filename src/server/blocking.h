@@ -106,8 +106,10 @@ class BlockingRegistry {
   // M7a D16: the check every wait must pass (the cluster topology): the error that ends it, or nullopt.
   // Waits that fail it now end with its error (the connection stays open); AddIfCurrent refuses a later
   // wait that fails it; an empty Redirect removes the check. Called with mu_ held, so it must only read the
-  // client's const state. Never blocks on another thread: it takes mu_, then each ended client's own mutex
-  // (outside mu_), and delivers by posting to the connection. Returns how many waits it ended.
+  // client's const state. It takes mu_, then each ended client's own mutex (outside mu_), and delivers by
+  // posting to the connection: it never waits for a thread that waits for the cluster manager's apply_mu_,
+  // but may wait for a blocked client's in-flight serve (which holds that client's mutex). Returns how many
+  // waits it ended.
   using Redirect = std::function<std::optional<std::string>(const BlockedClient&)>;
   size_t SetRedirect(Redirect redirect);
   size_t blocked_clients() const { return count_.load(); }
