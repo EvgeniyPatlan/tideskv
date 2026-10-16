@@ -51,6 +51,9 @@ struct ConfigValues {
   int min_replicas_max_lag = 10;         // min-replicas-max-lag, seconds (D12)
   int key_load_delay = 0;                // hidden test knob: us per key a replica loads (D14)
   int rdb_key_save_delay = 0;            // hidden test knob: us per key a master streams (D14)
+
+  // Cluster (M7a).
+  bool cluster_enabled = false;  // cluster-enabled (D19): startup-only, db 0 only, roles from the controller
 };
 
 class Config {

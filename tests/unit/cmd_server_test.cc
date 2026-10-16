@@ -352,5 +352,17 @@ TEST(Hello, RoleFollowsReplication) {
   EXPECT_NE(h.Run({"HELLO", "3"}).find("role\r\n$7\r\nreplica\r\n"), std::string::npos);
 }
 
+TEST(FormatInfo, ClusterSectionPrecedesKeyspace) {  // server.c:6214-6220, 5479
+  ServerStats s = SampleStats();
+  const std::string info = FormatInfo(s, {});
+  const size_t cluster = info.find("# Cluster\r\ncluster_enabled:0\r\n");
+  ASSERT_NE(cluster, std::string::npos) << info;
+  EXPECT_LT(cluster, info.find("# Keyspace\r\n"));
+  EXPECT_NE(info.find("redis_mode:standalone\r\n"), std::string::npos);
+  s.cluster_enabled = true;
+  EXPECT_EQ(FormatInfo(s, {"cluster"}), "# Cluster\r\ncluster_enabled:1\r\n");
+  EXPECT_NE(FormatInfo(s, {"server"}).find("redis_mode:cluster\r\n"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace tideskv

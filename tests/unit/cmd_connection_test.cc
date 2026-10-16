@@ -154,5 +154,12 @@ TEST(ClientUnblock, TimeoutReplyUsesTheTargetsProtocol) {
   EXPECT_EQ(other.TakeUnblocked(), (std::vector<std::string>{"_\r\n"}));
 }
 
+TEST(Hello, ReportsClusterModeWhenEnabled) {  // Kvrocks cmd_server.cc:1018-1024
+  CommandHarness h;
+  EXPECT_NE(h.Run({"HELLO"}).find("$4\r\nmode\r\n$10\r\nstandalone\r\n"), std::string::npos);
+  ASSERT_TRUE(h.services.config_.Set("cluster-enabled", "yes", /*at_runtime=*/false).ok());
+  EXPECT_NE(h.Run({"HELLO"}).find("$4\r\nmode\r\n$7\r\ncluster\r\n"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace tideskv

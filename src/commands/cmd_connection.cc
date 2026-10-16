@@ -78,7 +78,7 @@ void WriteHelloReply(ExecContext& ctx) {
   r.Bulk("id");
   r.Integer(static_cast<int64_t>(ctx.session.id));
   r.Bulk("mode");
-  r.Bulk("standalone");
+  r.Bulk(ctx.server.config().Snapshot().cluster_enabled ? "cluster" : "standalone");  // HELLO is rare
   r.Bulk("role");
   r.Bulk(ctx.server.replication().IsReplica() ? "replica" : "master");
   r.Bulk("modules");

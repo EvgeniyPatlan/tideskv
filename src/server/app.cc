@@ -276,6 +276,7 @@ ServerStats App::Stats() const {
   s.total_commands = k.total_commands;
   s.data_dir = v.dir;
   s.sync_mode = v.sync_mode;
+  s.cluster_enabled = v.cluster_enabled;
   s.storage_compression = std::string(CompressionName(storage_->compression()));
   FillStorageStats(s);
   s.background_compactions = scheduler_ ? scheduler_->completed() : 0;

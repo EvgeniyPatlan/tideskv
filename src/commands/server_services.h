@@ -86,6 +86,7 @@ struct ServerStats {
   int64_t loading_start_time = 0;     // unix seconds
   uint64_t loading_loaded_bytes = 0;  // LOAD payload bytes applied
   int64_t loading_eta_seconds = 0;    // Redis's formula (server.c:5850), computed in App::Stats
+  bool cluster_enabled = false;  // INFO # Cluster and redis_mode (M7a D25)
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and

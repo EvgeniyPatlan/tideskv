@@ -130,6 +130,10 @@ const std::vector<Option> BuildReplOptions() {
          return SetBounded(v, kIntMin, kIntMax, &c.rdb_key_save_delay);
        },
        [](const ConfigValues& c) { return std::to_string(c.rdb_key_save_delay); }, false, false, true},
+      // M7a D19: startup-only. Lives here for ParseYesNo; it is the one cluster option.
+      {"cluster-enabled", false,
+       [](ConfigValues& c, std::string_view v) { return ParseYesNo(v, &c.cluster_enabled); },
+       [](const ConfigValues& c) { return std::string(c.cluster_enabled ? "yes" : "no"); }},
   };
   static constexpr std::pair<std::string_view, std::string_view> kAliases[] = {
       {"slaveof", "replicaof"},

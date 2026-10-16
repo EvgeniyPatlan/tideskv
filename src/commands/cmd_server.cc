@@ -56,7 +56,7 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
   if (name == "server") {
     return Section("Server", {{"redis_version", std::string(kRedisCompatVersion)},
                               {"tideskv_version", s.version},
-                              {"redis_mode", "standalone"},
+                              {"redis_mode", s.cluster_enabled ? "cluster" : "standalone"},
                               {"arch_bits", "64"},
                               {"process_id", std::to_string(s.pid)},
                               {"tcp_port", std::to_string(s.tcp_port)},
@@ -84,13 +84,14 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
   }
   if (name == "persistence") return Section("Persistence", PersistenceFields(s));
   if (name == "replication") return FormatReplicationSection(s.repl);
+  if (name == "cluster") return Section("Cluster", {{"cluster_enabled", s.cluster_enabled ? "1" : "0"}});
   if (name == "keyspace") return Section("Keyspace", {{"sequence", std::to_string(s.repl.applied_seq)}});
   return "";
 }
 
-const std::vector<std::string>& AllSections() {
+const std::vector<std::string>& AllSections() {  // Redis order: # Cluster right before # Keyspace
   static const std::vector<std::string> kAll = {"server",      "clients",     "memory",  "stats",
-                                                "persistence", "replication", "keyspace"};
+                                                "persistence", "replication", "cluster", "keyspace"};
   return kAll;
 }
 

@@ -123,7 +123,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 38u);
+  EXPECT_EQ(c.Get("*").size(), 39u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -507,6 +507,17 @@ TEST(ConfigRepl, ChangeHookSeesEverySuccessfulSetAndNoFailedOne) {
   EXPECT_EQ(seen[0].min_replicas_to_write, 1);
   EXPECT_FALSE(seen[1].replica_serve_stale_data);
   EXPECT_EQ(seen[1].min_replicas_max_lag, 4);
+}
+
+TEST(ConfigCluster, ClusterEnabledIsAStartupOnlyBoolean) {  // M7a D19
+  Config c;
+  EXPECT_FALSE(c.Snapshot().cluster_enabled);
+  EXPECT_EQ(GetOne(c, "cluster-enabled"), "no");
+  ASSERT_TRUE(c.ApplyArgs({"--cluster-enabled", "yes"}).ok());
+  EXPECT_TRUE(c.Snapshot().cluster_enabled);
+  EXPECT_EQ(GetOne(c, "cluster-enabled"), "yes");
+  EXPECT_EQ(c.Set("cluster-enabled", "no", /*at_runtime=*/true).message(), "can't set immutable config");
+  EXPECT_EQ(c.Set("cluster-enabled", "maybe", /*at_runtime=*/false).message(), "argument must be 'yes' or 'no'");
 }
 
 }  // namespace
