@@ -73,6 +73,10 @@ inline constexpr std::string_view kErrInvalidSlotsSuffix =
 // Redis 7.2 redirection reply: "MOVED <slot> <host>:<port>" (cluster.c).
 inline constexpr std::string_view kMovedPrefix = "MOVED ";
 
+// TidesKV-only (M7a D7, spec section 5.4): the <reason> after kErrClusterReplication when the promotion
+// failed for an internal (non-user) cause; Kvrocks appends its own status text, TidesKV exposes no internals.
+inline constexpr std::string_view kReplicationReasonStorage = "storage error";
+
 // TidesKV-only (M7a D11): MIGRATE and FLUSHSLOTS arrive with M7b.
 inline constexpr std::string_view kErrMigrateNotSupported = "ERR slot migration is not supported yet";
 
