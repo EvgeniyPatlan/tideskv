@@ -517,7 +517,8 @@ TEST(ConfigCluster, ClusterEnabledIsAStartupOnlyBoolean) {  // M7a D19
   EXPECT_TRUE(c.Snapshot().cluster_enabled);
   EXPECT_EQ(GetOne(c, "cluster-enabled"), "yes");
   EXPECT_EQ(c.Set("cluster-enabled", "no", /*at_runtime=*/true).message(), "can't set immutable config");
-  EXPECT_EQ(c.Set("cluster-enabled", "maybe", /*at_runtime=*/false).message(), "argument must be 'yes' or 'no'");
+  EXPECT_EQ(c.Set("cluster-enabled", "maybe", /*at_runtime=*/false).message(),
+            "argument must be 'yes' or 'no'");
 }
 
 }  // namespace
