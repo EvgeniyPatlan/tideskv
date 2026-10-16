@@ -53,7 +53,8 @@ class ClientPause {
   bool BeginBackgroundWrite();  // the reaper: false while any pause is active; true counts it in flight
   void EndWrite();              // ends a kRunCounted admission or a BeginBackgroundWrite
   // Blocks until no write admitted before is in flight, `own` of them excepted (the caller's own EXEC, when
-  // CLIENT PAUSE runs inside it), or Shutdown(). Must not be called while holding the Engine gate.
+  // CLIENT PAUSE runs inside it), the pause is off (Unpause() or its end time), or Shutdown(). Must not be
+  // called while holding the Engine gate.
   void WaitForWrites(int own);
   // Parked clients still connected: INFO blocked_clients counts them (Redis BLOCKED_POSTPONE).
   size_t parked() const;

@@ -49,6 +49,7 @@ void ClientPause::Unpause() {
     links.swap(parked_);
   }
   cv_.notify_all();
+  drained_.notify_all();  // the pause is gone: WaitForWrites stops waiting
   ResumeAll(links);
 }
 
@@ -91,12 +92,13 @@ void ClientPause::EndWrite() {
 }
 
 // The caller's own writes are taken out while it waits, so two callers (two EXECs pausing at once) never
-// wait for each other.
+// wait for each other. Once the pause is off (UNPAUSE or its end time) the guarantee is moot: writes are
+// admitted again, and waiting for them could stall the caller's worker long past the pause.
 void ClientPause::WaitForWrites(int own) {
   std::unique_lock lock(mu_);
   waiters_.fetch_add(1);
   in_flight_.fetch_sub(own);
-  drained_.wait(lock, [this] { return stop_ || in_flight_.load() <= 0; });
+  drained_.wait(lock, [this] { return stop_ || in_flight_.load() <= 0 || mode() == Mode::kOff; });
   in_flight_.fetch_add(own);
   waiters_.fetch_sub(1);
 }
@@ -141,6 +143,7 @@ void ClientPause::TimerLoop() {
     }
     end_ns_.store(0);
     mode_.store(0);
+    drained_.notify_all();  // the pause is gone: WaitForWrites stops waiting
     auto links = std::exchange(parked_, {});
     lock.unlock();
     ResumeAll(links);

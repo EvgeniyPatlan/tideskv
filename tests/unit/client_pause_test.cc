@@ -164,6 +164,32 @@ TEST(ClientPause, ABackgroundWriteIsRefusedWhilePausedAndWaitedFor) {  // the ex
   p.EndWrite();
 }
 
+// The guarantee is moot once the pause is gone: a waiter stuck behind a held write returns on UNPAUSE.
+TEST(ClientPause, UnpauseReleasesAWaiterBehindAHeldWrite) {
+  ClientPause p;
+  auto a = std::make_shared<test::FakeLink>();
+  ASSERT_EQ(p.Admit(true, a), Admission::kRunCounted);
+  p.Pause(ClientPause::Clock::now() + 10s, Mode::kWrite);
+  Background waiter([&] { p.WaitForWrites(0); });
+  std::this_thread::sleep_for(50ms);
+  EXPECT_FALSE(waiter.done());
+  p.Unpause();
+  EXPECT_TRUE(WaitFor([&] { return waiter.done(); }));
+  p.EndWrite();  // before ~Background: releases a waiter the Unpause did not
+}
+
+// ... and once the pause expires.
+TEST(ClientPause, TheEndTimeReleasesAWaiterBehindAHeldWrite) {
+  ClientPause p;
+  auto a = std::make_shared<test::FakeLink>();
+  ASSERT_EQ(p.Admit(true, a), Admission::kRunCounted);
+  p.Pause(ClientPause::Clock::now() + 200ms, Mode::kWrite);
+  Background waiter([&] { p.WaitForWrites(0); });
+  EXPECT_TRUE(WaitFor([&] { return waiter.done(); }));
+  EXPECT_EQ(p.mode(), Mode::kOff);
+  p.EndWrite();  // before ~Background: releases a waiter the end time did not
+}
+
 TEST(ClientPause, ShutdownReleasesAWaiter) {
   ClientPause p;
   auto a = std::make_shared<test::FakeLink>();
