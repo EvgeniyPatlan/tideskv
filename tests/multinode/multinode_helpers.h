@@ -28,6 +28,9 @@ inline std::unique_ptr<RespClient> Client(const TestServer& s) {
 
 inline std::string Digest(RespClient& c) { return c.Command({"DEBUG", "DIGEST"}).str; }
 
+// DEBUG DIGEST-INDEX (M7a D23): [hex, entries, missing, orphans].
+inline RespValue DigestIndex(RespClient& c) { return c.Command({"DEBUG", "DIGEST-INDEX"}); }
+
 inline int64_t Sequence(RespClient& c) { return InfoField(c, "keyspace", "sequence"); }
 
 // ROLE's link state on a replica ("connect", "connecting", "handshake", "connected"); "" on a master.
@@ -84,7 +87,8 @@ inline void ExpectHealthyLoad(const Workload& load) {
   EXPECT_LE(st.error_count() * 10, st.steps) << "more than 10% of the steps failed";
 }
 
-// Waits until every replica has applied the master's last seq, then compares DEBUG DIGEST. The master
+// Waits until every replica has applied the master's last seq, then compares DEBUG DIGEST and DEBUG
+// DIGEST-INDEX (M7a D23: TTL deadlines and the expire index; no node may miss an expire entry). The master
 // may still write after the load stops (its reaper deletes expired keys), so a snapshot counts only if
 // the master's sequence did not move while the digests were read; a stable snapshot whose digests differ
 // is a divergence and fails at once.
@@ -111,11 +115,22 @@ inline void ExpectConverged(const TestServer& master, const std::vector<const Te
     }
     if (caught_up) {
       const std::string digest = Digest(*m);
+      const RespValue index = DigestIndex(*m);
       std::vector<std::string> digests;
-      for (auto& r : rs) digests.push_back(Digest(*r));
+      std::vector<RespValue> indexes;
+      for (auto& r : rs) {
+        digests.push_back(Digest(*r));
+        indexes.push_back(DigestIndex(*r));
+      }
       if (Sequence(*m) == seq) {
+        ASSERT_EQ(index.elements.size(), 4u) << ToDebugString(index);
+        EXPECT_EQ(index.elements[2].integer, 0) << "the master's expire index lost entries";
         for (size_t i = 0; i < rs.size(); ++i) {
           EXPECT_EQ(digests[i], digest) << "replica" << i << " diverged at seq " << seq;
+          ASSERT_EQ(indexes[i].elements.size(), 4u) << ToDebugString(indexes[i]);
+          EXPECT_EQ(indexes[i].elements[0].str, index.elements[0].str)
+              << "replica" << i << " expire index diverged at seq " << seq;
+          EXPECT_EQ(indexes[i].elements[2].integer, 0) << "replica" << i << " lost expire entries";
         }
         EXPECT_NE(digest, std::string(40, '0')) << "the master is empty: the load wrote nothing";
         return;

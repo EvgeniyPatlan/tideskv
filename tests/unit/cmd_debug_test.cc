@@ -159,11 +159,12 @@ TEST_F(CmdDebugTest, CorruptZsetScoreIsAnErrorReply) {
 
 TEST_F(CmdDebugTest, HelpNamesTheSupportedSubcommands) {
   const std::string reply = Run({"DEBUG", "HELP"});
-  EXPECT_EQ(reply.substr(0, 4), "*7\r\n");
+  EXPECT_EQ(reply.substr(0, 4), "*9\r\n");
   EXPECT_NE(reply.find("+DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"),
             std::string::npos);
   EXPECT_NE(reply.find("+DIGEST\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-VALUE <key> [<key> ...]\r\n"), std::string::npos);
+  EXPECT_NE(reply.find("+DIGEST-INDEX\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+HELP\r\n"), std::string::npos);
 }
 
