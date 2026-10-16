@@ -16,6 +16,7 @@
 #include "repl/replication_manager.h"
 #include "script/script_engine.h"
 #include "server/blocking.h"
+#include "server/client_pause.h"
 #include "server/compaction_scheduler.h"
 #include "server/config.h"
 #include "server/watch.h"
@@ -50,6 +51,7 @@ class App final : public ServerServices {
   WatchRegistry& watches() override { return watches_; }
   ScriptEngine& scripts() override { return scripts_; }
   Replication& replication() override { return *replication_; }
+  ClientPause& pause() override { return pause_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -76,6 +78,7 @@ class App final : public ServerServices {
   WatchRegistry watches_;                           // before engine_ and the reaper: it must outlive them
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;
+  ClientPause pause_;  // before reaper_ (its paused hook reads it) and server_ (connections park in it)
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it; started by role
   CommandRegistry registry_;
   CursorStore cursors_;

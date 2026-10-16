@@ -129,10 +129,12 @@ void ExpireReaper::Loop() {
   while (!stop_) {
     lock.unlock();
     try {  // an exception escaping this thread would std::terminate the server
-      auto n = RunOnce();
-      // Retried next cycle, quietly: the Engine's BUSY answer while a script is timed out, and the
-      // READONLY refusal of a cycle that began just before this server became a replica.
-      if (!n.ok() && !Quiet(n.status())) spdlog::error("expire reaper: {}", n.status().ToString());
+      if (!options_.paused || !options_.paused()) {
+        auto n = RunOnce();
+        // Retried next cycle, quietly: the Engine's BUSY answer while a script is timed out, and the
+        // READONLY refusal of a cycle that began just before this server became a replica.
+        if (!n.ok() && !Quiet(n.status())) spdlog::error("expire reaper: {}", n.status().ToString());
+      }
     } catch (const std::exception& e) {
       spdlog::error("expire reaper: {}", e.what());
     }

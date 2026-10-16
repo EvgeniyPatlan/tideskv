@@ -9,6 +9,7 @@
 #include <csignal>
 #include <filesystem>
 #include <thread>
+#include <utility>
 
 #include "commands/all_commands.h"
 #include "commands/blocking_serve.h"
@@ -93,7 +94,9 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
       std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_, repl_log_.get());
   engine_->SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));  // H6
   scripts_.SetOnTimeout([this] { engine_->WakeWaiters(); });  // the script thread holds the gate: no lock
-  reaper_ = std::make_unique<ExpireReaper>(*engine_, ExpireReaper::Options{});
+  ExpireReaper::Options reaper_options;
+  reaper_options.paused = [this] { return pause_.mode() != ClientPause::Mode::kOff; };  // D21
+  reaper_ = std::make_unique<ExpireReaper>(*engine_, std::move(reaper_options));
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
       MakeServerOptions(),
@@ -238,6 +241,7 @@ void App::Stop() {
   stopped_ = true;
   // First: a running script holds the gate, and a replica's applier waits for it (F3), as do workers.
   scripts_.KillForShutdown();
+  pause_.Shutdown();                           // parked connections die with the server
   if (trimmer_) trimmer_->Stop();              // it calls into replication_ and trims the replog
   if (replication_) replication_->Shutdown();  // replica links first: senders read the replog (M6a)
   server_->Stop();                             // no command can touch storage after this
@@ -282,7 +286,7 @@ ServerStats App::Stats() const {
   s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
   s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
   s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
-  s.blocked_clients = blocking_.blocked_clients();
+  s.blocked_clients = blocking_.blocked_clients() + pause_.parked();  // Redis counts postponed clients
   s.blocking_keys = blocking_.blocking_keys();
   s.lua_memory = scripts_.lua_memory();
   s.cached_scripts = scripts_.cached_scripts();

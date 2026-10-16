@@ -16,6 +16,7 @@
 #include "exec/thread_commit_seq.h"
 #include "repl/replication.h"
 #include "script/script_engine.h"
+#include "server/client_pause.h"
 #include "server/watch.h"
 #include "types/errors.h"
 
@@ -65,6 +66,9 @@ bool IsEvalFamily(std::string_view n) {
   return n == "eval" || n == "evalsha" || n == "eval_ro" || n == "evalsha_ro";
 }
 
+// EVAL and EVALSHA carry Redis's may-replicate flag whatever the script does (server.c:3914).
+bool IsMayReplicateScript(std::string_view n) { return n == "eval" || n == "evalsha"; }
+
 uint32_t ScriptSubcommandFlags(uint32_t base, const ArgList& argv) {
   if (argv.size() < 2) return base;
   const std::string sub = ToLower(argv[1]);
@@ -85,8 +89,25 @@ void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv, uint3
     ctx.session.multi.has_write |= (flags & kCmdWrite) != 0;
     ctx.session.multi.has_non_stale |= (flags & kCmdStale) == 0;
     ctx.session.multi.has_non_loading |= (flags & kCmdLoading) == 0;
+    ctx.session.multi.has_may_replicate |= (flags & kCmdWrite) != 0 || IsMayReplicateScript(spec.name);
   }
   ctx.reply.SimpleString("QUEUED");
+}
+
+// Redis is_may_replicate_command (server.c:3914): CLIENT PAUSE WRITE postpones these.
+bool MayReplicate(const Session& s, const CommandSpec& spec, const CallFlags& call) {
+  return call.is_write || IsMayReplicateScript(spec.name) ||
+         (spec.name == "exec" && s.multi.has_may_replicate);
+}
+
+// blockPostponeClient (server.c:4146, M7a D21): no reply now; the connection re-dispatches argv when the
+// pause resumes it. False when nothing is paused or the pause ended meanwhile: run the call now.
+bool Postpone(ExecContext& ctx, const CommandSpec& spec, const CallFlags& call, const ArgList& argv) {
+  ClientPause& pause = ctx.server.pause();
+  if (!pause.Blocks(MayReplicate(ctx.session, spec, call))) return false;
+  if (!pause.Park(ctx.session.link)) return false;
+  ctx.session.postponed = argv;  // Resume runs on this connection's thread, after Dispatch returned
+  return true;
 }
 
 }  // namespace
@@ -167,6 +188,7 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }
+  if (Postpone(ctx, *spec, call, argv)) return;  // CLIENT PAUSE (D21), before queueing (server.c:4146)
   if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv, flags);
   const uint64_t commits = ThreadCommitCount();
   spec->handler(ctx, argv);

@@ -57,6 +57,14 @@ struct CommandHarness {
     return Run(ArgList(argv.begin(), argv.end()));
   }
 
+  // What the connection does on ClientLink::Resume: re-dispatch the parked command.
+  std::string RunPostponed() {
+    if (!session.postponed) return "<nothing postponed>";
+    ArgList argv = std::move(*session.postponed);
+    session.postponed.reset();
+    return Run(argv);
+  }
+
   void RequirePassword(const std::string& pass) {
     EXPECT_TRUE(services.config_.Set("requirepass", pass, true).ok());
     session.authenticated = false;
@@ -170,6 +178,13 @@ struct SecondClient {
     auto replies = link->Take();
     if (!replies.empty()) session.blocked.reset();
     return replies;
+  }
+  // What the connection does on ClientLink::Resume: re-dispatch the parked command.
+  std::string RunPostponed() {
+    if (!session.postponed) return "<nothing postponed>";
+    ArgList argv = std::move(*session.postponed);
+    session.postponed.reset();
+    return Run(argv);
   }
 
   CommandHarness& h;

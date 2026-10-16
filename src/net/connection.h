@@ -24,8 +24,9 @@ struct ConnStats {
 };
 
 // One client. Lives on exactly one worker io_context; kept alive by the
-// shared_ptr captured in its pending async handler. While a command is blocked (session_.blocked set) it
-// executes nothing more but keeps reading, so pipelined input is buffered and EOF is detected (M4 F5).
+// shared_ptr captured in its pending async handler. While a command is blocked (session_.blocked set) or
+// postponed by CLIENT PAUSE (session_.postponed set, M7a D21) it executes nothing more but keeps reading, so
+// pipelined input is buffered and EOF is detected (M4 F5).
 class Connection : public std::enable_shared_from_this<Connection>, public ClientLink {
  public:
   Connection(asio::ip::tcp::socket socket, Session session, CommandExecutor executor,
@@ -38,17 +39,20 @@ class Connection : public std::enable_shared_from_this<Connection>, public Clien
   void Start();
   void Unblock(std::string reply) override;          // ClientLink: any thread
   void UnblockAndClose(std::string reply) override;  // ClientLink: any thread
+  void Resume() override;                            // ClientLink: any thread (CLIENT PAUSE ended, D21)
 
  private:
   void DoRead();
   void OnRead(std::error_code ec, size_t n);
   void ProcessInput();
+  bool Execute(const std::vector<std::string>& argv);  // false: the pipeline stops (blocked or postponed)
   void AfterInput();
   void StartWrite();
   void OnWrite(std::error_code ec);
   void ArmBlockTimer();
   void OnUnblocked(const std::string& reply, bool close_after);
   void ResumeAfterBlock();  // the blocked command ended: run the pipeline again
+  void OnResume();          // the postponed command runs again, then the pipeline (D21)
   void Handoff();           // PSYNC's reply is flushed: give the socket to session_.takeover (M6a D10)
   void FinishHandoff();
   void Close();

@@ -1,8 +1,8 @@
 #include <cstdint>
-#include <limits>
 #include <string>
 
 #include "commands/all_commands.h"
+#include "commands/block_args.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "exec/engine.h"
@@ -11,24 +11,6 @@
 
 namespace tideskv {
 namespace {
-
-// getTimeoutFromObjectOrReply(UNIT_MILLISECONDS) (timeout.c:165): *ms = 0 means forever. False after
-// replying the error.
-bool ParseWaitTimeout(ExecContext& ctx, const std::string& arg, int64_t* ms) {
-  if (!ParseInt64(arg, ms)) {
-    ctx.reply.Error(kErrTimeoutNotInteger);
-    return false;
-  }
-  if (*ms < 0) {
-    ctx.reply.Error(kErrTimeoutNegative);
-    return false;
-  }
-  if (*ms > 0 && *ms > std::numeric_limits<int64_t>::max() - ctx.server.engine().NowMs()) {
-    ctx.reply.Error(kErrTimeoutOutOfRange);  // the absolute deadline would overflow
-    return false;
-  }
-  return true;
-}
 
 // WAIT numreplicas timeout (waitCommand, replication.c:3537; M6b D9): the number of online replicas that
 // acknowledged this client's last write, once numreplicas of them did or the timeout passed. Inside MULTI
@@ -39,7 +21,9 @@ void Wait(ExecContext& ctx, const ArgList& argv) {
   int64_t numreplicas = 0;
   if (!ParseInt64(argv[1], &numreplicas)) return ctx.reply.Error(kErrNotInteger);
   int64_t timeout_ms = 0;
-  if (!ParseWaitTimeout(ctx, argv[2], &timeout_ms)) return;
+  if (Status st = ParseMsTimeout(argv[2], ctx.server.engine().NowMs(), &timeout_ms); !st.ok()) {
+    return ctx.reply.Error(st.message());
+  }
   const uint64_t woff = ctx.session.woff;
   const int64_t acked = repl.CountAcked(woff);
   if (acked >= numreplicas || ctx.block == nullptr) return ctx.reply.Integer(acked);

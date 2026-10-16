@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,15 +22,19 @@ class ClientLink {
   // Like Unblock, but the connection is closed once `reply` is written and runs none of its pipelined
   // input (Redis CLIENT_CLOSE_AFTER_REPLY; M6a D14 demotion).
   virtual void UnblockAndClose(std::string reply) = 0;
+  // Thread-safe and non-blocking (M7a D21): CLIENT PAUSE ended, so the connection re-dispatches the command
+  // it parked (Session::postponed) from the start, then the rest of its pipeline.
+  virtual void Resume() = 0;
 };
 
 // MULTI state (M5a plan G3).
 struct MultiState {
-  bool active = false;           // between MULTI and EXEC/DISCARD (Redis CLIENT_MULTI)
-  bool dirty_exec = false;       // a command was rejected while queueing: EXEC aborts (CLIENT_DIRTY_EXEC)
-  bool has_write = false;        // a queued command has the write flag (Redis mstate.cmd_flags)
-  bool has_non_stale = false;    // a queued command lacks the stale flag
-  bool has_non_loading = false;  // a queued command lacks the loading flag
+  bool active = false;             // between MULTI and EXEC/DISCARD (Redis CLIENT_MULTI)
+  bool dirty_exec = false;         // a command was rejected while queueing: EXEC aborts (CLIENT_DIRTY_EXEC)
+  bool has_write = false;          // a queued command has the write flag (Redis mstate.cmd_flags)
+  bool has_non_stale = false;      // a queued command lacks the stale flag
+  bool has_non_loading = false;    // a queued command lacks the loading flag
+  bool has_may_replicate = false;  // a queued write, EVAL or EVALSHA (CLIENT PAUSE WRITE, D21)
   std::vector<std::vector<std::string>> queued;
 };
 
@@ -60,6 +65,9 @@ struct Session {
   std::function<void(int fd, std::string unread)> takeover;
   bool is_replica_link = false;  // PSYNC succeeded: further PSYNC/SYNC are ignored (Redis CLIENT_SLAVE)
   uint64_t woff = 0;             // Redis c->woff: the seq of this client's last write (WAIT, M6b D9)
+  // CLIENT PAUSE (M7a D21): the command Dispatch parked instead of running; the connection executes nothing
+  // more until ClientLink::Resume re-dispatches it.
+  std::optional<std::vector<std::string>> postponed;
 };
 
 }  // namespace tideskv

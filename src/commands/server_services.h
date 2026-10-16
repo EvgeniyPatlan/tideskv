@@ -8,6 +8,7 @@
 namespace tideskv {
 
 class BlockingRegistry;
+class ClientPause;
 class CommandRegistry;
 class CursorStore;
 class Engine;
@@ -106,6 +107,7 @@ class ServerServices {
   virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
   virtual ScriptEngine& scripts() = 0;       // EVAL / SCRIPT (M5b)
   virtual Replication& replication() = 0;    // role queries (M6a)
+  virtual ClientPause& pause() = 0;          // CLIENT PAUSE (M7a D21)
 };
 
 }  // namespace tideskv

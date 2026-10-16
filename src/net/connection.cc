@@ -55,7 +55,8 @@ void Connection::OnRead(std::error_code ec, size_t n) {
     spdlog::warn("closing client id={} addr={}: query buffer limit exceeded", session_.id, session_.peer);
     return Close();
   }
-  if (!session_.blocked && !session_.takeover) ProcessInput();  // while blocked, input is only buffered
+  // While blocked or postponed, input is only buffered.
+  if (!session_.blocked && !session_.postponed && !session_.takeover) ProcessInput();
   AfterInput();
 }
 
@@ -75,21 +76,27 @@ void Connection::ProcessInput() {
       break;
     }
     stats_->total_commands.fetch_add(1, std::memory_order_relaxed);
-    const size_t reply_mark = reply_.size();
-    try {
-      executor_(session_, parser_.args(), reply_);
-    } catch (const std::exception& e) {
-      spdlog::error("command failed for client id={}: {}", session_.id, e.what());
-      reply_.Truncate(reply_mark);  // drop any half-written reply
-      reply_.Error(kErrInternal);
-      session_.close_after_reply = true;
-    }
-    if (session_.blocked) {  // the command parked itself: stop until it ends (F5)
-      ArmBlockTimer();
-      break;
-    }
+    if (!Execute(parser_.args())) break;
   }
   in_.erase(0, offset);
+}
+
+// Runs one command. False when the pipeline must stop after it: it blocked (F5) or was postponed (D21).
+bool Connection::Execute(const std::vector<std::string>& argv) {
+  const size_t reply_mark = reply_.size();
+  try {
+    executor_(session_, argv, reply_);
+  } catch (const std::exception& e) {
+    spdlog::error("command failed for client id={}: {}", session_.id, e.what());
+    reply_.Truncate(reply_mark);  // drop any half-written reply
+    reply_.Error(kErrInternal);
+    session_.close_after_reply = true;
+  }
+  if (session_.blocked) {  // the command parked itself: stop until it ends (F5)
+    ArmBlockTimer();
+    return false;
+  }
+  return !session_.postponed;
 }
 
 void Connection::AfterInput() {
@@ -102,8 +109,9 @@ void Connection::AfterInput() {
     return Handoff();
   }
   if (session_.takeover) return;  // no new reads: the socket is about to change hands
-  // Blocked: keep reading (EOF detection, buffering). Otherwise read only when no write is in flight.
-  if (session_.blocked || !writing_) DoRead();
+  // Blocked or postponed: keep reading (EOF detection, buffering). Otherwise read only when no write is in
+  // flight.
+  if (session_.blocked || session_.postponed || !writing_) DoRead();
 }
 
 void Connection::StartWrite() {
@@ -131,6 +139,20 @@ void Connection::Unblock(std::string reply) {
 void Connection::UnblockAndClose(std::string reply) {
   asio::post(socket_.get_executor(),
              [self = shared_from_this(), r = std::move(reply)]() { self->OnUnblocked(r, true); });
+}
+
+void Connection::Resume() {
+  asio::post(socket_.get_executor(), [self = shared_from_this()]() { self->OnResume(); });
+}
+
+// CLIENT PAUSE ended (D21): the parked command runs from the start (it may be parked again), then the
+// pipeline.
+void Connection::OnResume() {
+  if (closed_ || !session_.postponed) return;
+  std::vector<std::string> argv = std::move(*session_.postponed);
+  session_.postponed.reset();
+  if (Execute(argv) && !session_.takeover) ProcessInput();
+  AfterInput();
 }
 
 // Relies on at-most-once delivery: BlockedClient ends a wait exactly once (TryServe, Cancel and Unblock

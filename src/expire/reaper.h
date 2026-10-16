@@ -4,10 +4,12 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -35,9 +37,10 @@ class ExpireReaper {
     std::chrono::milliseconds interval{100};     // spec §4.5
     size_t batch_size = 1000;                    // spec §4.5
     std::chrono::milliseconds cycle_budget{25};  // keep re-running full batches until this is spent
+    std::function<bool()> paused;                // CLIENT PAUSE (M7a D21): skip cycles while true
   };
 
-  ExpireReaper(Engine& engine, Options options) : engine_(engine), options_(options) {}
+  ExpireReaper(Engine& engine, Options options) : engine_(engine), options_(std::move(options)) {}
   ~ExpireReaper() { Stop(); }
   ExpireReaper(const ExpireReaper&) = delete;
   ExpireReaper& operator=(const ExpireReaper&) = delete;

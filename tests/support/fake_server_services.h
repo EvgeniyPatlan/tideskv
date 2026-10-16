@@ -17,6 +17,7 @@
 #include "repl/wait_list.h"
 #include "script/script_engine.h"
 #include "server/blocking.h"
+#include "server/client_pause.h"
 #include "server/watch.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
@@ -135,6 +136,7 @@ class FakeServerServices final : public ServerServices {
   Replication& replication() override {
     return real_replication != nullptr ? *real_replication : replication_;
   }
+  ClientPause& pause() override { return pause_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -145,6 +147,7 @@ class FakeServerServices final : public ServerServices {
   ScriptEngine scripts_;
   FakeReplication replication_;
   Replication* real_replication = nullptr;  // set: replication() returns it instead of the fake
+  ClientPause pause_;
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

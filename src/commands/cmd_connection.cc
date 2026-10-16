@@ -1,11 +1,16 @@
+#include <algorithm>
+#include <chrono>
 #include <optional>
 #include <string>
 
 #include "commands/all_commands.h"
+#include "commands/block_args.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "exec/engine.h"
 #include "repl/replication.h"
 #include "server/blocking.h"
+#include "server/client_pause.h"
 #include "types/errors.h"
 
 namespace tideskv {
@@ -194,6 +199,26 @@ void ClientUnblock(ExecContext& ctx, const ArgList& argv) {
   ctx.reply.Integer(target->Unblock(r.Take()) ? 1 : 0);
 }
 
+// CLIENT PAUSE timeout [WRITE|ALL] (networking.c:285-303; M7a D21): the mode is checked before the timeout.
+void ClientPauseCmd(ExecContext& ctx, const ArgList& argv) {
+  ClientPause::Mode mode = ClientPause::Mode::kAll;
+  if (argv.size() == 4) {
+    if (EqualsIgnoreCase(argv[3], "write")) {
+      mode = ClientPause::Mode::kWrite;
+    } else if (!EqualsIgnoreCase(argv[3], "all")) {
+      return ctx.reply.Error(kErrClientPauseMode);
+    }
+  }
+  int64_t ms = 0;
+  if (Status st = ParseMsTimeout(argv[2], ctx.server.engine().NowMs(), &ms); !st.ok()) {
+    return ctx.reply.Error(st.message());
+  }
+  constexpr int64_t kMaxPauseMs = int64_t{100} * 365 * 24 * 3600 * 1000;  // steady_clock ns cannot hold more
+  ctx.server.pause().Pause(ClientPause::Clock::now() + std::chrono::milliseconds(std::min(ms, kMaxPauseMs)),
+                           mode);
+  ctx.reply.SimpleString("OK");
+}
+
 void Client(ExecContext& ctx, const ArgList& argv) {
   const std::string sub = ToLower(argv[1]);
   if (sub == "id" && argv.size() == 2) return ctx.reply.Integer(static_cast<int64_t>(ctx.session.id));
@@ -207,6 +232,11 @@ void Client(ExecContext& ctx, const ArgList& argv) {
   }
   if (sub == "setinfo" && argv.size() == 4) return ClientSetInfo(ctx, argv);
   if (sub == "unblock" && (argv.size() == 3 || argv.size() == 4)) return ClientUnblock(ctx, argv);
+  if (sub == "pause" && (argv.size() == 3 || argv.size() == 4)) return ClientPauseCmd(ctx, argv);
+  if (sub == "unpause" && argv.size() == 2) {
+    ctx.server.pause().Unpause();
+    return ctx.reply.SimpleString("OK");
+  }
   ctx.reply.Error("ERR unknown subcommand or wrong number of arguments for '" + argv[1] +
                   "'. Try CLIENT HELP.");
 }

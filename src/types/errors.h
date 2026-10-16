@@ -68,6 +68,8 @@ inline constexpr std::string_view kErrWaitOnReplica =
 
 inline constexpr std::string_view kErrUnblockReason = "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR";
 inline constexpr std::string_view kErrUnblockedByClient = "UNBLOCKED client unblocked via CLIENT UNBLOCK";
+inline constexpr std::string_view kErrClientPauseMode =
+    "ERR CLIENT PAUSE mode must be WRITE or ALL";  // networking.c:296
 // REPLICAOF NO ONE that could not persist the promotion (TidesKV; + the storage error). The node stays a
 // replica of the same master.
 inline constexpr std::string_view kErrPromotionFailed = "ERR REPLICAOF NO ONE failed, still a replica: ";
