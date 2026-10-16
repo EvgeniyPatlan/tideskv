@@ -13,6 +13,7 @@
 
 #include "commands/all_commands.h"
 #include "commands/blocking_serve.h"
+#include "commands/cluster_routing.h"
 #include "common/string_util.h"
 #include "common/version.h"
 #include "server/connection_block_handler.h"
@@ -174,6 +175,11 @@ cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
   };
   o.become_master = [this] { return replication_->BecomeMaster(); };
   o.make_durable = [this] { return storage_->Checkpoint(); };  // D20
+  // D16, under apply_mu_: SetRedirect only takes the registry's and the ended clients' mutexes and posts the
+  // replies, so it never waits for a thread that waits for apply_mu_.
+  o.on_publish = [this](const std::shared_ptr<const cluster::Topology>& t) {
+    blocking_.SetRedirect([t](const BlockedClient& c) { return BlockedRedirect(*t, c); });
+  };
   return o;
 }
 

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cluster/cluster_manager.h"
+#include "commands/cluster_routing.h"
 #include "support/command_harness.h"
 
 namespace tideskv::test {
@@ -31,11 +32,17 @@ struct ClusterHarness {
     o.is_replica = [&r] { return r.IsReplica(); };
     o.become_replica = [&r](const std::string& host, uint16_t p) { return r.BecomeReplica(host, p); };
     o.become_master = [&r] { return r.BecomeMaster(); };
+    o.on_publish = [&h](const std::shared_ptr<const cluster::Topology>& t) {
+      h.services.blocking_.SetRedirect([t](const BlockedClient& c) { return BlockedRedirect(*t, c); });
+    };
     manager = std::make_unique<cluster::ClusterManager>(h.services.storage_, std::move(o));
     EXPECT_TRUE(manager->Load().ok());
     h.services.cluster_manager = manager.get();
   }
-  ~ClusterHarness() { h_.services.cluster_manager = nullptr; }
+  ~ClusterHarness() {
+    h_.services.cluster_manager = nullptr;
+    h_.services.blocking_.SetRedirect({});
+  }
   ClusterHarness(const ClusterHarness&) = delete;
   ClusterHarness& operator=(const ClusterHarness&) = delete;
 

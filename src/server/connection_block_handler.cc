@@ -25,8 +25,15 @@ void ConnectionBlockHandler::Block(const BlockRequest& request) {
                                                 deadline, request.timeout_reply);
   session_.blocked = client;
   std::string refusal;
-  if (!registry_.AddIfCurrent(client, epoch_, &refusal)) {
-    client->UnblockAndClose(std::move(refusal));  // delivered like any unblock, after this command
+  bool close_after = false;
+  if (!registry_.AddIfCurrent(client, epoch_, &refusal, &close_after)) {
+    // delivered like any unblock, after this command; a demotion also closes the connection (M6a D14), a
+    // topology redirect (M7a D16) does not
+    if (close_after) {
+      client->UnblockAndClose(std::move(refusal));
+    } else {
+      client->Unblock(std::move(refusal));
+    }
     return;
   }
   for (const std::string& k : client->keys()) ready_.push_back({client->db(), k});

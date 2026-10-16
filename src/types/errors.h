@@ -132,6 +132,8 @@ inline constexpr std::string_view kErrRoScriptWithWriteFlag =
 inline constexpr std::string_view kErrBusyScript =
     "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
 inline constexpr std::string_view kErrNotBusy = "NOTBUSY No scripts in execution right now.";
+inline constexpr std::string_view kErrScriptNoCluster =
+    "ERR Can not run script on cluster, 'no-cluster' flag is set.";  // script.c:142
 inline constexpr std::string_view kErrReadOnlyReplica =
     "READONLY You can't write against a read only replica.";
 // server.c:1862 (shared.masterdownerr); verified on redis:7.2.5.

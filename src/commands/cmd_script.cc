@@ -35,6 +35,7 @@ void RunScript(ExecContext& ctx, const ScriptEngine::EvalRequest& req) {
   if (!mark.ok()) return ReplyError(ctx, mark.status());
   resp::ReplyBuilder scratch(ctx.reply.protocol());
   ScriptBridge bridge(ctx);
+  if (req.keys != nullptr) bridge.SetDeclaredKeys(*req.keys);
   const ScriptEngine::EvalResult result = ctx.server.scripts().Eval(req, bridge, scratch);
   // Then drop the mark: a live one slows every later write of the batch (an EXEC may run many scripts).
   const Status undone = result.killed ? engine.BatchRollbackTo(*mark) : Status::Ok();
@@ -62,7 +63,7 @@ void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_o
   const std::vector<std::string> args(split, argv.end());
   RunScript(ctx,
             {argv[1], by_sha, read_only, &keys, &args, ctx.server.config().Snapshot().busy_reply_threshold_ms,
-             ctx.server.replication().IsReplica()});
+             ctx.server.replication().IsReplica(), ctx.server.cluster() != nullptr});
 }
 
 void Eval(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, false, false); }

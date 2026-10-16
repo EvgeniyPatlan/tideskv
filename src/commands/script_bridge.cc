@@ -4,7 +4,9 @@
 
 #include <exception>
 
+#include "commands/cluster_routing.h"
 #include "commands/server_services.h"
+#include "common/crc16.h"
 #include "repl/replication.h"
 #include "types/errors.h"
 
@@ -17,6 +19,12 @@ ScriptBridge::ScriptBridge(ExecContext& caller) : caller_(caller) {
   session_.db = caller.session.db;
   session_.woff = caller.session.woff;  // WAIT inside the script counts the caller's last write (D9)
   session_.authenticated = true;        // the script runs as its caller
+  session_.readonly_reads = caller.session.readonly_reads;  // script.c:428-430
+  session_.asking = caller.session.asking;
+}
+
+void ScriptBridge::SetDeclaredKeys(const std::vector<std::string>& keys) {
+  first_slot_ = keys.empty() ? -1 : KeySlot(keys.front());
 }
 
 std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& argv, int resp,
@@ -49,6 +57,12 @@ std::optional<std::string> ScriptBridge::Call(const std::vector<std::string>& ar
   }
   if (is_write && caller_.server.replication().IsReplica()) {
     *error = "-" + std::string(kErrReadOnlyReplica);
+    return std::nullopt;
+  }
+  if (std::string e =
+          ScriptClusterRefusal(caller_.server, session_, *spec, argv, allow_cross_slot_, &first_slot_);
+      !e.empty()) {
+    *error = std::move(e);  // scriptVerifyClusterState, last before the call (script.c:526-557)
     return std::nullopt;
   }
   session_.protocol = resp;

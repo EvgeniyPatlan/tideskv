@@ -126,6 +126,11 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
     return {};
   }
   const ScriptFlags flags = scripts_.at(*sha).flags;
+  if (req.cluster && flags.shebang &&
+      flags.no_cluster) {  // scriptPrepareForRun (script.c:141), checked first
+    out.Error(kErrScriptNoCluster);
+    return {};
+  }
   if (req.replica && flags.shebang && !flags.no_writes) {  // scriptPrepareForRun, before the *_ro rule
     out.Error(kErrReadOnlyReplica);
     return {};
@@ -135,6 +140,7 @@ ScriptEngine::EvalResult ScriptEngine::Eval(const EvalRequest& req, ScriptCaller
     return {};
   }
   caller.SetReadOnly(req.read_only_command || flags.no_writes);
+  caller.SetCrossSlotAllowed(!flags.shebang || flags.allow_cross_slot);
   static const std::vector<std::string> kNone;
   struct RunGuard {  // also runs when Run throws, so BUSY cannot stick
     ScriptEngine& e;

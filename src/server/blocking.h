@@ -86,10 +86,12 @@ class BlockingRegistry {
   // consistent and the connection's current wait is the one that can be served; the old wait is
   // orphaned (its later Remove is a no-op) and ends only by its own timeout or disconnect.
   void Add(const std::shared_ptr<BlockedClient>& client);
-  // Add, unless a DisconnectAll ran since `epoch` was read: a blocking command dispatched before a
-  // demotion must not start waiting after it. Then nothing is registered, *refusal gets DisconnectAll's
-  // reply bytes, and false is returned.
-  bool AddIfCurrent(const std::shared_ptr<BlockedClient>& client, uint64_t epoch, std::string* refusal);
+  // Add, unless a DisconnectAll ran since `epoch` was read (a blocking command dispatched before a
+  // demotion must not start waiting after it; *close_after = true) or the redirect check refuses the wait
+  // (a command routed under an older topology, M7a D16; *close_after = false). Then nothing is registered,
+  // *refusal gets the reply bytes, and false is returned.
+  bool AddIfCurrent(const std::shared_ptr<BlockedClient>& client, uint64_t epoch, std::string* refusal,
+                    bool* close_after);
   uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }  // read before dispatch
   void Remove(const BlockedClient& client);                                  // idempotent
   // Cheap when nobody is blocked anywhere (one atomic load).
@@ -101,6 +103,13 @@ class BlockingRegistry {
   // connections after the reply (Redis disconnectAllBlockedClients; M6a D14), and starts a new epoch so
   // that AddIfCurrent refuses commands dispatched before it. Returns how many waits it ended.
   size_t DisconnectAll(std::string_view error);
+  // M7a D16: the check every wait must pass (the cluster topology): the error that ends it, or nullopt.
+  // Waits that fail it now end with its error (the connection stays open); AddIfCurrent refuses a later
+  // wait that fails it; an empty Redirect removes the check. Called with mu_ held, so it must only read the
+  // client's const state. Never blocks on another thread: it takes mu_, then each ended client's own mutex
+  // (outside mu_), and delivers by posting to the connection. Returns how many waits it ended.
+  using Redirect = std::function<std::optional<std::string>(const BlockedClient&)>;
+  size_t SetRedirect(Redirect redirect);
   size_t blocked_clients() const { return count_.load(); }
   size_t blocking_keys() const;  // distinct (db, key) with at least one waiter
 
@@ -114,6 +123,7 @@ class BlockingRegistry {
   std::atomic<size_t> count_{0};
   std::atomic<uint64_t> epoch_{0};  // written under mu_
   std::string refusal_;             // guarded by mu_: the last DisconnectAll's reply
+  Redirect redirect_;               // guarded by mu_
 };
 
 }  // namespace tideskv

@@ -26,6 +26,8 @@ class ScriptCaller {
   virtual std::optional<std::string> Call(const std::vector<std::string>& argv, int resp,
                                           std::string* error) = 0;
   virtual bool CommandExists(std::string_view name) const = 0;
+  // Redis SCRIPT_ALLOW_CROSS_SLOT (script.c:241): compat-mode scripts and allow-cross-slot-keys (M7a D15).
+  virtual void SetCrossSlotAllowed(bool /*allowed*/) {}
 };
 
 // The script cache, compile/lookup, the *_RO rule, and the busy/timeout/kill state (M5b H2-H7).
@@ -41,6 +43,7 @@ class ScriptEngine {
     const std::vector<std::string>* args = nullptr;
     int64_t busy_threshold_ms = 5000;  // 0 = no hook
     bool replica = false;  // this node is a replica: a shebang script without no-writes is refused
+    bool cluster = false;  // cluster mode: a shebang script with no-cluster is refused (D15)
   };
   struct EvalResult {
     bool killed = false;

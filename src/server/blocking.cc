@@ -112,11 +112,20 @@ void BlockingRegistry::AddLocked(const std::shared_ptr<BlockedClient>& client) {
 }
 
 bool BlockingRegistry::AddIfCurrent(const std::shared_ptr<BlockedClient>& client, uint64_t epoch,
-                                    std::string* refusal) {
-  std::lock_guard lock(mu_);  // the check and the insert are one step for DisconnectAll's snapshot
+                                    std::string* refusal, bool* close_after) {
+  std::lock_guard lock(
+      mu_);  // the checks and the insert are one step for DisconnectAll's / SetRedirect's snapshot
   if (epoch != epoch_.load(std::memory_order_relaxed)) {
     *refusal = refusal_;
+    *close_after = true;
     return false;
+  }
+  if (redirect_) {
+    if (auto error = redirect_(*client)) {
+      *refusal = "-" + *error + "\r\n";
+      *close_after = false;
+      return false;
+    }
   }
   AddLocked(client);
   return true;
@@ -174,6 +183,24 @@ size_t BlockingRegistry::DisconnectAll(std::string_view error) {
   size_t ended = 0;
   for (const auto& client : clients) {
     if (client->UnblockAndClose(reply)) ++ended;
+  }
+  return ended;
+}
+
+size_t BlockingRegistry::SetRedirect(Redirect redirect) {
+  std::vector<std::pair<std::shared_ptr<BlockedClient>, std::string>> ending;
+  {
+    std::lock_guard lock(mu_);
+    redirect_ = std::move(redirect);
+    if (redirect_) {
+      for (const auto& [id, client] : by_client_) {
+        if (auto error = redirect_(*client)) ending.emplace_back(client, "-" + *error + "\r\n");
+      }
+    }
+  }
+  size_t ended = 0;  // outside mu_: ending a wait takes BlockedClient::mu_, then mu_ (Remove)
+  for (auto& [client, reply] : ending) {
+    if (client->Unblock(std::move(reply))) ++ended;
   }
   return ended;
 }
