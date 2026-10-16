@@ -65,6 +65,8 @@ struct Session {
   std::function<void(int fd, std::string unread)> takeover;
   bool is_replica_link = false;  // PSYNC succeeded: further PSYNC/SYNC are ignored (Redis CLIENT_SLAVE)
   uint64_t woff = 0;             // Redis c->woff: the seq of this client's last write (WAIT, M6b D9)
+  bool readonly_reads = false;   // READONLY (cluster, M7a D13): reads of my master's slots run here
+  bool asking = false;           // ASKING: the next command may use an importing slot (consulted from M7b)
   // CLIENT PAUSE (M7a D21): the command Dispatch parked instead of running; the connection executes nothing
   // more until ClientLink::Resume re-dispatches it.
   std::optional<std::vector<std::string>> postponed;

@@ -148,7 +148,9 @@ void Reset(ExecContext& ctx, const ArgList&) {
   s.protocol = 2;
   ctx.reply.SetProtocol(2);
   s.authenticated = ctx.server.config().Snapshot().requirepass.empty();
-  s.name.clear();  // lib_name / lib_ver stay: they describe the client library
+  s.name.clear();            // lib_name / lib_ver stay: they describe the client library
+  s.readonly_reads = false;  // networking.c:1562 (cluster flags)
+  s.asking = false;
   ctx.reply.SimpleString("RESET");
 }
 

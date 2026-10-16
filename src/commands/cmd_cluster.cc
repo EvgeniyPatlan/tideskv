@@ -210,12 +210,35 @@ void Cluster(ExecContext& ctx, const ArgList& argv) {
   it->second.run(ctx, *cm, *t, argv);
 }
 
+// READONLY / READWRITE / ASKING (cluster.c:7282-7311): connection flags read by the router (D13).
+void ReadOnlyCmd(ExecContext& ctx, const ArgList&) {
+  if (ctx.server.cluster() == nullptr) return ctx.reply.Error(cluster::kErrClusterDisabled);
+  ctx.session.readonly_reads = true;
+  ctx.reply.SimpleString("OK");
+}
+
+void ReadWriteCmd(ExecContext& ctx, const ArgList&) {
+  if (ctx.server.cluster() == nullptr) return ctx.reply.Error(cluster::kErrClusterDisabled);
+  ctx.session.readonly_reads = false;
+  ctx.reply.SimpleString("OK");
+}
+
+void AskingCmd(ExecContext& ctx, const ArgList&) {
+  if (ctx.server.cluster() == nullptr) return ctx.reply.Error(cluster::kErrClusterDisabled);
+  ctx.session.asking = true;
+  ctx.reply.SimpleString("OK");
+}
+
 }  // namespace
 
 void RegisterClusterCommands(CommandRegistry& r) {
   // loading + stale: a full-syncing replica answers the controller's probe (D12); no_multi + noscript: RESET
   // changes the role (D8).
   r.Register({"cluster", -2, kCmdNoScript | kCmdNoMulti | kCmdLoading | kCmdStale, 0, 0, 0, &Cluster});
+  // Redis 7.2: readonly/readwrite "fast loading stale", asking "fast".
+  r.Register({"readonly", 1, kCmdFast | kCmdLoading | kCmdStale, 0, 0, 0, &ReadOnlyCmd});
+  r.Register({"readwrite", 1, kCmdFast | kCmdLoading | kCmdStale, 0, 0, 0, &ReadWriteCmd});
+  r.Register({"asking", 1, kCmdFast, 0, 0, 0, &AskingCmd});
 }
 
 }  // namespace tideskv

@@ -145,11 +145,43 @@ TEST(ClusterIT, AReplicaBootsAsAReplicaAndPartialSyncs) {
   rc = r.Connect();
   EXPECT_EQ(InfoString(*rc, "replication", "role"), "slave");
   EXPECT_EQ(InfoString(*rc, "replication", "master_replid"), replid);
-  EXPECT_EQ(rc->Command({"SET", "x", "1"}).type, RespValue::Type::kError);  // MOVED once Task 12 routes
+  EXPECT_EQ(rc->Command({"SET", "x", "1"}).str, "MOVED 16287 127.0.0.1:" + std::to_string(m.port()));
   m.Resume();
   ASSERT_TRUE(WaitFor([&] { return LinkOf(*rc) == "connected"; }, 30s));
   EXPECT_EQ(InfoField(*mc, "stats", "sync_full"), full);
   EXPECT_EQ(InfoField(*mc, "stats", "sync_partial_ok"), partial + 1);
+}
+
+TEST(ClusterIT, RoutingAcrossTwoMastersAndAReadonlyReplica) {  // D13
+  TestServer a(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs()});
+  TestServer b(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs()});
+  TestServer c(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs()});
+  const std::string nodes =
+      MasterLine('a', a, "0-8191") + MasterLine('b', b, "8192-16383") + SlaveLine('c', c, 'a');
+  Push(a, 'a', nodes, 1);
+  Push(b, 'b', nodes, 1);
+  Push(c, 'c', nodes, 1);
+  auto ac = a.Connect();
+  auto bc = b.Connect();
+  auto cc = c.Connect();
+  EXPECT_EQ(ac->Command({"SET", "foo", "1"}).str, "MOVED 12182 127.0.0.1:" + std::to_string(b.port()));
+  EXPECT_EQ(bc->Command({"SET", "foo", "1"}).str, "OK");
+  EXPECT_EQ(ac->Command({"MSET", "b", "1", "foo", "2"}).str,
+            "CROSSSLOT Keys in request don't hash to the same slot");
+  ASSERT_EQ(ac->Command({"SET", "b", "v"}).str, "OK");
+  ASSERT_TRUE(WaitFor([&] { return LinkOf(*cc) == "connected" && SameSequence(*ac, *cc); }, 30s));
+  EXPECT_EQ(cc->Command({"GET", "b"}).str, "MOVED 3300 127.0.0.1:" + std::to_string(a.port()));
+  ASSERT_EQ(cc->Command({"READONLY"}).str, "OK");
+  EXPECT_EQ(cc->Command({"GET", "b"}).str, "v");
+}
+
+TEST(ClusterIT, SlotsDroppedFromTheTopologyAreNotServed) {  // D3: Kvrocks keeps a stale owner
+  TestServer s(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs()});
+  Push(s, 'a', MasterLine('a', s, "0-16383"), 1);
+  auto c = s.Connect();
+  ASSERT_EQ(c->Command({"SET", "foo", "1"}).str, "OK");
+  ASSERT_EQ(c->Command({"CLUSTERX", "SETNODES", MasterLine('a', s, "0-8191"), "2"}).str, "OK");
+  EXPECT_EQ(c->Command({"GET", "foo"}).str, "CLUSTERDOWN Hash slot not served");
 }
 
 }  // namespace

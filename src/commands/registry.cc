@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "commands/all_commands.h"
+#include "commands/cluster_routing.h"
 #include "commands/multi_state.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
@@ -59,6 +60,14 @@ void Reject(ExecContext& ctx, const CommandSpec* spec, std::string_view error) {
     return ctx.reply.Error(std::string(kErrExecAbortBecause).append(error));
   }
   if (ctx.session.multi.active) ctx.session.multi.dirty_exec = true;
+  ctx.reply.Error(error);
+}
+
+// A routing refusal (D14): inside MULTI it dooms the transaction like any refusal; a refused EXEC discards it
+// and replies the bare -MOVED/-CROSSSLOT/-CLUSTERDOWN (server.c:3959-3966), not EXECABORT.
+void RejectRouted(ExecContext& ctx, const CommandSpec& spec, std::string_view error) {
+  if (spec.name != "exec") return Reject(ctx, &spec, error);
+  DiscardTransaction(ctx);
   ctx.reply.Error(error);
 }
 
@@ -181,9 +190,9 @@ std::string_view StateRefusal(ExecContext& ctx, const CallFlags& call) {
   return {};
 }
 
-void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
-  if (argv.empty()) return;
-  const CommandSpec* spec = registry.Find(argv[0]);
+namespace {
+
+void DispatchFound(ExecContext& ctx, const CommandSpec* spec, const ArgList& argv) {
   if (spec == nullptr) return Reject(ctx, nullptr, UnknownCommandMessage(argv));
   if (!ArityOk(spec->arity, argv.size())) {
     return Reject(ctx, spec, ArityError(spec->name));
@@ -191,6 +200,10 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
   if (!ctx.session.authenticated && (spec->flags & kCmdNoAuth) == 0) return Reject(ctx, spec, kErrNoAuth);
   const uint32_t flags = EffectiveFlags(ctx, *spec, argv);
   const CallFlags call = DeriveCallFlags(ctx.session, *spec, flags);
+  // D13: Redis getNodeByQuery, after auth and the effective flags, before NOREPLICAS/READONLY/.../BUSY.
+  if (std::string e = ClusterRefusal(ctx, *spec, argv, call.is_write); !e.empty()) {
+    return RejectRouted(ctx, *spec, e);
+  }
   if (std::string_view e = StateRefusal(ctx, call); !e.empty()) return Reject(ctx, spec, e);
   if ((spec->flags & kCmdAllowBusy) == 0 && ctx.server.scripts().TimedOut()) {
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
@@ -200,6 +213,19 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
   const uint64_t commits = ThreadCommitCount();
   spec->handler(ctx, argv);
   if (ThreadCommitCount() != commits) ctx.session.woff = ThreadLastCommitSeq();  // WAIT (M6b D9, M7a D24)
+}
+
+}  // namespace
+
+void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
+  if (argv.empty()) return;
+  const CommandSpec* spec = registry.Find(argv[0]);
+  DispatchFound(ctx, spec, argv);
+  // Redis resetClient (networking.c:2100): ASKING covers exactly the next command (refused or not), or a
+  // whole MULTI..EXEC; a postponed command has not run yet.
+  const bool keep = (spec != nullptr && spec->name == "asking") || ctx.session.multi.active ||
+                    ctx.session.postponed.has_value();
+  if (!keep) ctx.session.asking = false;
 }
 
 }  // namespace tideskv

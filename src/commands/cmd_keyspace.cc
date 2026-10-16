@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "cluster/cluster_errors.h"
 #include "commands/all_commands.h"
 #include "commands/cmd_util.h"
 #include "commands/reply_util.h"
@@ -59,6 +60,8 @@ void Select(ExecContext& ctx, const ArgList& argv) {
       db > std::numeric_limits<int32_t>::max()) {
     return ctx.reply.Error(kErrNotInteger);  // Redis getIntFromObjectOrReply: must fit int32
   }
+  if (db != 0 && ctx.server.cluster() != nullptr)
+    return ctx.reply.Error(cluster::kErrSelectInCluster);  // db.c:762
   if (db < 0 || db >= encoding::kNumDatabases) return ctx.reply.Error(kErrDbIndexOutOfRange);
   ctx.session.db = static_cast<uint8_t>(db);
   ctx.reply.SimpleString("OK");
