@@ -519,6 +519,14 @@ TEST_F(ReplClientTest, ReplicaTrimsBetweenBatchesWithoutConcurrentCommits) {
   BacklogTrimmer trimmer(replica_storage, replica.log, nullptr, replica.clock, hooks, {});
   std::atomic<int> trims{0};
   std::atomic<int> during_apply{0};  // the test hook counter: trims that saw another write txn open
+  // The client trims on an idle link too, so it must stop before the locals its trim hook uses die (also on
+  // an ASSERT's early return); the fixture's destructor runs too late.
+  struct StopClientFirst {
+    std::unique_ptr<ReplClient>& client;
+    ~StopClientFirst() {
+      if (client) client->Stop();
+    }
+  } stop_client_first{client};
   trim_hook = [&] {
     if (replica_storage.open_txns.load() != 0) ++during_apply;
     ++trims;
