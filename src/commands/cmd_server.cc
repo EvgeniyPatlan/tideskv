@@ -3,8 +3,10 @@
 #include <string>
 #include <vector>
 
+#include "cluster/cluster_errors.h"
 #include "commands/all_commands.h"
 #include "commands/info.h"
+#include "commands/key_extraction.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "script/script_engine.h"
@@ -158,12 +160,29 @@ void WriteCommandInfo(resp::ReplyBuilder& r, const CommandSpec& spec) {
   r.ArrayHeader(6);
   r.Bulk(spec.name);
   r.Integer(spec.arity);
-  const auto flags = FlagNames(spec.flags);
+  auto flags = FlagNames(spec.flags);
+  if (HasMovableKeys(spec.name)) flags.push_back("movablekeys");  // Redis CMD_MOVABLE_KEYS (D17)
   r.SetHeader(flags.size());
   for (std::string_view f : flags) r.SimpleString(f);
   r.Integer(spec.first_key);
   r.Integer(spec.last_key);
   r.Integer(spec.key_step);
+}
+
+// COMMAND GETKEYS command [args ...] (server.c:4988-5025).
+void CommandGetKeys(ExecContext& ctx, const ArgList& argv) {
+  const CommandSpec* spec = ctx.server.registry().Find(argv[2]);
+  if (spec == nullptr) return ctx.reply.Error(cluster::kErrGetkeysInvalidCommand);
+  if (spec->first_key == 0 && !HasMovableKeys(spec->name)) return ctx.reply.Error(cluster::kErrGetkeysNoKeys);
+  const ArgList call(argv.begin() + 2, argv.end());
+  if (!ArityOk(spec->arity, call.size())) return ctx.reply.Error(cluster::kErrGetkeysArity);
+  const std::vector<size_t> keys = KeyIndexes(*spec, call);
+  if (keys.empty()) {
+    return NoMandatoryKeys(spec->name) ? ctx.reply.ArrayHeader(0)
+                                       : ctx.reply.Error(cluster::kErrGetkeysInvalidArgs);
+  }
+  ctx.reply.ArrayHeader(keys.size());
+  for (size_t i : keys) ctx.reply.Bulk(call[i]);
 }
 
 void CommandCmd(ExecContext& ctx, const ArgList& argv) {
@@ -183,6 +202,8 @@ void CommandCmd(ExecContext& ctx, const ArgList& argv) {
       const CommandSpec* spec = ctx.server.registry().Find(argv[i]);
       spec != nullptr ? WriteCommandInfo(ctx.reply, *spec) : ctx.reply.NullArray();
     }
+  } else if (sub == "getkeys" && argv.size() >= 3) {
+    CommandGetKeys(ctx, argv);
   } else if (sub == "docs") {
     ctx.reply.MapHeader(0);  // docs not provided; redis-cli tolerates an empty map
   } else {
