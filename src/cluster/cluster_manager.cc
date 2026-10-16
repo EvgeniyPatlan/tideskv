@@ -130,7 +130,9 @@ Status ClusterManager::SetNodes(std::string_view nodes, int64_t version, bool fo
 Status ClusterManager::SetNodeId(std::string_view id) {
   if (id.size() != kNodeIdLength) return Err(kErrInvalidNodeId);
   std::lock_guard apply(apply_mu_);
-  auto next = std::make_shared<Topology>(*Current());
+  const std::shared_ptr<const Topology> cur = Current();
+  if (cur->myid == id) return ApplyRole(*cur);  // the controller resends it each sync: no checkpoint
+  auto next = std::make_shared<Topology>(*cur);
   next->myid = std::string(id);
   next->ResolveMyself();
   if (Status st = ApplyRole(*next); !st.ok()) return st;

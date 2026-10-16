@@ -118,6 +118,22 @@ TEST_F(ClusterManagerTest, SetNodeIdWinsUntilAForcedSetnodes) {
   EXPECT_EQ(m->Current()->myid, kA);  // force re-detects (Kvrocks)
 }
 
+// Final review minor 3: a checkpoint excludes every commit, and the controller resends SETNODEID on every
+// sync, so an unchanged id re-applies the role but persists, checkpoints and publishes nothing.
+TEST_F(ClusterManagerTest, AnUnchangedNodeIdAppliesTheRoleWithoutACheckpoint) {
+  auto m = Make(7002);
+  ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
+  ASSERT_TRUE(m->SetNodeId(kC).ok());
+  const int checkpoints_before = checkpoints;
+  const std::vector<int64_t> published_before = published;
+  replica = false;  // the role drifted (e.g. a failed earlier apply): SETNODEID re-applies it
+  ASSERT_TRUE(m->SetNodeId(kC).ok());
+  EXPECT_EQ(checkpoints, checkpoints_before);
+  EXPECT_EQ(published, published_before);
+  EXPECT_TRUE(replica);
+  EXPECT_EQ(m->Current()->myid, kC);
+}
+
 TEST_F(ClusterManagerTest, ASlaveFollowsItsMasterAndRepeatedPushesAreNoOps) {  // D10
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
