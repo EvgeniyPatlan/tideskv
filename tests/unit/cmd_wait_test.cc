@@ -3,10 +3,29 @@
 #include <string>
 #include <vector>
 
+#include "exec/thread_commit_seq.h"
 #include "support/command_harness.h"
 
 namespace tideskv::test {
 namespace {
+
+// M7a D24: a thread keeps t_last_commit_seq across ReplLogs (an earlier test on this thread, or a node
+// promoted after a full sync whose seqs restart). A write whose seq equals that stale value is still a write.
+TEST(WaitCmd, AWriteWhoseSeqEqualsTheThreadsStaleSeqStillSetsWoff) {
+  engine_internal::t_last_commit_seq = 1;  // what an earlier life on this thread left behind
+  CommandHarness h;                        // a fresh ReplLog: its first commit is seq 1
+  ASSERT_EQ(h.Run({"SET", "k", "v"}), kOk);
+  EXPECT_EQ(h.session.woff, 1u);
+}
+
+TEST(WaitCmd, EveryLocalCommitCountsOnItsThread) {
+  CommandHarness h;
+  const uint64_t before = ThreadCommitCount();
+  ASSERT_EQ(h.Run({"SET", "a", "1"}), kOk);
+  ASSERT_EQ(h.Run({"GET", "a"}), Bulk("1"));
+  ASSERT_EQ(h.Run({"SET", "b", "2"}), kOk);
+  EXPECT_EQ(ThreadCommitCount() - before, 2u);
+}
 
 TEST(WaitCmd, ParseErrorsAndImmediateAnswers) {  // live redis:7.2.5
   CommandHarness h;

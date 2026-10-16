@@ -130,6 +130,7 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
   if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
   if (Status st = AppendAndCommit(txn, seq, record, cum_ + record.size()); !st.ok()) return st;
   engine_internal::t_last_commit_seq = seq;  // this thread's write, for WAIT (M6b D9)
+  ++engine_internal::t_commit_count;         // M7a D24: detect a write by count, not by seq change
   return Status::Ok();
 }
 

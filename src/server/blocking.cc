@@ -46,11 +46,11 @@ bool BlockedClient::ended() const {
 BlockedClient::ServeResult BlockedClient::TryServe(const Attempt& attempt) {
   std::lock_guard lock(mu_);
   if (done_) return ServeResult::kGone;
-  const uint64_t before = ThreadLastCommitSeq();
+  const uint64_t commits = ThreadCommitCount();
   std::optional<std::string> reply = attempt();
   if (!reply) return ServeResult::kStillBlocked;
-  if (const uint64_t after = ThreadLastCommitSeq(); after != before) {
-    served_seq_.store(after, std::memory_order_release);  // published before Deliver posts the reply
+  if (ThreadCommitCount() != commits) {
+    served_seq_.store(ThreadLastCommitSeq(), std::memory_order_release);  // before Deliver posts the reply
   }
   EndLocked();
   Deliver(std::move(*reply), false);

@@ -168,9 +168,9 @@ void Dispatch(const CommandRegistry& registry, ExecContext& ctx, const ArgList& 
     return Reject(ctx, spec, kErrBusyScript);  // flags MULTI; EXEC becomes EXECABORT (sv:4115)
   }
   if (ctx.session.multi.active && !RunsImmediately(spec->name)) return Queue(ctx, *spec, argv, flags);
-  const uint64_t before = ThreadLastCommitSeq();
+  const uint64_t commits = ThreadCommitCount();
   spec->handler(ctx, argv);
-  if (const uint64_t after = ThreadLastCommitSeq(); after != before) ctx.session.woff = after;  // WAIT (D9)
+  if (ThreadCommitCount() != commits) ctx.session.woff = ThreadLastCommitSeq();  // WAIT (M6b D9, M7a D24)
 }
 
 }  // namespace tideskv
