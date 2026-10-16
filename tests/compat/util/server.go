@@ -29,6 +29,7 @@ var supportedConfigs = map[string]bool{
 	"replica-announce-ip": true, "replica-announce-port": true, "masterauth": true, "repl-timeout": true,
 	"repl-backlog-size": true, "replica-serve-stale-data": true, "min-replicas-to-write": true,
 	"min-replicas-max-lag": true, "key-load-delay": true, "rdb-key-save-delay": true,
+	"bind": true, "cluster-enabled": true, // tideskv: cluster knobs added in M7a
 } // tideskv: replication knobs added in M6b
 
 type KvrocksServer struct {
@@ -37,6 +38,7 @@ type KvrocksServer struct {
 	addr *net.TCPAddr
 	dir  string
 	log  *os.File
+	args []string // tideskv: kept for Start/Restart
 }
 
 func freePort(t testing.TB) int {
@@ -59,14 +61,26 @@ func StartServer(t testing.TB, configs map[string]string) *KvrocksServer {
 		}
 		args = append(args, "--"+k, v)
 	}
-	log, err := os.Create(filepath.Join(dir, "server.log"))
-	require.NoError(t, err)
-	cmd := exec.Command(*binPath, args...)
-	cmd.Stdout, cmd.Stderr = log, log
-	require.NoError(t, cmd.Start())
-	s := &KvrocksServer{t: t, cmd: cmd, addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}, dir: dir, log: log}
-	s.waitReady()
+	s := &KvrocksServer{t: t, addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}, dir: dir, args: args}
+	s.Start()
 	return s
+}
+
+// Start runs the server again with the same arguments, dir and port (after Close), and waits for PING.
+func (s *KvrocksServer) Start() {
+	log, err := os.OpenFile(filepath.Join(s.dir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	require.NoError(s.t, err)
+	cmd := exec.Command(*binPath, s.args...)
+	cmd.Stdout, cmd.Stderr = log, log
+	require.NoError(s.t, cmd.Start())
+	s.cmd, s.log = cmd, log
+	s.waitReady()
+}
+
+// Restart stops the server cleanly, then starts it again.
+func (s *KvrocksServer) Restart() {
+	s.Close()
+	s.Start()
 }
 
 func (s *KvrocksServer) waitReady() {
