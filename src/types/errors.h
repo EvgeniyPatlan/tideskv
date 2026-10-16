@@ -143,6 +143,11 @@ inline constexpr std::string_view kErrMasterDown =
 inline constexpr std::string_view kErrNoReplicas = "NOREPLICAS Not enough good replicas to write.";
 // server.c:1854 (shared.loadingerr).
 inline constexpr std::string_view kErrLoading = "LOADING Redis is loading the dataset in memory";
+// COMMAND GETKEYS (server.c:4988-5025, M7a D17).
+inline constexpr std::string_view kErrGetkeysInvalidCommand = "ERR Invalid command specified";
+inline constexpr std::string_view kErrGetkeysNoKeys = "ERR The command has no key arguments";
+inline constexpr std::string_view kErrGetkeysArity = "ERR Invalid number of arguments specified for command";
+inline constexpr std::string_view kErrGetkeysInvalidArgs = "ERR Invalid arguments specified for command";
 inline constexpr std::string_view kErrScriptFlushOption = "ERR SCRIPT FLUSH only support SYNC|ASYNC option";
 inline constexpr std::string_view kErrScriptDebugOption = "ERR Use SCRIPT DEBUG YES/SYNC/NO";
 inline constexpr std::string_view kErrScriptDebugUnsupported = "ERR SCRIPT DEBUG YES/SYNC is not supported";

@@ -2,7 +2,7 @@
 #include <string_view>
 
 // Cluster reply texts (M7a). Client-facing routing and restriction texts are Redis 7.2's (cluster.c, db.c,
-// replication.c, script.c, server.c); the CLUSTERX protocol and topology texts are Kvrocks v2.17.0's
+// replication.c, script.c); the CLUSTERX protocol and topology texts are Kvrocks v2.17.0's
 // (cmd_cluster.cc, cluster.cc, cluster_defs.h, commander.cc), which kvrocks-controller and the ported gocase
 // tests expect.
 namespace tideskv::cluster {
@@ -20,11 +20,6 @@ inline constexpr std::string_view kScriptErrCrossSlot =
 inline constexpr std::string_view kErrInvalidSlot = "ERR Invalid slot";  // COUNTKEYSINSLOT
 inline constexpr std::string_view kErrInvalidSlotOrCount =
     "ERR Invalid slot or number of keys";  // GETKEYSINSLOT
-inline constexpr std::string_view kErrGetkeysInvalidCommand =
-    "ERR Invalid command specified";  // COMMAND GETKEYS
-inline constexpr std::string_view kErrGetkeysNoKeys = "ERR The command has no key arguments";
-inline constexpr std::string_view kErrGetkeysArity = "ERR Invalid number of arguments specified for command";
-inline constexpr std::string_view kErrGetkeysInvalidArgs = "ERR Invalid arguments specified for command";
 
 // Kvrocks v2.17.0.
 inline constexpr std::string_view kErrClusterNotEnabled = "ERR Cluster mode is not enabled";  // CLUSTERX

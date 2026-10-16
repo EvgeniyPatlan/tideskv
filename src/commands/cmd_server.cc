@@ -3,7 +3,6 @@
 #include <string>
 #include <vector>
 
-#include "cluster/cluster_errors.h"
 #include "commands/all_commands.h"
 #include "commands/info.h"
 #include "commands/key_extraction.h"
@@ -172,14 +171,13 @@ void WriteCommandInfo(resp::ReplyBuilder& r, const CommandSpec& spec) {
 // COMMAND GETKEYS command [args ...] (server.c:4988-5025).
 void CommandGetKeys(ExecContext& ctx, const ArgList& argv) {
   const CommandSpec* spec = ctx.server.registry().Find(argv[2]);
-  if (spec == nullptr) return ctx.reply.Error(cluster::kErrGetkeysInvalidCommand);
-  if (spec->first_key == 0 && !HasMovableKeys(spec->name)) return ctx.reply.Error(cluster::kErrGetkeysNoKeys);
+  if (spec == nullptr) return ctx.reply.Error(kErrGetkeysInvalidCommand);
+  if (spec->first_key == 0 && !HasMovableKeys(spec->name)) return ctx.reply.Error(kErrGetkeysNoKeys);
   const ArgList call(argv.begin() + 2, argv.end());
-  if (!ArityOk(spec->arity, call.size())) return ctx.reply.Error(cluster::kErrGetkeysArity);
+  if (!ArityOk(spec->arity, call.size())) return ctx.reply.Error(kErrGetkeysArity);
   const std::vector<size_t> keys = KeyIndexes(*spec, call);
   if (keys.empty()) {
-    return NoMandatoryKeys(spec->name) ? ctx.reply.ArrayHeader(0)
-                                       : ctx.reply.Error(cluster::kErrGetkeysInvalidArgs);
+    return NoMandatoryKeys(spec->name) ? ctx.reply.ArrayHeader(0) : ctx.reply.Error(kErrGetkeysInvalidArgs);
   }
   ctx.reply.ArrayHeader(keys.size());
   for (size_t i : keys) ctx.reply.Bulk(call[i]);
