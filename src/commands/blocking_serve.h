@@ -11,4 +11,9 @@ namespace tideskv {
 // is logged and ends that waiter's wait with kErrInternal; it never propagates to the caller.
 void ServeBlockedClients(const CommandRegistry& registry, ServerServices& server, ReadyKeys& ready);
 
+// What a connection runs for one command: Dispatch, then ServeBlockedClients over *ctx.ready (non-null),
+// then, exceptions included, the end of the command's in-flight write (Session::write_in_flight), so CLIENT
+// PAUSE also waits for the pops this write served (M7a D21).
+void DispatchAndServe(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv);
+
 }  // namespace tideskv

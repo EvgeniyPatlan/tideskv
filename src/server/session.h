@@ -68,6 +68,9 @@ struct Session {
   // CLIENT PAUSE (M7a D21): the command Dispatch parked instead of running; the connection executes nothing
   // more until ClientLink::Resume re-dispatches it.
   std::optional<std::vector<std::string>> postponed;
+  // Dispatch admitted a may-replicate command that ClientPause counts in flight; DispatchAndServe ends it
+  // once the command and the waiters it served are done (M7a D21 barrier).
+  bool write_in_flight = false;
 };
 
 }  // namespace tideskv

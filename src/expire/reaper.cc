@@ -60,12 +60,37 @@ Result<size_t> ExpireReaper::DeleteDue(uint8_t db, std::span<const Due> due) {
   return deleted;
 }
 
-Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped) {
+namespace {
+
+// Ends an admitted delete commit (Options::end_write), however DeleteDue returned.
+class WriteEnd {
+ public:
+  explicit WriteEnd(const std::function<void()>& end) : end_(end) {}
+  ~WriteEnd() {
+    if (end_) end_();
+  }
+  WriteEnd(const WriteEnd&) = delete;
+  WriteEnd& operator=(const WriteEnd&) = delete;
+
+ private:
+  const std::function<void()>& end_;
+};
+
+}  // namespace
+
+Result<size_t> ExpireReaper::ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped,
+                                       bool* paused) {
   std::vector<Due> due;
   if (Status st = CollectDue(db, now_ms, &due, skipped); !st.ok()) return st;
   *full = due.size() >= options_.batch_size;
   size_t deleted = 0;
   for (size_t i = 0; i < due.size(); i += kKeysPerWrite) {
+    if (options_.begin_write && !options_.begin_write()) {  // CLIENT PAUSE: no commit from now on (D21)
+      *paused = true;
+      *full = false;
+      break;
+    }
+    const WriteEnd end(options_.end_write);
     const size_t n = std::min(kKeysPerWrite, due.size() - i);
     auto chunk = DeleteDue(db, std::span<const Due>(due).subspan(i, n));
     if (!chunk.ok()) return chunk.status();
@@ -86,10 +111,11 @@ Result<size_t> ExpireReaper::RunOnce() {
   size_t total = 0;
   size_t skipped = 0;
   Status first_error;
-  for (uint8_t db = 0; db < encoding::kNumDatabases; ++db) {
+  bool paused = false;
+  for (uint8_t db = 0; db < encoding::kNumDatabases && !paused; ++db) {
     bool full = true;
     while (full) {
-      auto n = ReapBatch(db, now, &full, &skipped);
+      auto n = ReapBatch(db, now, &full, &skipped, &paused);
       if (!n.ok()) {  // give up on this db for the cycle, but still reap the others
         if (first_error.ok()) first_error = n.status();
         break;
@@ -129,12 +155,10 @@ void ExpireReaper::Loop() {
   while (!stop_) {
     lock.unlock();
     try {  // an exception escaping this thread would std::terminate the server
-      if (!options_.paused || !options_.paused()) {
-        auto n = RunOnce();
-        // Retried next cycle, quietly: the Engine's BUSY answer while a script is timed out, and the
-        // READONLY refusal of a cycle that began just before this server became a replica.
-        if (!n.ok() && !Quiet(n.status())) spdlog::error("expire reaper: {}", n.status().ToString());
-      }
+      auto n = RunOnce();
+      // Retried next cycle, quietly: the Engine's BUSY answer while a script is timed out, and the
+      // READONLY refusal of a cycle that began just before this server became a replica.
+      if (!n.ok() && !Quiet(n.status())) spdlog::error("expire reaper: {}", n.status().ToString());
     } catch (const std::exception& e) {
       spdlog::error("expire reaper: {}", e.what());
     }

@@ -48,8 +48,7 @@ struct CommandHarness {
   std::string Run(const ArgList& argv) {
     ConnectionBlockHandler block(services.blocking_, session, argv, ready);
     ExecContext ctx{session, reply, services, &block, &ready};
-    Dispatch(services.registry(), ctx, argv);
-    ServeBlockedClients(services.registry(), services, ready);
+    DispatchAndServe(services.registry(), ctx, argv);
     return reply.Take();
   }
   // Binary-safe: each element keeps its length (std::string arguments may hold NULs).
@@ -167,8 +166,7 @@ struct SecondClient {
   std::string Run(const ArgList& argv) {
     ConnectionBlockHandler block(h.services.blocking_, session, argv, ready);
     ExecContext ctx{session, reply, h.services, &block, &ready};
-    Dispatch(h.services.registry(), ctx, argv);
-    ServeBlockedClients(h.services.registry(), h.services, ready);
+    DispatchAndServe(h.services.registry(), ctx, argv);
     return reply.Take();
   }
   std::string Run(std::initializer_list<std::string_view> argv) {

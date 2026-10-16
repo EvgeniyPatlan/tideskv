@@ -214,8 +214,17 @@ void ClientPauseCmd(ExecContext& ctx, const ArgList& argv) {
     return ctx.reply.Error(st.message());
   }
   constexpr int64_t kMaxPauseMs = int64_t{100} * 365 * 24 * 3600 * 1000;  // steady_clock ns cannot hold more
-  ctx.server.pause().Pause(ClientPause::Clock::now() + std::chrono::milliseconds(std::min(ms, kMaxPauseMs)),
-                           mode);
+  ClientPause& pause = ctx.server.pause();
+  pause.Pause(ClientPause::Clock::now() + std::chrono::milliseconds(std::min(ms, kMaxPauseMs)), mode);
+  // Nothing admitted before may commit after the OK (Redis is single-threaded; review fix 1). Inside EXEC the
+  // batch holds the gate those writes may need: wait once it released it, leaving out the EXEC itself; the
+  // rest of this transaction still runs, as in Redis.
+  if (ctx.after_batch == nullptr) {
+    pause.WaitForWrites(0);
+  } else {
+    const int own = ctx.session.write_in_flight ? 1 : 0;
+    ctx.after_batch->push_back([&pause, own] { pause.WaitForWrites(own); });
+  }
   ctx.reply.SimpleString("OK");
 }
 

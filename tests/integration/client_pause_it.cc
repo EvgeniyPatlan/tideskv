@@ -43,6 +43,21 @@ TEST(ClientPauseIT, ThePauseEndsByItselfAndResumesAPipeline) {
   EXPECT_EQ(second->str, "1");
 }
 
+// A client that disconnects while parked leaves the count; UNPAUSE still works (review fix 1, #3).
+TEST(ClientPauseIT, AClientClosedWhileParkedIsForgotten) {
+  TestServer s(TIDESKV_SERVER_BIN);
+  auto admin = s.Connect();
+  auto writer = s.Connect();
+  ASSERT_EQ(admin->Command({"CLIENT", "PAUSE", "30000", "WRITE"}).str, "OK");
+  ASSERT_TRUE(writer->Send({"SET", "k", "v"}));
+  ASSERT_TRUE(WaitFor([&] { return InfoField(*admin, "clients", "blocked_clients") == 1; }));
+  writer.reset();
+  EXPECT_TRUE(WaitFor([&] { return InfoField(*admin, "clients", "blocked_clients") == 0; }));
+  ASSERT_EQ(admin->Command({"CLIENT", "UNPAUSE"}).str, "OK");
+  EXPECT_EQ(admin->Command({"GET", "k"}).type, RespValue::Type::kNull);  // the parked write never ran
+  EXPECT_EQ(admin->Command({"SET", "k", "w"}).str, "OK");
+}
+
 // D21: expiry pauses with the clients, so the master's sequence holds still while a controller compares
 // replica offsets.
 TEST(ClientPauseIT, TheReaperIsPausedToo) {

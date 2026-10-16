@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
@@ -155,6 +156,23 @@ TEST_F(ReaperTest, ZeroBudgetStillMakesProgress) {
   const size_t first = *tight.RunOnce();
   EXPECT_GE(first, 1000u);  // at least one full batch
   EXPECT_LT(first, 2500u);
+}
+
+// CLIENT PAUSE (M7a D21, review fix 1): every delete commit asks begin_write first; a refusal ends the cycle
+// at once, between two commits, and each admitted commit is ended exactly once.
+TEST_F(ReaperTest, APauseStopsTheCycleBetweenTwoCommits) {
+  ExpireReaper::Options o = Fast();
+  int begun = 0;
+  int ended = 0;
+  o.begin_write = [&] { return ++begun == 1; };  // the pause starts during the first commit
+  o.end_write = [&] { ++ended; };
+  ExpireReaper paused(h.services.engine_, std::move(o));
+  for (int i = 0; i < 100; ++i) h.Run({"SET", "k" + std::to_string(i), "v", "PX", "1"});
+  h.clock().Advance(1);
+  EXPECT_EQ(*paused.RunOnce(), 32u);  // one commit of kKeysPerWrite keys
+  EXPECT_EQ(begun, 2);
+  EXPECT_EQ(ended, 1);
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).size(), 68u);
 }
 
 TEST_F(ReaperTest, BackgroundThreadReapsAndStops) {

@@ -95,7 +95,8 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   engine_->SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));  // H6
   scripts_.SetOnTimeout([this] { engine_->WakeWaiters(); });  // the script thread holds the gate: no lock
   ExpireReaper::Options reaper_options;
-  reaper_options.paused = [this] { return pause_.mode() != ClientPause::Mode::kOff; };  // D21
+  reaper_options.begin_write = [this] { return pause_.BeginBackgroundWrite(); };  // D21: CLIENT PAUSE waits
+  reaper_options.end_write = [this] { pause_.EndWrite(); };
   reaper_ = std::make_unique<ExpireReaper>(*engine_, std::move(reaper_options));
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(
@@ -104,8 +105,7 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
         ReadyKeys ready;
         ConnectionBlockHandler block(blocking_, session, argv, ready);
         ExecContext ctx{session, reply, *this, &block, &ready};
-        Dispatch(registry_, ctx, argv);
-        ServeBlockedClients(registry_, *this, ready);  // before this command's reply leaves (F6)
+        DispatchAndServe(registry_, ctx, argv);  // serves waiters before this command's reply leaves (F6)
       });
 }
 

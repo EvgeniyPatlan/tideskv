@@ -100,14 +100,21 @@ bool MayReplicate(const Session& s, const CommandSpec& spec, const CallFlags& ca
          (spec.name == "exec" && s.multi.has_may_replicate);
 }
 
-// blockPostponeClient (server.c:4146, M7a D21): no reply now; the connection re-dispatches argv when the
-// pause resumes it. False when nothing is paused or the pause ended meanwhile: run the call now.
+// blockPostponeClient (server.c:4146, M7a D21): true = postponed, no reply now; the connection re-dispatches
+// argv when the pause resumes it. Otherwise the call runs now; a may-replicate one stays counted in flight
+// (Session::write_in_flight) until DispatchAndServe ends it, so CLIENT PAUSE waits for it (review fix 1).
 bool Postpone(ExecContext& ctx, const CommandSpec& spec, const CallFlags& call, const ArgList& argv) {
-  ClientPause& pause = ctx.server.pause();
-  if (!pause.Blocks(MayReplicate(ctx.session, spec, call))) return false;
-  if (!pause.Park(ctx.session.link)) return false;
-  ctx.session.postponed = argv;  // Resume runs on this connection's thread, after Dispatch returned
-  return true;
+  switch (ctx.server.pause().Admit(MayReplicate(ctx.session, spec, call), ctx.session.link)) {
+    case ClientPause::Admission::kParked:
+      ctx.session.postponed = argv;  // Resume runs on this connection's thread, after Dispatch returned
+      return true;
+    case ClientPause::Admission::kRunCounted:
+      ctx.session.write_in_flight = true;
+      return false;
+    case ClientPause::Admission::kRun:
+      return false;
+  }
+  return false;
 }
 
 }  // namespace

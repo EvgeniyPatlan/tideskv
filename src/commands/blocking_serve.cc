@@ -9,6 +9,7 @@
 #include "commands/server_services.h"
 #include "exec/engine.h"
 #include "server/blocking.h"
+#include "server/client_pause.h"
 #include "types/errors.h"
 #include "types/object_store.h"
 
@@ -100,6 +101,32 @@ void ServeBlockedClients(const CommandRegistry& registry, ServerServices& server
     ServeKey(registry, server, rk, ready);
   }
   ready.clear();
+}
+
+namespace {
+
+// Ends the in-flight write Dispatch admitted, however the command ended.
+class WriteInFlightEnd {
+ public:
+  explicit WriteInFlightEnd(ExecContext& ctx) : ctx_(ctx) {}
+  ~WriteInFlightEnd() {
+    if (!ctx_.session.write_in_flight) return;
+    ctx_.session.write_in_flight = false;
+    ctx_.server.pause().EndWrite();
+  }
+  WriteInFlightEnd(const WriteInFlightEnd&) = delete;
+  WriteInFlightEnd& operator=(const WriteInFlightEnd&) = delete;
+
+ private:
+  ExecContext& ctx_;
+};
+
+}  // namespace
+
+void DispatchAndServe(const CommandRegistry& registry, ExecContext& ctx, const ArgList& argv) {
+  const WriteInFlightEnd end(ctx);
+  Dispatch(registry, ctx, argv);
+  ServeBlockedClients(registry, ctx.server, *ctx.ready);  // before this command's reply leaves (F6)
 }
 
 }  // namespace tideskv

@@ -1,9 +1,27 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <thread>
+
 #include "support/command_harness.h"
 
 namespace tideskv::test {
 namespace {
+
+using namespace std::chrono_literals;
+
+// HOLDSET: a write that, once admitted, waits for the test before running SET k v (between Dispatch's
+// pause check and the commit).
+std::atomic<bool> g_hold_entered{false};
+std::atomic<bool> g_hold_release{false};
+
+void HoldSet(ExecContext& ctx, const ArgList&) {
+  g_hold_entered = true;
+  while (!g_hold_release) std::this_thread::sleep_for(1ms);
+  ctx.server.registry().Find("set")->handler(ctx, {"SET", "k", "v"});
+}
 
 TEST(ClientPauseCmd, ParseErrorsAreRedis72s) {  // networking.c:285-303, timeout.c:165-196
   CommandHarness h;
@@ -61,6 +79,48 @@ TEST(ClientPauseCmd, AllModePostponesEveryCommandIncludingUnpause) {  // tests/u
   EXPECT_EQ(c.Run({"CLIENT", "UNPAUSE"}), "");
   h.services.pause_.Unpause();
   EXPECT_EQ(c.RunPostponed(), kOk);
+}
+
+// Review fix 1: CLIENT PAUSE replies only once every may-replicate command admitted before it committed
+// (Redis runs them to completion before PAUSE can run).
+TEST(ClientPauseCmd, PauseRepliesOnlyAfterAnInFlightWriteCommitted) {
+  CommandHarness h;
+  h.services.registry_.Register({"holdset", 1, kCmdWrite, 0, 0, 0, &HoldSet});
+  SecondClient writer(h);
+  SecondClient admin(h);
+  g_hold_entered = false;
+  g_hold_release = false;
+  std::string write_reply;
+  std::thread w([&] { write_reply = writer.Run({"HOLDSET"}); });
+  while (!g_hold_entered) std::this_thread::sleep_for(1ms);
+  std::atomic<bool> paused{false};
+  std::string pause_reply;
+  std::thread p([&] {
+    pause_reply = admin.Run({"CLIENT", "PAUSE", "60000", "WRITE"});
+    paused = true;
+  });
+  std::this_thread::sleep_for(100ms);
+  EXPECT_FALSE(paused);  // the write is still in flight
+  g_hold_release = true;
+  p.join();
+  w.join();
+  EXPECT_EQ(pause_reply, kOk);
+  EXPECT_EQ(write_reply, kOk);
+  EXPECT_EQ(h.Run({"GET", "k"}), Bulk("v"));  // committed before the OK
+  ASSERT_EQ(h.Run({"CLIENT", "UNPAUSE"}), kOk);
+}
+
+// Inside EXEC the barrier waits after the batch released the gate and leaves out the EXEC itself.
+TEST(ClientPauseCmd, PauseInsideExecDoesNotWaitForItsOwnTransaction) {
+  CommandHarness h;
+  SecondClient other(h);
+  ASSERT_EQ(h.Run({"MULTI"}), kOk);
+  ASSERT_EQ(h.Run({"SET", "k", "v"}), "+QUEUED\r\n");
+  ASSERT_EQ(h.Run({"CLIENT", "PAUSE", "60000", "WRITE"}), "+QUEUED\r\n");
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({kOk, kOk}));
+  EXPECT_EQ(other.Run({"SET", "k", "w"}), "");  // the pause is in force
+  ASSERT_EQ(h.Run({"CLIENT", "UNPAUSE"}), kOk);
+  EXPECT_EQ(other.RunPostponed(), kOk);
 }
 
 }  // namespace

@@ -37,7 +37,10 @@ class ExpireReaper {
     std::chrono::milliseconds interval{100};     // spec §4.5
     size_t batch_size = 1000;                    // spec §4.5
     std::chrono::milliseconds cycle_budget{25};  // keep re-running full batches until this is spent
-    std::function<bool()> paused;                // CLIENT PAUSE (M7a D21): skip cycles while true
+    // CLIENT PAUSE (M7a D21): asked before every delete commit; false (paused) ends the cycle at once. A
+    // true answer is matched by one end_write call after that commit. Either both are set or neither.
+    std::function<bool()> begin_write;
+    std::function<void()> end_write;
   };
 
   ExpireReaper(Engine& engine, Options options) : engine_(engine), options_(std::move(options)) {}
@@ -69,7 +72,8 @@ class ExpireReaper {
   };
   // Entries that do not decode are skipped and counted in *skipped.
   Status CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* out, size_t* skipped);
-  Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped);
+  // *paused: a begin_write refusal stopped the batch (and the cycle).
+  Result<size_t> ReapBatch(uint8_t db, int64_t now_ms, bool* full, size_t* skipped, bool* paused);
   Result<size_t> DeleteDue(uint8_t db, std::span<const Due> due);
   void Loop();
   bool Fenced() const;                 // the Engine's ReplLog refuses local writes (a replica)
