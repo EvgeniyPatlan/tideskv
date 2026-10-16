@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "cluster/cluster_manager.h"
 #include "commands/registry.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
@@ -137,6 +138,7 @@ class FakeServerServices final : public ServerServices {
     return real_replication != nullptr ? *real_replication : replication_;
   }
   ClientPause& pause() override { return pause_; }
+  cluster::ClusterManager* cluster() override { return cluster_manager; }
 
   CommandRegistry registry_;
   Config config_;
@@ -148,6 +150,7 @@ class FakeServerServices final : public ServerServices {
   FakeReplication replication_;
   Replication* real_replication = nullptr;  // set: replication() returns it instead of the fake
   ClientPause pause_;
+  cluster::ClusterManager* cluster_manager = nullptr;  // set by ClusterHarness
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 
+#include "cluster/cluster_manager.h"
 #include "commands/registry.h"
 #include "commands/server_services.h"
 #include "common/clock.h"
@@ -52,6 +53,7 @@ class App final : public ServerServices {
   ScriptEngine& scripts() override { return scripts_; }
   Replication& replication() override { return *replication_; }
   ClientPause& pause() override { return pause_; }
+  cluster::ClusterManager* cluster() override { return cluster_.get(); }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -74,6 +76,8 @@ class App final : public ServerServices {
   // D18: trims the replog; its thread on a master, the replica client's applier on a replica. Created
   // with replication_ (each refers to the other); stopped first in Stop(), destroyed before repl_log_.
   std::unique_ptr<repl::BacklogTrimmer> trimmer_;
+  // Its hooks call replication_, which outlives it; commands reach it through server_, destroyed first.
+  std::unique_ptr<cluster::ClusterManager> cluster_;
   ScriptEngine scripts_;                            // before engine_: its busy guard refers to it
   WatchRegistry watches_;                           // before engine_ and the reaper: it must outlive them
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it

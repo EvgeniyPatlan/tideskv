@@ -29,6 +29,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterDebugCommands(registry);
   RegisterReplicationCommands(registry);
   RegisterWaitCommand(registry);
+  RegisterClusterxCommand(registry);
 }
 
 }  // namespace tideskv

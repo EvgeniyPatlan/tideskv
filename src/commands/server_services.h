@@ -7,6 +7,10 @@
 
 namespace tideskv {
 
+namespace cluster {
+class ClusterManager;
+}
+
 class BlockingRegistry;
 class ClientPause;
 class CommandRegistry;
@@ -99,15 +103,16 @@ class ServerServices {
   virtual const CommandRegistry& registry() const = 0;
   virtual ServerStats Stats() const = 0;
   virtual void ResetStats() = 0;
-  virtual void RequestShutdown() = 0;        // must not block; the main thread performs the shutdown
-  virtual Engine& engine() = 0;              // data access for commands (Task 5)
-  virtual OidAllocator& oids() = 0;          // collection object ids (M3 E1)
-  virtual CursorStore& cursors() = 0;        // SCAN cursor table (Task 14)
-  virtual BlockingRegistry& blocking() = 0;  // blocked clients (M4 F4)
-  virtual WatchRegistry& watches() = 0;      // WATCH state (M5a G2)
-  virtual ScriptEngine& scripts() = 0;       // EVAL / SCRIPT (M5b)
-  virtual Replication& replication() = 0;    // role queries (M6a)
-  virtual ClientPause& pause() = 0;          // CLIENT PAUSE (M7a D21)
+  virtual void RequestShutdown() = 0;              // must not block; the main thread performs the shutdown
+  virtual Engine& engine() = 0;                    // data access for commands (Task 5)
+  virtual OidAllocator& oids() = 0;                // collection object ids (M3 E1)
+  virtual CursorStore& cursors() = 0;              // SCAN cursor table (Task 14)
+  virtual BlockingRegistry& blocking() = 0;        // blocked clients (M4 F4)
+  virtual WatchRegistry& watches() = 0;            // WATCH state (M5a G2)
+  virtual ScriptEngine& scripts() = 0;             // EVAL / SCRIPT (M5b)
+  virtual Replication& replication() = 0;          // role queries (M6a)
+  virtual ClientPause& pause() = 0;                // CLIENT PAUSE (M7a D21)
+  virtual cluster::ClusterManager* cluster() = 0;  // null unless cluster-enabled (M7a)
 };
 
 }  // namespace tideskv
