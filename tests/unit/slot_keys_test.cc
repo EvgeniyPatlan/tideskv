@@ -34,5 +34,22 @@ TEST(SlotKeys, DbZeroKeysAreNotOutsideAndAnyKeyMakesTheKeyspaceNonEmpty) {
   EXPECT_TRUE(Outside(h));
 }
 
+TEST(SlotKeys, CountAndListOneSlotOfDbZeroInKeyOrder) {
+  CommandHarness h;
+  for (const char* k : {"{b}2", "b", "{b}1", "foo"}) ASSERT_EQ(h.Run({"SET", k, "v"}), kOk);
+  ASSERT_EQ(h.Run({"SELECT", "1"}), kOk);
+  ASSERT_EQ(h.Run({"SET", "b", "other db"}), kOk);
+  uint64_t n = 0;
+  std::vector<std::string> keys;
+  ASSERT_TRUE(h.services.engine_
+                  .Read([&](ReadView& v, int64_t) {
+                    if (Status st = MoveInto(CountKeysInSlot(v, 3300), &n); !st.ok()) return st;
+                    return MoveInto(KeysInSlot(v, 3300, 2), &keys);
+                  })
+                  .ok());
+  EXPECT_EQ(n, 3u);
+  EXPECT_EQ(keys, (std::vector<std::string>{"b", "{b}1"}));
+}
+
 }  // namespace
 }  // namespace tideskv::test

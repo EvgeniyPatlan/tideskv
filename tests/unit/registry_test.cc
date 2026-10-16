@@ -117,15 +117,16 @@ TEST(Registry, FlagNamesAndArity) {
 TEST(RegistryFlags, LoadingAndStaleMatchRedis72) {
   CommandRegistry r;
   RegisterAllCommands(r);
-  // clusterx: allowed while loading/stale so a full-syncing replica still answers the controller (M7a D12).
+  // clusterx, cluster: allowed while loading/stale so a full-syncing replica still answers the controller
+  // (M7a D12).
   const std::set<std::string> loading = {
-      "auth",  "client", "command", "config",   "debug",   "discard", "clusterx", "echo",
-      "exec",  "hello",  "info",    "multi",    "psync",   "quit",    "replconf", "replicaof",
-      "reset", "role",   "select",  "shutdown", "slaveof", "sync",    "unwatch",  "watch"};
+      "auth", "client", "cluster",  "command", "config", "debug",   "discard",  "clusterx",  "echo",
+      "exec", "hello",  "info",     "multi",   "psync",  "quit",    "replconf", "replicaof", "reset",
+      "role", "select", "shutdown", "slaveof", "sync",   "unwatch", "watch"};
   const std::set<std::string> stale = {
-      "auth",      "client",  "clusterx",   "command", "config",   "debug",   "discard", "echo", "eval",
-      "eval_ro",   "evalsha", "evalsha_ro", "exec",    "hello",    "info",    "multi",   "quit", "replconf",
-      "replicaof", "reset",   "role",       "select",  "shutdown", "slaveof", "unwatch", "watch"};
+      "auth",     "client",    "cluster", "clusterx",   "command", "config",   "debug",   "discard", "echo",
+      "eval",     "eval_ro",   "evalsha", "evalsha_ro", "exec",    "hello",    "info",    "multi",   "quit",
+      "replconf", "replicaof", "reset",   "role",       "select",  "shutdown", "slaveof", "unwatch", "watch"};
   for (const auto& [name, spec] : r.all()) {
     EXPECT_EQ((spec.flags & kCmdLoading) != 0, loading.contains(name)) << name;
     EXPECT_EQ((spec.flags & kCmdStale) != 0, stale.contains(name)) << name;

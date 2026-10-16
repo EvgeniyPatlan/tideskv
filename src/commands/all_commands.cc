@@ -30,6 +30,7 @@ void RegisterAllCommands(CommandRegistry& registry) {
   RegisterReplicationCommands(registry);
   RegisterWaitCommand(registry);
   RegisterClusterxCommand(registry);
+  RegisterClusterCommands(registry);
 }
 
 }  // namespace tideskv
