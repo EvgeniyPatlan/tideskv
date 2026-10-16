@@ -18,6 +18,7 @@
 #include "server/connection_block_handler.h"
 #include "types/errors.h"
 #include "types/format_version.h"
+#include "types/slot_keys.h"
 
 namespace tideskv {
 namespace {
@@ -76,6 +77,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
     spdlog::warn("an interrupted full synchronisation left a partial dataset; it is discarded");
     if (Status st = app->engine_->AbortLoad(); !st.ok()) return st;  // before the identity and baseline
   }
+  if (Status st = app->CreateCluster(); !st.ok()) return st;      // the boot role (D19), before the identity
   if (Status st = app->CreateReplication(); !st.ok()) return st;  // before any commit, like Recover
   if (Status st = app->oids_->Init(); !st.ok()) return st;
   return app;
@@ -126,7 +128,7 @@ Status App::LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown) 
   }
   auto loaded = repl::LoadOrCreateIdentity(*storage_);
   if (!loaded.ok()) return loaded.status();
-  if (!config_->Snapshot().replicaof.empty()) return MoveInto(std::move(loaded), identity);
+  if (StartsAsReplica()) return MoveInto(std::move(loaded), identity);
   const std::string previous = loaded->replid;
   auto rotated = repl::RotateForMasterStart(*storage_, *loaded, last);
   if (!rotated.ok()) return rotated.status();
@@ -135,10 +137,56 @@ Status App::LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown) 
   return MoveInto(std::move(rotated), identity);
 }
 
+// M7a D19: cluster mode serves db 0 only and takes its roles from the controller; the persisted topology
+// gives the boot role, which CreateReplication needs (a cluster replica keeps its replid).
+Status App::CreateCluster() {
+  const ConfigValues v = config_->Snapshot();
+  if (!v.cluster_enabled) return Status::Ok();
+  if (!v.replicaof.empty()) {
+    return Status::InvalidArgument(
+        "replicaof cannot be set with cluster-enabled yes: the cluster controller assigns roles");
+  }
+  bool outside = false;
+  {
+    auto view = storage_->BeginRead();
+    if (!view.ok()) return view.status();
+    if (Status st = MoveInto(HasKeysOutsideDb0(**view), &outside); !st.ok()) return st;
+  }
+  if (outside) {
+    return Status::InvalidArgument(
+        "cluster-enabled yes, but databases 1-15 hold keys: cluster mode serves db 0 only; "
+        "move or flush them in standalone mode first");
+  }
+  cluster_ = std::make_unique<cluster::ClusterManager>(*storage_, ClusterOptions(v));
+  return cluster_->Load();
+}
+
+// The role hooks run on the CLUSTERX thread, never under the Engine gate (D8); replication_ exists from
+// CreateReplication on, before any client can send CLUSTERX. BecomeReplica cannot fail (false = already
+// replicating that master, a no-op), so the hook passes its result through.
+cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
+  cluster::ClusterManager::Options o;
+  o.port = v.port;
+  o.bind = v.bind;
+  o.is_replica = [this] { return replication_->IsReplica(); };
+  o.become_replica = [this](const std::string& host, uint16_t port) {
+    return replication_->BecomeReplica(host, port);
+  };
+  o.become_master = [this] { return replication_->BecomeMaster(); };
+  o.make_durable = [this] { return storage_->Checkpoint(); };  // D20
+  return o;
+}
+
+bool App::StartsAsReplica() const {
+  if (cluster_) return cluster_->BootMaster().has_value();  // D19: the topology's role
+  return !config_->Snapshot().replicaof.empty();
+}
+
 Status App::CreateReplication() {
   repl::ReplIdentity identity;
   repl::ReplicationManager::Options o;
   if (Status st = LoadReplState(&identity, &o.baseline_unknown); !st.ok()) return st;
+  if (cluster_) o.client.backoff_max = std::chrono::milliseconds(2000);  // D19: a refused PSYNC retries soon
   o.repl_timeout = [this] { return std::chrono::milliseconds(config_->Snapshot().repl_timeout * 1000); };
   o.maxclients = [this] { return static_cast<uint64_t>(config_->Snapshot().maxclients); };
   o.connected_clients = [this] { return server_->counters().connected; };
@@ -150,6 +198,7 @@ Status App::CreateReplication() {
   h.disconnect_blocked = [this](std::string_view error) { blocking_.DisconnectAll(error); };
   h.reinit_oids = [this] { return oids_->Init(); };
   h.set_replicaof = [this](const std::string& value) {
+    if (cluster_) return;  // D19: CONFIG REWRITE never persists a cluster role
     if (Status st = config_->Set("replicaof", value.empty() ? "no one" : value, /*at_runtime=*/false);
         !st.ok()) {
       spdlog::warn("cannot record replicaof in the config: {}", st.ToString());
@@ -173,8 +222,17 @@ Status App::CreateReplication() {
   return Status::Ok();
 }
 
-// `replicaof` from the config file or --replicaof: "<host> <port>" (validated when it was set).
+// `replicaof` from the config file or --replicaof: "<host> <port>" (validated when it was set); in cluster
+// mode the persisted topology's role instead (D19).
 Status App::StartRole() {
+  if (cluster_) {
+    if (const auto m = cluster_->BootMaster()) {
+      replication_->BecomeReplica(m->host, m->port);
+    } else {
+      reaper_->Start();
+    }
+    return Status::Ok();
+  }
   const std::string replicaof = config_->Snapshot().replicaof;
   if (replicaof.empty()) {
     reaper_->Start();

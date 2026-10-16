@@ -5,6 +5,7 @@
 #include <string_view>
 #include <utility>
 
+#include "cluster/cluster_errors.h"
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
@@ -116,6 +117,7 @@ void RunRoleChange(ExecContext& ctx, std::function<void()> change) {
 
 // REPLICAOF host port | NO ONE (replicaofCommand, redis72-replication §1.2).
 void Replicaof(ExecContext& ctx, const ArgList& argv) {
+  if (ctx.server.cluster() != nullptr) return ctx.reply.Error(cluster::kErrReplicaofInCluster);  // D10
   Replication& repl = ctx.server.replication();
   if (EqualsIgnoreCase(argv[1], "no") && EqualsIgnoreCase(argv[2], "one")) {
     if (ctx.server.engine().loading()) return ctx.reply.Error(kErrLoading);  // D7: Redis's answer

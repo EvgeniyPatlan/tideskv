@@ -106,7 +106,8 @@ class Replication {
   // REPLICAOF host port. False when already replicating that exact master (case-insensitive host).
   virtual bool BecomeReplica(const std::string& host, uint16_t port) = 0;
   // REPLICAOF NO ONE; a no-op on a master. A storage error (persisting the new identity, reloading the
-  // oid high-water mark) is returned and leaves the node a fenced replica of the same master.
+  // oid high-water mark) is returned and leaves the node a fenced replica of the same master;
+  // UserError(kErrLoading) when the node is half-loaded (D22); any UserError is client-facing verbatim.
   virtual Status BecomeMaster() = 0;
   virtual RoleInfo Role() const = 0;
   // MASTERDOWN (M6b D8): a replica whose link is not connected (sync included) while

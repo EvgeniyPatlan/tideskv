@@ -10,6 +10,7 @@
 
 #include "repl/replication_manager.h"
 #include "script/sha1hex.h"
+#include "support/cluster_harness.h"
 #include "support/command_harness.h"
 #include "support/replica_stack.h"
 #include "types/errors.h"
@@ -430,6 +431,17 @@ TEST(ReplicaofCmd, APromotionRefusedWithLoadingRepliesLoadingVerbatim) {  // M6b
   h.services.replication_.become_master_status = Status::UserError(std::string(kErrLoading));
   EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE"}), Err(kErrLoading));
   EXPECT_EQ(h.services.replication_.role(), ReplRole::kReplica);
+}
+
+TEST(ReplicaofCmd, RefusedInClusterModeInEveryForm) {  // replication.c:3149, M7a D10
+  CommandHarness h;
+  ClusterHarness c(h);
+  for (const ArgList& argv : {ArgList{"REPLICAOF", "127.0.0.1", "6379"}, ArgList{"REPLICAOF", "NO", "ONE"},
+                              ArgList{"SLAVEOF", "h", "1"}}) {
+    EXPECT_EQ(h.Run(argv), Err("ERR REPLICAOF not allowed in cluster mode.")) << argv[0];
+  }
+  EXPECT_TRUE(h.services.replication_.become_replica.empty());
+  EXPECT_EQ(h.services.replication_.become_master, 0);
 }
 
 }  // namespace

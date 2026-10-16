@@ -59,10 +59,13 @@ class App final : public ServerServices {
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
   net::ServerOptions MakeServerOptions();
   Status LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown);
+  Status CreateCluster();  // M7a D19: before CreateReplication (the boot role comes from the topology)
+  cluster::ClusterManager::Options ClusterOptions(const ConfigValues& v);
+  bool StartsAsReplica() const;  // R12 rotates the replid of a node that starts as a master
   Status CreateReplication();
   void FillStorageStats(ServerStats& s) const;
   void FillReplStats(ServerStats& s, const ConfigValues& v) const;
-  Status StartRole();  // the reaper on a master, the replica client when replicaof is set
+  Status StartRole();  // the reaper on a master, the replica client when replicaof (or the topology) says so
 
   std::unique_ptr<Config> config_;
   std::unique_ptr<TidesStorage> storage_;
