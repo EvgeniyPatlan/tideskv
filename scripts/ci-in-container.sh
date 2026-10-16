@@ -41,7 +41,10 @@ if [[ "$JOBS" == *" compat "* && ! -x build/release/src/tideskv-server ]]; then
   JOBS+="compat-build "
   run compat-build bash -c "cmake --preset release -DTIDESKV_WERROR=ON && cmake --build --preset release -j$J --target tideskv-server"
 fi
+# The cluster nodes bind 0.0.0.0 here; the controller reaches them at this container's address (M7a D26).
 run compat env TIDESKV_REF_ADDR="$REF_ADDR" TIDESKV_DIFF_SEEDS="$DIFF_SEEDS" \
+  TIDESKV_CONTROLLER_ADDR="${CONTROLLER_ADDR:-}" TIDESKV_CONTROLLER_REQUIRED="${CONTROLLER_ADDR:+1}" \
+  TIDESKV_CONTROLLER_NODE_HOST="$(hostname -i | awk '{print $1}')" \
   scripts/compat.sh build/release/src/tideskv-server --diff
 
 echo "=== summary"
