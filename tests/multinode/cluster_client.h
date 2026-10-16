@@ -26,7 +26,8 @@ struct NodeLine {
 };
 
 std::string NodesString(const std::vector<const TestServer*>& servers, const std::vector<NodeLine>& lines);
-// SETNODEID + SETNODES to each server (server i gets NodeId(i)), in `order` (default 0..n-1).
+// SETNODEID + SETNODES to each server (server i gets NodeId(i)), in `order` (default 0..n-1). Fails with
+// ASSERT_*: call it under ASSERT_NO_FATAL_FAILURE.
 void PushTopology(const std::vector<const TestServer*>& servers, const std::string& nodes, int64_t version,
                   std::vector<size_t> order = {});
 
@@ -41,6 +42,7 @@ class ClusterClient {
 
  private:
   static constexpr int kMaxAttempts = 100;
+  static constexpr int kMovedBeforeBackoff = 3;
   bool Refresh();
   RespClient* ConnectionTo(uint16_t port);
   std::vector<uint16_t> seeds_;

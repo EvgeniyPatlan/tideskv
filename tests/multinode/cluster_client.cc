@@ -87,6 +87,7 @@ RespValue ClusterClient::Command(const std::vector<std::string>& argv, const std
   RespValue last;
   last.type = RespValue::Type::kError;
   last.str = "no attempt succeeded";
+  int consecutive_moved = 0;
   for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
     if (owner_port_[slot] == 0 && !Refresh()) {
       std::this_thread::sleep_for(20ms);
@@ -107,8 +108,12 @@ RespValue ClusterClient::Command(const std::vector<std::string>& argv, const std
     if (StartsWith(r->str, "MOVED ")) {
       ++redirects_;
       owner_port_[slot] = MovedPort(r->str);
+      // A push reaches the nodes one by one: two of them may point at each other for a moment. Back off
+      // after a few MOVEDs in a row so that window cannot use up every attempt.
+      if (++consecutive_moved >= kMovedBeforeBackoff) std::this_thread::sleep_for(20ms);
       continue;
     }
+    consecutive_moved = 0;
     if (!Retryable(r->str)) return *r;
     owner_port_[slot] = 0;
     std::this_thread::sleep_for(20ms);
