@@ -24,6 +24,7 @@ class TestServer {
     uint16_t port = 0;                                     // 0 = a free port
     bool wait_ready = true;                                // wait until the server answers
     std::vector<std::pair<std::string, std::string>> env;  // overrides the child's environment
+    std::string config_file;                               // passed first (tideskv-server <file>); "" = none
   };
 
   // Two overloads rather than a defaulted Options: GCC cannot default-construct a

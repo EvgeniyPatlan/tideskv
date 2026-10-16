@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -120,6 +122,32 @@ TEST(ClusterIT, SetnodesMakesAReplicaAndRemovingItFromTheTopologyStopsReplicatin
   ASSERT_EQ(mc->Command({"CLUSTERX", "SETNODES", alone, "2"}).str, "OK");
   ASSERT_EQ(rc->Command({"CLUSTERX", "SETNODES", alone, "2"}).str, "OK");
   EXPECT_EQ(InfoString(*rc, "replication", "role"), "master");  // Kvrocks #2643
+}
+
+// D19: the controller assigns roles, so CONFIG REWRITE on a cluster replica must not persist replicaof
+// (a replicaof line with cluster-enabled yes refuses to start).
+TEST(ClusterIT, ConfigRewriteOnAClusterReplicaWritesNoReplicaof) {
+  TempDir conf_dir("tideskv-cluster-conf");
+  const std::string conf = (conf_dir.path() / "tideskv.conf").string();
+  std::ofstream(conf) << "cluster-enabled yes\n";
+  TestServer m(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs()});
+  TestServer r(TIDESKV_SERVER_BIN, {.config_file = conf});
+  const std::string nodes = MasterLine('a', m, "0-16383") + SlaveLine('b', r, 'a');
+  Push(m, 'a', nodes, 1);
+  Push(r, 'b', nodes, 1);
+  auto rc = r.Connect();
+  ASSERT_EQ(InfoString(*rc, "replication", "role"), "slave");
+  ASSERT_EQ(rc->Command({"CONFIG", "REWRITE"}).str, "OK");
+  std::stringstream written;
+  written << std::ifstream(conf).rdbuf();
+  EXPECT_NE(written.str().find("cluster-enabled yes"), std::string::npos) << written.str();
+  EXPECT_EQ(written.str().find("replicaof"), std::string::npos) << written.str();
+  rc.reset();
+  r.Restart();
+  ASSERT_TRUE(r.IsRunning()) << r.StderrSinceStart();
+  rc = r.Connect();
+  EXPECT_EQ(InfoString(*rc, "replication", "role"), "slave");
+  EXPECT_EQ(rc->Command({"CLUSTERX", "MYID"}).str, Id('b'));
 }
 
 // Review Focus #3, D19: a cluster replica boots as a replica (no replid rotation) even while its master is

@@ -149,6 +149,7 @@ void TestServer::Restart(std::vector<std::string> extra_args) {
 void TestServer::Spawn(const std::string& binary, const Options& options) {
   std::vector<std::string> args = {binary,      "--port", std::to_string(port_), "--dir", dir_,
                                    "--workers", "2",      "--sync-mode",         "none"};
+  if (!options.config_file.empty()) args.insert(args.begin() + 1, options.config_file);
   args.insert(args.end(), options.extra_args.begin(), options.extra_args.end());
   const std::string log = (log_dir_.path() / "stderr.log").string();
 
