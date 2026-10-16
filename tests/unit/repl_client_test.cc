@@ -573,6 +573,10 @@ TEST_F(ReplClientTest, SyncProgressIsReportedDuringTheLoadOnly) {
   for (int i = 0; i < 30; ++i) Write({"SET", "k" + std::to_string(i), "v"});
   StartClient();
   Link l = AcceptLink();
+  // Before the handshake: the load (and loading_start_ms) begins when the client reads +FULLRESYNC.
+  const int64_t before = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
   Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
   const test::SnapshotStream snap = test::SnapshotFrames(master.services.repl_log_);
   std::string chunks;
@@ -581,9 +585,6 @@ TEST_F(ReplClientTest, SyncProgressIsReportedDuringTheLoadOnly) {
     chunks += LoadFrame(snap.frames[i][1]);
     payload += snap.frames[i][1].size();
   }
-  const int64_t before = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::system_clock::now().time_since_epoch())
-                             .count();
   l.Send(chunks);  // no LOADEND yet: the load stays open
   ASSERT_TRUE(WaitFor([&] { return client->loaded_bytes() == payload; }));
   EXPECT_EQ(client->state(), ReplicaLinkState::kSync);
