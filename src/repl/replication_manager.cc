@@ -82,6 +82,10 @@ PsyncResult ReplicationManager::Decide(const PsyncRequest& req, const ReplicaPee
   // yet a sender (or, for the instant before its connection uncounts itself, as both: never neither).
   const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   PsyncResult r;
+  if (shut_down_) {  // R18-a: refuse before HandlePsync takes a snapshot, and register no CONTINUE
+    r.error = std::string(kErrPsyncShuttingDown);
+    return r;
+  }
   if (role() == ReplRole::kReplica) {  // F8: no chained replication (checked under mu_, as BecomeReplica)
     r.error = std::string(kErrPsyncOnReplica);
     return r;
@@ -222,7 +226,16 @@ Status ReplicationManager::BecomeMaster() {
     host = master_host_;
     port = master_port_;
   }
-  if (auto old = TakeClient()) old->Stop();
+  bool mid_load = false;
+  if (auto old = TakeClient()) {
+    old->Stop();
+    mid_load = old->stopped_mid_load();
+  }
+  if (Status st = RefuseHalfLoaded(mid_load); !st.ok()) {
+    spdlog::warn("REPLICAOF NO ONE refused: a full synchronisation from {}:{} was loading", host, port);
+    StartClient(host, port);  // its loop discards what is left of the load first (G1), then resyncs
+    return st;
+  }
   const uint64_t last = log_.last();
   const ReplIdentity promoted = Promote(identity(), last);
   Status st = options_.role.reinit_oids ? options_.role.reinit_oids() : Status::Ok();  // CF7
@@ -292,6 +305,15 @@ ReplicationManager::SyncProgress ReplicationManager::Sync() const {
 bool ReplicationManager::SameMaster(const std::string& host, uint16_t port) const {
   std::lock_guard lock(mu_);
   return role() == ReplRole::kReplica && EqualsIgnoreCase(host, master_host_) && port == master_port_;
+}
+
+// M7a D22 (M6b D7): promoting a half-loaded node is refused, decided here after the client stopped: it was
+// stopped mid-load, or the loader's abort failed and the node is still loading or marked (G1).
+Status ReplicationManager::RefuseHalfLoaded(bool stopped_mid_load) const {
+  const Engine* engine = options_.role.engine;
+  const bool partial = engine != nullptr && (engine->loading() || log_.load_incomplete());
+  if (stopped_mid_load || partial) return Status::UserError(std::string(kErrLoading));
+  return Status::Ok();
 }
 
 std::shared_ptr<ReplClient> ReplicationManager::TakeClient() {

@@ -81,6 +81,9 @@ class ReplClient {
   int64_t sync_last_io_ms() const { return sync_last_io_ms_.load(std::memory_order_acquire); }
   int64_t loading_start_ms() const { return loading_start_ms_.load(std::memory_order_acquire); }
   uint64_t loaded_bytes() const { return loaded_bytes_.load(std::memory_order_acquire); }
+  // M7a D22: Stop() ended a full-sync load whose start txn had committed and whose LOADEND had not: the
+  // keyspace was wiped (or is still partial, if the abort failed). Meaningful once Stop() has returned.
+  bool stopped_mid_load() const { return stopped_mid_load_.load(std::memory_order_acquire); }
 
  private:
   using SteadyClock = std::chrono::steady_clock;
@@ -148,6 +151,7 @@ class ReplClient {
   std::atomic<int64_t> loading_start_ms_{0};
   std::atomic<uint64_t> loaded_bytes_{0};
   std::atomic<bool> stop_{false};
+  std::atomic<bool> stopped_mid_load_{false};
   std::mutex fd_mu_;
   int active_fd_ = -1;  // guarded by fd_mu_: the socket Stop() shuts down
   std::mutex backoff_mu_;

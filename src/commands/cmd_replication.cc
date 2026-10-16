@@ -124,6 +124,7 @@ void Replicaof(ExecContext& ctx, const ArgList& argv) {
       return ctx.reply.SimpleString("OK");
     }
     const Status st = repl.BecomeMaster();  // a no-op on a master, still +OK
+    if (st.code() == StatusCode::kUserError) return ctx.reply.Error(st.message());  // -LOADING (D22)
     if (!st.ok()) return ctx.reply.Error(std::string(kErrPromotionFailed) + st.message());
     return ctx.reply.SimpleString("OK");
   }

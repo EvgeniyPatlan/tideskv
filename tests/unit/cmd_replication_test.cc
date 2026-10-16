@@ -12,6 +12,7 @@
 #include "script/sha1hex.h"
 #include "support/command_harness.h"
 #include "support/replica_stack.h"
+#include "types/errors.h"
 
 namespace tideskv::test {
 namespace {
@@ -421,6 +422,14 @@ TEST(RoleChange, APromotedReplicaLeasesOidsAboveTheMastersHighWaterMark) {
   auto oid = replica.services.oids_.Next();
   ASSERT_TRUE(oid.ok()) << oid.status().ToString();
   EXPECT_GE(*oid, master_hwm);
+}
+
+TEST(ReplicaofCmd, APromotionRefusedWithLoadingRepliesLoadingVerbatim) {  // M6b D7, M7a D22
+  CommandHarness h;
+  h.services.replication_.set_role(ReplRole::kReplica);
+  h.services.replication_.become_master_status = Status::UserError(std::string(kErrLoading));
+  EXPECT_EQ(h.Run({"REPLICAOF", "NO", "ONE"}), Err(kErrLoading));
+  EXPECT_EQ(h.services.replication_.role(), ReplRole::kReplica);
 }
 
 }  // namespace

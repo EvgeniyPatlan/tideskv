@@ -25,6 +25,7 @@
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
 #include "support/fake_clock.h"
+#include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "support/snapshot_frames.h"
 #include "types/errors.h"
@@ -224,6 +225,17 @@ TEST_F(ManagerTest, AShutDownMasterRefusesAFullResync) {
   EXPECT_EQ(r.error, kErrPsyncShuttingDown);
   EXPECT_EQ(r.pending_id, 0u);
   EXPECT_EQ(m->counters().sync_full, 0u);
+}
+
+// R18-a (M7a D22): a shut-down master refuses before deciding, so no CONTINUE hand-off is registered and no
+// FULLRESYNC snapshot is taken for nothing.
+TEST_F(ManagerTest, AShutDownMasterRefusesEvenAPartialResync) {
+  auto m = Make();
+  m->Shutdown();
+  const PsyncResult r = m->HandlePsync({id.replid, 4}, {});
+  EXPECT_EQ(r.error, kErrPsyncShuttingDown);
+  EXPECT_EQ(m->pending_count(), 0u);
+  EXPECT_EQ(m->counters().sync_partial_ok, 0u);
 }
 
 TEST_F(ManagerTest, DestructorShutsDown) {
@@ -661,6 +673,61 @@ TEST(ReplicationManagerFullSync, ReportsTheLoadAndAdoptsItsResult) {
   EXPECT_EQ(m.replid(), master_id);
   EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
   m.Shutdown();
+}
+
+// The replica half of a full sync left open: the start txn and one chunk committed, LOADEND never sent.
+struct OpenLoad {
+  explicit OpenLoad(Storage& storage) : replica(storage) {
+    for (int i = 0; i < 20; ++i) EXPECT_EQ(master.Run({"SET", "k" + std::to_string(i), "v"}), "+OK\r\n");
+  }
+  std::unique_ptr<ReplicationManager> Start() {
+    ReplicationManager::Options o;
+    o.role.engine = &replica.engine;
+    auto m = std::make_unique<ReplicationManager>(
+        replica.storage, replica.log, ReplIdentity{std::string(kReplIdLength, 'a'), {}}, std::move(o));
+    EXPECT_TRUE(m->BecomeReplica("127.0.0.1", fake.port()));
+    const std::string id = master.services.replication_.identity.replid;
+    EXPECT_TRUE(fake.Serve("FULLRESYNC " + id + " " + std::to_string(master.services.repl_log_.last())));
+    const test::SnapshotStream snap = test::SnapshotFrames(master.services.repl_log_);
+    EXPECT_GE(snap.frames.size(), 2u);
+    EXPECT_TRUE(fake.Send(LoadFrame(snap.frames[0][1])));  // one chunk; no LOADEND: the load stays open
+    EXPECT_TRUE(WaitFor([&] { return m->Sync().loaded_bytes > 0; }));
+    return m;
+  }
+  test::CommandHarness master;
+  test::ReplicaStack replica;
+  OneLinkMaster fake;
+};
+
+// M7a D22 (R18-b): the refusal is decided inside role_mu_, after the client stopped, not before it.
+TEST(ReplicationManagerFullSync, PromotionDuringALoadIsRefusedWithLoading) {
+  InMemoryStorage storage;
+  OpenLoad load(storage);
+  auto m = load.Start();
+  const Status st = m->BecomeMaster();
+  EXPECT_EQ(st.code(), StatusCode::kUserError);
+  EXPECT_EQ(st.message(), kErrLoading);
+  EXPECT_EQ(m->role(), ReplRole::kReplica);
+  EXPECT_EQ(m->Role().host, "127.0.0.1");  // the client was restarted for the same master
+  EXPECT_TRUE(load.replica.log.fenced());
+  EXPECT_FALSE(load.replica.engine.loading());  // the stopped loader discarded the partial keyspace
+  m->Shutdown();
+}
+
+// G1 + D22: the stopped loader's abort fails, so the node is still loading: refused, and the restarted
+// client's loop discards the load before it reconnects; then a promotion succeeds (an empty node, seq 0).
+TEST(ReplicationManagerFullSync, AFailedAbortIsRefusedUntilTheRestartedClientDiscardsTheLoad) {
+  test::FaultyStorage storage;
+  OpenLoad load(storage);
+  auto m = load.Start();
+  storage.fail_commit_in = 1;  // the next commit is the stopped loader's AbortLoad
+  EXPECT_EQ(m->BecomeMaster().message(), kErrLoading);
+  EXPECT_EQ(m->role(), ReplRole::kReplica);
+  EXPECT_TRUE(
+      WaitFor([&] { return !load.replica.engine.loading() && !load.replica.log.load_incomplete(); }, 5s));
+  ASSERT_TRUE(m->BecomeMaster().ok());
+  EXPECT_EQ(m->role(), ReplRole::kMaster);
+  m->Shutdown();
 }
 
 }  // namespace

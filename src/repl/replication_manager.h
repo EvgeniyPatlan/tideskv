@@ -162,6 +162,7 @@ class ReplicationManager final : public Replication {
   void TickLoop();
   void Reap();
   std::chrono::milliseconds Timeout() const;
+  Status RefuseHalfLoaded(bool stopped_mid_load) const;  // D22: kErrLoading for a half-loaded node
   std::shared_ptr<ReplClient> TakeClient();  // detaches the client (under mu_); the caller stops it
   std::shared_ptr<ReplClient> MakeClient();
   void StartClient(const std::string& host, uint16_t port);  // a new client, published under mu_

@@ -73,7 +73,9 @@ class FakeReplication final : public Replication {
     set_role(ReplRole::kReplica);
     return true;
   }
+  Status become_master_status = Status::Ok();  // not OK: BecomeMaster returns it and changes nothing
   Status BecomeMaster() override {
+    if (!become_master_status.ok()) return become_master_status;
     ++become_master;
     role_info = RoleInfo{};
     set_role(ReplRole::kMaster);
