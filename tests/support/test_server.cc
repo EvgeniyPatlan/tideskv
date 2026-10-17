@@ -183,12 +183,12 @@ TestServer::~TestServer() {
   if (pid_ > 0) {
     // A test whose TempDir dies before this server deleted the files of a running server. Its next flush
     // fails, and the background checkpoint holds SIGTERM up to TidesDB's 60 s flush wait.
+    // Its files are gone, so a clean shutdown proves nothing: kill it rather than wait out that stall.
     if (std::error_code ec; !std::filesystem::exists(dir_, ec)) {
       ADD_FAILURE() << "tideskv-server's data dir was removed while the server ran: " << dir_
                     << " (keep the TempDir alive until the server is stopped)";
-    }
-    const int code = Terminate();
-    if (code < 0) {
+      Kill9();
+    } else if (const int code = Terminate(); code < 0) {
       Kill9();
       ADD_FAILURE() << "tideskv-server did not exit after SIGTERM; stderr:\n" << Stderr();
     } else if (code != 0) {

@@ -76,7 +76,8 @@ class ReplClient {
   // Unix ms when the link last went down; -1 if it never came up; 0 while it is up.
   int64_t link_down_since_ms() const { return link_down_since_ms_.load(std::memory_order_acquire); }
   // Progress for INFO (M6b D11); all zero outside a full sync. Bytes received since +FULLRESYNC; unix ms of
-  // the last read during the load; unix ms when BeginLoad committed; LOAD payload bytes applied.
+  // the last read during the load; unix ms when the load started (stored just before BeginLoad raises
+  // loading); LOAD payload bytes applied.
   uint64_t sync_read_bytes() const { return sync_read_bytes_.load(std::memory_order_acquire); }
   int64_t sync_last_io_ms() const { return sync_last_io_ms_.load(std::memory_order_acquire); }
   int64_t loading_start_ms() const { return loading_start_ms_.load(std::memory_order_acquire); }
