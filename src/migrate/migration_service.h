@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -57,9 +58,13 @@ class MigrationService {
   // to the copy's fenced set (*fence_seq gets the barrier's seq when it moved); sys/migration is written when
   // its persisted part changed (persist, and only on a master); then the copy is published, after the gate is
   // released. On a failure (the edit's, the write's) the fence moves back and nothing is published. While a
-  // restore is pending (Restore, OnPromoted), the copy is first rebuilt from the record (see Restore), so an
-  // edit that lands before the posted restore neither overwrites the record nor is overwritten by it.
-  Status Mutate(const FallibleEdit& edit, bool persist = true, uint64_t* fence_seq = nullptr);
+  // promotion's restore is pending, the copy is first rebuilt from the record (cheaply: no erase here, see
+  // Restore), so an edit that lands before the posted restore neither overwrites the record nor is
+  // overwritten by it. That rebuild never fails the edit: on a replica it is skipped, and a record that
+  // cannot be loaded is logged at critical and leaves empty states (Writer's note 6).
+  Status Mutate(const FallibleEdit& edit, bool persist = true, uint64_t* fence_seq = nullptr) {
+    return MutateImpl(edit, persist, fence_seq, /*strict_restore=*/false);
+  }
   template <class F>
     requires std::is_void_v<std::invoke_result_t<F&, cluster::SlotStates&>>
   Status Mutate(F&& edit, bool persist = true, uint64_t* fence_seq = nullptr) {
@@ -69,12 +74,12 @@ class MigrationService {
                   }),
                   persist, fence_seq);
   }
-  // D8, on a master at boot or promotion, as one Mutate: the record's states (nothing when absent); an import
-  // left in start is erased and becomes error; each cleanup-pending range is posted to the worker. Corruption
-  // for a damaged record.
+  // D8, on a master at boot, as one Mutate: the record's states (nothing when absent); an import left in
+  // start becomes error and its erase is posted to the worker (with the CLIENT PAUSE hooks), as is each
+  // cleanup-pending range. Corruption for a damaged record (the boot stops).
   Status Restore();
-  // The become_master hook (under apply_mu_): marks the restore pending and posts it. A failure is logged at
-  // critical; for a damaged record the node keeps its (empty) states (Writer's note 6).
+  // The become_master hook (under apply_mu_): requests the restore and posts it; the first Mutate after it,
+  // on any thread, performs it (see Mutate). A second promotion before that is never lost (a generation).
   void OnPromoted();
   // D9, on the worker: erases `range`, then drops its cleanup entry, its migrated entry and its fence
   // (persisted). BUSY is waited out; another failure is retried after 1 s until Shutdown; a replica does
@@ -94,22 +99,49 @@ class MigrationService {
   static constexpr std::chrono::milliseconds kBusyRetry{10};  // as the eraser polls CLIENT PAUSE
   static constexpr std::chrono::seconds kFailureRetry{1};
 
-  // Under record_mu_: `s` becomes the record's states, a half import erased (-> error); `stored` gets the
-  // record as found (empty when absent), `resumed` the cleanup-pending ranges.
-  Status RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored,
-                     std::vector<cluster::SlotRange>* resumed);
+  struct Restored {  // what a restore leaves for the worker once its Mutate committed
+    bool ran = false;
+    std::vector<cluster::SlotRange> cleanup;
+    std::optional<cluster::SlotRange> half_import;
+  };
+
+  Status MutateImpl(const FallibleEdit& edit, bool persist, uint64_t* fence_seq, bool strict_restore);
+  bool RestorePending() const {
+    return restore_requested_.load(std::memory_order_acquire) !=
+           restore_applied_.load(std::memory_order_acquire);
+  }
+  // Under record_mu_, for generation `wanted`: skipped on a replica; a failure is returned when strict, else
+  // logged at critical with `s` left empty. Marks `wanted` applied unless it rebuilt `s` (`out->ran`: the
+  // caller marks it once its commit succeeded) or failed strictly.
+  Status PrepareRestore(uint64_t wanted, cluster::SlotStates& s, cluster::MigrationRecord* stored,
+                        Restored* out, bool strict);
+  // Under record_mu_: `s` becomes the record's states, a half import -> error; `stored` gets the record as
+  // found (empty when absent).
+  Status RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored, Restored* out);
+  void PostRestored(const Restored& r);  // the cleanups and the half-import erase, to the worker
+  // On the worker: erases what an import left in start (D8). Stops when a new import in start overlaps it
+  // (that import erases its range itself, D9), on a replica, or on Shutdown; failures retry after 1 s.
+  void RunHalfImportErase(cluster::SlotRange range);
+  bool NewImportOverlaps(cluster::SlotRange range) const;
   // Under record_mu_: moves the fence from `cur_fenced`, writes RecordOf(next) unless it equals `stored`,
   // publishes `next`.
   Status Commit(const SlotBits& cur_fenced, const cluster::MigrationRecord& stored,
                 std::shared_ptr<cluster::SlotStates> next, bool persist, uint64_t* fence_seq);
   Status SaveRecord(const cluster::MigrationRecord& record);
-  Status EraseWaitingOutBusy(cluster::SlotRange range, bool background);  // until not BUSY or Shutdown
+  Status EraseWith(cluster::SlotRange range, bool background,
+                   std::function<bool()> stop);  // EraseRange + stop
+  // Until not BUSY or Shutdown; `stop` (optional) also stops the eraser before a txn.
+  Status EraseWaitingOutBusy(cluster::SlotRange range, bool background,
+                             const std::function<bool()>& stop = {});
   void WorkerLoop();
   void WaitBeforeRetry(std::chrono::milliseconds delay);  // cut short by Shutdown
 
   MigrationDeps deps_;
   std::mutex record_mu_;
-  std::atomic<bool> restore_pending_{false};  // set by Restore/OnPromoted, cleared by a Mutate that restored
+  // Restore generations: Restore/OnPromoted bump requested; a restore (or its skip) marks it applied, under
+  // record_mu_. Pending while they differ.
+  std::atomic<uint64_t> restore_requested_{0};
+  std::atomic<uint64_t> restore_applied_{0};
   std::atomic<bool> stop_{false};
   std::mutex worker_mu_;
   std::condition_variable worker_cv_;

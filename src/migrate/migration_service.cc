@@ -21,21 +21,22 @@ Status MigrationService::SaveRecord(const cluster::MigrationRecord& record) {
   return deps_.make_durable ? deps_.make_durable() : Status::Ok();
 }
 
-Status MigrationService::Mutate(const FallibleEdit& edit, bool persist, uint64_t* fence_seq) {
+Status MigrationService::MutateImpl(const FallibleEdit& edit, bool persist, uint64_t* fence_seq,
+                                    bool strict_restore) {
   std::lock_guard lock(record_mu_);
   const std::shared_ptr<const cluster::SlotStates> cur = deps_.cluster.States();
   auto next = std::make_shared<cluster::SlotStates>(*cur);
-  const bool restoring = restore_pending_.load(std::memory_order_acquire);
   cluster::MigrationRecord stored = cluster::RecordOf(*cur);  // what sys/migration holds now
-  std::vector<cluster::SlotRange> resumed;
-  if (restoring) {
-    if (Status st = RestoreInto(*next, &stored, &resumed); !st.ok()) return st;
+  const uint64_t wanted = restore_requested_.load(std::memory_order_acquire);
+  Restored restored;
+  if (wanted != restore_applied_.load(std::memory_order_acquire)) {
+    if (Status st = PrepareRestore(wanted, *next, &stored, &restored, strict_restore); !st.ok()) return st;
   }
   if (Status st = edit(*next); !st.ok()) return st;
   if (Status st = Commit(cur->fenced, stored, std::move(next), persist, fence_seq); !st.ok()) return st;
-  if (restoring) {
-    restore_pending_.store(false, std::memory_order_release);
-    for (const cluster::SlotRange& r : resumed) Post([this, r] { RunCleanup(r); });
+  if (restored.ran) {
+    restore_applied_.store(wanted, std::memory_order_release);
+    PostRestored(restored);
   }
   return Status::Ok();
 }
@@ -61,45 +62,87 @@ Status MigrationService::Commit(const SlotBits& cur_fenced, const cluster::Migra
   return Status::Ok();
 }
 
+Status MigrationService::PrepareRestore(uint64_t wanted, cluster::SlotStates& s,
+                                        cluster::MigrationRecord* stored, Restored* out, bool strict) {
+  if (deps_.is_replica()) {  // demoted again before the restore: a replica holds the record passively (D21)
+    restore_applied_.store(wanted, std::memory_order_release);
+    return Status::Ok();
+  }
+  Status st = RestoreInto(s, stored, out);
+  if (st.ok() || strict) return st;
+  // Writer's note 6: the node keeps empty states; one bad restore never fails later edits.
+  spdlog::critical("cannot restore the slot migration states after a promotion: {}", st.ToString());
+  s = cluster::SlotStates{};
+  *stored = cluster::MigrationRecord{};
+  restore_applied_.store(wanted, std::memory_order_release);
+  return Status::Ok();
+}
+
 Status MigrationService::RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored,
-                                     std::vector<cluster::SlotRange>* resumed) {
+                                     Restored* out) {
   auto loaded = cluster::LoadMigrationRecord(deps_.storage);
   if (!loaded.ok()) return loaded.status();
   const std::optional<cluster::MigrationRecord>& record = *loaded;
   cluster::SlotStates restored =
       record.has_value() ? cluster::StatesFromRecord(*record) : cluster::SlotStates{};
   if (restored.import && restored.import->state == cluster::ImportState::kStart) {  // a half import (D8)
-    if (Status st = EraseWaitingOutBusy(restored.import->range, /*background=*/false); !st.ok()) return st;
+    out->half_import = restored.import->range;  // erased on the worker once this commits
     restored.import->state = cluster::ImportState::kError;
   }
   *stored = record.value_or(cluster::MigrationRecord{});
-  *resumed = restored.cleanup;
+  out->cleanup = restored.cleanup;
+  out->ran = true;
   s = std::move(restored);
   if (record.has_value()) spdlog::info("slot migration states restored from sys/migration");
   return Status::Ok();
 }
 
+void MigrationService::PostRestored(const Restored& r) {
+  if (r.half_import) Post([this, range = *r.half_import] { RunHalfImportErase(range); });
+  for (const cluster::SlotRange& c : r.cleanup) Post([this, c] { RunCleanup(c); });
+}
+
 Status MigrationService::Restore() {
-  restore_pending_.store(true, std::memory_order_release);
-  return Mutate([](cluster::SlotStates&) {});
+  restore_requested_.fetch_add(1, std::memory_order_acq_rel);
+  return MutateImpl([](cluster::SlotStates&) { return Status::Ok(); }, true, nullptr,
+                    /*strict_restore=*/true);
 }
 
 void MigrationService::OnPromoted() {
-  restore_pending_.store(true, std::memory_order_release);
+  restore_requested_.fetch_add(1, std::memory_order_acq_rel);
   Post([this] {
-    if (!restore_pending_.load(std::memory_order_acquire)) return;  // an earlier Mutate restored already
-    const Status st = Mutate([](cluster::SlotStates&) {});
-    if (st.ok()) return;
-    spdlog::critical("cannot restore the slot migration states after a promotion: {}", st.ToString());
-    // Writer's note 6: a damaged record leaves the states empty; any other failure retries on the next
-    // Mutate.
-    if (st.code() == StatusCode::kCorruption) restore_pending_.store(false, std::memory_order_release);
+    if (!RestorePending()) return;  // an earlier Mutate restored already
+    if (Status st = Mutate([](cluster::SlotStates&) {}); !st.ok()) {
+      spdlog::error("cannot commit the slot migration states restored after a promotion: {}", st.ToString());
+    }
   });
 }
 
+bool MigrationService::NewImportOverlaps(cluster::SlotRange range) const {
+  const std::shared_ptr<const cluster::SlotStates> s = deps_.cluster.States();
+  const std::optional<cluster::ImportJob>& import = s->import;
+  return import.has_value() && import->state == cluster::ImportState::kStart &&
+         cluster::Overlaps(import->range, range);
+}
+
+void MigrationService::RunHalfImportErase(cluster::SlotRange range) {
+  const auto superseded = [this, range] { return NewImportOverlaps(range); };
+  if (stopping() || deps_.is_replica() || superseded()) return;
+  const Status st = EraseWaitingOutBusy(range, /*background=*/true, superseded);
+  if (st.ok() || stopping() || superseded()) return;
+  spdlog::warn("erasing the half import of slot(s) {} failed: {}; retrying", cluster::FormatRange(range),
+               st.ToString());
+  WaitBeforeRetry(kFailureRetry);
+  Post([this, range] { RunHalfImportErase(range); });
+}
+
 Status MigrationService::EraseRange(cluster::SlotRange range, bool background) {
+  return EraseWith(range, background, {});
+}
+
+Status MigrationService::EraseWith(cluster::SlotRange range, bool background, std::function<bool()> stop) {
   SlotEraser::Hooks hooks;
-  hooks.stopping = [this] { return stopping(); };
+  hooks.stopping = [this, stop = std::move(stop)] { return stopping() || (stop && stop()); };
   if (background && deps_.begin_background_write) {
     hooks.begin_write = deps_.begin_background_write;
     hooks.end_write = deps_.end_background_write;
@@ -107,9 +150,10 @@ Status MigrationService::EraseRange(cluster::SlotRange range, bool background) {
   return SlotEraser(deps_.engine, std::move(hooks)).Erase(range);
 }
 
-Status MigrationService::EraseWaitingOutBusy(cluster::SlotRange range, bool background) {
+Status MigrationService::EraseWaitingOutBusy(cluster::SlotRange range, bool background,
+                                             const std::function<bool()>& stop) {
   for (;;) {
-    Status st = EraseRange(range, background);
+    Status st = EraseWith(range, background, stop);
     if (!deps_.engine.IsBusyAnswer(st) || stopping()) return st;
     WaitBeforeRetry(kBusyRetry);  // a timed-out script holds the gate: not a failure
   }

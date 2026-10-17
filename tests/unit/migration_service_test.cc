@@ -36,6 +36,27 @@ struct ServiceTest : ::testing::Test {
   void Persist(const cluster::MigrationRecord& r) {
     ASSERT_TRUE(h.services.repl_log_.CommitStandalone({cluster::MigrationRecordPut(r)}).ok());
   }
+  // A key of slot 12182 (B's) imported here, and a record whose import of it is still in start.
+  void HalfImport() {
+    ASSERT_TRUE(h.services.engine_
+                    .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
+                                   encoding::MetaKeyFor(0, "foo"), encoding::EncodeMetadata({}, "partial")}})
+                    .ok());
+    cluster::MigrationRecord r;
+    r.import = cluster::ImportJob{{12182, 12182}, cluster::ImportState::kStart};
+    Persist(r);
+  }
+  // Blocks the worker until the returned flag is set (or Shutdown, so a failed ASSERT never hangs the test).
+  std::shared_ptr<std::atomic<bool>> BlockWorker(migrate::MigrationService& svc) {
+    auto release = std::make_shared<std::atomic<bool>>(false);
+    svc.Post([release, &svc] {
+      while (!release->load() && !svc.stopping()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    return release;
+  }
+  static void StartJob(cluster::SlotStates& s) {
+    s.job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, MigrateState::kStart};
+  }
   CommandHarness h;
   ClusterHarness c{h};
 };
@@ -110,6 +131,7 @@ TEST_F(ServiceTest, RestoreErasesAHalfImport) {  // D8: importing start -> erase
   Persist(r);
   auto svc = Make();
   ASSERT_TRUE(svc->Restore().ok());
+  ASSERT_TRUE(svc->AwaitIdle(5s));  // the erase runs on the worker (fix round 1)
   EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(0));
   EXPECT_EQ(c.manager->States()->import->state, cluster::ImportState::kError);
   EXPECT_EQ(Record()->import->state, cluster::ImportState::kError);
@@ -254,6 +276,76 @@ TEST_F(ServiceTest, ACleanupWaitsOutABusyScriptWithoutFailing) {  // controller 
   EXPECT_TRUE(c.manager->States()->cleanup.empty());
   EXPECT_FALSE(engine.SlotFenced(5061));
   EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "5061"}), Int(0));
+}
+
+// Fix round 1 (a): the first Mutate after a promotion only rebuilds the states; the half import's erase runs
+// on the worker, so a command thread is never held for it.
+TEST_F(ServiceTest, AMutateAfterAPromotionLeavesTheHalfImportEraseToTheWorker) {
+  HalfImport();
+  auto svc = Make();
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->Mutate(StartJob).ok());
+  EXPECT_EQ(c.manager->States()->import->state, cluster::ImportState::kError);
+  EXPECT_EQ(Record()->import->state, cluster::ImportState::kError);
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1)) << "not erased on the caller's thread";
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(0));
+  EXPECT_EQ(c.manager->States()->job->state, MigrateState::kStart);
+}
+
+// Fix round 1 (b): a node demoted again before its restore ran skips it; later Mutates keep working.
+TEST_F(ServiceTest, APromotionUndoneBeforeTheRestoreLeavesLaterMutatesWorking) {
+  HalfImport();
+  auto svc = Make();
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  h.services.replication_.set_role(ReplRole::kReplica);
+  h.services.repl_log_.FenceLocalWrites(true);  // what a real demotion does
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  ASSERT_TRUE(svc->Mutate(StartJob).ok());
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) { s.job->state = MigrateState::kFail; }).ok());
+  EXPECT_FALSE(c.manager->States()->import.has_value()) << "a replica restores nothing";
+  EXPECT_EQ(Record()->import->state, cluster::ImportState::kStart) << "and writes nothing";
+  h.services.repl_log_.FenceLocalWrites(false);
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1));
+}
+
+// Fix round 1 (c): a restore failure at promotion is logged, leaves empty states and never fails an edit,
+// not even one that reaches the restore before the worker does.
+TEST_F(ServiceTest, ARestoreFailureAtPromotionKeepsEmptyStatesAndLaterMutatesProceed) {
+  ASSERT_TRUE(h.services.repl_log_
+                  .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
+                                      std::string(cluster::kSysMigration), "garbage"}})
+                  .ok());
+  auto svc = Make();
+  LogCapture log;
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->Mutate(StartJob).ok()) << "a command's edit is not answered with the restore's error";
+  EXPECT_TRUE(log.Contains("cannot restore the slot migration states"));
+  EXPECT_TRUE(c.manager->States()->migrated.empty());
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) { s.job->state = MigrateState::kFail; }).ok());
+  EXPECT_EQ(Record()->job->state, MigrateState::kFail) << "the next edit replaces the damaged record";
+}
+
+// Fix round 1 (c), on the worker alone.
+TEST_F(ServiceTest, ARestoreFailureOnTheWorkerIsLoggedAndClearsThePromotion) {
+  ASSERT_TRUE(h.services.repl_log_
+                  .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
+                                      std::string(cluster::kSysMigration), "garbage"}})
+                  .ok());
+  auto svc = Make();
+  LogCapture log;
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  EXPECT_TRUE(log.Contains("cannot restore the slot migration states"));
+  EXPECT_FALSE(c.manager->States()->job.has_value());
+  ASSERT_TRUE(svc->Mutate(StartJob).ok());
 }
 
 }  // namespace
