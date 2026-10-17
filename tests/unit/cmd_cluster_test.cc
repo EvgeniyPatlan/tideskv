@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -8,6 +9,7 @@
 #include "cluster/slot_states.h"
 #include "support/cluster_harness.h"
 #include "support/migration_harness.h"
+#include "types/errors.h"
 
 namespace tideskv::test {
 namespace {
@@ -167,6 +169,51 @@ TEST(ClusterCmd,
   EXPECT_TRUE(s->migrated.empty());
   p.source_cluster.Push(kThreeNodes, 2);  // the slot is back on this node: writable at once
   EXPECT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+}
+
+// Task 11 fix round 1: a fence-changing Mutate (a cleanup finishing, a SETNODES) between RESET's fence and
+// cm.Reset never lowers the all-slots fence, so no write commits after the emptiness check.
+TEST(ClusterCmd, AFenceChangeDuringResetKeepsEverySlotFenced) {
+  MigrationPair p;
+  migrate::MigrationService& m = p.source_migration();
+  SecondClient writer(p.source);
+  std::string write;
+  const Status st = m.ResetCluster([&] {
+    EXPECT_TRUE(m.Mutate([](cluster::SlotStates& s) { cluster::SetFenced(s, {100, 100}, true); }).ok());
+    EXPECT_TRUE(m.Mutate([](cluster::SlotStates& s) { cluster::SetFenced(s, {100, 100}, false); }).ok());
+    write = writer.Run({"SET", "b", "1"});
+    return Status::Ok();
+  });
+  EXPECT_TRUE(st.ok()) << st.ToString();
+  EXPECT_EQ(write, Err(kErrTryAgain));
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300)) << "the release restores the states' fence";
+  EXPECT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+}
+
+// Task 11 fix round 1 (controller ruling): RESET's running checks, the reset and OnReset run under
+// migrate_mu_, so a MIGRATE cannot publish start in between (OnReset would then lift the job's fence).
+TEST(ClusterCmd, ResetAndMigrateAreSerialised) {
+  MigrationPair p;
+  ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
+  migrate::MigrationService& m = p.source_migration();
+  std::promise<void> entered;
+  std::promise<void> go;
+  std::shared_future<void> released = go.get_future().share();
+  std::thread resetter([&] {
+    EXPECT_TRUE(m.ResetCluster([&] {
+                   entered.set_value();
+                   released.wait();
+                   return Status::Ok();
+                 }).ok());
+  });
+  entered.get_future().wait();
+  auto migrate = std::async(std::launch::async, [&] { return m.Migrate({{3300, 3300}}, kNodeB, nullptr); });
+  EXPECT_EQ(migrate.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout)
+      << "MIGRATE waits for the reset";
+  go.set_value();
+  resetter.join();
+  EXPECT_TRUE(migrate.get().ok());
+  m.migrator().Stop();
 }
 
 }  // namespace

@@ -30,7 +30,8 @@
 // Slot migration on one node (M7b): the states it publishes next to the topology, the replicated
 // sys/migration record, the migrate worker thread (cleanups, link-loss erases, SETNODES transitions) and the
 // target's importer (Task 9) and the source's migrator (Task 10). Owned by App when cluster-enabled;
-// commands reach it only through ServerServices::migration() (D26). Lock order: {migrate_mu_ |
+// commands reach it only through ServerServices::migration() (D26). Lock order: migrate_mu_ -> apply_mu_
+// (ResetCluster only; nothing under apply_mu_ takes migrate_mu_); {migrate_mu_ |
 // SlotImporter::mu_} -> record_mu_ -> Engine gate (taken and released) -> (states publish, never under the
 // gate); worker_mu_ is a leaf.
 namespace tideskv::migrate {
@@ -110,12 +111,20 @@ class MigrationService {
   // FLUSHDB/FLUSHALL (D10, Writer's note 1): cancels a running job and fails a running import. Flags and a
   // post only: it may run inside an EXEC or a script that holds the Engine gate.
   void OnFlush();
-  Status FlushSlots(const std::vector<cluster::SlotRange>& ranges);  // D13: refused while a job is in start
+  // D13: refused while a job is in start; the check and the erase run under migrate_mu_, so no MIGRATE starts
+  // in between.
+  Status FlushSlots(const std::vector<cluster::SlotRange>& ranges);
   bool MigrationRunning() const;  // a job in start (CLUSTER RESET, FLUSHSLOTS)
   bool ImportRunning() const;     // an import in start (CLUSTER RESET)
   // CLUSTER RESET succeeded (D15, D20): migrated, cleanup and imported ranges and their fences go; a success
   // block goes, a fail block and the import block stay.
   Status OnReset();
+  // CLUSTER RESET (D20), all under migrate_mu_ so no MIGRATE publishes start in between: refused while a job
+  // or an import is in start (Kvrocks order); then every slot held fenced (Engine::HoldAllFenced: no
+  // concurrent Mutate can lower it) while `reset` (the emptiness check and ClusterManager::Reset, which takes
+  // apply_mu_: migrate_mu_ -> apply_mu_) and, on success, OnReset run; the release puts the fence back to the
+  // states' set. Never under apply_mu_ or the Engine gate.
+  Status ResetCluster(const std::function<Status()>& reset);
 
   void Post(std::function<void()> task);              // the migrate worker, FIFO; dropped after Shutdown
   bool AwaitIdle(std::chrono::milliseconds timeout);  // true once every task posted before the call ran
@@ -167,7 +176,7 @@ class MigrationService {
 
   MigrationDeps deps_;
   std::mutex record_mu_;
-  std::mutex migrate_mu_;  // Migrate: the checks and the start publish, together
+  std::mutex migrate_mu_;  // Migrate, FlushSlots, ResetCluster: each one's checks and its change, together
   // Restore generations: Restore/OnPromoted bump requested; a restore (or its skip) marks it applied, under
   // record_mu_. Pending while they differ.
   std::atomic<uint64_t> restore_requested_{0};

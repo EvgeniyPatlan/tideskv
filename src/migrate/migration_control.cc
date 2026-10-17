@@ -1,6 +1,7 @@
 // MigrationService's command entries (M7b D10, D12, D13, D20).
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -102,6 +103,7 @@ bool MigrationService::ImportRunning() const {
 }
 
 Status MigrationService::FlushSlots(const std::vector<SlotRange>& ranges) {
+  std::lock_guard lock(migrate_mu_);
   if (MigrationRunning()) return Err(cluster::kErrFlushWhileMigrating);
   for (SlotRange r : ranges) {
     if (Status st = EraseRange(r, /*background=*/false); !st.ok()) return st;
@@ -117,6 +119,17 @@ Status MigrationService::OnReset() {
     s.imported.clear();
     s.fenced.reset();
   });
+}
+
+Status MigrationService::ResetCluster(const std::function<Status()>& reset) {
+  std::lock_guard lock(migrate_mu_);
+  if (MigrationRunning()) return Err(cluster::kErrResetWhileMigrating);
+  if (ImportRunning()) return Err(cluster::kErrResetWhileImporting);
+  deps_.engine.HoldAllFenced();
+  Status st = reset();
+  if (st.ok()) st = OnReset();
+  deps_.engine.ReleaseAllFenced();  // the fence becomes the states' set (C11), whoever moved it meanwhile
+  return st;
 }
 
 }  // namespace tideskv::migrate

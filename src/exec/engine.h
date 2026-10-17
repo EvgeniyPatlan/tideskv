@@ -217,7 +217,13 @@ class Engine {
   // WriteExclusive (FLUSH*, Writer's note 1), oid leases.
   uint64_t FenceSlots(uint16_t first, uint16_t last);
   uint64_t UnfenceSlots(uint16_t first, uint16_t last);
-  uint64_t AssignFence(const SlotBits& bits);  // the fence becomes exactly `bits`
+  uint64_t AssignFence(const SlotBits& bits);  // the requested fence becomes exactly `bits`
+  // CLUSTER RESET (M7b D20): while at least one hold is up, every slot is fenced whatever FenceSlots,
+  // UnfenceSlots or AssignFence request meanwhile (a concurrent states Mutate cannot lower it); those still
+  // edit the requested set, which the fence becomes again at the last release. Same barrier and rules as
+  // FenceSlots.
+  void HoldAllFenced();
+  void ReleaseAllFenced();
   bool SlotFenced(uint16_t slot) const { return fence_.Test(slot); }
   SlotBits FencedSlots() const { return fence_.Bits(); }
 
@@ -250,7 +256,8 @@ class Engine {
   bool Observing() const { return observer_ != nullptr && !observer_->Idle(); }
   void Report(const std::vector<DbKey>& keys);                       // under the gate, after commit
   uint64_t ChangeFence(const std::function<void(SlotBits&)>& edit);  // under the exclusive barrier
-  Status CommitInternal(const std::vector<encoding::ReplOp>& ops);   // ApplyImport / WriteInternal (D22)
+  void ApplyFence();  // under the exclusive gate: fence_ = everything while held, else fence_requested_
+  Status CommitInternal(const std::vector<encoding::ReplOp>& ops);  // ApplyImport / WriteInternal (D22)
 
   Storage& storage_;
   LockManager& locks_;
@@ -263,6 +270,9 @@ class Engine {
   std::function<bool()> busy_;        // empty: plain gate waits
   std::string busy_reply_;
   SlotFence fence_;  // M7b D4: changed only under the exclusive gate
+  // Guarded by the exclusive gate: the fence the states asked for, and the CLUSTER RESET holds (D20).
+  SlotBits fence_requested_;
+  int fence_holds_ = 0;
 };
 
 }  // namespace tideskv

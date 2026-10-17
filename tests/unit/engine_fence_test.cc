@@ -141,6 +141,30 @@ TEST(EngineFence, UnfenceAndAssignReplaceTheFencedSet) {
   EXPECT_EQ(h.Run({"SET", "b", "1"}), kOk);
 }
 
+// CLUSTER RESET (M7b D20, Task 11 fix round 1): while held, every slot stays fenced whatever a concurrent
+// fence change assigns; the changes edit the requested set, which the last release restores.
+TEST(EngineFence, AHoldKeepsEverySlotFencedUntilTheLastRelease) {
+  CommandHarness h;
+  Engine& e = h.services.engine_;
+  e.FenceSlots(10, 20);
+  e.HoldAllFenced();
+  EXPECT_TRUE(e.SlotFenced(0));
+  EXPECT_TRUE(e.SlotFenced(kSlotCount - 1));
+  e.AssignFence({});  // a Mutate lowering the fence meanwhile
+  e.UnfenceSlots(0, kSlotCount - 1);
+  EXPECT_TRUE(e.SlotFenced(kSlotB));
+  EXPECT_EQ(h.Run({"SET", "b", "1"}), Err(kErrTryAgain));
+  e.FenceSlots(30, 30);  // requested: {30}
+  e.HoldAllFenced();     // holds count
+  e.ReleaseAllFenced();
+  EXPECT_TRUE(e.SlotFenced(kSlotB));
+  e.ReleaseAllFenced();
+  EXPECT_TRUE(e.SlotFenced(30));
+  EXPECT_FALSE(e.SlotFenced(10));
+  EXPECT_FALSE(e.SlotFenced(kSlotB));
+  EXPECT_EQ(h.Run({"SET", "b", "1"}), kOk);
+}
+
 TEST(SlotFence, AnyTracksTheBitsAndAnyKeyHashesKeys) {
   SlotFence f;
   EXPECT_FALSE(f.any());

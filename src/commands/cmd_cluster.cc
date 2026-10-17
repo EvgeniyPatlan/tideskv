@@ -139,29 +139,31 @@ void Replicas(ExecContext& ctx, ClusterManager&, const Topology& t, const ArgLis
   ctx.reply.Verbatim(*text);
 }
 
-// D20: the emptiness check and the reset run with every slot fenced, so no write lands between them (closes
-// the M7a Task 10 ruling); ClusterManager::Reset's role change takes no gate. Afterwards (and on any failure)
-// the fence goes back to the published states' set, never to a copy taken before: a worker or migrator Mutate
-// may have moved it meanwhile (controller ruling C11). OnReset clears that set on success.
-Status ResetUnderFence(ExecContext& ctx, ClusterManager& cm, migrate::MigrationService* m) {
-  Engine& engine = ctx.server.engine();
-  engine.FenceSlots(0, kSlotCount - 1);
+// D20: the emptiness check and ClusterManager::Reset (whose role change takes no gate) run with every slot
+// held fenced (MigrationService::ResetCluster), so no write lands between them (closes the M7a Task 10
+// ruling).
+Status ResetIfEmpty(ExecContext& ctx, ClusterManager& cm) {
   bool empty = false;
-  Status st = engine.Read([&](ReadView& v, int64_t) { return MoveInto(KeyspaceEmpty(v), &empty); });
-  if (st.ok()) st = cm.Reset(empty);
-  if (st.ok() && m != nullptr) st = m->OnReset();
-  engine.AssignFence(cm.States()->fenced);  // the gate is released before any states publish (OnReset)
-  return st;
+  const Status st =
+      ctx.server.engine().Read([&](ReadView& v, int64_t) { return MoveInto(KeyspaceEmpty(v), &empty); });
+  return st.ok() ? cm.Reset(empty) : st;
 }
 
 void Reset(ExecContext& ctx, ClusterManager& cm, const Topology&, const ArgList& argv) {
   if (argv.size() == 3 && !EqualsIgnoreCase(argv[2], "hard") && !EqualsIgnoreCase(argv[2], "soft")) {
     return ctx.reply.Error(kErrSyntax);
   }
+  const auto reset = [&ctx, &cm] { return ResetIfEmpty(ctx, cm); };
   migrate::MigrationService* m = ctx.server.migration();
-  if (m != nullptr && m->MigrationRunning()) return ctx.reply.Error(cluster::kErrResetWhileMigrating);
-  if (m != nullptr && m->ImportRunning()) return ctx.reply.Error(cluster::kErrResetWhileImporting);
-  if (Status st = ResetUnderFence(ctx, cm, m); !st.ok()) return ReplyError(ctx, st);
+  Status st = Status::Ok();
+  if (m != nullptr) {
+    st = m->ResetCluster(reset);
+  } else {  // no migration service: nothing else moves the fence
+    ctx.server.engine().HoldAllFenced();
+    st = reset();
+    ctx.server.engine().ReleaseAllFenced();
+  }
+  if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }
 

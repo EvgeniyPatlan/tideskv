@@ -18,10 +18,30 @@ uint64_t Engine::ChangeFence(const std::function<void(SlotBits&)>& edit) {
   assert(ActiveBatch() == nullptr && "a fence change inside a batch deadlocks on the gate");
   [[maybe_unused]] const engine_internal::ReentryCheck reentry;
   std::lock_guard barrier(gate_);  // every write holding the gate finishes first (D4), busy or not
-  SlotBits bits = fence_.Bits();
-  edit(bits);
-  fence_.Assign(bits);
+  edit(fence_requested_);
+  ApplyFence();
   return repl_log_ != nullptr ? repl_log_->last() : 0;  // inside the barrier: the end of the final delta
+}
+
+void Engine::ApplyFence() {
+  if (fence_holds_ == 0) {
+    fence_.Assign(fence_requested_);
+    return;
+  }
+  SlotBits all;
+  all.set();
+  fence_.Assign(all);
+}
+
+void Engine::HoldAllFenced() {
+  ChangeFence([this](SlotBits&) { ++fence_holds_; });
+}
+
+void Engine::ReleaseAllFenced() {
+  ChangeFence([this](SlotBits&) {
+    assert(fence_holds_ > 0 && "a release without a hold");
+    --fence_holds_;
+  });
 }
 
 uint64_t Engine::FenceSlots(uint16_t first, uint16_t last) {
