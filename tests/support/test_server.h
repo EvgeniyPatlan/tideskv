@@ -43,7 +43,8 @@ class TestServer {
   int Terminate();  // SIGTERM, then Wait()
   void Kill9();
   // SIGSTOP / SIGCONT: freezes every thread of the server (its reaper, its replication threads) and
-  // thaws it. Terminate and the destructor resume a paused server first.
+  // thaws it. Pause returns once every thread is stopped. Terminate and the destructor resume a paused
+  // server first.
   void Pause();
   void Resume();
   // Starts the server again on the same dir and port (after Kill9 or Terminate, or stopping it first),

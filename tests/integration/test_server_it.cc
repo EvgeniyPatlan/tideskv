@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
@@ -155,6 +156,34 @@ TEST(TestServerIT, ManyKeyMsetRunsUnderEverySanitizer) {
   }
   EXPECT_EQ(c->Command(cmd).str, "OK");
   EXPECT_EQ(c->Command({"DBSIZE"}).integer, 200);
+}
+
+// The states of every thread of `pid` ('T' = stopped), from /proc/<pid>/task/<tid>/stat.
+std::string ThreadStates(pid_t pid) {
+  std::string states;
+  for (const auto& task : std::filesystem::directory_iterator("/proc/" + std::to_string(pid) + "/task")) {
+    std::ifstream in(task.path() / "stat");
+    std::string stat((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const size_t paren = stat.rfind(')');  // the comm field may hold spaces and parentheses
+    if (paren != std::string::npos && paren + 2 < stat.size()) states += stat[paren + 2];
+  }
+  return states;
+}
+
+// SIGSTOP is asynchronous: a thread already running (a replication thread about to ACK) goes on until the
+// stop reaches it. Pause must return only once every thread is stopped, or a test's "frozen" replica may
+// still acknowledge the writes sent right after it (WaitIT under load).
+TEST(TestServerIT, PauseReturnsOnceEveryThreadIsStopped) {
+  TestServer s(TIDESKV_SERVER_BIN);
+  for (int round = 0; round < 100; ++round) {
+    s.Pause();
+    const std::string states = ThreadStates(s.pid());
+    ASSERT_EQ(states.find_first_not_of('T'), std::string::npos) << "round " << round << ": " << states;
+    s.Resume();
+  }
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(c->Command({"PING"}).str, "PONG");  // resumed
 }
 
 }  // namespace

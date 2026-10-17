@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <fstream>
 #include <sstream>
 #include <string_view>
@@ -237,10 +238,23 @@ int TestServer::Wait(std::chrono::milliseconds timeout) {
   }
 }
 
+// kill() only queues SIGSTOP: a thread already running goes on until the stop reaches it (a replica's
+// thread could still ACK a write sent after kill returned). WUNTRACED reports the child once every thread
+// has stopped.
 void TestServer::Pause() {
   if (pid_ <= 0 || paused_) return;
   ::kill(pid_, SIGSTOP);
   paused_ = true;
+  int status = 0;
+  pid_t r = -1;
+  do {
+    r = ::waitpid(pid_, &status, WUNTRACED);
+  } while (r < 0 && errno == EINTR);
+  if (r == pid_ && !WIFSTOPPED(status)) {  // it exited before the stop: keep the status like IsRunning
+    pid_ = -1;
+    exit_code_ = DecodeStatus(status);
+    paused_ = false;
+  }
 }
 
 void TestServer::Resume() {
