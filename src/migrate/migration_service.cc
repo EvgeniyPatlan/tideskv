@@ -181,11 +181,11 @@ Status MigrationService::EraseWaitingOutBusy(cluster::SlotRange range, bool back
 
 bool MigrationService::AdmitBackgroundWrite(const std::function<bool()>& stop) {
   if (!deps_.begin_background_write) return true;
-  while (!stopping() && !(stop && stop())) {
+  for (;;) {  // Shutdown and `stop` end an actual wait only: unpaused, the write is admitted at once
     if (deps_.begin_background_write()) return true;
+    if (stopping() || (stop && stop())) return false;
     std::this_thread::sleep_for(kBusyRetry);  // as the eraser polls CLIENT PAUSE
   }
-  return false;
 }
 
 void MigrationService::EndBackgroundWrite() {
@@ -196,13 +196,14 @@ void MigrationService::RunCleanup(cluster::SlotRange range) {
   if (stopping() || deps_.is_replica()) return;
   Status st = EraseWaitingOutBusy(range, /*background=*/true);
   if (st.ok()) {
-    if (!AdmitBackgroundWrite()) return;  // Shutdown while paused: the record still says cleanup pending
+    const BackgroundWrite admitted(*this, deps_.is_replica);
+    // Shutdown while paused: the record still says cleanup pending. Demoted meanwhile: its master resumes.
+    if (!admitted.admitted() || deps_.is_replica()) return;
     st = Mutate([range](cluster::SlotStates& s) {
       std::erase_if(s.cleanup, [range](cluster::SlotRange c) { return c == range; });
       std::erase_if(s.migrated, [range](const cluster::MigratedRange& m) { return m.range == range; });
       cluster::SetFenced(s, range, false);
     });
-    EndBackgroundWrite();
   }
   if (st.ok() || stopping()) return;
   spdlog::warn("cleanup of slot(s) {} failed: {}; retrying", cluster::FormatRange(range), st.ToString());

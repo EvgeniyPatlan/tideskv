@@ -175,14 +175,16 @@ Status SlotImporter::FailLocked(cluster::SlotRange range, bool erase, bool backg
     if (!st.ok()) return st;
   }
   // D9 (ruling S5): on the worker the record write waits while CLIENT PAUSE holds writes; a command's path is
-  // admitted already, and a replica writes no record (D21), so neither waits.
-  const bool admit = background && !service_.deps().is_replica();
-  if (admit && !service_.AdmitBackgroundWrite()) return Status::Internal("shutting down");
-  const Status st = service_.Mutate([range](cluster::SlotStates& s) {
+  // admitted already, and a replica (or a node demoted during the wait) writes no record (D21), so neither
+  // waits.
+  std::optional<BackgroundWrite> admitted;
+  if (background) admitted.emplace(service_, service_.deps().is_replica);
+  if (admitted && !admitted->admitted() && !service_.deps().is_replica()) {
+    return Status::Internal("shutting down");
+  }
+  return service_.Mutate([range](cluster::SlotStates& s) {
     if (s.import && s.import->range == range) s.import->state = cluster::ImportState::kError;
   });
-  if (admit) service_.EndBackgroundWrite();
-  return st;
 }
 
 void SlotImporter::FailOnWorker(uint64_t link, bool any_link, const char* why) {

@@ -81,12 +81,16 @@ void MigrationService::OnDemoted() {
 
 // D9: the Mutate below and the cleanups are background writes, held while CLIENT PAUSE holds writes.
 void MigrationService::ApplyTransition() {
-  if (stopping() || deps_.is_replica()) return;                                // a demotion is OnDemoted's
-  if (!AdmitBackgroundWrite()) return;                                         // Shutdown while paused
-  const std::shared_ptr<const cluster::Topology> t = deps_.cluster.Current();  // read once admitted
+  if (stopping() || deps_.is_replica()) return;  // a demotion is OnDemoted's
   Transition done;
-  const Status st = Mutate([&t, &done](cluster::SlotStates& next) { done = Apply(*t, next); });
-  EndBackgroundWrite();
+  Status st;
+  {
+    const BackgroundWrite admitted(*this, deps_.is_replica);
+    // Shutdown while paused, or demoted meanwhile (checked again once admitted): nothing to write.
+    if (!admitted.admitted() || deps_.is_replica()) return;
+    const std::shared_ptr<const cluster::Topology> t = deps_.cluster.Current();  // read once admitted
+    st = Mutate([&t, &done](cluster::SlotStates& next) { done = Apply(*t, next); });
+  }
   if (done.cancel) migrator_->Cancel();
   if (!st.ok()) {  // nothing was added
     if (stopping()) return;

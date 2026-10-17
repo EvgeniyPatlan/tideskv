@@ -248,16 +248,7 @@ void SlotMigrator::Delay() {
 Status SlotMigrator::Publish(const MigrateJob& job, const Status& outcome) {
   Status result = outcome;
   if (result.ok()) {
-    // D9 (ruling S5): the record write waits while CLIENT PAUSE holds writes; the target acked already, so
-    // this only delays the MOVED. A Stop meanwhile leaves the record as a kill -9 here would (D8).
-    if (!service_.AdmitBackgroundWrite([this] { return stopped_.load(std::memory_order_acquire); })) {
-      return Err(cluster::kErrMigrationCanceled);
-    }
-    result = service_.Mutate([&job](cluster::SlotStates& s) {
-      if (s.job && s.job->range == job.range) s.job->state = cluster::MigrateState::kSuccess;
-      s.migrated.push_back({job.range, job.dst_id, job.dst_host, job.dst_port});
-    });
-    service_.EndBackgroundWrite();
+    result = PublishSuccess(job);
     if (result.ok()) {
       spdlog::info("slot(s) {} migrated to {}", cluster::FormatRange(job.range), job.dst_id);
       return result;
@@ -271,6 +262,22 @@ Status SlotMigrator::Publish(const MigrateJob& job, const Status& outcome) {
   return result;
 }
 
+// D9 (ruling S5): the success record waits while CLIENT PAUSE holds writes; the target acked already, so this
+// only delays the MOVED. A cancel or a demotion meanwhile (D10: a manual failover pauses first) ends the wait
+// and fails the job instead; checked again once admitted.
+Status SlotMigrator::PublishSuccess(const MigrateJob& job) {
+  const auto halted = [this] {
+    return stopped_.load(std::memory_order_acquire) || cancel_.load(std::memory_order_acquire) ||
+           service_.deps().is_replica();
+  };
+  const BackgroundWrite admitted(service_, halted);
+  if (!admitted.admitted() || halted()) return Err(cluster::kErrMigrationCanceled);
+  return service_.Mutate([&job](cluster::SlotStates& s) {
+    if (s.job && s.job->range == job.range) s.job->state = cluster::MigrateState::kSuccess;
+    s.migrated.push_back({job.range, job.dst_id, job.dst_host, job.dst_port});
+  });
+}
+
 void SlotMigrator::PublishFailure(const MigrateJob& job) {
   if (import_started_ && transport_) {
     const std::string range = cluster::FormatRange(job.range);
@@ -279,6 +286,11 @@ void SlotMigrator::PublishFailure(const MigrateJob& job) {
                    st.ToString());
     }
   }
+  // D9: the fail record waits for CLIENT UNPAUSE too; a replica writes no record (D21) and does not wait.
+  const auto& is_replica = service_.deps().is_replica;
+  const BackgroundWrite admitted(
+      service_, [this, &is_replica] { return stopped_.load(std::memory_order_acquire) || is_replica(); });
+  if (!admitted.admitted() && !is_replica()) return;  // Stop while paused: as a kill -9 here would (D8)
   const Status st = service_.Mutate([&job](cluster::SlotStates& s) {
     if (s.job && s.job->range == job.range) s.job->state = cluster::MigrateState::kFail;
     cluster::SetFenced(s, job.range, false);

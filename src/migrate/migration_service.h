@@ -109,8 +109,8 @@ class MigrationService {
   }
   // D9: waits while CLIENT PAUSE holds writes (only an actual pause: admitted commands in flight, such as the
   // CLUSTERX that triggered a cleanup, are never waited for); true once admitted (pair it with
-  // EndBackgroundWrite), false on Shutdown or once `stop` (optional) says so. Without the pause hooks: true
-  // at once.
+  // EndBackgroundWrite; prefer the BackgroundWrite guard), false when Shutdown or `stop` (optional) ends a
+  // wait. Unpaused or without the pause hooks: true at once, so callers re-check their own conditions.
   bool AdmitBackgroundWrite(const std::function<bool()>& stop = {});
   void EndBackgroundWrite();
   SlotImporter& importer() { return *importer_; }                       // the target side (M7b D14)
@@ -214,6 +214,24 @@ class MigrationService {
   std::unique_ptr<SlotMigrator> migrator_;   // stopped first by Shutdown
   std::unique_ptr<SlotImporter> importer_;   // its worker tasks end before Shutdown returns
   std::thread worker_;                       // last: starts once every other member exists
+};
+
+// D9: one admitted background write (MigrationService::AdmitBackgroundWrite), ended however the scope exits,
+// so an exception never leaks a CLIENT PAUSE in-flight count.
+class BackgroundWrite {
+ public:
+  explicit BackgroundWrite(MigrationService& service, const std::function<bool()>& stop = {})
+      : service_(service), admitted_(service.AdmitBackgroundWrite(stop)) {}
+  ~BackgroundWrite() {
+    if (admitted_) service_.EndBackgroundWrite();
+  }
+  BackgroundWrite(const BackgroundWrite&) = delete;
+  BackgroundWrite& operator=(const BackgroundWrite&) = delete;
+  bool admitted() const { return admitted_; }
+
+ private:
+  MigrationService& service_;
+  const bool admitted_;
 };
 
 }  // namespace tideskv::migrate

@@ -74,6 +74,7 @@ class SlotMigrator {
   Status SendOps(const std::vector<encoding::ReplOp>& ops);
   Status SendChunk(std::string_view chunk);
   Status Publish(const MigrateJob& job, const Status& outcome);
+  Status PublishSuccess(const MigrateJob& job);
   void PublishFailure(const MigrateJob& job);
   void Delay();
   Status Canceled() const;
