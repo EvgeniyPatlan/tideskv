@@ -27,15 +27,17 @@ class SlotImporter {
   // makes `link` the import link. Kvrocks texts for a second range.
   Status Start(cluster::SlotRange range, uint64_t link);
   // IMPORTDATA on `link`: CRC, range and CF checks, oid remap, derived expires, one ApplyImport. Any failure
-  // fails the import (erase + error) and is returned.
+  // fails the import (erase + error) and is returned. On a replica (demoted meanwhile) nothing is applied:
+  // the import fails without an erase and kErrSlaveCantImport is returned.
   Status Data(uint64_t link, std::string_view chunk);
   // IMPORT <R> 1 (success: imported, served) or 2 (fail: erase + error); idempotent for an import that
   // already ended that way.
   Status Finish(cluster::SlotRange range, bool success);
   // ~Connection of `link`: if it is still importing, erase + error on the worker (no erase on a replica).
   void LinkClosed(uint64_t link);
-  // FLUSHDB/FLUSHALL on this node (Task 11): a running import fails, on the worker. Never blocks.
-  void FailRunning();
+  // FLUSHDB/FLUSHALL on this node (Task 11), a demotion (Task 12): a running import fails, on the worker,
+  // with `why` (a string literal) logged. Never blocks. Data refuses chunks on a replica before that runs.
+  void FailRunning(const char* why);
   bool running() const;
 
  private:

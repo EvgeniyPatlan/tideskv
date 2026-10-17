@@ -266,7 +266,7 @@ TEST(SlotImporterTest, AFlushFailsTheRunningImportOnTheWorker) {
   SecondClient link(p.target);
   ASSERT_NO_FATAL_FAILURE(Import(p, link, "3300", {3300, 3300}, nullptr));
   ASSERT_TRUE(p.target_migration().importer().running());
-  p.target_migration().importer().FailRunning();
+  p.target_migration().importer().FailRunning("the keyspace was flushed");
   ASSERT_TRUE(p.target_migration().AwaitIdle(5s));
   EXPECT_FALSE(p.target_migration().importer().running());
   EXPECT_EQ(p.target.Run({"KEYS", "*"}), "*0\r\n");
@@ -350,6 +350,36 @@ TEST(SlotImporterTest, ACleanupThatNeverEndsAnswersCleanupPending) {  // S2(b)
   EXPECT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "0"}), Err(cluster::kErrImportCleanupPending));
   EXPECT_FALSE(p.target_cluster.manager->States()->import.has_value());
   EXPECT_FALSE(link.session.import_link);
+}
+
+// Fix round 1 (Task 12): a demotion fails the import on the worker, which may be busy; meanwhile IMPORTDATA
+// on the old link is refused and applies nothing (a replica has one committer). The data is kept (no erase).
+TEST(SlotImporterTest, ImportDataIsRefusedOnceTheTargetIsDemoted) {
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  const std::vector<std::string> chunks = RangeChunks(p.source, {3300, 3300});
+  ASSERT_FALSE(chunks.empty());
+  SecondClient link(p.target);
+  ASSERT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "0"}), kOk);
+  auto release = BlockWorker(p.target_migration());
+  const std::string demoted = kNodeA + " 127.0.0.1 7000 master - 0-16383\n" + kNodeB +
+                              " 127.0.0.1 7001 slave " + kNodeA + "\n" + kNodeC + " 127.0.0.1 7002 slave " +
+                              kNodeA + "\n";
+  p.target_cluster.Push(demoted, 2);
+  ASSERT_EQ(p.target.services.replication_.role(), ReplRole::kReplica);
+  // The command is refused at dispatch (a replica is read-only); a chunk whose command was admitted before
+  // the demotion reaches Data, which refuses it too:
+  EXPECT_EQ(link.Run({"CLUSTER", "IMPORTDATA", chunks[0]}).rfind("-READONLY", 0), 0u);
+  EXPECT_EQ(p.target_migration().importer().Data(link.session.id, chunks[0]).message(),
+            cluster::kErrSlaveCantImport);
+  EXPECT_EQ(p.target.Cf(ColumnFamily::kMeta).count(encoding::MetaKeyFor(0, "b")), 0u) << "nothing applied";
+  EXPECT_FALSE(p.target_migration().importer().running());
+  EXPECT_EQ(p.target_cluster.manager->States()->import->state, ImportState::kError);
+  release->store(true);
+  ASSERT_TRUE(p.target_migration().AwaitIdle(5s));
+  EXPECT_EQ(p.target_migration().importer().Data(link.session.id, chunks[0]).message(),
+            cluster::kErrImportNotRunning);
+  EXPECT_EQ(p.target.Cf(ColumnFamily::kMeta).count(encoding::MetaKeyFor(0, "b")), 0u);
 }
 
 }  // namespace

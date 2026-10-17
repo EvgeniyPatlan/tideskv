@@ -89,7 +89,7 @@ Status MigrationService::Migrate(const std::vector<SlotRange>& ranges, std::stri
 
 void MigrationService::OnFlush() {
   migrator_->Cancel();
-  importer_->FailRunning();
+  importer_->FailRunning("the keyspace was flushed");
 }
 
 bool MigrationService::MigrationRunning() const {

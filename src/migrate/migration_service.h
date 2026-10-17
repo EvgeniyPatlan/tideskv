@@ -50,6 +50,8 @@ struct MigrationDeps {
   std::function<Status()> make_durable = {};
   TransportFactory connect = {};                   // required from Task 10: the session with a target (D3)
   std::function<MigrateSettings()> settings = {};  // required from Task 10: re-read before every chunk
+  // D14: IMPORT start's bounded wait for the migrate worker (an overlapping cleanup). Tests shorten it.
+  std::chrono::milliseconds import_worker_wait = std::chrono::seconds(10);
 };
 
 class MigrationService {

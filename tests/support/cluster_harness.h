@@ -62,9 +62,12 @@ inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::Cluste
 }
 
 // A ClusterManager over the harness's storage whose role hooks drive its FakeReplication, and the node's
-// MigrationService; `port` picks which node of kThreeNodes this harness is (7000 = A, 7001 = B, 7002 = C).
+// MigrationService; `port` picks which node of kThreeNodes this harness is (7000 = A, 7001 = B, 7002 = C);
+// `import_worker_wait` is the service's MigrationDeps::import_worker_wait.
 struct ClusterHarness {
-  explicit ClusterHarness(CommandHarness& h, uint16_t port = 7000) : h_(h) {
+  explicit ClusterHarness(CommandHarness& h, uint16_t port = 7000,
+                          std::chrono::milliseconds import_worker_wait = std::chrono::seconds(10))
+      : h_(h) {
     cluster::ClusterManager::Options o;
     o.port = port;
     o.bind = "127.0.0.1";
@@ -89,13 +92,15 @@ struct ClusterHarness {
     manager = std::make_unique<cluster::ClusterManager>(h.services.storage_, std::move(o));
     EXPECT_TRUE(manager->Load().ok());
     h.services.cluster_manager = manager.get();
-    migration = std::make_unique<migrate::MigrationService>(MigrationDepsOf(
+    migrate::MigrationDeps deps = MigrationDepsOf(
         h, *manager,
         [this](const std::string& host, uint16_t p, std::chrono::milliseconds t,
                const std::atomic<bool>* cancel) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
           if (!transport) return Status::IOError("no transport");
           return transport(host, p, t, cancel);
-        }));
+        });
+    deps.import_worker_wait = import_worker_wait;
+    migration = std::make_unique<migrate::MigrationService>(std::move(deps));
     h.services.migration_service = migration.get();
   }
   ~ClusterHarness() {

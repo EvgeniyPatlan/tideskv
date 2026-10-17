@@ -60,6 +60,11 @@ TEST(MigrationTransitions, ADemotionStopsTheJobAndClearsTheStates) {  // D7, goc
   auto done = std::make_shared<std::promise<Status>>();
   ASSERT_TRUE(
       StartJob(p.source_migration(), {3300, 3300}, [done](const Status& s) { done->set_value(s); }).ok());
+  for (int i = 0; i < 5000 && !p.target_cluster.manager->States()->import; ++i) {
+    std::this_thread::sleep_for(
+        1ms);  // IMPORT <R> 0 reached the target: the cancel must tell it (IMPORT <R> 2)
+  }
+  ASSERT_TRUE(p.target_cluster.manager->States()->import.has_value());
   const std::string swapped = kNodeA + " 127.0.0.1 7000 slave " + kNodeC + "\n" + kNodeB +
                               " 127.0.0.1 7001 master - 8192-16383\n" + kNodeC +
                               " 127.0.0.1 7002 master - 0-8191\n";
@@ -88,11 +93,12 @@ TEST(MigrationTransitions,
   }
 }
 
-// Controller ruling S2(a): the push moves R away while the worker is busy (here: held), so its transition is
-// still queued when IMPORT <R> 0 lands (the importer's worker wait times out after 10 s) and releases the
-// migrated entry. The transition must then not clean R up: it holds the import's (non-empty) data.
+// Controller ruling S2(a), a regression guard of the ordering: the push moves R away while the worker is
+// busy (here: held), so its transition is still queued when IMPORT <R> 0 lands (the importer's worker wait,
+// shortened here, times out) and releases the migrated entry. The transition must then not clean R up: it
+// holds the import's (non-empty) data.
 TEST(MigrationTransitions, AnImportThatLandsBeforeTheTransitionKeepsItsData) {
-  MigrationPair p;
+  MigrationPair p(100ms);
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
   ASSERT_EQ(p.target.Run({"SET", "b", "back"}), kOk);  // imported on B: served there

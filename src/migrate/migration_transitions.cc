@@ -71,8 +71,8 @@ void MigrationService::OnTopology() {
 }
 
 void MigrationService::OnDemoted() {
-  migrator_->Cancel();       // D10: fails at its next check and still tells the target (IMPORT <R> 2)
-  importer_->FailRunning();  // a replica has one committer: no more IMPORTDATA here (posted)
+  migrator_->Cancel();  // D10: fails at its next check and still tells the target (IMPORT <R> 2)
+  importer_->FailRunning("this node was demoted");  // posted; Data refuses chunks on a replica meanwhile
   Post([this] {
     const Status st = Mutate([](cluster::SlotStates& s) { s = cluster::SlotStates{}; }, /*persist=*/false);
     if (!st.ok()) spdlog::warn("cannot clear the migration states after a demotion: {}", st.ToString());

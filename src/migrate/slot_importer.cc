@@ -15,8 +15,6 @@
 namespace tideskv::migrate {
 namespace {
 
-constexpr auto kWorkerWait = std::chrono::seconds(10);  // D14: an overlapping cleanup, bounded
-
 Status Err(std::string_view text) { return Status::UserError(std::string(text)); }
 
 Status Mismatch(const cluster::SlotStates& s, cluster::SlotRange got) {
@@ -60,10 +58,11 @@ bool SlotImporter::running() const {
 // own erase or chunks. An overlapping cleanup found under mu_ is waited for once more.
 Status SlotImporter::Start(cluster::SlotRange range, uint64_t link) {
   if (Status st = service_.Mutate([](cluster::SlotStates&) {}); !st.ok()) return st;
-  service_.AwaitIdle(kWorkerWait);
+  const std::chrono::milliseconds wait = service_.deps().import_worker_wait;
+  service_.AwaitIdle(wait);
   bool cleanup_pending = false;
   if (Status st = TryStart(range, link, &cleanup_pending); !st.ok() || !cleanup_pending) return st;
-  service_.AwaitIdle(kWorkerWait);
+  service_.AwaitIdle(wait);
   if (Status st = TryStart(range, link, &cleanup_pending); !st.ok() || !cleanup_pending) return st;
   return Err(cluster::kErrImportCleanupPending);
 }
@@ -119,6 +118,15 @@ Status SlotImporter::Data(uint64_t link, std::string_view chunk) {
   std::lock_guard lock(mu_);
   if (!range_ || link != link_) return Err(cluster::kErrImportNotRunning);
   const cluster::SlotRange range = *range_;
+  if (service_.deps().is_replica()) {  // demoted: a replica has one committer (its replication link)
+    spdlog::warn("import of slot(s) {} failed: this node is a replica now", cluster::FormatRange(range));
+    // Kvrocks StopForLinkError: a replica keeps the data; its new master's Restore erases it (D8, C9).
+    if (Status f = FailLocked(range, /*erase=*/false, /*background=*/false); !f.ok()) {
+      spdlog::warn("cannot fail the import of slot(s) {} cleanly: {}", cluster::FormatRange(range),
+                   f.ToString());
+    }
+    return Err(cluster::kErrSlaveCantImport);
+  }
   auto ops = DecodeChunk(chunk);
   Status st = ops.status();
   std::vector<encoding::ReplOp> out;
@@ -190,8 +198,8 @@ void SlotImporter::LinkClosed(uint64_t link) {
   service_.Post([this, link] { FailOnWorker(link, /*any_link=*/false, "the import link was lost"); });
 }
 
-void SlotImporter::FailRunning() {
-  service_.Post([this] { FailOnWorker(0, /*any_link=*/true, "the keyspace was flushed"); });
+void SlotImporter::FailRunning(const char* why) {
+  service_.Post([this, why] { FailOnWorker(0, /*any_link=*/true, why); });
 }
 
 }  // namespace tideskv::migrate
