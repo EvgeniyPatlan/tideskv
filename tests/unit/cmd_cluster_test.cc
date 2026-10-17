@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "cluster/slot_states.h"
 #include "support/cluster_harness.h"
 
 namespace tideskv::test {
@@ -113,6 +114,22 @@ TEST(ClusterCmd, ReplicasAndHelp) {
   EXPECT_NE(
       h.Run({"CLUSTER", "HELP"}).find("CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
       std::string::npos);
+}
+
+TEST(ClusterCmd, InfoShowsTheMigrationBlocksOfThePublishedStates) {  // D15
+  CommandHarness h;
+  ClusterHarness c(h);
+  c.Push(kThreeNodes, 1);
+  auto s = std::make_shared<cluster::SlotStates>();
+  s->job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, cluster::MigrateState::kStart};
+  c.manager->PublishStates(s);
+  const std::string info = h.Run({"CLUSTER", "INFO"});
+  EXPECT_NE(info.find("cluster_my_epoch:1\r\nmigrating_slot(s): 3300\r\ndestination_node: " + kNodeB +
+                      "\r\nmigrating_state: start\r\n"),
+            std::string::npos)
+      << info;
+  h.services.replication_.set_role(ReplRole::kReplica);  // replicating: no block (cluster.cc:440)
+  EXPECT_EQ(h.Run({"CLUSTER", "INFO"}).find("migrating_slot"), std::string::npos);
 }
 
 }  // namespace

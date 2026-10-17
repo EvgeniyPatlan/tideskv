@@ -3,10 +3,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "cluster/nodes_parser.h"
+#include "cluster/slot_states.h"
+#include "support/controller_info.h"
 
 namespace tideskv::cluster {
 namespace {
@@ -145,6 +148,74 @@ TEST(ClusterViews, NodesAndInfoParseWithTheControllersRules) {
       for (size_t i = 8; i < f.size(); ++i) EXPECT_TRUE(ControllerSlotRange(f[i])) << f[i];
     }
   }
+}
+
+TEST(ClusterViews, InfoAppendsTheMigratingThenTheImportingBlock) {  // D15, KM §1.1
+  const Topology t = Make(kFour, 3, kA);
+  SlotStates s;
+  s.job = SourceJob{{100, 200}, kB, "10.0.0.2", 7001, MigrateState::kStart};
+  s.import = ImportJob{{7, 7}, ImportState::kError};
+  EXPECT_EQ(ClusterInfoText(t, s, false),
+            ClusterInfoText(t) + "migrating_slot(s): 100-200\r\ndestination_node: " + kB +
+                "\r\nmigrating_state: start\r\nimporting_slot(s): 7\r\nimport_state: error\r\n");
+  EXPECT_EQ(ClusterInfoText(t, SlotStates{}, false), ClusterInfoText(t));
+}
+
+TEST(ClusterViews, TheBlocksAreHiddenOnAReplicaOrARouterNode) {  // cluster.cc:440-450
+  SlotStates s;
+  s.job = SourceJob{{1, 1}, kB, "10.0.0.2", 7001, MigrateState::kSuccess};
+  EXPECT_EQ(ClusterInfoText(Make(kFour, 3, kC), s, true), ClusterInfoText(Make(kFour, 3, kC)));  // a slave
+  EXPECT_EQ(ClusterInfoText(Make(kFour, 3, kA), s, true),
+            ClusterInfoText(Make(kFour, 3, kA)));  // replicating
+  const Topology router = Make(kFour, 3, std::string(40, 'z'));
+  EXPECT_EQ(ClusterInfoText(router, s, false), ClusterInfoText(router));
+}
+
+// Review Focus #5: every state and range shape parses under the controller's rules (never -1, one range, one
+// colon per line, CRLF), and a push that leaves the states alone leaves the block alone.
+TEST(ClusterViews, TheMigrationBlocksParseWithTheControllersRules) {
+  const Topology t = Make(kFour, 7, kA);
+  for (MigrateState st : {MigrateState::kStart, MigrateState::kSuccess, MigrateState::kFail}) {
+    for (SlotRange r : {SlotRange{5, 5}, SlotRange{0, 16383}, SlotRange{100, 200}, SlotRange{16383, 16383}}) {
+      for (bool with_import : {false, true}) {
+        SlotStates s;
+        s.job = SourceJob{r, kB, "10.0.0.2", 7001, st};
+        if (with_import) s.import = ImportJob{{300, 301}, ImportState::kSuccess};
+        const std::string info = ClusterInfoText(t, s, false);
+        const test::ControllerClusterInfo c = test::ParseLikeController(info);
+        ASSERT_TRUE(c.ok) << info;
+        EXPECT_EQ(c.epoch, 7);
+        EXPECT_EQ(c.migrating_slot, FormatRange(r));
+        EXPECT_EQ(c.migrating_state, StateName(st));
+        EXPECT_EQ(info.find("migrating_slot(s): -1"), std::string::npos);
+        EXPECT_EQ(info.find("\n"), info.find("\r\n") + 1);  // no bare LF
+        for (const std::string& line : test::GoSplit(info.substr(0, info.size() - 2), "\r\n")) {
+          EXPECT_EQ(std::count(line.begin(), line.end(), ':'), 1) << line;
+        }
+      }
+    }
+  }
+  const test::ControllerClusterInfo absent =
+      test::ParseLikeController(ClusterInfoText(t, SlotStates{}, false));
+  EXPECT_TRUE(absent.ok);
+  EXPECT_EQ(absent.migrating_slot, "");  // before any MIGRATE: no block at all, never "-1" (KM §1.3)
+  SlotStates success;  // what a SETNODES leaves: the same states, so the same block (D7, D15)
+  success.job = SourceJob{{9, 9}, kB, "10.0.0.2", 7001, MigrateState::kSuccess};
+  const test::ControllerClusterInfo after =
+      test::ParseLikeController(ClusterInfoText(Make(kFour, 8, kA), success, false));
+  EXPECT_TRUE(after.ok);
+  EXPECT_EQ(after.epoch, 8);
+  EXPECT_EQ(after.migrating_slot, "9");
+  EXPECT_EQ(after.migrating_state, "success");
+}
+
+TEST(ControllerInfo, TheTranscribedParserRejectsWhatTheControllerRejects) {
+  EXPECT_FALSE(test::ParseLikeController("migrating_slot(s): -1\r\n").ok);
+  EXPECT_FALSE(test::ParseLikeController("migrating_slot(s): 0 5\r\n").ok);
+  EXPECT_FALSE(test::ParseLikeController("migrating_slot(s): 5-3\r\n").ok);
+  EXPECT_FALSE(test::ParseLikeController("migrating_slot(s): 1-2-3\r\n").ok);
+  EXPECT_FALSE(test::ParseLikeController("migrating_slot(s): 16384\r\n").ok);
+  EXPECT_TRUE(test::ParseLikeController("migrating_slot: 5\r\nx:y:z\r\n").ok);  // two colons: skipped
 }
 
 }  // namespace

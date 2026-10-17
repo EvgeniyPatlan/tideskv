@@ -13,6 +13,7 @@
 #include "encoding/meta_codec.h"
 #include "types/collection.h"
 #include "types/list_type.h"
+#include "types/slot_keys.h"
 #include "types/zset_type.h"
 
 namespace tideskv {
@@ -135,11 +136,10 @@ Status XorObjectDigest(ReadView& view, uint8_t db, uint16_t slot, std::string_vi
   return st;
 }
 
-// Adds every stored key of db to final; the db id is mixed in before its first key, and not at all
-// for an empty db.
-Status DigestDb(ReadView& view, uint8_t db, Digest20& final_digest) {
-  auto it = view.NewIterator(ColumnFamily::kMeta,
-                             {encoding::DbPrefix(db), encoding::DbPrefix(static_cast<uint8_t>(db + 1))});
+// Adds every stored key of db in `range` to final; the db id is mixed in before its first key, and not at all
+// for an empty walk. with_ttl: M7b D23.
+Status DigestMetas(ReadView& view, uint8_t db, IterOptions range, bool with_ttl, Digest20& final_digest) {
+  auto it = view.NewIterator(ColumnFamily::kMeta, std::move(range));
   if (!it.ok()) return it.status();
   bool first = true;
   Status st = (*it)->SeekToFirst();
@@ -155,9 +155,19 @@ Status DigestDb(ReadView& view, uint8_t db, Digest20& final_digest) {
     Digest20 d{};
     MixDigest(d, mk.user_key);
     if (Status ost = XorObjectDigest(view, db, mk.slot, mk.user_key, *meta, d); !ost.ok()) return ost;
+    if (with_ttl && meta->meta.expire_ms != 0) {
+      std::string ms;
+      coding::PutFixed64BE(&ms, static_cast<uint64_t>(meta->meta.expire_ms));
+      MixDigest(d, ms);
+    }
     XorDigest(final_digest, Bytes(d));
   }
   return st;
+}
+
+Status DigestDb(ReadView& view, uint8_t db, Digest20& final_digest) {
+  return DigestMetas(view, db, {encoding::DbPrefix(db), encoding::DbPrefix(static_cast<uint8_t>(db + 1))},
+                     /*with_ttl=*/false, final_digest);
 }
 
 }  // namespace
@@ -177,6 +187,12 @@ Result<Digest20> ValueDigest(ReadView& view, uint8_t db, std::string_view key) {
   auto meta = encoding::DecodeMetadata(*raw);
   if (!meta.ok()) return meta.status();
   if (Status st = XorObjectDigest(view, db, KeySlot(key), key, *meta, d); !st.ok()) return st;
+  return d;
+}
+
+Result<Digest20> SlotRangeDigest(ReadView& view, uint16_t first, uint16_t last, bool with_ttl) {
+  Digest20 d{};
+  if (Status st = DigestMetas(view, 0, SlotRangeBounds(first, last), with_ttl, d); !st.ok()) return st;
   return d;
 }
 

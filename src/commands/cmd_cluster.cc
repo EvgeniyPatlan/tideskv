@@ -38,8 +38,8 @@ int64_t NowMs() {
       .count();
 }
 
-void Info(ExecContext& ctx, ClusterManager&, const Topology& t, const ArgList&) {
-  ctx.reply.Verbatim(cluster::ClusterInfoText(t));
+void Info(ExecContext& ctx, ClusterManager& cm, const Topology& t, const ArgList&) {
+  ctx.reply.Verbatim(cluster::ClusterInfoText(t, *cm.States(), ctx.server.replication().IsReplica()));
 }
 
 void Nodes(ExecContext& ctx, ClusterManager&, const Topology& t, const ArgList&) {

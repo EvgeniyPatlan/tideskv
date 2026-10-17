@@ -20,6 +20,10 @@ using Digest20 = std::array<uint8_t, 20>;
 Result<Digest20> DatasetDigest(ReadView& view);
 // xorObjectDigest for one stored key (no key name, no db), expired or not; zeros when the key is missing.
 Result<Digest20> ValueDigest(ReadView& view, uint8_t db, std::string_view key);
+// TidesKV DEBUG DIGEST-SLOTS (M7b D23): DatasetDigest's per-key algorithm over the db-0 keys of slots
+// first..last only, so it is oid-free and equal on a migration's source (fenced, before cleanup) and target
+// (after the import). with_ttl also mixes each key's exact expire_ms (8 bytes BE) into its digest.
+Result<Digest20> SlotRangeDigest(ReadView& view, uint16_t first, uint16_t last, bool with_ttl);
 std::string DigestHex(const Digest20& d);  // 40 lowercase hex characters
 
 }  // namespace tideskv

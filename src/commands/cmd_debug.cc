@@ -3,6 +3,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cluster/nodes_parser.h"
 #include "commands/all_commands.h"
 #include "commands/cmd_util.h"
 #include "commands/reply_util.h"
@@ -18,7 +19,7 @@ namespace tideskv {
 namespace {
 
 void DebugHelp(ExecContext& ctx) {
-  static constexpr std::array<std::string_view, 8> kLines = {
+  static constexpr std::array<std::string_view, 10> kLines = {
       "DIGEST",
       "    Output a hex signature representing the current DB content.",
       "DIGEST-VALUE <key> [<key> ...]",
@@ -26,6 +27,8 @@ void DebugHelp(ExecContext& ctx) {
       "DIGEST-INDEX",
       "    Output a hex signature of the TTLs and the expire index, then its entry, missing and orphan "
       "counts.",
+      "DIGEST-SLOTS <slot|from-to> [TTL]",
+      "    Output a hex signature of the keys in the slot range (TTL: with their exact deadlines).",
       "HELP",
       "    Print this help."};
   ctx.reply.ArrayHeader(kLines.size() + 1);
@@ -72,12 +75,30 @@ void DebugDigestIndex(ExecContext& ctx) {
   ctx.reply.Integer(static_cast<int64_t>(d.orphans));
 }
 
+// M7b D23: TidesKV only. One slot range of db 0; TTL mixes each key's exact deadline.
+void DebugDigestSlots(ExecContext& ctx, const ArgList& argv) {
+  if (argv.size() > 4 || (argv.size() == 4 && !EqualsIgnoreCase(argv[3], "ttl"))) {
+    return ctx.reply.Error(kErrSyntax);
+  }
+  std::vector<cluster::SlotRange> ranges;
+  if (Status st = MoveInto(cluster::ParseSlotRanges(argv[2]), &ranges); !st.ok()) return ReplyError(ctx, st);
+  if (ranges.size() != 1) return ctx.reply.Error(kErrSyntax);
+  Digest20 d{};
+  const Engine::LoadingReadScope during_load;  // CF6
+  const Status st = ctx.server.engine().Snapshot([&](ReadView& v, int64_t) {
+    return MoveInto(SlotRangeDigest(v, ranges[0].start, ranges[0].end, argv.size() == 4), &d);
+  });
+  if (!st.ok()) return ReplyError(ctx, st);
+  ctx.reply.SimpleString(DigestHex(d));
+}
+
 void Debug(ExecContext& ctx, const ArgList& argv) {
   const std::string sub = ToLower(argv[1]);
   if (sub == "help" && argv.size() == 2) return DebugHelp(ctx);
   if (sub == "digest" && argv.size() == 2) return DebugDigest(ctx);
   if (sub == "digest-value") return DebugDigestValue(ctx, argv);
   if (sub == "digest-index" && argv.size() == 2) return DebugDigestIndex(ctx);
+  if (sub == "digest-slots" && argv.size() >= 3) return DebugDigestSlots(ctx, argv);
   ctx.reply.Error(SubcommandSyntaxError(argv[1], "DEBUG"));
 }
 

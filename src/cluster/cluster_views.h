@@ -4,6 +4,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cluster/slot_states.h"
 #include "cluster/topology.h"
 #include "common/status.h"
 
@@ -12,7 +13,11 @@
 // field 6 = version, no migration markers).
 namespace tideskv::cluster {
 
-std::string ClusterInfoText(const Topology& t);                   // requires t.initialized()
+// D15: the M7a lines, then the migrating block and the importing block of `s` (Kvrocks
+// slot_migrate.cc:512-544, slot_import.cc:129-155), only when myself is a master of the topology and the node
+// is not replicating.
+std::string ClusterInfoText(const Topology& t, const SlotStates& s, bool is_replica);  // requires initialized
+std::string ClusterInfoText(const Topology& t);                                        // no blocks
 std::string ClusterNodesText(const Topology& t, int64_t now_ms);  // ping_sent now-1, pong now (Kvrocks)
 Result<std::string> ClusterReplicasText(const Topology& t, std::string_view master_id, int64_t now_ms);
 

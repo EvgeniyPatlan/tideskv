@@ -4,6 +4,7 @@
 
 #include "script/sha1hex.h"
 #include "support/command_harness.h"
+#include "types/errors.h"
 
 // Expected digests were produced by redis:7.2.5 (--enable-debug-command yes) on the same commands
 // (redis72-replication §10.4, plus the zset score and multi-db cases re-run for M6a Task 7).
@@ -159,13 +160,28 @@ TEST_F(CmdDebugTest, CorruptZsetScoreIsAnErrorReply) {
 
 TEST_F(CmdDebugTest, HelpNamesTheSupportedSubcommands) {
   const std::string reply = Run({"DEBUG", "HELP"});
-  EXPECT_EQ(reply.substr(0, 4), "*9\r\n");
+  EXPECT_EQ(reply.substr(0, 5), "*11\r\n");
   EXPECT_NE(reply.find("+DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"),
             std::string::npos);
   EXPECT_NE(reply.find("+DIGEST\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-VALUE <key> [<key> ...]\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-INDEX\r\n"), std::string::npos);
+  EXPECT_NE(reply.find("+DIGEST-SLOTS <slot|from-to> [TTL]\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+HELP\r\n"), std::string::npos);
+}
+
+TEST_F(CmdDebugTest, DigestSlotsTakesOneRangeAndAnOptionalTtl) {  // M7b D23
+  const std::string zeros = "+" + std::string(40, '0') + "\r\n";
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "0-16383"}), zeros);
+  ASSERT_EQ(h.Run({"SET", "b", "1"}), kOk);
+  const std::string all = h.Run({"DEBUG", "DIGEST-SLOTS", "0-16383"});
+  EXPECT_NE(all, zeros);
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "3300"}), all);
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "3301-16383"}), zeros);
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "3300", "TTL"}), all);  // no TTL on b: the same digest
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "3300", "NOPE"}), Err(kErrSyntax));
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "1 2"}), Err(kErrSyntax));  // one range only
+  EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "16384"}), Err("ERR Invalid slot id: out of numeric range"));
 }
 
 }  // namespace

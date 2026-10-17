@@ -178,5 +178,31 @@ TEST(Digest, ValueDigestOfMissingKeyIsZeros) {
   EXPECT_EQ(got, Digest20{});
 }
 
+TEST(Digest, SlotRangeDigestCoversOnlyTheRangeAndIgnoresOids) {  // M7b D23
+  test::CommandHarness a;
+  test::CommandHarness b;
+  ASSERT_EQ(b.Run({"HSET", "{foo}pad", "f", "v"}), test::Int(1));  // b's oids are shifted by one collection
+  for (test::CommandHarness* h : {&a, &b}) {
+    ASSERT_EQ(h->Run({"HSET", "{b}h", "f", "v"}), test::Int(1));
+    ASSERT_EQ(h->Run({"RPUSH", "{b}l", "x", "y"}), test::Int(2));
+    ASSERT_EQ(h->Run({"SET", "b", "1"}), test::kOk);
+  }
+  ASSERT_EQ(a.Run({"SET", "foo", "only on a"}), test::kOk);  // another slot
+  const auto digest = [](test::CommandHarness& h, bool ttl) {
+    Digest20 d{};
+    EXPECT_TRUE(
+        h.services.engine_
+            .Snapshot([&](ReadView& v, int64_t) { return MoveInto(SlotRangeDigest(v, 3300, 3300, ttl), &d); })
+            .ok());
+    return DigestHex(d);
+  };
+  EXPECT_EQ(digest(a, false), digest(b, false));
+  EXPECT_NE(digest(a, false), std::string(40, '0'));
+  ASSERT_EQ(a.Run({"PEXPIREAT", "b", "1800000000000"}), test::Int(1));
+  ASSERT_EQ(b.Run({"PEXPIREAT", "b", "1800000000001"}), test::Int(1));
+  EXPECT_EQ(digest(a, false), digest(b, false));  // Redis's digest: "has a TTL" only
+  EXPECT_NE(digest(a, true), digest(b, true));    // TTL mode: the exact deadline
+}
+
 }  // namespace
 }  // namespace tideskv

@@ -36,9 +36,7 @@ std::vector<const ClusterNode*> ReplicasOf(const Topology& t, const std::string&
   return out;
 }
 
-}  // namespace
-
-std::string ClusterInfoText(const Topology& t) {
+std::string BaseInfo(const Topology& t) {
   const std::string assigned = std::to_string(t.AssignedSlots());
   const std::string version = std::to_string(t.version);
   std::string out;
@@ -54,7 +52,32 @@ std::string ClusterInfoText(const Topology& t) {
   line("cluster_size", std::to_string(t.Size()));
   line("cluster_current_epoch", version);
   line("cluster_my_epoch", version);
-  return out;  // M7a: no migrating/importing block, never a "-1" range (D12)
+  return out;  // the migration blocks follow (M7b D15)
+}
+
+// One range, never -1 (KM §1.3), CRLF, one colon per line (KC §4.2).
+std::string MigrationBlocks(const Topology& t, const SlotStates& s, bool is_replica) {
+  const ClusterNode* me = t.Myself();
+  if (me == nullptr || me->role != NodeRole::kMaster || is_replica) return {};
+  std::string out;
+  if (s.job) {
+    out.append("migrating_slot(s): ").append(FormatRange(s.job->range)).append("\r\n");
+    out.append("destination_node: ").append(s.job->dst_id).append("\r\n");
+    out.append("migrating_state: ").append(StateName(s.job->state)).append("\r\n");
+  }
+  if (s.import) {
+    out.append("importing_slot(s): ").append(FormatRange(s.import->range)).append("\r\n");
+    out.append("import_state: ").append(StateName(s.import->state)).append("\r\n");
+  }
+  return out;
+}
+
+}  // namespace
+
+std::string ClusterInfoText(const Topology& t) { return BaseInfo(t); }
+
+std::string ClusterInfoText(const Topology& t, const SlotStates& s, bool is_replica) {
+  return BaseInfo(t) + MigrationBlocks(t, s, is_replica);
 }
 
 std::string ClusterNodesText(const Topology& t, int64_t now_ms) {
