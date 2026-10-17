@@ -12,6 +12,7 @@
 #include "common/string_util.h"
 #include "encoding/key_codec.h"
 #include "exec/engine.h"
+#include "migrate/migration_service.h"
 #include "repl/replication.h"
 #include "types/keyspace.h"
 
@@ -89,6 +90,8 @@ bool FlushArgsOk(const ArgList& argv) {
 
 void FlushDbCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
+  // M7b D10: a running job fails and a running import fails (flags and a post only, Writer's note 1).
+  if (migrate::MigrationService* m = ctx.server.migration()) m->OnFlush();
   const uint8_t db = ctx.session.db;
   const Status st =
       ctx.server.engine().WriteExclusive([db](WriteTxn& txn, int64_t) { return FlushDb(txn, db); }, {db});
@@ -98,6 +101,8 @@ void FlushDbCmd(ExecContext& ctx, const ArgList& argv) {
 
 void FlushAllCmd(ExecContext& ctx, const ArgList& argv) {
   if (!FlushArgsOk(argv)) return ctx.reply.Error(kErrSyntax);
+  // M7b D10: a running job fails and a running import fails (flags and a post only, Writer's note 1).
+  if (migrate::MigrationService* m = ctx.server.migration()) m->OnFlush();
   std::vector<uint8_t> all(encoding::kNumDatabases);
   std::iota(all.begin(), all.end(), uint8_t{0});
   const Status st =

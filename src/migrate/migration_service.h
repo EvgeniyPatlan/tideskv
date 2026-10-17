@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -102,6 +103,20 @@ class MigrationService {
   SlotMigrator& migrator() { return *migrator_; }                       // the source side (M7b D2-D5)
   uint64_t OldestNeeded() const { return migrator_->oldest_needed(); }  // D19: App pins the backlog with it
 
+  // ---- Control, from the commands (Task 11) ----
+  // CLUSTERX MIGRATE (D12): one range; Kvrocks's execute checks in order; the start state published before
+  // returning; `done` (may be null) gets the outcome. Serialised by migrate_mu_.
+  Status Migrate(const std::vector<cluster::SlotRange>& ranges, std::string_view dst_id, MigrateDone done);
+  // FLUSHDB/FLUSHALL (D10, Writer's note 1): cancels a running job and fails a running import. Flags and a
+  // post only: it may run inside an EXEC or a script that holds the Engine gate.
+  void OnFlush();
+  Status FlushSlots(const std::vector<cluster::SlotRange>& ranges);  // D13: refused while a job is in start
+  bool MigrationRunning() const;  // a job in start (CLUSTER RESET, FLUSHSLOTS)
+  bool ImportRunning() const;     // an import in start (CLUSTER RESET)
+  // CLUSTER RESET succeeded (D15, D20): migrated, cleanup and imported ranges and their fences go; a success
+  // block goes, a fail block and the import block stay.
+  Status OnReset();
+
   void Post(std::function<void()> task);              // the migrate worker, FIFO; dropped after Shutdown
   bool AwaitIdle(std::chrono::milliseconds timeout);  // true once every task posted before the call ran
   void Shutdown();                                    // idempotent: stops the worker
@@ -152,6 +167,7 @@ class MigrationService {
 
   MigrationDeps deps_;
   std::mutex record_mu_;
+  std::mutex migrate_mu_;  // Migrate: the checks and the start publish, together
   // Restore generations: Restore/OnPromoted bump requested; a restore (or its skip) marks it applied, under
   // record_mu_. Pending while they differ.
   std::atomic<uint64_t> restore_requested_{0};

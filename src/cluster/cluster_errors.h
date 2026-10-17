@@ -104,11 +104,23 @@ inline constexpr std::string_view kErrMigrationCanceled =
 inline constexpr std::string_view kErrAlreadyMigrating =
     "ERR There is already a migrating job";  // slot_migrate.cc:72
 
+// CLUSTERX MIGRATE execute errors, in Kvrocks order (cluster.cc:309-346, slot_migrate.cc:66-80; M7b D12).
+inline constexpr std::string_view kErrNoDestination = "ERR Can't find the destination node id";
+inline constexpr std::string_view kErrSlotMigrated = "ERR Can't migrate slot which has been migrated";
+inline constexpr std::string_view kErrNotMySlot = "ERR Can't migrate slot which doesn't belong to me";
+inline constexpr std::string_view kErrSlaveCantMigrate = "ERR Slave can't migrate slot";
+inline constexpr std::string_view kErrMigrateToSlave = "ERR Can't migrate slot to a slave";
+inline constexpr std::string_view kErrMigrateToMyself = "ERR Can't migrate slot to myself";
+// TidesKV-only (M7b D12): Kvrocks silently migrates the first range (KM open question 4).
+inline constexpr std::string_view kErrMultipleRanges = "ERR Can't migrate multiple slot ranges at a time";
+// cmd_cluster.cc:299-312 (D13); cluster.cc:963-965 (D20).
+inline constexpr std::string_view kErrFlushWhileMigrating =
+    "ERR Cannot flush slot when migration is in progress";
+inline constexpr std::string_view kErrResetWhileMigrating = "ERR Can't reset cluster while migrating slot";
+inline constexpr std::string_view kErrResetWhileImporting = "ERR Can't reset cluster while importing slot";
+
 // TidesKV-only (M7a D7, spec section 5.4): the <reason> after kErrClusterReplication when the promotion
 // failed for an internal (non-user) cause; Kvrocks appends its own status text, TidesKV exposes no internals.
 inline constexpr std::string_view kReplicationReasonStorage = "storage error";
-
-// TidesKV-only (M7a D11): MIGRATE and FLUSHSLOTS arrive with M7b.
-inline constexpr std::string_view kErrMigrateNotSupported = "ERR slot migration is not supported yet";
 
 }  // namespace tideskv::cluster

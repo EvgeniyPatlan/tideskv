@@ -5,12 +5,13 @@
 #include "cluster/cluster_manager.h"
 #include "cluster/nodes_parser.h"
 #include "commands/all_commands.h"
+#include "commands/clusterx_migrate.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
 
 // CLUSTERX (Kvrocks v2.17.0 cmd_cluster.cc CommandClusterX; M7a D8, D11): parsed first, then refused when
-// cluster mode is off, as Kvrocks. MIGRATE and FLUSHSLOTS are parsed and refused until M7b.
+// cluster mode is off, as Kvrocks. MIGRATE and FLUSHSLOTS run in cmd_clusterx_migrate.cc (M7b).
 namespace tideskv {
 namespace {
 
@@ -21,6 +22,8 @@ struct ClusterxCall {
   int64_t version = 0;
   bool force = false;
   std::vector<cluster::SlotRange> slots;
+  bool sync = false;
+  int64_t timeout = 0;  // seconds; 0 = forever (SYNC only)
 };
 
 Status Err(std::string_view text) { return Status::UserError(std::string(text)); }
@@ -32,10 +35,10 @@ Status ParseMigrate(const ArgList& argv, ClusterxCall* c) {  // cmd_cluster.cc:1
   const std::string flag = ToLower(argv[4]);
   if (flag == "async") return argv.size() == 6 ? Err(cluster::kErrAsyncTimeout) : Status::Ok();
   if (flag != "sync") return Err(cluster::kErrInvalidSyncFlag);
+  c->sync = true;
   if (argv.size() == 6) {
-    int64_t timeout = 0;
-    if (!ParseInt64(argv[5], &timeout)) return Err(cluster::kErrMigrateTimeout);
-    if (timeout < 0) return Err(cluster::kErrMigrateTimeoutNegative);
+    if (!ParseInt64(argv[5], &c->timeout)) return Err(cluster::kErrMigrateTimeout);
+    if (c->timeout < 0) return Err(cluster::kErrMigrateTimeoutNegative);
   }
   return Status::Ok();
 }
@@ -77,7 +80,8 @@ Status Parse(const ArgList& argv, ClusterxCall* c) {
 void Run(ExecContext& ctx, ClusterManager& cm, const ClusterxCall& c, const ArgList& argv) {
   if (c.sub == "version") return ctx.reply.Bulk(std::to_string(cm.Current()->version));
   if (c.sub == "myid") return ctx.reply.Bulk(cm.Current()->myid);
-  if (c.sub == "migrate" || c.sub == "flushslots") return ctx.reply.Error(cluster::kErrMigrateNotSupported);
+  if (c.sub == "migrate") return RunMigrate(ctx, c.slots, argv[3], c.sync, c.timeout);
+  if (c.sub == "flushslots") return RunFlushSlots(ctx, c.slots);
   Status st = Status::Ok();
   if (c.sub == "setnodes") {
     st = cm.SetNodes(argv[2], c.version, c.force);

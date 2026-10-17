@@ -14,6 +14,7 @@
 #include "repl/backlog_trimmer.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
+#include "types/keyspace.h"
 
 namespace tideskv::test {
 namespace {
@@ -138,20 +139,23 @@ TEST(SlotMigratorTest, ACancelDuringTheFenceFailsTheJobBeforeImportEnd) {  // D1
 }
 
 // D2, D10: a flush committed the instant before the barrier is in the final delta [next, fence_seq]; the job
-// fails after raising the fence. (A FLUSH during the fence commits after fence_seq: Task 11's OnFlush cancels
-// the job, which ACancelDuringTheFenceFailsTheJobBeforeImportEnd covers.)
+// fails after raising the fence. The flush is committed through the Engine: the FLUSH commands also cancel
+// the job up front (Task 11's OnFlush, FlushDuringMigration.* in cmd_clusterx_migrate_test.cc), which would
+// end it before the fence and leave this path unreached.
 TEST(SlotMigratorTest, AFlushInTheFinalDeltaFailsTheJob) {
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
-  SecondClient writer(p.source);
-  std::string flushed;
+  Status flushed = Status::IOError("not run");
   bool was_fenced = false;
   migrate::SlotMigrator::Hooks hooks;
-  hooks.before_fence = [&] { flushed = writer.Run({"FLUSHALL"}); };  // the default gap: no catch-up round
+  hooks.before_fence = [&] {  // the default gap: no catch-up round
+    flushed =
+        p.source.services.engine_.WriteExclusive([](WriteTxn& txn, int64_t) { return FlushDb(txn, 0); }, {0});
+  };
   hooks.after_fence = [&] { was_fenced = p.source.services.engine_.SlotFenced(3300); };
   p.source_migration().migrator().SetHooks(hooks);
   EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
-  EXPECT_EQ(flushed, kOk);
+  EXPECT_TRUE(flushed.ok()) << flushed.ToString();
   EXPECT_TRUE(was_fenced);
   ExpectFailedAfterTheFence(p);
 }

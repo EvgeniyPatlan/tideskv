@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 
+#include "cluster/cluster_errors.h"
 #include "cluster/slot_states.h"
 #include "support/cluster_harness.h"
+#include "support/migration_harness.h"
 
 namespace tideskv::test {
 namespace {
@@ -130,6 +134,39 @@ TEST(ClusterCmd, InfoShowsTheMigrationBlocksOfThePublishedStates) {  // D15
       << info;
   h.services.replication_.set_role(ReplRole::kReplica);  // replicating: no block (cluster.cc:440)
   EXPECT_EQ(h.Run({"CLUSTER", "INFO"}).find("migrating_slot"), std::string::npos);
+}
+
+TEST(ClusterCmd, ResetIsRefusedWhileMigratingOrImporting) {  // D20, cluster.cc:963-965
+  MigrationPair p;
+  ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
+  ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
+  EXPECT_EQ(p.source.Run({"CLUSTER", "RESET"}), Err(cluster::kErrResetWhileMigrating));
+  for (int i = 0; i < 1000 && !p.target_migration().ImportRunning(); ++i) {  // IMPORT start comes later
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_EQ(p.target.Run({"CLUSTER", "RESET"}), Err(cluster::kErrResetWhileImporting));
+  p.source_migration().migrator().Stop();
+}
+
+TEST(ClusterCmd,
+     ResetChecksEmptinessUnderTheFenceAndClearsTheStates) {  // D20, gocase
+                                                             // TestClusterResetPreservesForbiddenSlot
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
+  ASSERT_TRUE(p.source_migration().migrator().WaitIdle(std::chrono::seconds(10)));
+  ASSERT_TRUE(p.source.services.engine_.SlotFenced(3300));
+  ASSERT_EQ(p.source.Run({"SET", "bar", "1"}), kOk);
+  EXPECT_EQ(p.source.Run({"CLUSTER", "RESET", "HARD"}), Err(cluster::kErrResetNotEmpty));
+  EXPECT_TRUE(p.source.services.engine_.SlotFenced(3300)) << "a refused reset restores the fence";
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(5061));
+  ASSERT_EQ(p.source.Run({"FLUSHALL"}), kOk);
+  ASSERT_EQ(p.source.Run({"CLUSTER", "RESET", "HARD"}), kOk);
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
+  const auto s = p.source_cluster.manager->States();
+  EXPECT_FALSE(s->job.has_value()) << "RESET clears a success block (D15)";
+  EXPECT_TRUE(s->migrated.empty());
+  p.source_cluster.Push(kThreeNodes, 2);  // the slot is back on this node: writable at once
+  EXPECT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
 }
 
 }  // namespace

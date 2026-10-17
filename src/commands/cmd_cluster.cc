@@ -14,6 +14,7 @@
 #include "common/crc16.h"
 #include "common/string_util.h"
 #include "exec/engine.h"
+#include "migrate/migration_service.h"
 #include "repl/replication.h"
 #include "types/slot_keys.h"
 
@@ -138,15 +139,29 @@ void Replicas(ExecContext& ctx, ClusterManager&, const Topology& t, const ArgLis
   ctx.reply.Verbatim(*text);
 }
 
+// D20: the emptiness check and the reset run with every slot fenced, so no write lands between them (closes
+// the M7a Task 10 ruling); ClusterManager::Reset's role change takes no gate. Afterwards (and on any failure)
+// the fence goes back to the published states' set, never to a copy taken before: a worker or migrator Mutate
+// may have moved it meanwhile (controller ruling C11). OnReset clears that set on success.
+Status ResetUnderFence(ExecContext& ctx, ClusterManager& cm, migrate::MigrationService* m) {
+  Engine& engine = ctx.server.engine();
+  engine.FenceSlots(0, kSlotCount - 1);
+  bool empty = false;
+  Status st = engine.Read([&](ReadView& v, int64_t) { return MoveInto(KeyspaceEmpty(v), &empty); });
+  if (st.ok()) st = cm.Reset(empty);
+  if (st.ok() && m != nullptr) st = m->OnReset();
+  engine.AssignFence(cm.States()->fenced);  // the gate is released before any states publish (OnReset)
+  return st;
+}
+
 void Reset(ExecContext& ctx, ClusterManager& cm, const Topology&, const ArgList& argv) {
   if (argv.size() == 3 && !EqualsIgnoreCase(argv[2], "hard") && !EqualsIgnoreCase(argv[2], "soft")) {
     return ctx.reply.Error(kErrSyntax);
   }
-  bool empty = false;
-  const Status read =
-      ctx.server.engine().Read([&](ReadView& v, int64_t) { return MoveInto(KeyspaceEmpty(v), &empty); });
-  if (!read.ok()) return ReplyError(ctx, read);
-  if (Status st = cm.Reset(empty); !st.ok()) return ReplyError(ctx, st);
+  migrate::MigrationService* m = ctx.server.migration();
+  if (m != nullptr && m->MigrationRunning()) return ctx.reply.Error(cluster::kErrResetWhileMigrating);
+  if (m != nullptr && m->ImportRunning()) return ctx.reply.Error(cluster::kErrResetWhileImporting);
+  if (Status st = ResetUnderFence(ctx, cm, m); !st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");
 }
 

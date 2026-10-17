@@ -70,10 +70,9 @@ TEST(ClusterxCmd, ParseErrorsAreKvrocks) {
       {{"CLUSTERX", "MIGRATE", "1", kNodeB, "maybe"}, "ERR Invalid sync flag"},
       {{"CLUSTERX", "MIGRATE", "1", kNodeB, "sync", "x"}, "ERR timeout is not an integer or out of range"},
       {{"CLUSTERX", "MIGRATE", "1", kNodeB, "sync", "-1"}, "ERR timeout is negative"},
-      {{"CLUSTERX", "MIGRATE", "1", kNodeB}, "ERR slot migration is not supported yet"},
-      {{"CLUSTERX", "MIGRATE", "0-1", kNodeB, "sync", "10"}, "ERR slot migration is not supported yet"},
+      {{"CLUSTERX", "MIGRATE", "1", kNodeB}, "ERR Can't find the destination node id"},
+      {{"CLUSTERX", "MIGRATE", "0-1", kNodeB, "sync", "10"}, "ERR Can't find the destination node id"},
       {{"CLUSTERX", "FLUSHSLOTS"}, "ERR wrong number of arguments"},
-      {{"CLUSTERX", "FLUSHSLOTS", "0-1"}, "ERR slot migration is not supported yet"},
   };
   for (const auto& [argv, error] : cases) EXPECT_EQ(h.Run(argv), Err(error)) << argv.back();
 }

@@ -96,6 +96,15 @@ uint32_t ClusterSubcommandFlags(uint32_t base, const ArgList& argv) {
   return base;
 }
 
+// M7b D13: CLUSTERX FLUSHSLOTS deletes data, so it is a write (READONLY refuses it on a replica) and is not
+// loading/stale; the rest of CLUSTERX keeps its flags (a controller repoints a full-syncing replica).
+uint32_t ClusterxSubcommandFlags(uint32_t base, const ArgList& argv) {
+  if (argv.size() >= 2 && EqualsIgnoreCase(argv[1], "flushslots")) {
+    return (base & ~(kCmdLoading | kCmdStale)) | kCmdWrite;
+  }
+  return base;
+}
+
 void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv, uint32_t flags) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
   if (spec.name == "script") {  // subcommand lookup precedes queueing in Redis processCommand
@@ -171,6 +180,7 @@ bool ArityOk(int arity, size_t argc) {
 uint32_t EffectiveFlags(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   if (spec.name == "script") return ScriptSubcommandFlags(spec.flags, argv);
   if (spec.name == "cluster") return ClusterSubcommandFlags(spec.flags, argv);
+  if (spec.name == "clusterx") return ClusterxSubcommandFlags(spec.flags, argv);
   if (!IsEvalFamily(spec.name) || argv.size() < 2) return spec.flags;
   const std::optional<ScriptFlags> f =
       ctx.server.scripts().PeekFlags(argv[1], spec.name.starts_with("evalsha"));
