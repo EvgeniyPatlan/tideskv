@@ -35,6 +35,11 @@ std::string ZScorePrefix(uint8_t db, uint16_t slot, uint64_t oid);
 std::string EncodeZScoreKey(uint8_t db, uint16_t slot, uint64_t oid, double score, std::string_view member);
 bool DecodeZScoreKey(std::string_view encoded, ZScoreKey* out);
 
+// M7b D2: the oid of an oid-bearing key (a subkey or zscore key, or their 11-byte DEL_PREFIX prefix), and
+// that key with another oid. False when `key` is shorter than kObjectPrefixSize.
+bool PeekObjectOid(std::string_view key, uint64_t* oid);
+bool RewriteObjectOid(std::string* key, uint64_t oid);
+
 std::string EncodeListIndex(uint64_t index);
 bool DecodeListIndex(std::string_view field, uint64_t* index);
 

@@ -44,6 +44,10 @@ std::string ExpireValue(uint64_t oid) {
   return out;
 }
 
+bool DecodeExpireValue(std::string_view value, uint64_t* oid) {
+  return value.size() == 8 && coding::GetFixed64BE(&value, oid);
+}
+
 Result<StoredObject> LoadObject(ReadView& view, uint8_t db, std::string_view key, int64_t now_ms) {
   auto raw = view.Get(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key));
   if (!raw.ok()) {

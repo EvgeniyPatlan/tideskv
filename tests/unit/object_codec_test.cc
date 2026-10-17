@@ -75,5 +75,23 @@ TEST(ObjectCodec, ListIndexOrderingAndRoundTrip) {
   EXPECT_FALSE(DecodeListIndex("123", &idx));
 }
 
+TEST(ObjectCodec, PeeksAndRewritesTheOidOfSubkeyAndZscoreKeys) {  // M7b D2
+  std::string sub = EncodeSubkey(0, 3300, 42, "field");
+  uint64_t oid = 0;
+  ASSERT_TRUE(PeekObjectOid(sub, &oid));
+  EXPECT_EQ(oid, 42u);
+  ASSERT_TRUE(RewriteObjectOid(&sub, 1000));
+  EXPECT_EQ(sub, EncodeSubkey(0, 3300, 1000, "field"));
+  std::string z = EncodeZScoreKey(0, 3300, 42, -2.5, "m");
+  ASSERT_TRUE(RewriteObjectOid(&z, 7));
+  EXPECT_EQ(z, EncodeZScoreKey(0, 3300, 7, -2.5, "m"));
+  std::string prefix = SubkeyPrefix(0, 3300, 42);
+  ASSERT_TRUE(RewriteObjectOid(&prefix, 9));
+  EXPECT_EQ(prefix, SubkeyPrefix(0, 3300, 9));
+  std::string short_key("\x00\x0c", 2);
+  EXPECT_FALSE(PeekObjectOid(short_key, &oid));
+  EXPECT_FALSE(RewriteObjectOid(&short_key, 1));
+}
+
 }  // namespace
 }  // namespace tideskv::encoding

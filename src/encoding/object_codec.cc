@@ -62,4 +62,18 @@ bool DecodeListIndex(std::string_view field, uint64_t* index) {
   return field.size() == 8 && coding::GetFixed64BE(&field, index);
 }
 
+bool PeekObjectOid(std::string_view key, uint64_t* oid) {
+  if (key.size() < kObjectPrefixSize) return false;
+  *oid = coding::DecodeFixed64BE(key.data() + 3);  // after [db u8][slot u16]
+  return true;
+}
+
+bool RewriteObjectOid(std::string* key, uint64_t oid) {
+  if (key->size() < kObjectPrefixSize) return false;
+  std::string be;
+  coding::PutFixed64BE(&be, oid);
+  key->replace(3, 8, be);
+  return true;
+}
+
 }  // namespace tideskv::encoding

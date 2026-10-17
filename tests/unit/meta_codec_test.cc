@@ -80,5 +80,33 @@ TEST(MetaCodec, TypeNames) {
   EXPECT_EQ(TypeName(ValueType::kZSet), "zset");
 }
 
+TEST(MetaCodec, PeeksAndRewritesACollectionsOidAndLeavesStringsAlone) {  // M7b D2
+  Metadata list;
+  list.type = ValueType::kList;
+  list.expire_ms = 1234;
+  list.oid = 42;
+  list.size = 3;
+  list.head = kListInitialIndex - 1;
+  list.tail = kListInitialIndex + 1;
+  std::string encoded = EncodeMetadata(list);
+  uint64_t oid = 0;
+  ASSERT_TRUE(PeekMetaOid(encoded, &oid));
+  EXPECT_EQ(oid, 42u);
+  ASSERT_TRUE(RewriteMetaOid(&encoded, 1000));
+  auto back = DecodeMetadata(encoded);
+  ASSERT_TRUE(back.ok());
+  EXPECT_EQ(back->meta.oid, 1000u);
+  EXPECT_EQ(back->meta.expire_ms, 1234);
+  EXPECT_EQ(back->meta.size, 3u);
+  EXPECT_EQ(back->meta.head, list.head);
+  EXPECT_EQ(back->meta.tail, list.tail);
+  std::string str = EncodeMetadata(Metadata{}, "payload");
+  EXPECT_FALSE(PeekMetaOid(str, &oid));
+  EXPECT_FALSE(RewriteMetaOid(&str, 5));
+  EXPECT_EQ(str, EncodeMetadata(Metadata{}, "payload"));
+  std::string truncated = EncodeMetadata(list).substr(0, 20);
+  EXPECT_FALSE(PeekMetaOid(truncated, &oid));
+}
+
 }  // namespace
 }  // namespace tideskv::encoding

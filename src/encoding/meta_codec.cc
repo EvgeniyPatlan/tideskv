@@ -73,4 +73,21 @@ Result<DecodedMetadata> DecodeMetadata(std::string_view in) {
   return d;
 }
 
+bool PeekMetaOid(std::string_view in, uint64_t* oid) {
+  if (in.size() < kHeaderSize || !IsKnownType(static_cast<uint8_t>(in[0]))) return false;
+  const auto type = static_cast<ValueType>(in[0]);
+  if (type == ValueType::kString || in.size() != ExpectedSize(type)) return false;
+  *oid = coding::DecodeFixed64BE(in.data() + kHeaderSize);
+  return true;
+}
+
+bool RewriteMetaOid(std::string* encoded, uint64_t oid) {
+  uint64_t old = 0;
+  if (!PeekMetaOid(*encoded, &old)) return false;
+  std::string be;
+  coding::PutFixed64BE(&be, oid);
+  encoded->replace(kHeaderSize, 8, be);
+  return true;
+}
+
 }  // namespace tideskv::encoding

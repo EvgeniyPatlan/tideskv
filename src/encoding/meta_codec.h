@@ -38,4 +38,9 @@ struct DecodedMetadata {
 std::string EncodeMetadata(const Metadata& meta, std::string_view string_payload = {});
 Result<DecodedMetadata> DecodeMetadata(std::string_view encoded);
 
+// M7b D2: a collection's oid in an encoded meta record, and the record with another oid (in place). False
+// for a string record or a malformed one.
+bool PeekMetaOid(std::string_view encoded, uint64_t* oid);
+bool RewriteMetaOid(std::string* encoded, uint64_t oid);
+
 }  // namespace tideskv::encoding

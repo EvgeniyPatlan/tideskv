@@ -24,6 +24,7 @@ struct StoredObject {
 };
 
 std::string ExpireValue(uint64_t oid);  // value of an expire-CF entry: big-endian oid (0 for strings)
+bool DecodeExpireValue(std::string_view value, uint64_t* oid);  // M7b D2: false unless 8 bytes
 
 // Reads (db, key). An object whose deadline is <= now_ms is reported as kExpired.
 Result<StoredObject> LoadObject(ReadView& view, uint8_t db, std::string_view key, int64_t now_ms);
