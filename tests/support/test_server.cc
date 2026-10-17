@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string_view>
+#include <system_error>
 #include <thread>
 
 extern char** environ;  // POSIX; declared explicitly rather than relying on _GNU_SOURCE
@@ -179,6 +181,12 @@ void TestServer::Spawn(const std::string& binary, const Options& options) {
 
 TestServer::~TestServer() {
   if (pid_ > 0) {
+    // A test whose TempDir dies before this server deleted the files of a running server. Its next flush
+    // fails, and the background checkpoint holds SIGTERM up to TidesDB's 60 s flush wait.
+    if (std::error_code ec; !std::filesystem::exists(dir_, ec)) {
+      ADD_FAILURE() << "tideskv-server's data dir was removed while the server ran: " << dir_
+                    << " (keep the TempDir alive until the server is stopped)";
+    }
     const int code = Terminate();
     if (code < 0) {
       Kill9();

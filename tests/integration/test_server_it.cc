@@ -21,6 +21,7 @@ namespace {
 uint16_t g_taken_port = 0;  // EXPECT_NONFATAL_FAILURE's statement may not use locals
 std::string g_fake_server;  // likewise
 std::string g_marker;       // likewise
+std::string g_data_dir;     // likewise
 
 // A stand-in for tideskv-server: prints `lines` to stderr, then idles until SIGTERM and exits 0, so only
 // the log can make the harness fail the test.
@@ -184,6 +185,20 @@ TEST(TestServerIT, PauseReturnsOnceEveryThreadIsStopped) {
   auto c = s.Connect();
   ASSERT_NE(c, nullptr);
   EXPECT_EQ(c->Command({"PING"}).str, "PONG");  // resumed
+}
+
+// A test whose TempDir dies before the server it backs (a test-local dir handed to a fixture-owned server)
+// deletes the data dir of a running server: its next flush fails, and the background checkpoint then holds
+// SIGTERM up to TidesDB's 60 s flush wait (ReplicationIT under load). The harness reports it.
+TEST(TestServerIT, ADataDirRemovedWhileTheServerRunsFailsTheTest) {
+  auto dir = std::make_unique<TempDir>("tideskv-it-data");
+  g_data_dir = dir->str();
+  EXPECT_NONFATAL_FAILURE(
+      {
+        TestServer s(TIDESKV_SERVER_BIN, {.dir = g_data_dir});
+        std::filesystem::remove_all(g_data_dir);
+      },
+      "data dir was removed while the server ran");
 }
 
 }  // namespace

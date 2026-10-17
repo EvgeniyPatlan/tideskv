@@ -90,6 +90,9 @@ void MixedWrites(RespClient& c, int n) {
 }
 
 struct ReplicationIT : ::testing::Test {
+  // For a replica that restarts on its own dir. Declared first so that it outlives `replica` (a TempDir in
+  // the test body would delete the running replica's files before the fixture stops it).
+  TempDir replica_dir{"tideskv-it-replica"};
   TestServer master{TIDESKV_SERVER_BIN};
   std::unique_ptr<TestServer> replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN);
 
@@ -221,9 +224,8 @@ TEST_F(ReplicationIT, PromotionKeepsDataAndAcceptsWrites) {
 }
 
 TEST_F(ReplicationIT, ReplicaRestartResumesWithPartialSync) {
-  TempDir dir("tideskv-it-replica");
   TestServer::Options o;
-  o.dir = dir.str();
+  o.dir = replica_dir.str();
   replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
   Follow(*replica);
   auto m = Client(master);
@@ -265,9 +267,8 @@ TEST_F(ReplicationIT, ReplicaWithForeignDataIsFullySyncedAndLosesItsOwnKeys) {
 // D18: a master whose backlog was trimmed past what a stopped replica holds answers its PSYNC with
 // +FULLRESYNC, and the replica loads the master's snapshot (M6b).
 TEST_F(ReplicationIT, TrimmedBacklogForcesFullResyncForAFarBehindReplica) {
-  TempDir dir("tideskv-it-replica");
   TestServer::Options o;
-  o.dir = dir.str();
+  o.dir = replica_dir.str();
   replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
   Follow(*replica);
   auto m = Client(master);
@@ -342,7 +343,6 @@ TEST_F(ReplicationIT, ReplicaContinuesAfterTheMasterRestarts) {
 // the replica loads the master's data (M6b).
 TEST_F(ReplicationIT, ReplicaAheadOfARestartedMasterGetsFullResync) {
   namespace fs = std::filesystem;
-  TempDir replica_dir("tideskv-it-replica");
   TestServer::Options o;
   o.dir = replica_dir.str();
   replica = std::make_unique<TestServer>(TIDESKV_SERVER_BIN, o);
