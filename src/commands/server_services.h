@@ -10,6 +10,9 @@ namespace tideskv {
 namespace cluster {
 class ClusterManager;
 }
+namespace migrate {
+class MigrationService;
+}
 
 class BlockingRegistry;
 class ClientPause;
@@ -113,6 +116,7 @@ class ServerServices {
   virtual Replication& replication() = 0;          // role queries (M6a)
   virtual ClientPause& pause() = 0;                // CLIENT PAUSE (M7a D21)
   virtual cluster::ClusterManager* cluster() = 0;  // null unless cluster-enabled (M7a)
+  virtual migrate::MigrationService* migration() = 0;  // null unless cluster-enabled (M7b)
 };
 
 }  // namespace tideskv

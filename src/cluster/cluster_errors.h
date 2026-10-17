@@ -73,6 +73,22 @@ inline constexpr std::string_view kMovedPrefix = "MOVED ";
 inline constexpr std::string_view kErrTryAgainFenced =
     "TRYAGAIN Can't write to slot being migrated which is in write forbidden phase";
 
+// CLUSTER IMPORT (Kvrocks v2.17.0 cluster.cc:348-404, slot_import.cc:31-77, cluster_defs.h:37-43; M7b D14).
+inline constexpr std::string_view kErrSlaveCantImport = "ERR Slave can't import slot";
+inline constexpr std::string_view kErrImportOwnSlot = "ERR Can't import slot which belongs to me";
+inline constexpr std::string_view kErrOneImportPrefix =
+    "ERR only one importing job is allowed, current importing: ";  // then the range
+inline constexpr std::string_view kErrImportMismatchPrefix = "ERR mismatch slot, importing slot(s): ";
+inline constexpr std::string_view kImportMismatchMiddle = ", but got: ";  // Kvrocks prints -1 for no import
+inline constexpr std::string_view kErrInvalidImportState = "ERR Invalid import state";
+inline constexpr std::string_view kErrSlotRangeInvalid = "ERR Slot range is invalid";
+// TidesKV-only (M7b D14): IMPORTDATA outside the import link; IMPORT 1 or IMPORTDATA of an import that is
+// not in start; an IMPORT start that waited too long for this node's cleanup of an overlapping range.
+inline constexpr std::string_view kErrNotImportLink = "ERR this connection is not importing slots";
+inline constexpr std::string_view kErrImportNotRunning = "ERR the import of slot(s) is not in progress";
+inline constexpr std::string_view kErrImportCleanupPending =
+    "ERR the cleanup of an overlapping slot range is still running";
+
 // TidesKV-only (M7a D7, spec section 5.4): the <reason> after kErrClusterReplication when the promotion
 // failed for an internal (non-user) cause; Kvrocks appends its own status text, TidesKV exposes no internals.
 inline constexpr std::string_view kReplicationReasonStorage = "storage error";

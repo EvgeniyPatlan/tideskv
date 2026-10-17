@@ -276,6 +276,7 @@ net::ServerOptions App::MakeServerOptions() {
   o.init_session = [this](Session& s) { s.authenticated = config_->Snapshot().requirepass.empty(); };
   o.on_disconnect = [this](Session& s) {
     if (s.watch) watches_.UnwatchAll(*s.watch);
+    if (s.on_close) s.on_close();  // M7b D14: an import link's loss (posts to the migrate worker)
   };
   return o;
 }

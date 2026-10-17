@@ -19,12 +19,13 @@
 #include "common/status.h"
 #include "exec/engine.h"
 #include "exec/repl_log.h"
+#include "migrate/slot_importer.h"
 #include "storage/storage.h"
 #include "types/oid_allocator.h"
 
 // Slot migration on one node (M7b): the states it publishes next to the topology, the replicated
-// sys/migration record, and the migrate worker thread (cleanups, link-loss erases, SETNODES transitions).
-// Tasks 9 and 10 add the target's importer and the source's migrator. Owned by App when cluster-enabled;
+// sys/migration record, the migrate worker thread (cleanups, link-loss erases, SETNODES transitions) and the
+// target's importer (Task 9). Task 10 adds the source's migrator. Owned by App when cluster-enabled;
 // commands reach it only through ServerServices::migration() (D26). Lock order: {migrate_mu_ |
 // SlotImporter::mu_} -> record_mu_ -> Engine gate (taken and released) -> (states publish, never under the
 // gate); worker_mu_ is a leaf.
@@ -88,6 +89,11 @@ class MigrationService {
   // The eraser stopping on Shutdown, with the CLIENT PAUSE hooks (background) or without (inside an admitted
   // command, M7a D21). One attempt: BUSY is returned.
   Status EraseRange(cluster::SlotRange range, bool background);
+  // EraseRange until it is not BUSY or Shutdown (the worker's erases); `stop` (optional) also stops the
+  // eraser before a txn.
+  Status EraseWaitingOutBusy(cluster::SlotRange range, bool background,
+                             const std::function<bool()>& stop = {});
+  SlotImporter& importer() { return *importer_; }  // the target side (M7b D14)
 
   void Post(std::function<void()> task);              // the migrate worker, FIFO; dropped after Shutdown
   bool AwaitIdle(std::chrono::milliseconds timeout);  // true once every task posted before the call ran
@@ -103,6 +109,7 @@ class MigrationService {
     bool ran = false;
     std::vector<cluster::SlotRange> cleanup;
     std::optional<cluster::SlotRange> half_import;
+    std::vector<cluster::SlotRange> imported;  // the record's imported ranges
   };
 
   Status MutateImpl(const FallibleEdit& edit, bool persist, uint64_t* fence_seq, bool strict_restore);
@@ -121,10 +128,11 @@ class MigrationService {
   Status RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored, Restored* out);
   void PostRestored(const Restored& r);  // the cleanups and the half-import erase, to the worker
   // On the worker: erases what an import left in start (D8). Stops for good once any other import overlaps it
-  // (start, success or error: that import erased its range itself, D9), on a replica, or on Shutdown;
-  // failures retry after 1 s.
-  void RunHalfImportErase(cluster::SlotRange range);
-  bool NewImportOverlaps(cluster::SlotRange range) const;  // an import other than the restored one
+  // (start, success or error: that import erased its range itself, D9), or a range imported since the restore
+  // (not in `restored_imported`) does, on a replica, or on Shutdown; failures retry after 1 s.
+  void RunHalfImportErase(cluster::SlotRange range, std::vector<cluster::SlotRange> restored_imported);
+  bool NewImportOverlaps(cluster::SlotRange range,
+                         const std::vector<cluster::SlotRange>& restored_imported) const;
   // Under record_mu_: moves the fence from `cur_fenced`, writes RecordOf(next) unless it equals `stored`,
   // publishes `next`.
   Status Commit(const SlotBits& cur_fenced, const cluster::MigrationRecord& stored,
@@ -132,9 +140,6 @@ class MigrationService {
   Status SaveRecord(const cluster::MigrationRecord& record);
   Status EraseWith(cluster::SlotRange range, bool background,
                    std::function<bool()> stop);  // EraseRange + stop
-  // Until not BUSY or Shutdown; `stop` (optional) also stops the eraser before a txn.
-  Status EraseWaitingOutBusy(cluster::SlotRange range, bool background,
-                             const std::function<bool()>& stop = {});
   void WorkerLoop();
   void WaitBeforeRetry(std::chrono::milliseconds delay);  // cut short by Shutdown
 
@@ -150,6 +155,7 @@ class MigrationService {
   std::deque<std::function<void()>> tasks_;  // guarded by worker_mu_
   uint64_t posted_ = 0;                      // guarded by worker_mu_
   uint64_t done_ = 0;                        // guarded by worker_mu_
+  std::unique_ptr<SlotImporter> importer_;   // its worker tasks end before Shutdown returns
   std::thread worker_;                       // last: starts once every other member exists
 };
 

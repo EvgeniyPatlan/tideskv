@@ -12,7 +12,9 @@
 namespace tideskv::migrate {
 
 MigrationService::MigrationService(MigrationDeps deps)
-    : deps_(std::move(deps)), worker_([this] { WorkerLoop(); }) {}
+    : deps_(std::move(deps)),
+      importer_(std::make_unique<SlotImporter>(*this)),
+      worker_([this] { WorkerLoop(); }) {}
 
 MigrationService::~MigrationService() { Shutdown(); }
 
@@ -93,6 +95,7 @@ Status MigrationService::RestoreInto(cluster::SlotStates& s, cluster::MigrationR
   }
   *stored = record.value_or(cluster::MigrationRecord{});
   out->cleanup = restored.cleanup;
+  out->imported = restored.imported;
   out->ran = true;
   s = std::move(restored);
   if (record.has_value()) spdlog::info("slot migration states restored from sys/migration");
@@ -100,7 +103,9 @@ Status MigrationService::RestoreInto(cluster::SlotStates& s, cluster::MigrationR
 }
 
 void MigrationService::PostRestored(const Restored& r) {
-  if (r.half_import) Post([this, range = *r.half_import] { RunHalfImportErase(range); });
+  if (r.half_import) {
+    Post([this, range = *r.half_import, imported = r.imported] { RunHalfImportErase(range, imported); });
+  }
   for (const cluster::SlotRange& c : r.cleanup) Post([this, c] { RunCleanup(c); });
 }
 
@@ -120,22 +125,31 @@ void MigrationService::OnPromoted() {
   });
 }
 
-bool MigrationService::NewImportOverlaps(cluster::SlotRange range) const {
+bool MigrationService::NewImportOverlaps(cluster::SlotRange range,
+                                         const std::vector<cluster::SlotRange>& restored_imported) const {
   const std::shared_ptr<const cluster::SlotStates> s = deps_.cluster.States();
   const std::optional<cluster::ImportJob>& import = s->import;
   const cluster::ImportJob restored{range, cluster::ImportState::kError};  // what the restore left
-  return import.has_value() && !(*import == restored) && cluster::Overlaps(import->range, range);
+  if (import.has_value() && !(*import == restored) && cluster::Overlaps(import->range, range)) return true;
+  // A later import reached success here and was then replaced by a disjoint one (controller ruling, Task 9).
+  return std::any_of(s->imported.begin(), s->imported.end(), [&](cluster::SlotRange r) {
+    return cluster::Overlaps(r, range) &&
+           std::find(restored_imported.begin(), restored_imported.end(), r) == restored_imported.end();
+  });
 }
 
-void MigrationService::RunHalfImportErase(cluster::SlotRange range) {
-  const auto superseded = [this, range] { return NewImportOverlaps(range); };
+void MigrationService::RunHalfImportErase(cluster::SlotRange range,
+                                          std::vector<cluster::SlotRange> restored_imported) {
+  const auto superseded = [this, range, &restored_imported] {
+    return NewImportOverlaps(range, restored_imported);
+  };
   if (stopping() || deps_.is_replica() || superseded()) return;
   const Status st = EraseWaitingOutBusy(range, /*background=*/true, superseded);
   if (st.ok() || stopping() || superseded()) return;
   spdlog::warn("erasing the half import of slot(s) {} failed: {}; retrying", cluster::FormatRange(range),
                st.ToString());
   WaitBeforeRetry(kFailureRetry);
-  Post([this, range] { RunHalfImportErase(range); });
+  Post([this, range, imported = std::move(restored_imported)] { RunHalfImportErase(range, imported); });
 }
 
 Status MigrationService::EraseRange(cluster::SlotRange range, bool background) {

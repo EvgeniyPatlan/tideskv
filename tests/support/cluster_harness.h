@@ -21,8 +21,23 @@ inline const std::string kThreeNodes = kNodeA + " 127.0.0.1 7000 master - 0-8191
                                        " 127.0.0.1 7001 master - 8192-16383\n" + kNodeC +
                                        " 127.0.0.1 7002 slave " + kNodeA + "\n";
 
-// A ClusterManager over the harness's storage whose role hooks drive its FakeReplication; `port` picks
-// which node of kThreeNodes this harness is (7000 = A, 7001 = B, 7002 = C).
+// The MigrationService dependencies of a harness node: its engine, log, storage and oids, `cm`, and its
+// FakeReplication's role (M7b). No CLIENT PAUSE hooks until Task 13 wires them.
+inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::ClusterManager& cm) {
+  FakeReplication& r = h.services.replication_;
+  return migrate::MigrationDeps{.engine = h.services.engine_,
+                                .log = h.services.repl_log_,
+                                .storage = h.services.storage_,
+                                .oids = h.services.oids_,
+                                .cluster = cm,
+                                .is_replica = [&r] { return r.IsReplica(); },
+                                .begin_background_write = {},
+                                .end_background_write = {},
+                                .make_durable = {}};
+}
+
+// A ClusterManager over the harness's storage whose role hooks drive its FakeReplication, and the node's
+// MigrationService; `port` picks which node of kThreeNodes this harness is (7000 = A, 7001 = B, 7002 = C).
 struct ClusterHarness {
   explicit ClusterHarness(CommandHarness& h, uint16_t port = 7000) : h_(h) {
     cluster::ClusterManager::Options o;
@@ -32,14 +47,21 @@ struct ClusterHarness {
     FakeReplication& r = h.services.replication_;
     o.is_replica = [&r] { return r.IsReplica(); };
     o.become_replica = [&r](const std::string& host, uint16_t p) { return r.BecomeReplica(host, p); };
-    o.become_master = [&r] { return r.BecomeMaster(); };
+    o.become_master = [this, &r] {
+      const Status st = r.BecomeMaster();
+      if (st.ok() && migration) migration->OnPromoted();  // as App (M7b D8)
+      return st;
+    };
     o.on_publish = [this](const std::shared_ptr<const cluster::Topology>&) { RefreshRedirect(); };
     o.on_states_publish = [this](const std::shared_ptr<const cluster::SlotStates>&) { RefreshRedirect(); };
     manager = std::make_unique<cluster::ClusterManager>(h.services.storage_, std::move(o));
     EXPECT_TRUE(manager->Load().ok());
     h.services.cluster_manager = manager.get();
+    migration = std::make_unique<migrate::MigrationService>(MigrationDepsOf(h, *manager));
+    h.services.migration_service = migration.get();
   }
   ~ClusterHarness() {
+    h_.services.migration_service = nullptr;
     h_.services.cluster_manager = nullptr;
     h_.services.blocking_.SetRedirect({});
   }
@@ -59,21 +81,7 @@ struct ClusterHarness {
 
   CommandHarness& h_;
   std::unique_ptr<cluster::ClusterManager> manager;
+  std::unique_ptr<migrate::MigrationService> migration;  // over manager (M7b); null only while constructing
 };
-
-// The MigrationService dependencies of a harness node: its engine, log, storage and oids, `cm`, and its
-// FakeReplication's role (M7b). No CLIENT PAUSE hooks until Task 13 wires them.
-inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::ClusterManager& cm) {
-  FakeReplication& r = h.services.replication_;
-  return migrate::MigrationDeps{.engine = h.services.engine_,
-                                .log = h.services.repl_log_,
-                                .storage = h.services.storage_,
-                                .oids = h.services.oids_,
-                                .cluster = cm,
-                                .is_replica = [&r] { return r.IsReplica(); },
-                                .begin_background_write = {},
-                                .end_background_write = {},
-                                .make_durable = {}};
-}
 
 }  // namespace tideskv::test

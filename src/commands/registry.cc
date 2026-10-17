@@ -86,6 +86,16 @@ uint32_t ScriptSubcommandFlags(uint32_t base, const ArgList& argv) {
   return base;
 }
 
+// M7b D14: CLUSTER IMPORT / IMPORTDATA write, so NOREPLICAS, READONLY and CLIENT PAUSE apply, and are refused
+// while loading or stale; the other subcommands keep CLUSTER's loading|stale (the controller's probes).
+uint32_t ClusterSubcommandFlags(uint32_t base, const ArgList& argv) {
+  if (argv.size() < 2) return base;
+  const std::string sub = ToLower(argv[1]);
+  if (sub == "import" || sub == "importdata")
+    return (base & ~(kCmdLoading | kCmdStale)) | kCmdWrite | kCmdAdmin;
+  return base;
+}
+
 void Queue(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv, uint32_t flags) {
   if ((spec.flags & kCmdNoMulti) != 0) return Reject(ctx, &spec, kErrNotAllowedInMulti);
   if (spec.name == "script") {  // subcommand lookup precedes queueing in Redis processCommand
@@ -160,6 +170,7 @@ bool ArityOk(int arity, size_t argc) {
 
 uint32_t EffectiveFlags(ExecContext& ctx, const CommandSpec& spec, const ArgList& argv) {
   if (spec.name == "script") return ScriptSubcommandFlags(spec.flags, argv);
+  if (spec.name == "cluster") return ClusterSubcommandFlags(spec.flags, argv);
   if (!IsEvalFamily(spec.name) || argv.size() < 2) return spec.flags;
   const std::optional<ScriptFlags> f =
       ctx.server.scripts().PeekFlags(argv[1], spec.name.starts_with("evalsha"));

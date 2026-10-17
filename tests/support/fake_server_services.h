@@ -14,6 +14,7 @@
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "exec/repl_log.h"
+#include "migrate/migration_service.h"
 #include "repl/replication.h"
 #include "repl/wait_list.h"
 #include "script/script_engine.h"
@@ -139,6 +140,7 @@ class FakeServerServices final : public ServerServices {
   }
   ClientPause& pause() override { return pause_; }
   cluster::ClusterManager* cluster() override { return cluster_manager; }
+  migrate::MigrationService* migration() override { return migration_service; }
 
   CommandRegistry registry_;
   Config config_;
@@ -150,7 +152,8 @@ class FakeServerServices final : public ServerServices {
   FakeReplication replication_;
   Replication* real_replication = nullptr;  // set: replication() returns it instead of the fake
   ClientPause pause_;
-  cluster::ClusterManager* cluster_manager = nullptr;  // set by ClusterHarness
+  cluster::ClusterManager* cluster_manager = nullptr;      // set by ClusterHarness
+  migrate::MigrationService* migration_service = nullptr;  // set by ClusterHarness
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

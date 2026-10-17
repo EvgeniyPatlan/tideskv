@@ -380,6 +380,45 @@ TEST_F(ServiceTest, AHalfImportEraseNeverDeletesALaterImportsData) {
   EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1)) << "the imported data survives";
 }
 
+// Controller ruling (Task 9): a range imported after the restore stays superseding once a later, disjoint
+// import replaces the importing block.
+TEST_F(ServiceTest, AHalfImportEraseNeverDeletesARangeImportedSinceTheRestore) {
+  HalfImport();
+  auto svc = Make();
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {  // IMPORT start of 12182 (it erased its range itself)
+                   s.import = cluster::ImportJob{{12182, 12182}, cluster::ImportState::kStart};
+                 })
+                  .ok());
+  ASSERT_TRUE(h.services.engine_
+                  .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
+                                 encoding::MetaKeyFor(0, "foo"), encoding::EncodeMetadata({}, "imported")}})
+                  .ok());
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {  // IMPORT success, then a disjoint IMPORT start
+                   s.import->state = cluster::ImportState::kSuccess;
+                   s.imported.push_back({12182, 12182});
+                   s.import = cluster::ImportJob{{12539, 12539}, cluster::ImportState::kStart};
+                 })
+                  .ok());
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1)) << "the imported data survives";
+}
+
+// The other side: a range the record already listed as imported does not stop the erase of the half import.
+TEST_F(ServiceTest, AnImportedRangeFromTheRecordDoesNotSupersedeTheHalfImportErase) {
+  HalfImport();
+  cluster::MigrationRecord r = *Record();
+  r.imported = {{12182, 12182}};
+  Persist(r);
+  auto svc = Make();
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  ASSERT_TRUE(svc->AwaitIdle(5s));  // the erase the restore task posted
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(0));
+}
+
 // Fix round 1 (c), on the worker alone.
 TEST_F(ServiceTest, ARestoreFailureOnTheWorkerIsLoggedAndClearsThePromotion) {
   ASSERT_TRUE(h.services.repl_log_

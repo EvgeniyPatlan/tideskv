@@ -8,6 +8,7 @@
 #include "cluster/cluster_manager.h"
 #include "cluster/cluster_views.h"
 #include "commands/all_commands.h"
+#include "commands/cluster_import.h"
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/crc16.h"
@@ -149,6 +150,14 @@ void Reset(ExecContext& ctx, ClusterManager& cm, const Topology&, const ArgList&
   ctx.reply.SimpleString("OK");
 }
 
+void Import(ExecContext& ctx, ClusterManager&, const Topology& t, const ArgList& argv) {
+  ClusterImport(ctx, t, argv);
+}
+
+void ImportData(ExecContext& ctx, ClusterManager&, const Topology&, const ArgList& argv) {
+  ClusterImportData(ctx, argv);
+}
+
 void Help(ExecContext& ctx, ClusterManager&, const Topology&, const ArgList&) {
   static constexpr std::string_view kLines[] = {
       "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -185,6 +194,8 @@ const std::map<std::string, Sub, std::less<>>& Subcommands() {
       {"countkeysinslot", {3, 3, false, &CountKeys}},
       {"getkeysinslot", {4, 4, false, &GetKeys}},
       {"help", {2, 2, false, &Help}},
+      {"import", {4, 4, false, &Import}},  // needs no topology: Kvrocks's "Slave can't import slot" then
+      {"importdata", {3, 3, false, &ImportData}},
       {"info", {2, 2, true, &Info}},
       {"keyslot", {3, 3, false, &KeySlotCmd}},
       {"myid", {2, 2, false, &MyId}},

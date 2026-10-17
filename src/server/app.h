@@ -55,6 +55,7 @@ class App final : public ServerServices {
   Replication& replication() override { return *replication_; }
   ClientPause& pause() override { return pause_; }
   cluster::ClusterManager* cluster() override { return cluster_.get(); }
+  migrate::MigrationService* migration() override { return migration_.get(); }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
