@@ -13,6 +13,7 @@
 
 #include "common/status.h"
 #include "exec/repl_log.h"
+#include "repl/replog_reader.h"
 #include "repl/socket_io.h"
 #include "resp/request_parser.h"
 #include "storage/storage.h"
@@ -79,7 +80,6 @@ class ReplSender {
   Status CheckLiveness();
   std::chrono::milliseconds Timeout() const;
 
-  Storage& storage_;
   ReplLog& log_;
   Fd fd_;
   Callbacks cb_;
@@ -89,7 +89,7 @@ class ReplSender {
 
   // Sender thread only (set before Start).
   std::optional<SyncSnapshot> snapshot_;  // released as soon as LOADEND is written
-  uint64_t next_;
+  ReplogReader reader_;  // where streaming continues: the replica holds reader_.next() - 1 once sent
   std::string in_;
   resp::RequestParser parser_;
   SteadyClock::time_point last_write_{};

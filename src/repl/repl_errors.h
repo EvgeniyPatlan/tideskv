@@ -24,4 +24,9 @@ inline constexpr std::string_view kReplyAlreadyConnected =
 // snapshot is streamed, so the replica keeps its data and retries elsewhere or later.
 inline constexpr std::string_view kErrPsyncShuttingDown = "ERR PSYNC refused: this node is shutting down";
 
+// TidesKV-only (M7b D19, R16): a replog read found its first wanted entry trimmed. Status text, read by
+// ReplSender (the link drops) and the slot migrator (the job fails). + "<n> is not retained"
+inline constexpr std::string_view kMsgReplogEntryPrefix = "replog entry ";
+inline constexpr std::string_view kMsgReplogEntryNotRetained = " is not retained";
+
 }  // namespace tideskv

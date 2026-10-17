@@ -51,14 +51,13 @@ std::string BatchFrame(uint64_t seq, std::string_view payload) {
 }
 
 ReplSender::ReplSender(Storage& storage, ReplLog& log, Fd fd, uint64_t next_seq, Callbacks cb)
-    : storage_(storage),
-      log_(log),
+    : log_(log),
       fd_(std::move(fd)),
       cb_(std::move(cb)),
       start_(std::max<uint64_t>(next_seq, 1)),
-      next_(start_),
+      reader_(storage, start_),
       parser_(kReplicaInputLimits),
-      sent_(next_ - 1) {}
+      sent_(start_ - 1) {}
 
 ReplSender::~ReplSender() { Stop(); }
 
@@ -105,10 +104,10 @@ Status ReplSender::Loop() {
   }
   if (Status st = ParseInput(); !st.ok()) return st;  // bytes that followed PSYNC
   while (!stop_.load(std::memory_order_acquire)) {
-    if (next_ <= log_.last()) {
+    if (reader_.next() <= log_.last()) {
       if (Status st = StreamRound(); !st.ok()) return st;
     } else {
-      log_.WaitBeyond(next_ - 1, kWaitSlice);
+      log_.WaitBeyond(reader_.next() - 1, kWaitSlice);
     }
     if (Status st = PollInput(); !st.ok()) return st;
     if (Status st = CheckLiveness(); !st.ok()) return st;
@@ -158,35 +157,22 @@ Status ReplSender::BetweenKeys() {
   return Status::Ok();
 }
 
-// One round: frames next_.. (at most kCoalesceBytes, never beyond the watermark) and writes them.
+// One round: frames reader_.next().. (at most kCoalesceBytes, never beyond the watermark) and writes them.
 Status ReplSender::StreamRound() {
   std::string out;
   if (Status st = ReadFrames(log_.last(), &out); !st.ok()) return st;
   if (Status st = WriteAll(fd_.get(), out, Timeout()); !st.ok()) return st;
-  sent_.store(next_ - 1, std::memory_order_release);
+  sent_.store(reader_.next() - 1, std::memory_order_release);
   last_write_ = SteadyClock::now();
   return Status::Ok();
 }
 
-// A fresh read view per round (an old iterator does not see newer commits), bounded above by the
-// watermark `last` and positioned with Seek, never SeekToFirst (tidesdb-replication constraint 8).
+// One round of frames from the shared reader (M7b D2): at most kCoalesceBytes of payload, never past `last`.
 Status ReplSender::ReadFrames(uint64_t last, std::string* out) {
-  auto view = storage_.BeginRead();
-  if (!view.ok()) return view.status();
-  auto it = (*view)->NewIterator(ColumnFamily::kReplog,
-                                 IterOptions{encoding::ReplogKey(next_), encoding::ReplogKey(last + 1)});
-  if (!it.ok()) return it.status();
-  Status st = (*it)->Seek(encoding::ReplogKey(next_));
-  while (st.ok() && (*it)->Valid() && next_ <= last && out->size() < kCoalesceBytes) {
-    uint64_t seq = 0;
-    if (!encoding::DecodeReplogKey((*it)->key(), &seq) || seq != next_) break;  // a gap: reported below
-    out->append(BatchFrame(seq, (*it)->value()));
-    ++next_;
-    st = (*it)->Next();
-  }
-  if (!st.ok() && !st.IsNotFound()) return st;
-  if (out->empty()) return Status::NotFound("replog entry " + std::to_string(next_) + " is not retained");
-  return Status::Ok();
+  return reader_.Read(last, kCoalesceBytes, [out](uint64_t seq, std::string_view payload) {
+    out->append(BatchFrame(seq, payload));
+    return Status::Ok();
+  });
 }
 
 Status ReplSender::PollInput() {
@@ -222,7 +208,8 @@ Status ReplSender::HandleFrame(const std::vector<std::string>& args) {
       !ParseUint64(args[2], &seq)) {
     return Status::IOError("unexpected frame from replica");
   }
-  if (seq >= next_) return Status::IOError("replica acknowledged seq " + args[2] + " it was never sent");
+  if (seq >= reader_.next())
+    return Status::IOError("replica acknowledged seq " + args[2] + " it was never sent");
   if (seq > acked_.load(std::memory_order_relaxed)) acked_.store(seq, std::memory_order_release);
   last_ack_ = SteadyClock::now();
   last_ack_ms_.store(UnixMs(), std::memory_order_release);

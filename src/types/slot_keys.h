@@ -18,4 +18,8 @@ Result<bool> KeyspaceEmpty(ReadView& view);      // no meta record in any db
 Result<uint64_t> CountKeysInSlot(ReadView& view, uint16_t slot);
 Result<std::vector<std::string>> KeysInSlot(ReadView& view, uint16_t slot, uint64_t count);  // key-byte order
 
+// [0][first] .. [0][last+1): the db-0 keys of meta, subkey and zscore in slots first..last (M7b D2). The
+// upper bound of 16383 is [0][0x40][0x00], after every slot.
+IterOptions SlotRangeBounds(uint16_t first, uint16_t last);
+
 }  // namespace tideskv

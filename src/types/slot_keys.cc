@@ -63,4 +63,8 @@ Result<std::vector<std::string>> KeysInSlot(ReadView& view, uint16_t slot, uint6
   return keys;
 }
 
+IterOptions SlotRangeBounds(uint16_t first, uint16_t last) {
+  return {encoding::MetaSlotPrefix(0, first), encoding::MetaSlotPrefix(0, static_cast<uint16_t>(last + 1))};
+}
+
 }  // namespace tideskv

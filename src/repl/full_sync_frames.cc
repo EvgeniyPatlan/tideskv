@@ -44,11 +44,16 @@ Status SnapshotChunker::NextOp(std::optional<encoding::ReplOp>* out) {
     out->swap(pending_);
     return Status::Ok();
   }
-  while (cf_index_ < std::size(kLoadableCfs)) {
-    const ColumnFamily cf = kLoadableCfs[cf_index_];
+  if (Status st = NextKeyspaceOp(out); !st.ok() || out->has_value()) return st;
+  return NextSysOp(out);
+}
+
+Status SnapshotChunker::NextKeyspaceOp(std::optional<encoding::ReplOp>* out) {
+  while (cf_index_ < options_.cfs.size()) {
+    const ColumnFamily cf = options_.cfs[cf_index_];
     Status st;
     if (!it_) {
-      auto it = view_.NewIterator(cf);
+      auto it = view_.NewIterator(cf, options_.bounds);
       if (!it.ok()) return it.status();
       it_ = std::move(it).value();
       st = it_->SeekToFirst();
@@ -64,15 +69,20 @@ Status SnapshotChunker::NextOp(std::optional<encoding::ReplOp>* out) {
     it_.reset();
     ++cf_index_;
   }
-  if (sys_done_) return Status::Ok();
-  sys_done_ = true;
-  auto hwm = view_.Get(ColumnFamily::kSys, OidAllocator::kHwmKey);
-  if (hwm.ok()) {
-    *out = encoding::ReplOp{encoding::ReplOpType::kPut, ColumnFamily::kSys,
-                            std::string(OidAllocator::kHwmKey), *hwm};
-    return Status::Ok();
+  return Status::Ok();
+}
+
+Status SnapshotChunker::NextSysOp(std::optional<encoding::ReplOp>* out) {
+  while (sys_index_ < options_.sys_keys.size()) {
+    const std::string& key = options_.sys_keys[sys_index_++];
+    auto value = view_.Get(ColumnFamily::kSys, key);
+    if (value.ok()) {
+      *out = encoding::ReplOp{encoding::ReplOpType::kPut, ColumnFamily::kSys, key, *value};
+      return Status::Ok();
+    }
+    if (!value.status().IsNotFound()) return value.status();
   }
-  return hwm.status().IsNotFound() ? Status::Ok() : hwm.status();
+  return Status::Ok();
 }
 
 Result<std::optional<std::string>> SnapshotChunker::Next(const std::function<Status()>& between_keys) {
@@ -83,7 +93,7 @@ Result<std::optional<std::string>> SnapshotChunker::Next(const std::function<Sta
     if (Status st = NextOp(&op); !st.ok()) return st;
     if (!op) break;
     const size_t size = op->key.size() + op->value.size() + kOpOverhead;
-    if (!ops.empty() && (bytes + size > kLoadChunkBytes || ops.size() >= kLoadChunkOps)) {
+    if (!ops.empty() && (bytes + size > options_.max_bytes || ops.size() >= options_.max_ops)) {
       pending_ = std::move(op);
       break;
     }

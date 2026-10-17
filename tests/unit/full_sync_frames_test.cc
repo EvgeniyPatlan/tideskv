@@ -2,9 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include "common/coding.h"
 #include "encoding/replog_codec.h"
 #include "storage/memory_storage.h"
+#include "support/command_harness.h"
 #include "types/oid_allocator.h"
+#include "types/slot_keys.h"
 
 namespace tideskv::repl {
 namespace {
@@ -114,6 +117,70 @@ TEST(FullSyncFrames, BetweenKeysRunsPerKeyAndItsErrorEndsTheWalk) {
   auto chunk = c.Next([&] { return ++calls == 3 ? Status::IOError("stopped") : Status::Ok(); });
   EXPECT_EQ(chunk.status().code(), StatusCode::kIOError);
   EXPECT_EQ(calls, 3);
+}
+
+// M7b D2: the migrator's walk — meta, subkey, zscore of one slot range, no expire CF, no sys record.
+TEST(SnapshotChunker, AWalkBoundedToASlotRangeSkipsOtherSlotsTheExpireCfAndSys) {
+  test::CommandHarness h;
+  ASSERT_EQ(h.Run({"SET", "b", "1", "PX", "100000"}), test::kOk);  // slot 3300, with a TTL
+  ASSERT_EQ(h.Run({"HSET", "{b}h", "f", "v"}), test::Int(1));
+  ASSERT_EQ(h.Run({"ZADD", "{b}z", "1", "m"}), test::Int(1));
+  ASSERT_EQ(h.Run({"SET", "foo", "1"}), test::kOk);  // slot 12182
+  ASSERT_EQ(h.Run({"HSET", "{foo}h", "f", "v"}), test::Int(1));
+  auto snap = h.services.repl_log_.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  ChunkerOptions o;
+  o.cfs = {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore};
+  o.bounds = SlotRangeBounds(3300, 3300);
+  o.sys_keys = {};
+  SnapshotChunker chunker(*snap->view, 0, o);
+  std::vector<encoding::ReplOp> ops;
+  for (;;) {
+    auto next = chunker.Next(nullptr);
+    ASSERT_TRUE(next.ok());
+    if (!next->has_value()) break;
+    auto batch = encoding::DecodeReplogBatch(**next);
+    ASSERT_TRUE(batch.ok());
+    ops.insert(ops.end(), batch->ops.begin(), batch->ops.end());
+  }
+  ASSERT_EQ(ops.size(), 6u);  // 3 metas, the hash field and the zset member (subkey), its score (zscore)
+  for (size_t i = 0; i < ops.size(); ++i) {
+    EXPECT_EQ(ops[i].type, encoding::ReplOpType::kPut);
+    EXPECT_EQ(coding::DecodeFixed16BE(ops[i].key.data() + 1), 3300) << i;
+  }
+  EXPECT_EQ(ops[0].cf, ColumnFamily::kMeta);
+  EXPECT_EQ(ops[2].cf, ColumnFamily::kMeta);
+  EXPECT_EQ(ops[3].cf, ColumnFamily::kSubkey);
+  EXPECT_EQ(ops[5].cf, ColumnFamily::kZScore);
+}
+
+TEST(SnapshotChunker, SetMaxBytesSplitsTheNextChunks) {
+  test::CommandHarness h;
+  for (int i = 0; i < 20; ++i)
+    ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), std::string(100, 'v')}), test::kOk);
+  auto snap = h.services.repl_log_.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  ChunkerOptions o;
+  o.cfs = {ColumnFamily::kMeta};
+  o.bounds = SlotRangeBounds(3300, 3300);
+  o.sys_keys = {};
+  SnapshotChunker chunker(*snap->view, 0, o);
+  chunker.SetMaxBytes(300);  // about two 130-byte records per chunk
+  size_t chunks = 0;
+  for (;;) {
+    auto next = chunker.Next(nullptr);
+    ASSERT_TRUE(next.ok());
+    if (!next->has_value()) break;
+    ++chunks;
+  }
+  EXPECT_EQ(chunks, 10u);
+  EXPECT_EQ(chunker.ops(), 20u);
+}
+
+TEST(SlotKeys, SlotRangeBoundsCoverTheLastSlot) {
+  const IterOptions b = SlotRangeBounds(16380, 16383);
+  EXPECT_EQ(b.lower, encoding::MetaSlotPrefix(0, 16380));
+  EXPECT_EQ(b.upper, std::string("\x00\x40\x00", 3));
 }
 
 }  // namespace
