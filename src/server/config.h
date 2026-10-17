@@ -54,6 +54,12 @@ struct ConfigValues {
 
   // Cluster (M7a).
   bool cluster_enabled = false;  // cluster-enabled (D19): startup-only, db 0 only, roles from the controller
+
+  // Slot migration (M7b D17, Kvrocks names and defaults); runtime, read before every chunk.
+  int64_t migrate_sequence_gap = 10000;  // migrate-sequence-gap: replog lag that starts the fence
+  int migrate_batch_size_kb = 16;        // migrate-batch-size-kb: IMPORTDATA chunk size
+  int migrate_batch_rate_limit_mb = 16;  // migrate-batch-rate-limit-mb: MiB/s of chunk bytes
+  int migrate_delay_ms = 0;  // hidden test knob (D25): holds a job in its snapshot phase and fence
 };
 
 class Config {

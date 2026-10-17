@@ -19,13 +19,16 @@
 #include "common/status.h"
 #include "exec/engine.h"
 #include "exec/repl_log.h"
+#include "migrate/migrate_settings.h"
+#include "migrate/migration_transport.h"
 #include "migrate/slot_importer.h"
+#include "migrate/slot_migrator.h"
 #include "storage/storage.h"
 #include "types/oid_allocator.h"
 
 // Slot migration on one node (M7b): the states it publishes next to the topology, the replicated
 // sys/migration record, the migrate worker thread (cleanups, link-loss erases, SETNODES transitions) and the
-// target's importer (Task 9). Task 10 adds the source's migrator. Owned by App when cluster-enabled;
+// target's importer (Task 9) and the source's migrator (Task 10). Owned by App when cluster-enabled;
 // commands reach it only through ServerServices::migration() (D26). Lock order: {migrate_mu_ |
 // SlotImporter::mu_} -> record_mu_ -> Engine gate (taken and released) -> (states publish, never under the
 // gate); worker_mu_ is a leaf.
@@ -43,6 +46,8 @@ struct MigrationDeps {
   // After each sys/migration write, as for sys/cluster_cfg (M7a D20; App: storage Checkpoint), so a kill -9
   // right after a success or an import keeps the outcome (D8, Writer's note 8). Empty = none.
   std::function<Status()> make_durable = {};
+  TransportFactory connect = {};                   // required from Task 10: the session with a target (D3)
+  std::function<MigrateSettings()> settings = {};  // required from Task 10: re-read before every chunk
 };
 
 class MigrationService {
@@ -93,7 +98,9 @@ class MigrationService {
   // eraser before a txn.
   Status EraseWaitingOutBusy(cluster::SlotRange range, bool background,
                              const std::function<bool()>& stop = {});
-  SlotImporter& importer() { return *importer_; }  // the target side (M7b D14)
+  SlotImporter& importer() { return *importer_; }                       // the target side (M7b D14)
+  SlotMigrator& migrator() { return *migrator_; }                       // the source side (M7b D2-D5)
+  uint64_t OldestNeeded() const { return migrator_->oldest_needed(); }  // D19: App pins the backlog with it
 
   void Post(std::function<void()> task);              // the migrate worker, FIFO; dropped after Shutdown
   bool AwaitIdle(std::chrono::milliseconds timeout);  // true once every task posted before the call ran
@@ -155,6 +162,7 @@ class MigrationService {
   std::deque<std::function<void()>> tasks_;  // guarded by worker_mu_
   uint64_t posted_ = 0;                      // guarded by worker_mu_
   uint64_t done_ = 0;                        // guarded by worker_mu_
+  std::unique_ptr<SlotMigrator> migrator_;   // stopped first by Shutdown
   std::unique_ptr<SlotImporter> importer_;   // its worker tasks end before Shutdown returns
   std::thread worker_;                       // last: starts once every other member exists
 };

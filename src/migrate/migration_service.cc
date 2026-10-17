@@ -13,6 +13,7 @@ namespace tideskv::migrate {
 
 MigrationService::MigrationService(MigrationDeps deps)
     : deps_(std::move(deps)),
+      migrator_(std::make_unique<SlotMigrator>(*this, deps_.connect, deps_.settings)),
       importer_(std::make_unique<SlotImporter>(*this)),
       worker_([this] { WorkerLoop(); }) {}
 
@@ -233,6 +234,7 @@ void MigrationService::WorkerLoop() {
 }
 
 void MigrationService::Shutdown() {
+  migrator_->Stop();  // D10: shutdown cancels the job; the target sees the link close
   {
     std::lock_guard lock(worker_mu_);
     stop_.store(true, std::memory_order_release);

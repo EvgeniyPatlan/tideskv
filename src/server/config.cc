@@ -11,6 +11,8 @@
 #include <limits>
 #include <mutex>
 
+#include <spdlog/spdlog.h>
+
 #include "common/glob.h"
 #include "common/string_util.h"
 #include "server/config_options.h"
@@ -172,7 +174,18 @@ const Option* FindOption(std::string_view name) {
   return nullptr;
 }
 
+// Kvrocks v2.17.0 config.cc:140-146, 939-941 (M7b D17): deprecated, accepted at startup with a warning and
+// ignored; at runtime they are unknown options, as in Kvrocks.
+bool IsDeprecatedOption(std::string_view name) {
+  return EqualsIgnoreCase(name, "migrate-type") || EqualsIgnoreCase(name, "migrate-speed") ||
+         EqualsIgnoreCase(name, "migrate-pipeline-size");
+}
+
 Status ApplyOne(ConfigValues& v, std::string_view name, std::string_view value, bool at_runtime) {
+  if (!at_runtime && IsDeprecatedOption(name)) {
+    spdlog::warn("'{}' is deprecated and does not take effect.", name);
+    return Status::Ok();
+  }
   const Option* opt = FindOption(name);
   if (opt == nullptr) return Status::InvalidArgument("unknown option '" + std::string(name) + "'");
   if (at_runtime && !opt->mutable_at_runtime) return Status::InvalidArgument("can't set immutable config");

@@ -89,6 +89,21 @@ inline constexpr std::string_view kErrImportNotRunning = "ERR the import of slot
 inline constexpr std::string_view kErrImportCleanupPending =
     "ERR the cleanup of an overlapping slot range is still running";
 
+// MIGRATE stage errors (Kvrocks v2.17.0 slot_migrate.cc:35-36, 245, 255, 662, 676; KM §2.3), the SYNC reply
+// of a failed job. kErrStageExistingData is TidesKV's (Kvrocks returns the raw send error for the snapshot
+// phase).
+inline constexpr std::string_view kErrStageConnect = "ERR failed to connect to the destination node: ";
+inline constexpr std::string_view kErrStageAuth = "ERR failed to authenticate on destination node: ";
+inline constexpr std::string_view kErrStageImportStatus =
+    "ERR failed to set import status on destination node: ";
+inline constexpr std::string_view kErrStageExistingData = "ERR failed to migrate existing data, ";
+inline constexpr std::string_view kErrStageIncremental = "ERR migrate incremental data failed, ";
+inline constexpr std::string_view kErrStageLastIncremental = "ERR migrate last incremental data failed, ";
+inline constexpr std::string_view kErrMigrationCanceled =
+    "ERR key migration stopped due to a task cancellation";
+inline constexpr std::string_view kErrAlreadyMigrating =
+    "ERR There is already a migrating job";  // slot_migrate.cc:72
+
 // TidesKV-only (M7a D7, spec section 5.4): the <reason> after kErrClusterReplication when the promotion
 // failed for an internal (non-user) cause; Kvrocks appends its own status text, TidesKV exposes no internals.
 inline constexpr std::string_view kReplicationReasonStorage = "storage error";

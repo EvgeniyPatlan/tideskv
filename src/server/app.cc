@@ -225,7 +225,10 @@ Status App::CreateReplication() {
       std::make_unique<repl::ReplicationManager>(*storage_, *repl_log_, std::move(identity), std::move(o));
   repl::BacklogTrimmer::Hooks th;
   th.config = [this] { return config_->Snapshot(); };
-  th.oldest_needed = [this] { return replication_->OldestNeeded(); };
+  th.oldest_needed = [this] {  // M7b D19: a running migration pins the age trim too
+    const uint64_t replicas = replication_->OldestNeeded();
+    return migration_ ? std::min(replicas, migration_->OldestNeeded()) : replicas;
+  };
   th.drop_replicas_needing = [this](uint64_t up_to) { replication_->DropReplicasNeeding(up_to); };
   trimmer_ = std::make_unique<repl::BacklogTrimmer>(*storage_, *repl_log_, storage_.get(), clock_,
                                                     std::move(th), repl::BacklogTrimmer::Options{});

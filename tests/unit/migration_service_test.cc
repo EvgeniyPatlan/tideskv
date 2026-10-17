@@ -26,7 +26,7 @@ using cluster::MigrateState;
 struct ServiceTest : ::testing::Test {
   ServiceTest() { c.Push(kThreeNodes, 1); }  // node A owns 0-8191 ("b" 3300, "bar" 5061)
   std::unique_ptr<migrate::MigrationService> Make() {
-    return std::make_unique<migrate::MigrationService>(MigrationDepsOf(h, *c.manager));
+    return std::make_unique<migrate::MigrationService>(MigrationDepsOf(h, *c.manager, {}));
   }
   std::optional<cluster::MigrationRecord> Record() {
     auto r = cluster::LoadMigrationRecord(h.services.storage_);

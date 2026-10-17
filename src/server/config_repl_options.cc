@@ -134,6 +134,23 @@ const std::vector<Option> BuildReplOptions() {
       {"cluster-enabled", false,
        [](ConfigValues& c, std::string_view v) { return ParseYesNo(v, &c.cluster_enabled); },
        [](const ConfigValues& c) { return std::string(c.cluster_enabled ? "yes" : "no"); }},
+      // M7b D17 (Kvrocks config.cc:241-243), D25 (hidden).
+      {"migrate-sequence-gap", true,
+       [](ConfigValues& c, std::string_view v) { return SetBounded(v, 1, kIntMax, &c.migrate_sequence_gap); },
+       [](const ConfigValues& c) { return std::to_string(c.migrate_sequence_gap); }},
+      {"migrate-batch-size-kb", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetBounded(v, 1, kIntMax, &c.migrate_batch_size_kb);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.migrate_batch_size_kb); }},
+      {"migrate-batch-rate-limit-mb", true,
+       [](ConfigValues& c, std::string_view v) {
+         return SetBounded(v, 1, kIntMax, &c.migrate_batch_rate_limit_mb);
+       },
+       [](const ConfigValues& c) { return std::to_string(c.migrate_batch_rate_limit_mb); }},
+      {"migrate-delay-ms", true,
+       [](ConfigValues& c, std::string_view v) { return SetBounded(v, 0, kIntMax, &c.migrate_delay_ms); },
+       [](const ConfigValues& c) { return std::to_string(c.migrate_delay_ms); }, false, false, true},
   };
   static constexpr std::pair<std::string_view, std::string_view> kAliases[] = {
       {"slaveof", "replicaof"},

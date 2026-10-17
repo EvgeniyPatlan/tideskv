@@ -123,7 +123,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 39u);
+  EXPECT_EQ(c.Get("*").size(), 42u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -519,6 +519,26 @@ TEST(ConfigCluster, ClusterEnabledIsAStartupOnlyBoolean) {  // M7a D19
   EXPECT_EQ(c.Set("cluster-enabled", "no", /*at_runtime=*/true).message(), "can't set immutable config");
   EXPECT_EQ(c.Set("cluster-enabled", "maybe", /*at_runtime=*/false).message(),
             "argument must be 'yes' or 'no'");
+}
+
+TEST(ConfigMigrate, TheMigrateKnobsAreRuntimeAndTheDeprecatedOnesStartupOnly) {  // M7b D17, KM §9
+  Config c;
+  EXPECT_EQ(GetOne(c, "migrate-sequence-gap"), "10000");
+  EXPECT_EQ(GetOne(c, "migrate-batch-size-kb"), "16");
+  EXPECT_EQ(GetOne(c, "migrate-batch-rate-limit-mb"), "16");
+  ASSERT_TRUE(c.Set("migrate-batch-size-kb", "1", true).ok());
+  ASSERT_TRUE(c.Set("migrate-batch-rate-limit-mb", "1", true).ok());
+  EXPECT_EQ(c.Snapshot().migrate_batch_size_kb, 1);
+  EXPECT_EQ(c.Set("migrate-sequence-gap", "0", true).message(),
+            "argument must be between 1 and 2147483647 inclusive");
+  ASSERT_TRUE(c.Set("migrate-delay-ms", "250", true).ok());  // hidden (D25)
+  EXPECT_EQ(c.Get("migrate-delay-ms"), (Config::Pairs{{"migrate-delay-ms", "250"}}));
+  for (const auto& [name, value] : c.Get("*")) EXPECT_NE(name, "migrate-delay-ms");
+  ASSERT_TRUE(c.ApplyArgs({"--migrate-type", "redis-command"}).ok());  // accepted with a warning, no effect
+  test::TempDir dir;
+  ASSERT_TRUE(c.LoadFile(WriteFile(dir, "migrate-speed 4096\nmigrate-pipeline-size 16\n")).ok());
+  EXPECT_EQ(c.Set("migrate-type", "redis-command", true).message(), "unknown option 'migrate-type'");
+  EXPECT_TRUE(c.Get("migrate-type").empty());
 }
 
 }  // namespace

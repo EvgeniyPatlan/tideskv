@@ -35,5 +35,9 @@ inline constexpr std::string_view kMsgNoReplyWithinTimeout = "no reply within th
 inline constexpr std::string_view kMsgReplyLineTooLong = "protocol error: reply line too long";
 inline constexpr std::string_view kMsgUnreadableReplyPrefix =
     "protocol error: unreadable reply to ";  // + command
+// TidesKV-only (M7b D3): the slot migrator's transport got a reply that is neither +... nor -...; reaches a
+// CLUSTER MIGRATE status after a stage prefix.
+inline constexpr std::string_view kMsgUnexpectedReplyPrefix =
+    "protocol error: unexpected reply to ";  // + command
 
 }  // namespace tideskv
