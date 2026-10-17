@@ -248,11 +248,16 @@ void SlotMigrator::Delay() {
 Status SlotMigrator::Publish(const MigrateJob& job, const Status& outcome) {
   Status result = outcome;
   if (result.ok()) {
-    // S5 seam: Task 13 wraps this Mutate in AdmitBackgroundWrite/EndBackgroundWrite (CLIENT PAUSE).
+    // D9 (ruling S5): the record write waits while CLIENT PAUSE holds writes; the target acked already, so
+    // this only delays the MOVED. A Stop meanwhile leaves the record as a kill -9 here would (D8).
+    if (!service_.AdmitBackgroundWrite([this] { return stopped_.load(std::memory_order_acquire); })) {
+      return Err(cluster::kErrMigrationCanceled);
+    }
     result = service_.Mutate([&job](cluster::SlotStates& s) {
       if (s.job && s.job->range == job.range) s.job->state = cluster::MigrateState::kSuccess;
       s.migrated.push_back({job.range, job.dst_id, job.dst_host, job.dst_port});
     });
+    service_.EndBackgroundWrite();
     if (result.ok()) {
       spdlog::info("slot(s) {} migrated to {}", cluster::FormatRange(job.range), job.dst_id);
       return result;

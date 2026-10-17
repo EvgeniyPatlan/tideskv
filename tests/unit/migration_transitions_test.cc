@@ -4,8 +4,10 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "cluster/cluster_errors.h"
 #include "support/controller_info.h"
@@ -122,6 +124,57 @@ TEST(MigrationTransitions, AnImportThatLandsBeforeTheTransitionKeepsItsData) {
   ASSERT_TRUE(m.AwaitIdle(5s));
   EXPECT_EQ(p.source.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(1));
   EXPECT_EQ(p.source.Run({"GET", "b"}), Bulk("back")) << "imported: served before a push grants it";
+}
+
+TEST(MigrationTransitions, TheCleanupWaitsWhileClientsArePaused) {  // D9, M7a D21: sequence holds still
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
+  ASSERT_EQ(p.source.Run({"CLIENT", "PAUSE", "60000", "WRITE"}), kOk);
+  const uint64_t seq = p.source.services.repl_log_.last();
+  p.source_cluster.Push(kMoved, 2);  // sys/cluster_cfg is node-local: not a replicated write
+  EXPECT_FALSE(p.source_migration().AwaitIdle(300ms));
+  EXPECT_EQ(p.source.services.repl_log_.last(), seq) << "no replicated write while paused";
+  EXPECT_EQ(p.source.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(1));
+  ASSERT_EQ(p.source.Run({"CLIENT", "UNPAUSE"}), kOk);
+  ASSERT_TRUE(p.source_migration().AwaitIdle(5s));
+  EXPECT_EQ(p.source.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(0));
+}
+
+TEST(MigrationTransitions, TheSuccessRecordWaitsWhileClientsArePaused) {  // D9, ruling S5
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  std::atomic<uint64_t> seq{0};
+  migrate::SlotMigrator::Hooks hooks;
+  hooks.after_fence = [&p, &seq] {  // the fence is up: only the final delta and IMPORT <R> 1 remain
+    p.source.services.pause_.Pause(ClientPause::Clock::now() + 60s, ClientPause::Mode::kWrite);
+    seq.store(p.source.services.repl_log_.last());
+  };
+  p.source_migration().migrator().SetHooks(std::move(hooks));
+  auto done = std::make_shared<std::promise<Status>>();
+  ASSERT_TRUE(
+      StartJob(p.source_migration(), {3300, 3300}, [done](const Status& s) { done->set_value(s); }).ok());
+  const auto import_state = [&p] {
+    const std::optional<cluster::ImportJob> import = p.target_cluster.manager->States()->import;
+    return import.has_value() ? std::optional(import->state) : std::nullopt;
+  };
+  const auto job_state = [&p] {
+    const std::optional<cluster::SourceJob> job = p.source_cluster.manager->States()->job;
+    return job.has_value() ? std::optional(job->state) : std::nullopt;
+  };
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (import_state() != cluster::ImportState::kSuccess && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_EQ(import_state(), cluster::ImportState::kSuccess);  // the target acked
+  auto outcome = done->get_future();
+  EXPECT_EQ(outcome.wait_for(300ms), std::future_status::timeout) << "the success write waits";
+  EXPECT_EQ(p.source.services.repl_log_.last(), seq.load()) << "no replicated write while paused";
+  EXPECT_EQ(job_state(), cluster::MigrateState::kStart);
+  p.source.services.pause_.Unpause();
+  ASSERT_EQ(outcome.wait_for(5s), std::future_status::ready);
+  EXPECT_TRUE(outcome.get().ok());
+  EXPECT_EQ(job_state(), cluster::MigrateState::kSuccess);
 }
 
 }  // namespace

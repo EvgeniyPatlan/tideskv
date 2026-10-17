@@ -43,22 +43,22 @@ inline migrate::MigrateSettings HarnessMigrateSettings(CommandHarness& h) {
 }
 
 // The MigrationService dependencies of a harness node: its engine, log, storage and oids, `cm`, its
-// FakeReplication's role, `connect` and its config's migrate settings (M7b). No CLIENT PAUSE hooks until
-// Task 13 wires them.
+// FakeReplication's role, `connect`, its config's migrate settings and its CLIENT PAUSE (M7b D9).
 inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::ClusterManager& cm,
                                               migrate::TransportFactory connect) {
   FakeReplication& r = h.services.replication_;
-  return migrate::MigrationDeps{.engine = h.services.engine_,
-                                .log = h.services.repl_log_,
-                                .storage = h.services.storage_,
-                                .oids = h.services.oids_,
-                                .cluster = cm,
-                                .is_replica = [&r] { return r.IsReplica(); },
-                                .begin_background_write = {},
-                                .end_background_write = {},
-                                .make_durable = {},
-                                .connect = std::move(connect),
-                                .settings = [&h] { return HarnessMigrateSettings(h); }};
+  return migrate::MigrationDeps{
+      .engine = h.services.engine_,
+      .log = h.services.repl_log_,
+      .storage = h.services.storage_,
+      .oids = h.services.oids_,
+      .cluster = cm,
+      .is_replica = [&r] { return r.IsReplica(); },
+      .begin_background_write = [&h] { return h.services.pause_.BeginBackgroundWrite(); },
+      .end_background_write = [&h] { h.services.pause_.EndWrite(); },
+      .make_durable = {},
+      .connect = std::move(connect),
+      .settings = [&h] { return HarnessMigrateSettings(h); }};
 }
 
 // A ClusterManager over the harness's storage whose role hooks drive its FakeReplication, and the node's

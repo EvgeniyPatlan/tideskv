@@ -174,11 +174,15 @@ Status SlotImporter::FailLocked(cluster::SlotRange range, bool erase, bool backg
                                  : service_.EraseRange(range, /*background=*/false);
     if (!st.ok()) return st;
   }
-  // Task 13 seam (CLIENT PAUSE, D9): on the background path this Mutate is wrapped in
-  // AdmitBackgroundWrite/EndBackgroundWrite; a command's path is already admitted.
-  return service_.Mutate([range](cluster::SlotStates& s) {
+  // D9 (ruling S5): on the worker the record write waits while CLIENT PAUSE holds writes; a command's path is
+  // admitted already, and a replica writes no record (D21), so neither waits.
+  const bool admit = background && !service_.deps().is_replica();
+  if (admit && !service_.AdmitBackgroundWrite()) return Status::Internal("shutting down");
+  const Status st = service_.Mutate([range](cluster::SlotStates& s) {
     if (s.import && s.import->range == range) s.import->state = cluster::ImportState::kError;
   });
+  if (admit) service_.EndBackgroundWrite();
+  return st;
 }
 
 void SlotImporter::FailOnWorker(uint64_t link, bool any_link, const char* why) {

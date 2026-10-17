@@ -33,8 +33,8 @@ Status App::CreateMigration() {
                               .oids = *oids_,
                               .cluster = *cluster_,
                               .is_replica = [this] { return replication_->IsReplica(); },
-                              .begin_background_write = {},
-                              .end_background_write = {},
+                              .begin_background_write = [this] { return pause_.BeginBackgroundWrite(); },
+                              .end_background_write = [this] { pause_.EndWrite(); },
                               .make_durable = [this] { return storage_->Checkpoint(); },
                               .connect = migrate::ConnectResp,
                               .settings = [this] { return SettingsOf(config_->Snapshot()); }};

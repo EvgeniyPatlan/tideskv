@@ -342,5 +342,34 @@ TEST_F(ReaperTest, AFencedReplicaReapsNothingAndStaysQuiet) {
   EXPECT_EQ(*reaper.RunOnce(), 1u);
 }
 
+TEST(Reaper, LeavesTheSlotsItIsToldToSkip) {  // M7b D20
+  CommandHarness h;
+  ASSERT_EQ(h.Run({"SET", "b", "v", "PX", "10"}), kOk);    // slot 3300
+  ASSERT_EQ(h.Run({"SET", "foo", "v", "PX", "10"}), kOk);  // slot 12182
+  h.clock().Advance(100);
+  ExpireReaper::Options o = Fast();
+  o.skip_slot = [](uint16_t slot) { return slot == 3300; };
+  ExpireReaper reaper(h.services.engine_, o);
+  auto n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok()) << n.status().ToString();
+  EXPECT_EQ(*n, 1u);
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).count(encoding::MetaKeyFor(0, "b")), 1u);
+  EXPECT_EQ(h.Cf(ColumnFamily::kMeta).count(encoding::MetaKeyFor(0, "foo")), 0u);
+}
+
+TEST(Reaper, AFenceThatWinsTheRaceIsRetriedNextCycle) {  // M7b D20: the Engine check is the backstop
+  CommandHarness h;
+  ASSERT_EQ(h.Run({"SET", "b", "v", "PX", "10"}), kOk);
+  h.clock().Advance(100);
+  h.services.engine_.FenceSlots(3300, 3300);  // as if raised after the collection
+  ExpireReaper reaper(h.services.engine_, Fast());
+  auto n = reaper.RunOnce();
+  EXPECT_EQ(n.status().message(), kErrTryAgain);
+  h.services.engine_.UnfenceSlots(3300, 3300);
+  n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok());
+  EXPECT_EQ(*n, 1u);
+}
+
 }  // namespace
 }  // namespace tideskv

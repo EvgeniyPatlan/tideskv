@@ -27,6 +27,7 @@ Status ExpireReaper::CollectDue(uint8_t db, int64_t now_ms, std::vector<Due>* ou
         ++*skipped;  // undecodable: leave it, keep reaping the rest (RunOnce logs the count)
         continue;
       }
+      if (options_.skip_slot && options_.skip_slot(ek.slot)) continue;  // M7b D20
       out->push_back(
           {std::string(ek.user_key), ek.expire_ms, coding::DecodeFixed64BE((*it)->value().data())});
     }
@@ -131,6 +132,8 @@ Result<size_t> ExpireReaper::RunOnce() {
 
 bool ExpireReaper::Quiet(const Status& st) const {
   if (engine_.IsBusyAnswer(st)) return true;
+  // M7b D20: a fence raised between collecting and deleting; the chunk is retried next cycle.
+  if (st.code() == StatusCode::kUserError && st.message() == kErrTryAgain) return true;
   return Fenced() && st.code() == StatusCode::kUserError && st.message() == kErrReadOnlyReplica;
 }
 

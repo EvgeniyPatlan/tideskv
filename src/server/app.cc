@@ -101,6 +101,9 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   ExpireReaper::Options reaper_options;
   reaper_options.begin_write = [this] { return pause_.BeginBackgroundWrite(); };  // D21: CLIENT PAUSE waits
   reaper_options.end_write = [this] { pause_.EndWrite(); };
+  reaper_options.skip_slot = [this](uint16_t slot) {  // M7b D20; migration_ exists before the reaper starts
+    return migration_ != nullptr && migration_->ReaperSkips(slot);
+  };
   reaper_ = std::make_unique<ExpireReaper>(*engine_, std::move(reaper_options));
   RegisterAllCommands(registry_);
   server_ = std::make_unique<net::Server>(

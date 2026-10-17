@@ -382,5 +382,41 @@ TEST(SlotImporterTest, ImportDataIsRefusedOnceTheTargetIsDemoted) {
   EXPECT_EQ(p.target.Cf(ColumnFamily::kMeta).count(encoding::MetaKeyFor(0, "b")), 0u);
 }
 
+TEST(SlotImporterTest, TheReaperLeavesAnImportingSlotAlone) {  // D20: clock skew must not corrupt an import
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1", "PX", "10"}), kOk);
+  SecondClient link(p.target);
+  ASSERT_NO_FATAL_FAILURE(Import(p, link, "3300", {3300, 3300}, nullptr));
+  p.target.clock().Advance(1000);  // expired by the target's clock
+  ExpireReaper::Options o;
+  o.skip_slot = [&p](uint16_t slot) { return p.target_migration().ReaperSkips(slot); };
+  ExpireReaper reaper(p.target.services.engine_, o);
+  auto n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok());
+  EXPECT_EQ(*n, 0u);
+  ASSERT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "1"}), kOk);  // imported: this node's reaper owns it now
+  n = reaper.RunOnce();
+  ASSERT_TRUE(n.ok());
+  EXPECT_EQ(*n, 1u);
+}
+
+TEST(SlotImporterTest, AFailureRecordOnTheWorkerWaitsForClientUnpause) {  // D9, ruling S5
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  SecondClient link(p.target);
+  ASSERT_NO_FATAL_FAILURE(Import(p, link, "3300", {3300, 3300}, nullptr));
+  ASSERT_EQ(p.target.Run({"CLIENT", "PAUSE", "60000", "WRITE"}), kOk);
+  const uint64_t seq = p.target.services.repl_log_.last();
+  ASSERT_TRUE(link.session.on_close);
+  link.session.on_close();  // the link is lost: the failure runs on the worker
+  EXPECT_FALSE(p.target_migration().AwaitIdle(300ms));
+  EXPECT_EQ(p.target.services.repl_log_.last(), seq) << "no replicated write while paused";
+  EXPECT_EQ(p.target_cluster.manager->States()->import->state, ImportState::kStart);
+  ASSERT_EQ(p.target.Run({"CLIENT", "UNPAUSE"}), kOk);
+  ASSERT_TRUE(p.target_migration().AwaitIdle(5s));
+  EXPECT_EQ(p.target.Run({"KEYS", "*"}), "*0\r\n");
+  EXPECT_EQ(p.target_cluster.manager->States()->import->state, ImportState::kError);
+}
+
 }  // namespace
 }  // namespace tideskv::test

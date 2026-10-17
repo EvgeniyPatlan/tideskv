@@ -41,6 +41,9 @@ class ExpireReaper {
     // true answer is matched by one end_write call after that commit. Either both are set or neither.
     std::function<bool()> begin_write;
     std::function<void()> end_write;
+    // M7b D20: slots whose entries are left alone (a fenced slot this node migrates, an importing slot it
+    // imports); checked while collecting. Empty = none.
+    std::function<bool(uint16_t slot)> skip_slot;
   };
 
   ExpireReaper(Engine& engine, Options options) : engine_(engine), options_(std::move(options)) {}

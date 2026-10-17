@@ -79,12 +79,14 @@ void MigrationService::OnDemoted() {
   });
 }
 
-// Task 13 seam (CLIENT PAUSE, D9): the Mutate below and the cleanups are background writes.
+// D9: the Mutate below and the cleanups are background writes, held while CLIENT PAUSE holds writes.
 void MigrationService::ApplyTransition() {
-  if (stopping() || deps_.is_replica()) return;  // a demotion is OnDemoted's
-  const std::shared_ptr<const cluster::Topology> t = deps_.cluster.Current();
+  if (stopping() || deps_.is_replica()) return;                                // a demotion is OnDemoted's
+  if (!AdmitBackgroundWrite()) return;                                         // Shutdown while paused
+  const std::shared_ptr<const cluster::Topology> t = deps_.cluster.Current();  // read once admitted
   Transition done;
   const Status st = Mutate([&t, &done](cluster::SlotStates& next) { done = Apply(*t, next); });
+  EndBackgroundWrite();
   if (done.cancel) migrator_->Cancel();
   if (!st.ok()) {  // nothing was added
     if (stopping()) return;

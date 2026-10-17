@@ -103,6 +103,16 @@ class MigrationService {
   // eraser before a txn.
   Status EraseWaitingOutBusy(cluster::SlotRange range, bool background,
                              const std::function<bool()>& stop = {});
+  // D20: the reaper leaves a fenced slot (this node migrates it) and an importing slot (it imports it) alone.
+  bool ReaperSkips(uint16_t slot) const {
+    return deps_.engine.SlotFenced(slot) || deps_.cluster.States()->Importing(slot);
+  }
+  // D9: waits while CLIENT PAUSE holds writes (only an actual pause: admitted commands in flight, such as the
+  // CLUSTERX that triggered a cleanup, are never waited for); true once admitted (pair it with
+  // EndBackgroundWrite), false on Shutdown or once `stop` (optional) says so. Without the pause hooks: true
+  // at once.
+  bool AdmitBackgroundWrite(const std::function<bool()>& stop = {});
+  void EndBackgroundWrite();
   SlotImporter& importer() { return *importer_; }                       // the target side (M7b D14)
   SlotMigrator& migrator() { return *migrator_; }                       // the source side (M7b D2-D5)
   uint64_t OldestNeeded() const { return migrator_->oldest_needed(); }  // D19: App pins the backlog with it

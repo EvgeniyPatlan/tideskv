@@ -4,7 +4,10 @@
 #include <vector>
 
 #include "cluster/slot_states.h"
+#include "commands/blocking_serve.h"
 #include "commands/cluster_routing.h"
+#include "encoding/meta_codec.h"
+#include "encoding/object_codec.h"
 #include "support/cluster_harness.h"
 
 namespace tideskv::test {
@@ -105,6 +108,36 @@ TEST(ClusterBlocking, AskingIsCarriedIntoABlockedWait) {
   imported->imported.push_back({3300, 3300});
   c.manager->PublishStates(imported);
   EXPECT_TRUE(h.TakeUnblocked().empty()) << "imported: served here from now on";
+}
+
+TEST(ClusterBlocking, AServeRefusedByTheFenceStaysBlocked) {  // D18
+  CommandHarness h;
+  ClusterHarness c(h);
+  c.Push(kThreeNodes, 1);
+  EXPECT_EQ(h.Run({"BLPOP", "b", "0"}), "");
+  h.services.engine_.FenceSlots(3300, 3300);  // the fence lands between a push's commit and its serve
+  encoding::Metadata list;
+  list.type = encoding::ValueType::kList;
+  ASSERT_TRUE(MoveInto(h.services.oids_.Next(), &list.oid).ok());
+  list.size = 1;
+  list.head = list.tail = encoding::kListInitialIndex;
+  ASSERT_TRUE(
+      h.services.engine_
+          .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta, encoding::MetaKeyFor(0, "b"),
+                         encoding::EncodeMetadata(list)},
+                        {encoding::ReplOpType::kPut, ColumnFamily::kSubkey,
+                         encoding::EncodeSubkey(0, 3300, list.oid,
+                                                encoding::EncodeListIndex(encoding::kListInitialIndex)),
+                         "v"}})
+          .ok());  // the push, committed (ApplyImport is unfenced)
+  ReadyKeys ready{{0, "b"}};
+  ServeBlockedClients(h.services.registry(), h.services, ready);
+  EXPECT_TRUE(h.TakeUnblocked().empty()) << "refused by the fence: the wait stays";
+  EXPECT_EQ(h.services.blocking_.blocked_clients(), 1u);
+  h.services.engine_.UnfenceSlots(3300, 3300);
+  ReadyKeys again{{0, "b"}};
+  ServeBlockedClients(h.services.registry(), h.services, again);
+  EXPECT_EQ(h.TakeUnblocked(), (Replies{Arr({Bulk("b"), Bulk("v")})}));
 }
 
 }  // namespace

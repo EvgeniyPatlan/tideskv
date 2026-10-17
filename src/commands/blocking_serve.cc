@@ -5,6 +5,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "commands/server_services.h"
 #include "exec/engine.h"
@@ -33,7 +34,12 @@ std::optional<std::string> ReRun(const CommandRegistry& registry, ServerServices
   ExecContext ctx{session, reply, server, &block, &ready};
   spec->handler(ctx, w.argv());
   if (block.would_block) return std::nullopt;
-  return reply.Take();
+  std::string out = reply.Take();
+  // M7b D18: a serve the fence refused stays blocked; the success publish then MOVEs the wait.
+  if (std::string_view(out).starts_with("-") && std::string_view(out).substr(1).starts_with(kErrTryAgain)) {
+    return std::nullopt;
+  }
+  return out;
 }
 
 // TryServe with ReRun. An exception from the re-run must not reach the pusher whose command signalled the
