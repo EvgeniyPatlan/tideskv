@@ -79,6 +79,13 @@ struct ClusterHarness {
     };
     o.on_publish = [this](const std::shared_ptr<const cluster::Topology>&) { RefreshRedirect(); };
     o.on_states_publish = [this](const std::shared_ptr<const cluster::SlotStates>&) { RefreshRedirect(); };
+    o.stop_migration = [this] {  // as App (M7b D7)
+      if (migration) migration->OnDemoted();
+    };
+    o.on_transition = [this](const std::shared_ptr<const cluster::Topology>&,
+                             const std::shared_ptr<const cluster::Topology>&) {
+      if (migration) migration->OnTopology();
+    };
     manager = std::make_unique<cluster::ClusterManager>(h.services.storage_, std::move(o));
     EXPECT_TRUE(manager->Load().ok());
     h.services.cluster_manager = manager.get();

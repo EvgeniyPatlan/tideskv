@@ -112,8 +112,10 @@ void MigrationService::PostRestored(const Restored& r) {
 
 Status MigrationService::Restore() {
   restore_requested_.fetch_add(1, std::memory_order_acq_rel);
-  return MutateImpl([](cluster::SlotStates&) { return Status::Ok(); }, true, nullptr,
-                    /*strict_restore=*/true);
+  Status st = MutateImpl([](cluster::SlotStates&) { return Status::Ok(); }, true, nullptr,
+                         /*strict_restore=*/true);
+  if (st.ok()) OnTopology();  // S4: after the restored cleanups, which it never schedules twice
+  return st;
 }
 
 void MigrationService::OnPromoted() {

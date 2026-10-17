@@ -1,3 +1,4 @@
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include "commands/reply_util.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "migrate/migration_service.h"
 
 // CLUSTERX (Kvrocks v2.17.0 cmd_cluster.cc CommandClusterX; M7a D8, D11): parsed first, then refused when
 // cluster mode is off, as Kvrocks. MIGRATE and FLUSHSLOTS run in cmd_clusterx_migrate.cc (M7b).
@@ -16,6 +18,10 @@ namespace tideskv {
 namespace {
 
 using cluster::ClusterManager;
+
+// Writer's note 4: a push's cleanup finishes before the reply when it is short (gocase "Slot keys are not
+// cleared after migration but cleared after setslot"); a longer one goes on asynchronously (D9).
+constexpr auto kTransitionWait = std::chrono::seconds(2);
 
 struct ClusterxCall {
   std::string sub;
@@ -91,6 +97,8 @@ void Run(ExecContext& ctx, ClusterManager& cm, const ClusterxCall& c, const ArgL
     st = cm.SetSlot(c.slots, argv[4], c.version);
   }
   if (!st.ok()) return ReplyError(ctx, st);
+  // Outside apply_mu_: the transition work this change posted (M7b D7).
+  if (migrate::MigrationService* m = ctx.server.migration()) m->AwaitIdle(kTransitionWait);
   ctx.reply.SimpleString("OK");
 }
 

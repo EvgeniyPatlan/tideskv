@@ -117,16 +117,21 @@ Status ClusterManager::ApplyRole(const Topology& next) const {
   const ClusterNode* me = next.Myself();
   if (me == nullptr || me->role == NodeRole::kMaster) return Promote();
   const ClusterNode* master = next.Find(me->master_id);
-  if (master != nullptr && options_.become_replica) options_.become_replica(master->host, master->port);
+  if (master == nullptr || !options_.become_replica) return Status::Ok();
+  const bool demoting = options_.is_replica && !options_.is_replica();
+  if (demoting && options_.stop_migration) options_.stop_migration();  // M7b D7: before the role changes
+  options_.become_replica(master->host, master->port);
   return Status::Ok();
 }
 
 Status ClusterManager::Commit(const std::shared_ptr<const Topology>& next) {
+  const std::shared_ptr<const Topology> prev = Current();
   if (Status st = SaveClusterCfg(storage_, *next); !st.ok()) return st;
   if (options_.make_durable) {
     if (Status st = options_.make_durable(); !st.ok()) return st;
   }
   Publish(next);
+  if (options_.on_transition) options_.on_transition(prev, next);  // M7b D7
   return Status::Ok();
 }
 

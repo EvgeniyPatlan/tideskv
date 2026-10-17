@@ -84,7 +84,8 @@ class MigrationService {
   }
   // D8, on a master at boot, as one Mutate: the record's states (nothing when absent); an import left in
   // start becomes error and its erase is posted to the worker (with the CLIENT PAUSE hooks), as is each
-  // cleanup-pending range. Corruption for a damaged record (the boot stops).
+  // cleanup-pending range. Corruption for a damaged record (the boot stops). Then OnTopology (ruling S4): a
+  // migrated range the persisted topology already moved away is cleaned up.
   Status Restore();
   // The become_master hook (under apply_mu_): requests the restore and posts it; the first Mutate after it,
   // on any thread, performs it (see Mutate). A second promotion before that is never lost (a generation).
@@ -125,6 +126,14 @@ class MigrationService {
   // apply_mu_: migrate_mu_ -> apply_mu_) and, on success, OnReset run; the release puts the fence back to the
   // states' set. Never under apply_mu_ or the Engine gate.
   Status ResetCluster(const std::function<Status()>& reset);
+
+  // ---- SETNODES transitions (Task 12, D7) ----
+  // The on_transition hook (under apply_mu_): posts D7's table to the worker, which reads the topology
+  // published by then. Never takes migrate_mu_.
+  void OnTopology();
+  // The stop_migration hook (under apply_mu_): cancels the job (a flag) and fails a running import; the
+  // worker clears the states (a replica holds none, D21; a later promotion restores them from the record).
+  void OnDemoted();
 
   void Post(std::function<void()> task);              // the migrate worker, FIFO; dropped after Shutdown
   bool AwaitIdle(std::chrono::milliseconds timeout);  // true once every task posted before the call ran
@@ -173,6 +182,9 @@ class MigrationService {
                    std::function<bool()> stop);  // EraseRange + stop
   void WorkerLoop();
   void WaitBeforeRetry(std::chrono::milliseconds delay);  // cut short by Shutdown
+  // On the worker (migration_transitions.cc): D7's table against the topology published now, inside one
+  // Mutate (ruling S2(a)); then the cleanups it scheduled run inline, so CLUSTERX can wait for them.
+  void ApplyTransition();
 
   MigrationDeps deps_;
   std::mutex record_mu_;

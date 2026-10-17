@@ -184,6 +184,14 @@ cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
   // mutexes and posts the replies, so it never waits for a thread that waits for either.
   o.on_publish = [this](const std::shared_ptr<const cluster::Topology>&) { RefreshRedirect(); };
   o.on_states_publish = [this](const std::shared_ptr<const cluster::SlotStates>&) { RefreshRedirect(); };
+  // M7b D7: the migration follows the topology; both hooks only set flags or post (under apply_mu_).
+  o.stop_migration = [this] {
+    if (migration_) migration_->OnDemoted();
+  };
+  o.on_transition = [this](const std::shared_ptr<const cluster::Topology>&,
+                           const std::shared_ptr<const cluster::Topology>&) {
+    if (migration_) migration_->OnTopology();
+  };
   return o;
 }
 

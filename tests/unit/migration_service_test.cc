@@ -120,6 +120,30 @@ TEST_F(ServiceTest, RestoreFencesMigratedRangesAndResumesTheCleanup) {  // D8 bo
   EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(1));
 }
 
+// Controller ruling S4: a migrated range the persisted topology already moved away (the push landed before
+// a restart) is cleaned up after the boot restore, as a push would have done.
+TEST_F(ServiceTest, RestoreCleansUpAMigratedRangeThePersistedTopologyMovedAway) {  // D7, D8
+  ASSERT_EQ(h.Run({"SET", "b", "migrated"}), kOk);                                 // 3300
+  cluster::MigrationRecord r;
+  r.job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, MigrateState::kSuccess};
+  r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
+  Persist(r);
+  c.Push(kNodeA + " 127.0.0.1 7000 master - 0-3299 3301-8191\n" + kNodeB +
+             " 127.0.0.1 7001 master - 3300 8192-16383\n",
+         2);
+  ASSERT_TRUE(c.migration->AwaitIdle(5s));  // the harness's own service: no states, nothing to do
+  auto svc = Make();
+  ASSERT_TRUE(svc->Restore().ok());
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(0));
+  EXPECT_FALSE(h.services.engine_.SlotFenced(3300));
+  EXPECT_TRUE(c.manager->States()->migrated.empty());
+  EXPECT_TRUE(c.manager->States()->cleanup.empty());
+  ASSERT_TRUE(Record().has_value());
+  EXPECT_TRUE(Record()->migrated.empty());
+  EXPECT_EQ(Record()->job->state, MigrateState::kSuccess);  // D15: the block stays
+}
+
 TEST_F(ServiceTest, RestoreErasesAHalfImport) {  // D8: importing start -> erase + error
   ASSERT_EQ(h.services.engine_
                 .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +14,7 @@
 #include "cluster/cluster_store.h"
 #include "cluster/slot_states.h"
 #include "storage/memory_storage.h"
+#include "support/migration_harness.h"
 #include "types/errors.h"
 
 namespace tideskv::cluster {
@@ -271,6 +273,81 @@ TEST_F(ClusterManagerTest, StatesArePublishedWithTheirOwnGenerationAndHook) {  /
   std::thread reader([&] { EXPECT_EQ(m.States()->migrated.size(), 1u); });
   reader.join();
   EXPECT_EQ(seen, (std::vector<size_t>{1}));
+}
+
+TEST_F(ClusterManagerTest, StopMigrationRunsBeforeBecomeReplicaOnlyWhenAMasterIsDemoted) {  // M7b D7
+  int stops = 0;
+  ClusterManager::Options o;
+  o.port = 7000;
+  o.bind = "127.0.0.1";
+  o.local_addresses = [] { return std::vector<std::string>{"127.0.0.1"}; };
+  o.is_replica = [this] { return replica; };
+  o.become_replica = [this, &stops](const std::string& host, uint16_t p) {
+    events.push_back("replicaof after " + std::to_string(stops) + " stop(s)");
+    replica = true;
+    master = host + ":" + std::to_string(p);
+    return true;
+  };
+  o.stop_migration = [&stops] { ++stops; };
+  InMemoryStorage other;
+  ClusterManager mgr(other, std::move(o));
+  ASSERT_TRUE(mgr.Load().ok());
+  ASSERT_TRUE(mgr.SetNodes(kNodes, 1, false).ok());  // A, a master
+  const std::string demoted =
+      kA + " 127.0.0.1 7000 slave " + kB + "\n" + kB + " 127.0.0.1 7001 master - 0-16383\n";
+  ASSERT_TRUE(mgr.SetNodes(demoted, 2, false).ok());
+  ASSERT_TRUE(mgr.SetNodes(demoted, 3, false).ok());  // already a replica: no second stop
+  EXPECT_EQ(stops, 1);
+  ASSERT_GE(events.size(), 1u);
+  EXPECT_EQ(events[0], "replicaof after 1 stop(s)");
+}
+
+TEST_F(ClusterManagerTest, OnTransitionSeesThePreviousAndTheNewTopology) {  // M7b D7
+  std::vector<std::pair<int64_t, int64_t>> seen;
+  ClusterManager::Options o;
+  o.on_transition = [&](const std::shared_ptr<const Topology>& prev,
+                        const std::shared_ptr<const Topology>& next) {
+    seen.emplace_back(prev->version, next->version);
+  };
+  ClusterManager m(storage, std::move(o));
+  ASSERT_TRUE(m.Load().ok());
+  ASSERT_TRUE(m.SetNodes(kNodes, 1, false).ok());
+  ASSERT_TRUE(m.SetNodes(kNodes, 1, false).ok());  // the same version: nothing published, no transition
+  ASSERT_TRUE(m.SetSlot({{0, 0}}, kB, 2).ok());
+  EXPECT_EQ(seen, (std::vector<std::pair<int64_t, int64_t>>{{kNoVersion, 1}, {1, 2}}));
+}
+
+// Review Focus #3: the controller's v+1 push lands after a fast success (an empty or tiny slot). It must not
+// revert routing or reopen writes on the source, and the v+2 push that moves the range must clean it up.
+TEST_F(ClusterManagerTest, APushAfterAFastSuccessKeepsMovedAndTheNextPushCleansUp) {
+  test::MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), test::kOk);
+  ASSERT_TRUE(test::RunJob(p, {3300, 3300}).ok());  // success, before any push
+  p.source_cluster.Push(test::kThreeNodes, 2);      // the controller's v+1: nothing moved
+  p.target_cluster.Push(test::kThreeNodes, 2);
+  ASSERT_TRUE(p.source_migration().AwaitIdle(std::chrono::seconds(5)));
+  ASSERT_TRUE(p.target_migration().AwaitIdle(std::chrono::seconds(5)));
+  EXPECT_EQ(p.source.Run({"GET", "b"}), test::Err("MOVED 3300 127.0.0.1:7001"));
+  EXPECT_EQ(p.source.Run({"SET", "b", "2"}), test::Err("MOVED 3300 127.0.0.1:7001"));
+  EXPECT_TRUE(p.source.services.engine_.SlotFenced(3300));
+  EXPECT_EQ(p.source.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}),
+            test::Int(1));                                 // kept until the range moves
+  EXPECT_EQ(p.target.Run({"GET", "b"}), test::Bulk("1"));  // imported: still served
+  const std::string moved = test::kNodeA + " 127.0.0.1 7000 master - 0-3299 3301-8191\n" + test::kNodeB +
+                            " 127.0.0.1 7001 master - 3300 8192-16383\n" + test::kNodeC +
+                            " 127.0.0.1 7002 slave " + test::kNodeA + "\n";
+  p.source_cluster.Push(moved, 3);
+  p.target_cluster.Push(moved, 3);
+  ASSERT_TRUE(p.source_migration().AwaitIdle(std::chrono::seconds(5)));
+  ASSERT_TRUE(p.target_migration().AwaitIdle(std::chrono::seconds(5)));
+  EXPECT_EQ(p.source.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), test::Int(0));
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
+  EXPECT_TRUE(p.source_cluster.manager->States()->migrated.empty());
+  EXPECT_TRUE(p.source_cluster.manager->States()->cleanup.empty());
+  EXPECT_NE(p.source.Run({"CLUSTER", "INFO"}).find("migrating_state: success"), std::string::npos);  // D15
+  EXPECT_EQ(p.source.Run({"GET", "b"}), test::Err("MOVED 3300 127.0.0.1:7001"));  // now by the topology
+  EXPECT_TRUE(p.target_cluster.manager->States()->imported.empty());              // granted: owned now
+  EXPECT_EQ(p.target.Run({"GET", "b"}), test::Bulk("1"));
 }
 
 }  // namespace

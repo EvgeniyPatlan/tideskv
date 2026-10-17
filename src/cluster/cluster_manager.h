@@ -41,6 +41,13 @@ class ClusterManager {
     std::function<void(const std::shared_ptr<const Topology>&)> on_publish;
     // M7b D18: after every states publish (blocked clients follow the migration states too).
     std::function<void(const std::shared_ptr<const SlotStates>&)> on_states_publish;
+    // M7b D7: a master about to be demoted (before become_replica, under apply_mu_). Must not block.
+    std::function<void()> stop_migration;
+    // M7b D7: after each published topology change (SETNODES, SETNODEID, SETSLOT; not Load or Reset), with
+    // the previous and the new topology, under apply_mu_. Must not block: it posts to the migrate worker.
+    std::function<void(const std::shared_ptr<const Topology>& prev,
+                       const std::shared_ptr<const Topology>& next)>
+        on_transition;
   };
 
   ClusterManager(Storage& storage, Options options);

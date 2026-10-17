@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "support/cluster_harness.h"
+#include "support/migration_harness.h"
 
 namespace tideskv::test {
 namespace {
@@ -95,6 +96,16 @@ TEST(ClusterxCmd, NeverRunsInsideATransactionOrAScript) {  // D8
   EXPECT_NE(h.Run({"EVAL", "return redis.call('clusterx','version')", "0"})
                 .find("This Redis command is not allowed from script"),
             std::string::npos);
+}
+
+TEST(ClusterxCmd,
+     SetslotWaitsForTheCleanupItTriggered) {  // gocase "... cleared after setslot", Writer's note 4
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
+  EXPECT_EQ(p.source.Run({"KEYS", "*"}), Arr({Bulk("b")}));  // kept after the migration
+  ASSERT_EQ(p.source.Run({"CLUSTERX", "SETSLOT", "3300", "NODE", kNodeB, "2"}), kOk);
+  EXPECT_EQ(p.source.Run({"KEYS", "*"}), "*0\r\n");  // gone right after the reply
 }
 
 }  // namespace
