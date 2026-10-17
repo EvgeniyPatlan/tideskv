@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cluster/slot_states.h"
 #include "cluster/topology.h"
 #include "common/status.h"
 #include "storage/storage.h"
@@ -38,6 +39,8 @@ class ClusterManager {
     std::function<Status()> make_durable;  // after each sys txn (D20: storage Checkpoint)
     // After every publish, with the new topology (D16: blocked clients follow it).
     std::function<void(const std::shared_ptr<const Topology>&)> on_publish;
+    // M7b D18: after every states publish (blocked clients follow the migration states too).
+    std::function<void(const std::shared_ptr<const SlotStates>&)> on_states_publish;
   };
 
   ClusterManager(Storage& storage, Options options);
@@ -48,6 +51,12 @@ class ClusterManager {
   Status Load();
   // The published topology; one atomic load while it is unchanged (thread-local cache, D3).
   std::shared_ptr<const Topology> Current() const;
+  // M7b D6: the migration states, with their own generation and the same thread-local cache as Current().
+  // states_mu_ is a leaf: the migrator thread and CLUSTER IMPORT publish without apply_mu_, so SETNODES can
+  // stop the migrator while holding apply_mu_. The caller serialises its read-modify-write
+  // (MigrationService::record_mu_); PublishStates then calls on_states_publish.
+  std::shared_ptr<const SlotStates> States() const;
+  void PublishStates(const std::shared_ptr<const SlotStates>& next);
   // The master to replicate from at boot: myself is a slave of a node in the topology; nullopt = a master.
   std::optional<Endpoint> BootMaster() const;
 
@@ -70,6 +79,9 @@ class ClusterManager {
   mutable std::mutex topo_mu_;  // guards topo_; generation_ is written under it
   std::shared_ptr<const Topology> topo_;
   std::atomic<uint64_t> generation_{0};
+  mutable std::mutex states_mu_;  // leaf: guards states_; states_generation_ is written under it
+  std::shared_ptr<const SlotStates> states_;
+  std::atomic<uint64_t> states_generation_{0};
 };
 
 }  // namespace tideskv::cluster

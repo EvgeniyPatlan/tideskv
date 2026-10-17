@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "cluster/slot_states.h"
 #include "commands/cluster_routing.h"
 #include "support/cluster_harness.h"
 
@@ -60,6 +61,50 @@ TEST(ClusterBlocking, AWaitWithoutKeysIsNeverRedirected) {  // WAIT
   const BlockedClient waiter(registry, Session{}, {"WAIT", "1", "0"}, encoding::ValueType::kList, {},
                              std::nullopt);
   EXPECT_FALSE(BlockedRedirect(cluster::Topology{}, waiter).has_value());
+}
+
+TEST(ClusterBlocking, AFenceKeepsAWaitAndTheSuccessPublishMovesIt) {  // D18
+  CommandHarness h;
+  ClusterHarness c(h);
+  c.Push(kThreeNodes, 1);
+  SecondClient other(h);
+  EXPECT_EQ(h.Run({"BLPOP", "b", "0"}), "");        // slot 3300
+  EXPECT_EQ(other.Run({"BLPOP", "bar", "0"}), "");  // slot 5061
+  auto fenced = std::make_shared<cluster::SlotStates>();
+  fenced->fenced.set(3300);
+  c.manager->PublishStates(fenced);
+  EXPECT_TRUE(h.TakeUnblocked().empty()) << "the fence is short: the wait stays";
+  auto success = std::make_shared<cluster::SlotStates>(*fenced);
+  success->migrated.push_back({{3300, 3300}, kNodeB, "127.0.0.1", 7001});
+  c.manager->PublishStates(success);
+  EXPECT_EQ(h.TakeUnblocked(), (Replies{Err("MOVED 3300 127.0.0.1:7001")}));
+  EXPECT_TRUE(other.TakeUnblocked().empty());
+  EXPECT_EQ(h.link->closes(), 0);
+}
+
+// D18, the M7a ledger carry: the ASKING flag of a blocking command belongs to the wait, and routes it.
+TEST(ClusterBlocking, AskingIsCarriedIntoABlockedWait) {
+  CommandHarness h;
+  ClusterHarness c(h);
+  c.Push(kThreeNodes, 1);  // A owns 3300
+  SecondClient plain(h);
+  ASSERT_EQ(h.Run({"ASKING"}), kOk);
+  EXPECT_EQ(h.Run({"BLPOP", "b", "0"}), "");
+  EXPECT_EQ(plain.Run({"BLPOP", "{b}x", "0"}), "");
+  ASSERT_NE(h.session.blocked, nullptr);
+  EXPECT_TRUE(h.session.blocked->session().asking);
+  EXPECT_FALSE(h.session.asking);  // the connection's flag covered exactly that command
+  auto importing = std::make_shared<cluster::SlotStates>();
+  importing->import = cluster::ImportJob{{3300, 3300}, cluster::ImportState::kStart};
+  c.manager->PublishStates(importing);
+  c.Push(kAllOnB, 2);  // B owns 3300 now, and A imports it back
+  EXPECT_EQ(plain.TakeUnblocked(), (Replies{Err("MOVED 3300 127.0.0.1:7001")}));
+  EXPECT_TRUE(h.TakeUnblocked().empty()) << "an ASKING wait on an importing slot keeps waiting";
+  auto imported = std::make_shared<cluster::SlotStates>(*importing);
+  imported->import->state = cluster::ImportState::kSuccess;
+  imported->imported.push_back({3300, 3300});
+  c.manager->PublishStates(imported);
+  EXPECT_TRUE(h.TakeUnblocked().empty()) << "imported: served here from now on";
 }
 
 }  // namespace

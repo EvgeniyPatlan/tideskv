@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_errors.h"
 #include "cluster/cluster_store.h"
+#include "cluster/slot_states.h"
 #include "storage/memory_storage.h"
 #include "types/errors.h"
 
@@ -251,6 +252,25 @@ TEST_F(ClusterManagerTest, ReadersOnOtherThreadsSeeEveryPublishInOrder) {  // D3
   reader.join();
   EXPECT_TRUE(monotonic.load());
   EXPECT_EQ(m->Current()->version, 50);
+}
+
+TEST_F(ClusterManagerTest, StatesArePublishedWithTheirOwnGenerationAndHook) {  // M7b D6
+  std::vector<size_t> seen;
+  ClusterManager::Options o;
+  o.on_states_publish = [&](const std::shared_ptr<const SlotStates>& s) {
+    seen.push_back(s->migrated.size());
+  };
+  ClusterManager m(storage, std::move(o));
+  ASSERT_TRUE(m.Load().ok());
+  EXPECT_TRUE(m.States()->migrated.empty());
+  auto next = std::make_shared<SlotStates>();
+  next->migrated.push_back({{1, 2}, kB, "h", 1});
+  m.PublishStates(next);
+  EXPECT_EQ(m.States()->migrated.size(), 1u);
+  EXPECT_EQ(m.Current()->version, kNoVersion);  // the topology is untouched
+  std::thread reader([&] { EXPECT_EQ(m.States()->migrated.size(), 1u); });
+  reader.join();
+  EXPECT_EQ(seen, (std::vector<size_t>{1}));
 }
 
 }  // namespace

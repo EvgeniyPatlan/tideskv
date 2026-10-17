@@ -32,9 +32,8 @@ struct ClusterHarness {
     o.is_replica = [&r] { return r.IsReplica(); };
     o.become_replica = [&r](const std::string& host, uint16_t p) { return r.BecomeReplica(host, p); };
     o.become_master = [&r] { return r.BecomeMaster(); };
-    o.on_publish = [&h](const std::shared_ptr<const cluster::Topology>& t) {
-      h.services.blocking_.SetRedirect([t](const BlockedClient& c) { return BlockedRedirect(*t, c); });
-    };
+    o.on_publish = [this](const std::shared_ptr<const cluster::Topology>&) { RefreshRedirect(); };
+    o.on_states_publish = [this](const std::shared_ptr<const cluster::SlotStates>&) { RefreshRedirect(); };
     manager = std::make_unique<cluster::ClusterManager>(h.services.storage_, std::move(o));
     EXPECT_TRUE(manager->Load().ok());
     h.services.cluster_manager = manager.get();
@@ -48,6 +47,13 @@ struct ClusterHarness {
 
   void Push(const std::string& nodes, int64_t version) {
     ASSERT_TRUE(manager->SetNodes(nodes, version, false).ok());
+  }
+
+  // What App::RefreshRedirect does (D16, M7b D18).
+  void RefreshRedirect() {
+    const std::shared_ptr<const cluster::Topology> t = manager->Current();
+    const std::shared_ptr<const cluster::SlotStates> s = manager->States();
+    h_.services.blocking_.SetRedirect([t, s](const BlockedClient& c) { return BlockedRedirect(*t, *s, c); });
   }
 
   CommandHarness& h_;

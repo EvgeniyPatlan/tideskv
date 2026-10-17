@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "commands/all_commands.h"
+#include "commands/cluster_routing.h"
 #include "commands/multi_state.h"
 #include "commands/registry.h"
 #include "commands/reply_util.h"
@@ -128,6 +129,16 @@ void Exec(ExecContext& ctx, const ArgList&) {
   if (!batch.ok()) {
     DiscardTransaction(ctx);
     return ReplyError(ctx, batch.status());
+  }
+  // M7b D4: the slot became fenced between queueing and EXEC: one whole TRYAGAIN, nothing applied. A queued
+  // EVAL/EVALSHA (has_may_replicate) may write, so it counts as a write here.
+  const ArgList no_args;
+  if (std::string e = FencedCallRefusal(ctx, CallKeys(ctx, *ctx.server.registry().Find("exec"), no_args),
+                                        m.has_write || m.has_may_replicate);
+      !e.empty()) {
+    batch->reset();
+    DiscardTransaction(ctx);
+    return ctx.reply.Error(e);
   }
   const Result<bool> failed = WatchFailed(ctx);
   if (!failed.ok() || *failed) {

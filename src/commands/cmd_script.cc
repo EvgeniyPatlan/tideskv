@@ -2,10 +2,13 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "commands/all_commands.h"
+#include "commands/cluster_routing.h"
 #include "commands/registry.h"
 #include "commands/reply_util.h"
 #include "commands/script_bridge.h"
@@ -23,13 +26,17 @@ namespace {
 
 // H3: run inside a batch (our own, or EXEC's); a killed script is undone to its mark; the reply is
 // sent only once our own batch committed.
-void RunScript(ExecContext& ctx, const ScriptEngine::EvalRequest& req) {
+void RunScript(ExecContext& ctx, const ScriptEngine::EvalRequest& req, bool writes) {
   Engine& engine = ctx.server.engine();
   std::unique_ptr<Engine::Batch> own;
   if (!engine.InBatch()) {
     auto batch = engine.BeginBatch();
     if (!batch.ok()) return ReplyError(ctx, batch.status());
     own = std::move(batch).value();
+    // M7b D4: declared keys of a fenced slot fail the whole script (inside EXEC, EXEC's check covers it).
+    std::vector<std::string_view> keys;
+    if (req.keys != nullptr) keys.assign(req.keys->begin(), req.keys->end());
+    if (std::string e = FencedCallRefusal(ctx, keys, writes); !e.empty()) return ctx.reply.Error(e);
   }
   auto mark = engine.BatchMark();
   if (!mark.ok()) return ReplyError(ctx, mark.status());
@@ -61,9 +68,14 @@ void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_o
   const auto split = argv.begin() + 3 + numkeys;
   const std::vector<std::string> keys(argv.begin() + 3, split);
   const std::vector<std::string> args(split, argv.end());
+  // M7b D4: plain EVAL is registered without the write flag, so any script that is neither EVAL_RO nor a
+  // shebang no-writes script counts as a write for the whole-call fence check.
+  const std::optional<ScriptFlags> f = ctx.server.scripts().PeekFlags(argv[1], by_sha);
+  const bool writes = !read_only && !(f && f->shebang && f->no_writes);
   RunScript(ctx,
             {argv[1], by_sha, read_only, &keys, &args, ctx.server.config().Snapshot().busy_reply_threshold_ms,
-             ctx.server.replication().IsReplica(), ctx.server.cluster() != nullptr});
+             ctx.server.replication().IsReplica(), ctx.server.cluster() != nullptr},
+            writes);
 }
 
 void Eval(ExecContext& ctx, const ArgList& argv) { EvalGeneric(ctx, argv, false, false); }

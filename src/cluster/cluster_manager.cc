@@ -22,7 +22,8 @@ ClusterManager::ClusterManager(Storage& storage, Options options)
     : storage_(storage),
       options_(std::move(options)),
       instance_(g_next_instance.fetch_add(1)),
-      topo_(std::make_shared<const Topology>()) {}
+      topo_(std::make_shared<const Topology>()),
+      states_(std::make_shared<const SlotStates>()) {}
 
 std::shared_ptr<const Topology> ClusterManager::Current() const {
   struct Cache {
@@ -45,6 +46,29 @@ void ClusterManager::Publish(const std::shared_ptr<const Topology>& next) {
     generation_.fetch_add(1, std::memory_order_release);
   }
   if (options_.on_publish) options_.on_publish(next);
+}
+
+std::shared_ptr<const SlotStates> ClusterManager::States() const {
+  struct Cache {
+    uint64_t instance = 0;
+    uint64_t generation = 0;
+    std::shared_ptr<const SlotStates> states;
+  };
+  thread_local Cache cache;
+  if (cache.instance != instance_ || cache.generation != states_generation_.load(std::memory_order_acquire)) {
+    std::lock_guard lock(states_mu_);
+    cache = {instance_, states_generation_.load(std::memory_order_relaxed), states_};
+  }
+  return cache.states;
+}
+
+void ClusterManager::PublishStates(const std::shared_ptr<const SlotStates>& next) {
+  {
+    std::lock_guard lock(states_mu_);
+    states_ = next;
+    states_generation_.fetch_add(1, std::memory_order_release);
+  }
+  if (options_.on_states_publish) options_.on_states_publish(next);
 }
 
 Status ClusterManager::Load() {

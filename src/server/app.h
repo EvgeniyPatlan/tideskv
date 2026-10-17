@@ -61,6 +61,7 @@ class App final : public ServerServices {
   Status LoadReplState(repl::ReplIdentity* identity, bool* baseline_unknown);
   Status CreateCluster();  // M7a D19: before CreateReplication (the boot role comes from the topology)
   cluster::ClusterManager::Options ClusterOptions(const ConfigValues& v);
+  void RefreshRedirect();        // D16, M7b D18: blocked clients follow topology and states
   bool StartsAsReplica() const;  // R12 rotates the replid of a node that starts as a master
   Status CreateReplication();
   void FillStorageStats(ServerStats& s) const;

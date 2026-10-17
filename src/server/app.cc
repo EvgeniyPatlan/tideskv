@@ -175,12 +175,17 @@ cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
   };
   o.become_master = [this] { return replication_->BecomeMaster(); };
   o.make_durable = [this] { return storage_->Checkpoint(); };  // D20
-  // D16, under apply_mu_: SetRedirect only takes the registry's and the ended clients' mutexes and posts the
-  // replies, so it never waits for a thread that waits for apply_mu_.
-  o.on_publish = [this](const std::shared_ptr<const cluster::Topology>& t) {
-    blocking_.SetRedirect([t](const BlockedClient& c) { return BlockedRedirect(*t, c); });
-  };
+  // D16, M7b D18, under apply_mu_ or record_mu_: SetRedirect only takes the registry's and the ended clients'
+  // mutexes and posts the replies, so it never waits for a thread that waits for either.
+  o.on_publish = [this](const std::shared_ptr<const cluster::Topology>&) { RefreshRedirect(); };
+  o.on_states_publish = [this](const std::shared_ptr<const cluster::SlotStates>&) { RefreshRedirect(); };
   return o;
+}
+
+void App::RefreshRedirect() {
+  const std::shared_ptr<const cluster::Topology> t = cluster_->Current();
+  const std::shared_ptr<const cluster::SlotStates> s = cluster_->States();
+  blocking_.SetRedirect([t, s](const BlockedClient& c) { return BlockedRedirect(*t, *s, c); });
 }
 
 bool App::StartsAsReplica() const {

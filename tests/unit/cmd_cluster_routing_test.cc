@@ -2,7 +2,10 @@
 
 #include <string>
 
+#include "cluster/cluster_errors.h"
+#include "cluster/slot_states.h"
 #include "support/cluster_harness.h"
+#include "types/errors.h"
 
 namespace tideskv::test {
 namespace {
@@ -201,6 +204,49 @@ TEST(ClusterRouting, HashTagEdgeCasesRouteLikeRedis) {
   const std::string nul("k\0x", 3);
   EXPECT_EQ(h.Run({"MSET", "{" + nul + "}1", "1", nul, "2"}), kOk);  // binary tags (5125)
   EXPECT_EQ(h.Run({"CLUSTER", "KEYSLOT", "{{}}"}), Int(4092));       // the tag is "{"
+}
+
+// Review Focus #4: the fence lands between queueing and EXEC. Route still passes (the states are not
+// published yet, as in the instant between the barrier and the publish), so EXEC itself must refuse, as a
+// whole.
+TEST(ClusterRouting, AFencedSlotFailsAWholeExec) {
+  RoutedA h;
+  ASSERT_EQ(h.Run({"MULTI"}), kOk);
+  ASSERT_EQ(h.Run({"SET", "b", "1"}), "+QUEUED\r\n");
+  ASSERT_EQ(h.Run({"INCR", "{b}n"}), "+QUEUED\r\n");
+  h.services.engine_.FenceSlots(3300, 3300);
+  EXPECT_EQ(h.Run({"EXEC"}), Err(kErrTryAgain));  // one error reply, never an EXEC array
+  EXPECT_FALSE(h.session.multi.active);
+  h.services.engine_.UnfenceSlots(3300, 3300);
+  EXPECT_EQ(h.Run({"GET", "b"}), kNil);
+  EXPECT_EQ(h.Run({"GET", "{b}n"}), kNil);
+  ASSERT_EQ(h.Run({"MULTI"}), kOk);  // a transaction that only reads a fenced slot runs
+  ASSERT_EQ(h.Run({"GET", "b"}), "+QUEUED\r\n");
+  h.services.engine_.FenceSlots(3300, 3300);
+  EXPECT_EQ(h.Run({"EXEC"}), Arr({kNil}));
+}
+
+TEST(ClusterRouting, AFencedSlotFailsAWholeEval) {  // D4
+  RoutedA h;
+  h.services.engine_.FenceSlots(3300, 3300);
+  EXPECT_EQ(
+      h.Run({"EVAL", "redis.call('set', KEYS[1], 'x') return redis.call('incr', KEYS[2])", "2", "b", "{b}n"}),
+      Err(kErrTryAgain));
+  EXPECT_EQ(h.Run({"EVAL_RO", "return redis.call('get', KEYS[1])", "1", "b"}), kNil);
+  EXPECT_EQ(h.Run({"EVAL", "#!lua flags=no-writes\nreturn redis.call('get', KEYS[1])", "1", "b"}), kNil);
+  h.services.engine_.UnfenceSlots(3300, 3300);
+  EXPECT_EQ(h.Run({"GET", "b"}), kNil);
+  EXPECT_EQ(h.Run({"GET", "{b}n"}), kNil);
+}
+
+TEST(ClusterRouting, ScriptCallsToAFencedSlotAnswerTryagain) {  // a fenced slot is local, not non-local
+  RoutedA h;
+  auto s = std::make_shared<cluster::SlotStates>();
+  s->fenced.set(3300);
+  h.cluster.manager->PublishStates(s);
+  EXPECT_EQ(h.Run({"SET", "b", "1"}), Err(cluster::kErrTryAgainFenced));  // Route's fast path
+  EXPECT_NE(h.Run({"EVAL", "return redis.call('set', 'b', 'x')", "0"}).find("TRYAGAIN"), std::string::npos);
+  EXPECT_EQ(h.Run({"GET", "b"}), kNil);
 }
 
 }  // namespace

@@ -67,6 +67,11 @@ inline constexpr std::string_view kErrInvalidSlotsSuffix =
     "`. No slots to parse. Please use spaces to separate slots.";
 // Redis 7.2 redirection reply: "MOVED <slot> <host>:<port>" (cluster.c).
 inline constexpr std::string_view kMovedPrefix = "MOVED ";
+// Kvrocks v2.17.0 cluster.cc:925 (M7b D4, D6): Route's answer for a write to a fenced slot, and for an ASKING
+// write on an importing slot (D6). Equal to tideskv::kErrTryAgain (types/errors.h; cluster/ may not include
+// types/): static_assert in commands/cluster_routing.cc.
+inline constexpr std::string_view kErrTryAgainFenced =
+    "TRYAGAIN Can't write to slot being migrated which is in write forbidden phase";
 
 // TidesKV-only (M7a D7, spec section 5.4): the <reason> after kErrClusterReplication when the promotion
 // failed for an internal (non-user) cause; Kvrocks appends its own status text, TidesKV exposes no internals.
