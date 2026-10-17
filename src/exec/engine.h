@@ -15,6 +15,7 @@
 #include "exec/lock_manager.h"
 #include "exec/recording_txn.h"
 #include "exec/repl_log.h"
+#include "exec/slot_fence.h"
 #include "exec/write_observer.h"
 #include "storage/storage.h"
 
@@ -206,6 +207,20 @@ class Engine {
     bool previous_;
   };
 
+  // ---- The slot write fence of a migrating source (M7b D4) ----
+  // Each change takes the gate exclusively, the barrier BeginLoad uses: every write already holding the gate
+  // commits (or fails) first, and every later Write/RunWrite sees the new fence and answers kErrTryAgain for
+  // a fenced key. Returns repl_log()->last() read inside that barrier (0 without a log): no write to a newly
+  // fenced slot can commit after it, so a migrator ships its final delta through exactly that seq. Waits
+  // through a busy script, as BeginLoad (D24.2). Never from inside an Engine fn or with a batch open on this
+  // thread (it would deadlock on the gate). Unfenced: ApplyReplicated, loads, ApplyImport, WriteInternal,
+  // WriteExclusive (FLUSH*, Writer's note 1), oid leases.
+  uint64_t FenceSlots(uint16_t first, uint16_t last);
+  uint64_t UnfenceSlots(uint16_t first, uint16_t last);
+  uint64_t AssignFence(const SlotBits& bits);  // the fence becomes exactly `bits`
+  bool SlotFenced(uint16_t slot) const { return fence_.Test(slot); }
+  SlotBits FencedSlots() const { return fence_.Bits(); }
+
  private:
   // M6b D6: whether a call that now holds the gate is refused because a load runs.
   bool LoadingRefuses(bool read) const;
@@ -223,7 +238,8 @@ class Engine {
   // Flushed-db keys to report (G2); empty unless scope.flushed_dbs and a non-idle observer.
   Status CollectFlushed(ReadView& view, const engine_internal::WriteScope& scope, std::vector<DbKey>* out);
   bool Observing() const { return observer_ != nullptr && !observer_->Idle(); }
-  void Report(const std::vector<DbKey>& keys);  // under the gate, after commit
+  void Report(const std::vector<DbKey>& keys);                       // under the gate, after commit
+  uint64_t ChangeFence(const std::function<void(SlotBits&)>& edit);  // under the exclusive barrier
 
   Storage& storage_;
   LockManager& locks_;
@@ -235,6 +251,7 @@ class Engine {
   std::atomic<bool> loading_{false};  // M6b D6: raised under the exclusive gate
   std::function<bool()> busy_;        // empty: plain gate waits
   std::string busy_reply_;
+  SlotFence fence_;  // M7b D4: changed only under the exclusive gate
 };
 
 }  // namespace tideskv

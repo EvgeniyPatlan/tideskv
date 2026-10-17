@@ -91,6 +91,7 @@ Status Engine::Write(uint8_t db, const std::vector<std::string_view>& keys, cons
   if (!AcquireShared()) return BusyStatus();
   std::shared_lock gate(gate_, std::adopt_lock);
   if (LoadingRefuses(/*read=*/false)) return Status::UserError(std::string(kErrLoading));
+  if (fence_.AnyKey(keys)) return Status::UserError(std::string(kErrTryAgain));  // M7b D4, under the gate
   const LockManager::Guard guard = locks_.Lock(db, keys);
   return RunTxn(fn, WriteScope{db, &keys, also_modified, nullptr});
 }

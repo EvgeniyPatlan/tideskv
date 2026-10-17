@@ -86,6 +86,10 @@ inline constexpr std::string_view kErrMaxClients = "ERR max number of clients re
 // TidesKV-only (R12): the write's replicated batch would exceed encoding::kMaxReplBatchBytes, which no
 // replica accepts; nothing is committed.
 inline constexpr std::string_view kErrTooLargeToReplicate = "ERR transaction too large to replicate";
+// Kvrocks v2.17.0 cluster.cc:925 (M7b D4): a write to a slot in the final phase of its migration. The same
+// text is cluster::kErrTryAgainFenced (Task 5), which Route answers; cluster/ may not include types/.
+inline constexpr std::string_view kErrTryAgain =
+    "TRYAGAIN Can't write to slot being migrated which is in write forbidden phase";
 // TidesKV-only: an exception escaped a command (the connection's catch-all, a blocked command's re-run).
 inline constexpr std::string_view kErrInternal = "ERR internal error";
 // TidesKV-only: a storage failure behind a command (reply_util.cc ReplyError; a FULLRESYNC whose

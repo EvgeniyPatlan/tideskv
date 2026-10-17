@@ -40,6 +40,10 @@ Status Engine::Batch::RunRead(const ReadFn& fn) {
 Status Engine::Batch::RunWrite(const WriteFn& fn, const WriteScope& scope) {
   [[maybe_unused]] const ReentryCheck reentry;
   if (engine_.LoadingRefuses(/*read=*/false)) return Status::UserError(std::string(kErrLoading));
+  // M7b D4 backstop for undeclared keys of a script; EXEC and EVAL refuse a fenced call as a whole (Task 5).
+  if (scope.keys != nullptr && engine_.fence_.AnyKey(*scope.keys)) {
+    return Status::UserError(std::string(kErrTryAgain));
+  }
   if (!broken_.ok()) return broken_;
   const std::string savepoint = "exec" + std::to_string(next_savepoint_++);
   if (Status st = recorder_.Savepoint(savepoint); !st.ok()) return st;
