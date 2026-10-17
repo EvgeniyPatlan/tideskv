@@ -71,6 +71,29 @@ TEST(SlotErase, CollectsTheExpireDeletesOfTheRangeInResumableSteps) {  // D9 ste
   EXPECT_EQ(steps, 3);
 }
 
+TEST(SlotErase, TheWalkIsBoundedByMetasWalkedNotByTtlsFound) {  // a long TTL-less range is many short steps
+  CommandHarness h;
+  for (int i = 0; i < 7; ++i) ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), "v"}), kOk);
+  ASSERT_EQ(h.Run({"SET", "{b}ttl", "v", "PX", "100000"}), kOk);
+  size_t total = 0;
+  std::string after;
+  int steps = 0;
+  for (bool done = false; !done; ++steps) {
+    ASSERT_LT(steps, 10);
+    ExpireDeletes step;
+    ASSERT_TRUE(h.services.engine_
+                    .Read([&](ReadView& v, int64_t) {
+                      return MoveInto(CollectExpireDeletes(v, 3300, 3300, after, 3), &step);
+                    })
+                    .ok());
+    total += step.ops.size();
+    after = step.resume_after;
+    done = step.done;
+  }
+  EXPECT_EQ(total, 1u);
+  EXPECT_EQ(steps, 3);  // 8 metas, 3 per step
+}
+
 TEST(SlotErase, RangeDeletesAreThreeAndBoundTheLastSlot) {  // D9 step 2, the 32-per-commit cap
   const auto ops = SlotRangeDeletes(16380, 16383);
   ASSERT_EQ(ops.size(), 3u);

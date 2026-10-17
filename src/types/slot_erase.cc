@@ -13,8 +13,9 @@ Result<ExpireDeletes> CollectExpireDeletes(ReadView& view, uint16_t first, uint1
   if (!it.ok()) return it.status();
   Status st = after.empty() ? (*it)->SeekToFirst() : (*it)->Seek(after);
   if (st.ok() && !after.empty() && (*it)->Valid() && (*it)->key() == after) st = (*it)->Next();
+  size_t walked = 0;
   for (; st.ok() && (*it)->Valid(); st = (*it)->Next()) {
-    if (out.ops.size() >= limit) return out;  // more to walk: resume after the last key
+    if (walked++ >= limit) return out;  // more to walk: resume after the last key
     encoding::MetaKey mk;
     if (!encoding::DecodeMetaKey((*it)->key(), &mk)) return Status::Corruption("undecodable meta key");
     auto meta = encoding::DecodeMetadata((*it)->value());

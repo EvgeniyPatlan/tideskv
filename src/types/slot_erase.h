@@ -20,8 +20,8 @@ struct ExpireDeletes {
 };
 
 // Step 1: walks the metas of slots first..last after `after` ("" = from the first) and collects the expire
-// deletes of at most `limit` metas with a TTL, each from the meta's own deadline (as DeleteObject). Logically
-// expired, unreaped keys count: they are stored state.
+// deletes of the metas with a TTL among at most `limit` metas walked (bounds the shared-gate hold), each from
+// the meta's own deadline (as DeleteObject). Logically expired, unreaped keys count: they are stored state.
 Result<ExpireDeletes> CollectExpireDeletes(ReadView& view, uint16_t first, uint16_t last,
                                            std::string_view after, size_t limit);
 // Step 2: DeleteRange([0][first], [0][last+1]) in meta, subkey and zscore. Three range deletes stay under
