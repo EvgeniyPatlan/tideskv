@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -23,6 +24,7 @@ using namespace std::chrono_literals;
 
 constexpr int kMaxCatchUpRounds = 10;           // Kvrocks kMaxLoopTimes (slot_migrate.cc:655)
 constexpr size_t kReadBytes = size_t{1} << 20;  // replog payload read per ReplogReader round
+constexpr uint64_t kNotRefenced = UINT64_MAX;   // the fence Mutate found the range fenced already
 constexpr size_t kFrameOverhead = 40;           // *3 $7 CLUSTER $10 IMPORTDATA $<n>: the rate limit counts it
 
 Status Err(std::string_view text) { return Status::UserError(std::string(text)); }
@@ -173,11 +175,15 @@ Status SlotMigrator::CatchUp(const MigrateJob& job, uint64_t* next) {
 Status SlotMigrator::FenceAndFinish(const MigrateJob& job, uint64_t next) {
   if (hooks_.before_fence) hooks_.before_fence();
   if (Status st = Canceled(); !st.ok()) return st;  // never raise a fence for a job already cancelled
-  uint64_t fence_seq = 0;                           // D4: nothing to the range commits after it
+  uint64_t fence_seq = kNotRefenced;                // D4: nothing to the range commits after it
   const Status fenced =
       service_.Mutate([&job](cluster::SlotStates& s) { cluster::SetFenced(s, job.range, true); },
                       /*persist=*/true, &fence_seq);
   if (!fenced.ok()) return Stage(cluster::kErrStageLastIncremental, fenced);
+  // The range was fenced already (Mutate moved no fence and left fence_seq untouched): its bits went up under
+  // an earlier exclusive barrier, so nothing to it committed after that barrier's seq, which last() now
+  // covers. The final delta then still ships everything up to the fence.
+  if (fence_seq == kNotRefenced) fence_seq = service_.deps().log.last();
   if (hooks_.after_fence) hooks_.after_fence();
   Delay();  // D25: holds the fence
   if (Status st = ShipRange(job, &next, fence_seq); !st.ok())

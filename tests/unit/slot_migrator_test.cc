@@ -2,10 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "cluster/cluster_errors.h"
 #include "repl/backlog_trimmer.h"
@@ -92,6 +95,99 @@ TEST(SlotMigratorTest, ACancelFailsTheJobAndTellsTheTarget) {  // D10
   EXPECT_EQ(p.target.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(0));
   EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
   EXPECT_EQ(p.source.Run({"GET", "b"}), Bulk("1"));  // the source serves again (D1)
+}
+
+// A MigrationTransport into the target whose IMPORT <R> 1 fails; every other call goes through.
+class FailingImportEnd final : public migrate::MigrationTransport {
+ public:
+  explicit FailingImportEnd(CommandHarness& target) : link_(target) {}
+  Status Call(const std::vector<std::string_view>& args) override {
+    if (args.size() == 4 && args[1] == "IMPORT" && args[3] == "1") return Status::UserError("ERR boom");
+    return link_.Call(args);
+  }
+  void Shutdown() override { link_.Shutdown(); }
+
+ private:
+  InProcessTransport link_;
+};
+
+// What every failure after the fence leaves (D10): fail, the fence lowered, the source writable again, the
+// target's import in error with its copy erased.
+void ExpectFailedAfterTheFence(MigrationPair& p) {
+  EXPECT_EQ(p.source_cluster.manager->States()->job.value().state, MigrateState::kFail);
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
+  EXPECT_EQ(p.source.Run({"SET", "{b}after", "1"}), kOk);
+  EXPECT_EQ(p.target_cluster.manager->States()->import.value().state, cluster::ImportState::kError);
+  EXPECT_EQ(p.target.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(0));
+}
+
+TEST(SlotMigratorTest, ACancelDuringTheFenceFailsTheJobBeforeImportEnd) {  // D10: the check before IMPORT 1
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  bool was_fenced = false;
+  migrate::SlotMigrator::Hooks hooks;
+  hooks.after_fence = [&] {
+    was_fenced = p.source.services.engine_.SlotFenced(3300);
+    p.source_migration().migrator().Cancel();
+  };
+  p.source_migration().migrator().SetHooks(hooks);
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
+  EXPECT_TRUE(was_fenced);
+  ExpectFailedAfterTheFence(p);
+  EXPECT_EQ(p.source.Run({"GET", "b"}), Bulk("1"));
+}
+
+// D2, D10: a flush committed the instant before the barrier is in the final delta [next, fence_seq]; the job
+// fails after raising the fence. (A FLUSH during the fence commits after fence_seq: Task 11's OnFlush cancels
+// the job, which ACancelDuringTheFenceFailsTheJobBeforeImportEnd covers.)
+TEST(SlotMigratorTest, AFlushInTheFinalDeltaFailsTheJob) {
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  SecondClient writer(p.source);
+  std::string flushed;
+  bool was_fenced = false;
+  migrate::SlotMigrator::Hooks hooks;
+  hooks.before_fence = [&] { flushed = writer.Run({"FLUSHALL"}); };  // the default gap: no catch-up round
+  hooks.after_fence = [&] { was_fenced = p.source.services.engine_.SlotFenced(3300); };
+  p.source_migration().migrator().SetHooks(hooks);
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
+  EXPECT_EQ(flushed, kOk);
+  EXPECT_TRUE(was_fenced);
+  ExpectFailedAfterTheFence(p);
+}
+
+TEST(SlotMigratorTest, AFailedImportEndFailsTheJobAndLowersTheFence) {  // KM §2.3, D10
+  MigrationPair p;
+  p.source_cluster.transport =
+      [&p](const std::string&, uint16_t, std::chrono::milliseconds,
+           const std::atomic<bool>*) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
+    return std::unique_ptr<migrate::MigrationTransport>(std::make_unique<FailingImportEnd>(p.target));
+  };
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), std::string(cluster::kErrStageImportStatus) + "ERR boom");
+  ExpectFailedAfterTheFence(p);
+  EXPECT_TRUE(p.source_cluster.manager->States()->migrated.empty());  // D8: nothing recorded
+}
+
+// The fence Mutate finds the range fenced already (it moves no fence and reports no seq): the final delta
+// still ships every write acknowledged before that earlier fence.
+TEST(SlotMigratorTest, AnAlreadyFencedRangeStillShipsItsFinalDelta) {
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "snapshot"}), kOk);
+  SecondClient writer(p.source);
+  std::string late;
+  migrate::SlotMigrator::Hooks hooks;
+  hooks.after_snapshot = [&] {
+    late = writer.Run({"SET", "{b}late", "acked"});  // the default gap: no catch-up round ships it
+    ASSERT_TRUE(p.source_migration()
+                    .Mutate([](cluster::SlotStates& s) { cluster::SetFenced(s, {3300, 3300}, true); })
+                    .ok());
+  };
+  p.source_migration().migrator().SetHooks(hooks);
+  ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
+  EXPECT_EQ(late, kOk);
+  EXPECT_EQ(p.target.Run({"GET", "{b}late"}), Bulk("acked"));
+  EXPECT_EQ(p.target.Run({"GET", "b"}), Bulk("snapshot"));
 }
 
 TEST(SlotMigratorTest, AFlushSeenInTheCatchUpCancelsTheJob) {  // D2, D10
