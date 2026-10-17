@@ -245,6 +245,8 @@ Status ReplClient::FullSync(int fd, const PsyncOutcome& o) {
     ReplClient* c;
     ~EndProgress() { c->ResetSyncProgress(); }
   } const end_progress{this};
+  // Before Begin: BeginLoad raises Engine::loading(), and INFO must never show loading:1 with no start time.
+  loading_start_ms_.store(UnixMs(), std::memory_order_release);
   FullSyncLoader loader(engine_, o.replid, o.seq, LoaderHooks());
   if (Status st = loader.Begin(); !st.ok()) return st;
   struct MidLoad {  // D22: a Stop between the start txn and LOADEND leaves the keyspace wiped or partial
@@ -254,7 +256,6 @@ Status ReplClient::FullSync(int fd, const PsyncOutcome& o) {
       if (!done && c->stopping()) c->stopped_mid_load_.store(true, std::memory_order_release);
     }
   } mid_load{this};
-  loading_start_ms_.store(UnixMs(), std::memory_order_release);
   if (Status st = LoadUntilDone(fd, loader); !st.ok()) return st;
   mid_load.done = true;
   spdlog::info("full resynchronisation from {}:{} loaded: {} bytes, seq {}", host_, port_,

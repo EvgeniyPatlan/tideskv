@@ -146,6 +146,7 @@ struct ReplClientTest : ::testing::Test {
       adopted.push_back(id);
     };
     cb.publish_identity = [this](const ReplIdentity& id) {
+      if (on_publish_identity) on_publish_identity();
       std::lock_guard lock(mu);
       identity = id;
     };
@@ -222,6 +223,7 @@ struct ReplClientTest : ::testing::Test {
   test::FaultyStorage replica_storage;  // counts the write txns alive at once
   test::ReplicaStack replica{replica_storage};
   std::function<Status()> trim_hook;
+  std::function<void()> on_publish_identity;  // runs on the client thread, before the identity is stored
   FakeMaster fake;
   std::mutex mu;
   ConfigValues cfg;
@@ -599,6 +601,25 @@ TEST_F(ReplClientTest, SyncProgressIsReportedDuringTheLoadOnly) {
   EXPECT_EQ(client->sync_last_io_ms(), 0);
   EXPECT_EQ(client->loading_start_ms(), 0);
   EXPECT_EQ(client->loaded_bytes(), 0u);
+}
+
+// INFO reports loading_start_time whenever it reports loading:1, so the start time is published no later
+// than the engine's loading flag. FullSyncLoader::Begin publishes the cleared identity after BeginLoad raised
+// it.
+TEST_F(ReplClientTest, TheLoadStartTimeIsSetOnceTheEngineReportsLoading) {
+  Write({"SET", "k", "v"});
+  std::atomic<int64_t> start_seen_while_loading{-1};
+  on_publish_identity = [&] {
+    if (replica.engine.loading() && start_seen_while_loading.load() < 0)
+      start_seen_while_loading.store(client->loading_start_ms());
+  };
+  StartClient();
+  Link l = AcceptLink();
+  Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()));
+  const uint64_t s = SendSnapshot(l);
+  ASSERT_TRUE(WaitAck(l, s));
+  client->Stop();
+  EXPECT_GT(start_seen_while_loading.load(), 0);
 }
 
 TEST_F(ReplClientTest, AfterAFullSyncAReconnectAsksToContinueFromTheBaseline) {
