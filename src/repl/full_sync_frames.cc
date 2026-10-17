@@ -22,7 +22,7 @@ std::string LoadEndFrame(uint64_t seq, std::string_view record, uint64_t ops) {
 
 bool IsLoadableOp(const encoding::ReplOp& op) {
   if (op.type != encoding::ReplOpType::kPut) return false;
-  if (op.cf == ColumnFamily::kSys) return op.key == OidAllocator::kHwmKey;
+  if (op.cf == ColumnFamily::kSys) return op.key == OidAllocator::kHwmKey || op.key == cluster::kSysMigration;
   for (ColumnFamily cf : kLoadableCfs) {
     if (op.cf == cf) return true;
   }

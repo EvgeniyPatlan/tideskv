@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cluster/migration_record.h"
 #include "common/coding.h"
 #include "encoding/replog_codec.h"
 #include "storage/memory_storage.h"
@@ -181,6 +182,31 @@ TEST(SlotKeys, SlotRangeBoundsCoverTheLastSlot) {
   const IterOptions b = SlotRangeBounds(16380, 16383);
   EXPECT_EQ(b.lower, encoding::MetaSlotPrefix(0, 16380));
   EXPECT_EQ(b.upper, std::string("\x00\x40\x00", 3));
+}
+
+TEST(SnapshotChunker, TheMigrationRecordIsStreamedAfterTheOidLeaseAndLoadable) {  // M7b D8
+  test::CommandHarness h;
+  ASSERT_EQ(h.Run({"HSET", "h", "f", "v"}), test::Int(1));  // leases an oid block
+  cluster::MigrationRecord r;
+  r.imported = {{1, 2}};
+  ASSERT_TRUE(h.services.repl_log_.CommitStandalone({cluster::MigrationRecordPut(r)}).ok());
+  auto snap = h.services.repl_log_.SnapshotAtLast();
+  ASSERT_TRUE(snap.ok());
+  SnapshotChunker chunker(*snap->view, 0);
+  std::vector<encoding::ReplOp> ops;
+  for (;;) {
+    auto next = chunker.Next(nullptr);
+    ASSERT_TRUE(next.ok());
+    if (!next->has_value()) break;
+    auto decoded = DecodeLoadChunk(**next);  // every op passes IsLoadableOp
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    ops.insert(ops.end(), decoded->begin(), decoded->end());
+  }
+  ASSERT_GE(ops.size(), 2u);
+  EXPECT_EQ(ops[ops.size() - 2].key, OidAllocator::kHwmKey);
+  EXPECT_EQ(ops.back().key, cluster::kSysMigration);
+  EXPECT_EQ(ops.back().value, cluster::EncodeMigrationRecord(r));
+  EXPECT_FALSE(IsLoadableOp({encoding::ReplOpType::kPut, ColumnFamily::kSys, "cluster_cfg", "x"}));
 }
 
 }  // namespace

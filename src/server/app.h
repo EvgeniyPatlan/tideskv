@@ -12,6 +12,7 @@
 #include "exec/lock_manager.h"
 #include "exec/repl_log.h"
 #include "expire/reaper.h"
+#include "migrate/migration_service.h"
 #include "net/server.h"
 #include "repl/backlog_trimmer.h"
 #include "repl/replication_manager.h"
@@ -64,6 +65,7 @@ class App final : public ServerServices {
   void RefreshRedirect();        // D16, M7b D18: blocked clients follow topology and states
   bool StartsAsReplica() const;  // R12 rotates the replid of a node that starts as a master
   Status CreateReplication();
+  Status CreateMigration();  // M7b D8: after the oid lease, before serving
   void FillStorageStats(ServerStats& s) const;
   void FillReplStats(ServerStats& s, const ConfigValues& v) const;
   Status StartRole();  // the reaper on a master, the replica client when replicaof (or the topology) says so
@@ -88,6 +90,9 @@ class App final : public ServerServices {
   std::unique_ptr<Engine> engine_;
   ClientPause pause_;  // before reaper_ (its paused hook reads it) and server_ (connections park in it)
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it; started by role
+  // M7b: refers to engine_, repl_log_, storage_, oids_ and cluster_; shut down in Stop() before replication_,
+  // destroyed before engine_. Null unless cluster-enabled.
+  std::unique_ptr<migrate::MigrationService> migration_;
   CommandRegistry registry_;
   CursorStore cursors_;
   BlockingRegistry blocking_;  // before server_: connections cancel their waiters when destroyed

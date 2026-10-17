@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cluster/migration_record.h"
 #include "common/status.h"
 #include "encoding/replog_codec.h"
 #include "storage/storage.h"
@@ -24,7 +25,8 @@ inline constexpr size_t kLoadChunkOps = 65536;
 std::string LoadFrame(std::string_view chunk);
 std::string LoadEndFrame(uint64_t seq, std::string_view record, uint64_t ops);
 
-// Whether an op may come from a master's snapshot (D3): a PUT into meta/subkey/zscore/expire, or sys/oid_hwm.
+// Whether an op may come from a master's snapshot (D3): a PUT into meta/subkey/zscore/expire, sys/oid_hwm, or
+// sys/migration (M7b D8).
 bool IsLoadableOp(const encoding::ReplOp& op);
 
 // Decodes one LOAD chunk (a replog-v1 batch: CRC, structure) and checks every op is loadable.
@@ -36,7 +38,9 @@ struct ChunkerOptions {
   std::vector<ColumnFamily> cfs = {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore,
                                    ColumnFamily::kExpire};
   IterOptions bounds;  // applied to every CF's iterator; empty = the whole CF
-  std::vector<std::string> sys_keys = {std::string(OidAllocator::kHwmKey)};  // PUT if present, in order
+  std::vector<std::string> sys_keys = {
+      std::string(OidAllocator::kHwmKey),
+      std::string(cluster::kSysMigration)};  // PUT if present, in order (M7b D8)
   size_t max_bytes = kLoadChunkBytes;
   size_t max_ops = kLoadChunkOps;
 };

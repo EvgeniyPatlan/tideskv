@@ -81,6 +81,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   if (Status st = app->CreateCluster(); !st.ok()) return st;      // the boot role (D19), before the identity
   if (Status st = app->CreateReplication(); !st.ok()) return st;  // before any commit, like Recover
   if (Status st = app->oids_->Init(); !st.ok()) return st;
+  if (Status st = app->CreateMigration(); !st.ok()) return st;  // M7b D8: a damaged record stops the boot
   return app;
 }
 
@@ -173,7 +174,11 @@ cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
   o.become_replica = [this](const std::string& host, uint16_t port) {
     return replication_->BecomeReplica(host, port);
   };
-  o.become_master = [this] { return replication_->BecomeMaster(); };
+  o.become_master = [this] {
+    const Status st = replication_->BecomeMaster();
+    if (st.ok() && migration_) migration_->OnPromoted();  // M7b D8: posts Restore, never under apply_mu_
+    return st;
+  };
   o.make_durable = [this] { return storage_->Checkpoint(); };  // D20
   // D16, M7b D18, under apply_mu_ or record_mu_: SetRedirect only takes the registry's and the ended clients'
   // mutexes and posts the replies, so it never waits for a thread that waits for either.
@@ -312,9 +317,11 @@ void App::Stop() {
   scripts_.KillForShutdown();
   pause_.Shutdown();                           // parked connections die with the server
   if (trimmer_) trimmer_->Stop();              // it calls into replication_ and trims the replog
+  if (migration_) migration_->Shutdown();      // M7b: its threads write and talk to peers
   if (replication_) replication_->Shutdown();  // replica links first: senders read the replog (M6a)
   server_->Stop();                             // no command can touch storage after this
   reaper_.reset();                             // joins the reaper thread; it writes through engine_
+  migration_.reset();                          // the connections' close hooks used it until server_->Stop()
   engine_.reset();                             // references storage_, so it goes first
   scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
   oids_.reset();       // likewise (its persist hook checkpoints storage_)

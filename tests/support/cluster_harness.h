@@ -7,6 +7,7 @@
 
 #include "cluster/cluster_manager.h"
 #include "commands/cluster_routing.h"
+#include "migrate/migration_service.h"
 #include "support/command_harness.h"
 
 namespace tideskv::test {
@@ -59,5 +60,20 @@ struct ClusterHarness {
   CommandHarness& h_;
   std::unique_ptr<cluster::ClusterManager> manager;
 };
+
+// The MigrationService dependencies of a harness node: its engine, log, storage and oids, `cm`, and its
+// FakeReplication's role (M7b). No CLIENT PAUSE hooks until Task 13 wires them.
+inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::ClusterManager& cm) {
+  FakeReplication& r = h.services.replication_;
+  return migrate::MigrationDeps{.engine = h.services.engine_,
+                                .log = h.services.repl_log_,
+                                .storage = h.services.storage_,
+                                .oids = h.services.oids_,
+                                .cluster = cm,
+                                .is_replica = [&r] { return r.IsReplica(); },
+                                .begin_background_write = {},
+                                .end_background_write = {},
+                                .make_durable = {}};
+}
 
 }  // namespace tideskv::test

@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "cluster/migration_record.h"
 #include "encoding/replog_codec.h"
 #include "repl/full_sync_frames.h"
 #include "storage/memory_storage.h"
@@ -191,6 +192,20 @@ TEST_F(LoaderTest, TheKeyLoadDelayIsPerKeyAndStoppable) {
   stopper.join();
   EXPECT_GE(took, 250ms);   // it did sleep per key
   EXPECT_LT(took, 1500ms);  // and stopped within one key's delay of the request
+}
+
+TEST_F(LoaderTest, BeginDropsAStaleMigrationRecord) {  // M7b D8: only the master's record survives a load
+  {
+    auto txn = storage.BeginWrite();
+    ASSERT_TRUE(txn.ok());
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kSys, cluster::kSysMigration, "stale").ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  FullSyncLoader loader(replica.engine, std::string(40, 'a'), 0, Hooks());
+  ASSERT_TRUE(loader.Begin().ok());
+  auto view = storage.BeginRead();
+  ASSERT_TRUE(view.ok());
+  EXPECT_TRUE((*view)->Get(ColumnFamily::kSys, cluster::kSysMigration).status().IsNotFound());
 }
 
 }  // namespace

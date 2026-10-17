@@ -4,6 +4,7 @@
 
 #include <utility>
 
+#include "cluster/migration_record.h"
 #include "common/debug_delay.h"
 #include "common/string_util.h"
 #include "encoding/replog_codec.h"
@@ -24,7 +25,12 @@ FullSyncLoader::~FullSyncLoader() {
 
 Status FullSyncLoader::Begin() {
   const ReplIdentity cleared{hooks_.identity().replid, {}};  // the old history no longer describes the data
-  if (Status st = engine_.BeginLoad(IdentityOps(cleared)); !st.ok()) return st;
+  std::vector<encoding::ReplOp> extra = IdentityOps(cleared);
+  // M7b D8: the master's sys/migration, if any, arrives as a snapshot PUT; a stale one of ours must not
+  // survive.
+  extra.push_back(
+      {encoding::ReplOpType::kDelete, ColumnFamily::kSys, std::string(cluster::kSysMigration), ""});
+  if (Status st = engine_.BeginLoad(extra); !st.ok()) return st;
   begun_ = true;
   hooks_.publish_identity(cleared);
   if (hooks_.on_baseline_known) hooks_.on_baseline_known();
