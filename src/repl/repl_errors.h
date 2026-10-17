@@ -29,4 +29,11 @@ inline constexpr std::string_view kErrPsyncShuttingDown = "ERR PSYNC refused: th
 inline constexpr std::string_view kMsgReplogEntryPrefix = "replog entry ";
 inline constexpr std::string_view kMsgReplogEntryNotRetained = " is not retained";
 
+// TidesKV-only (M7b D3): Status texts of repl::RespConn, shared by the replica handshake (they reach the
+// log and, through the migrator, a CLUSTER MIGRATE status). Peer-neutral: the peer is a master or a target.
+inline constexpr std::string_view kMsgNoReplyWithinTimeout = "no reply within the timeout";
+inline constexpr std::string_view kMsgReplyLineTooLong = "protocol error: reply line too long";
+inline constexpr std::string_view kMsgUnreadableReplyPrefix =
+    "protocol error: unreadable reply to ";  // + command
+
 }  // namespace tideskv

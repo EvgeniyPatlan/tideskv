@@ -17,6 +17,7 @@
 #include "repl/full_sync_loader.h"
 #include "repl/repl_state.h"
 #include "repl/replication.h"
+#include "repl/resp_conn.h"
 #include "repl/socket_io.h"
 #include "resp/reply_parser.h"
 #include "resp/request_parser.h"
@@ -102,16 +103,14 @@ class ReplClient {
   bool DiscardUnfinishedLoad(std::chrono::milliseconds retry_in);
   bool Publish(int fd);  // false when Stop() came first
   void Unpublish();
-  Status Handshake(int fd, const ConfigValues& cfg);
-  Status Psync(int fd, PsyncOutcome* out);
+  Status Handshake(RespConn& conn, const ConfigValues& cfg);
+  Status Psync(RespConn& conn, PsyncOutcome* out);
   Status FullSync(int fd, const PsyncOutcome& o);        // the load, until LOADEND committed
   Status LoadUntilDone(int fd, FullSyncLoader& loader);  // reads and loads frames until LOADEND
   Status ParseLoadFrames(FullSyncLoader& loader, bool* done);
   FullSyncLoader::Hooks LoaderHooks();
   void ResetSyncProgress();
   Status AdoptReplid(std::string_view replid);
-  Result<resp::ReplyNode> Command(int fd, const std::vector<std::string_view>& args);
-  Result<std::string> ReadLine(int fd);
   Status Stream(int fd);
   Status ParseFrames();
   // Hands each complete frame in in_ to handle, until in_ holds no complete frame or *stop (if given)

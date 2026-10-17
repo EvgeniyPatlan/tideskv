@@ -15,7 +15,6 @@ namespace {
 using namespace std::chrono_literals;
 using resp::ReplyNode;
 
-constexpr size_t kMaxReplyLine = size_t{64} * 1024;
 // The largest BATCH frame payload accepted from a master is the largest batch a master commits (R12):
 // a bigger frame is a protocol error and drops the link, so a hostile or broken master cannot make the
 // replica buffer (or decode) more than this. What may sit unparsed: one maximal frame plus its header.
@@ -145,10 +144,11 @@ Status ReplClient::RunLink(bool* continued) {
     ReplClient* client;
     ~Unpublisher() { client->Unpublish(); }  // before fd closes: Stop never shuts down a reused number
   } const unpublish{this};
+  RespConn conn(fd->get(), &in_, timeout_);  // what follows +CONTINUE stays in in_ for Stream (M7b D3)
   SetState(ReplicaLinkState::kHandshake);
-  if (Status st = Handshake(fd->get(), cfg); !st.ok()) return st;
+  if (Status st = Handshake(conn, cfg); !st.ok()) return st;
   PsyncOutcome psync;
-  if (Status st = Psync(fd->get(), &psync); !st.ok()) return st;
+  if (Status st = Psync(conn, &psync); !st.ok()) return st;
   if (psync.full) {
     if (Status st = FullSync(fd->get(), psync); !st.ok()) return st;
   }
@@ -174,8 +174,8 @@ void ReplClient::Unpublish() {
 
 // PING, AUTH, REPLCONF listening-port / ip-address / capa (D8). Only PING and AUTH must succeed; a master
 // that does not understand a REPLCONF option is logged and tolerated, as Redis does.
-Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
-  auto pong = Command(fd, {"PING"});
+Status ReplClient::Handshake(RespConn& conn, const ConfigValues& cfg) {
+  auto pong = conn.Command({"PING"});
   if (!pong.ok()) return pong.status();
   if (pong->type == ReplyNode::Type::kError && !PingErrorAccepted(pong->str)) {
     return Status::IOError("the master answered PING with -" + pong->str);
@@ -184,7 +184,7 @@ Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
     std::vector<std::string_view> auth{"AUTH"};
     if (!cfg.masteruser.empty()) auth.emplace_back(cfg.masteruser);
     auth.emplace_back(cfg.masterauth);
-    auto r = Command(fd, auth);
+    auto r = conn.Command(auth);
     if (!r.ok()) return r.status();
     if (r->type == ReplyNode::Type::kError) return Status::IOError("the master refused AUTH: -" + r->str);
   }
@@ -195,7 +195,7 @@ Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
     options.push_back({"REPLCONF", "ip-address", cfg.replica_announce_ip});
   options.push_back({"REPLCONF", "capa", "psync2"});
   for (const auto& option : options) {
-    auto r = Command(fd, option);
+    auto r = conn.Command(option);
     if (!r.ok()) return r.status();
     if (r->type == ReplyNode::Type::kError) {
       spdlog::warn("master {}:{} refused REPLCONF {}: -{}", host_, port_, option[1], r->str);
@@ -206,12 +206,12 @@ Status ReplClient::Handshake(int fd, const ConfigValues& cfg) {
 
 // PSYNC <replid|?> <last+1> (D8). OK for +CONTINUE (the replid adopted) and for a valid
 // +FULLRESYNC <replid> <seq> (out->full; the load follows on this link, M6b D4).
-Status ReplClient::Psync(int fd, PsyncOutcome* out) {
+Status ReplClient::Psync(RespConn& conn, PsyncOutcome* out) {
   const uint64_t last = log_.last();
   const bool unknown = baseline_unknown_.load(std::memory_order_acquire);
   const std::string replid = last == 0 && !unknown ? "?" : cb_.identity().replid;  // F5
   const std::string next = std::to_string(last + 1);
-  auto r = Command(fd, {"PSYNC", replid, next});
+  auto r = conn.Command({"PSYNC", replid, next});
   if (!r.ok()) return r.status();
   if (r->type == ReplyNode::Type::kError) return Status::IOError("the master refused PSYNC: -" + r->str);
   const std::string_view reply = r->str;
@@ -331,34 +331,6 @@ Status ReplClient::AdoptReplid(std::string_view replid) {
   spdlog::info("replica adopted the master's replication id {} at seq {}", replid, log_.last());
   if (cb_.on_adopt) cb_.on_adopt(std::string(replid));
   return Status::Ok();
-}
-
-Result<ReplyNode> ReplClient::Command(int fd, const std::vector<std::string_view>& args) {
-  if (Status st = WriteAll(fd, RespCommand(args), timeout_); !st.ok()) return st;
-  auto line = ReadLine(fd);
-  if (!line.ok()) return line.status();
-  auto node = resp::ParseReply(*line);
-  if (!node.ok()) return Status::IOError("protocol error: unreadable reply to " + std::string(args[0]));
-  return node;
-}
-
-// One reply line, CRLF included. The handshake replies are all single-line (status or error); whatever
-// follows the line (the stream after +CONTINUE) stays in in_.
-Result<std::string> ReplClient::ReadLine(int fd) {
-  const auto deadline = SteadyClock::now() + timeout_;
-  for (;;) {
-    const size_t end = in_.find("\r\n");
-    if (end != std::string::npos) {
-      std::string line = in_.substr(0, end + 2);
-      in_.erase(0, end + 2);
-      return line;
-    }
-    if (in_.size() > kMaxReplyLine) return Status::IOError("protocol error: reply line too long");
-    const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - SteadyClock::now());
-    if (left <= 0ms) return Status::TimedOut("no reply from the master within repl-timeout");
-    const Status st = ReadSome(fd, &in_, left);
-    if (!st.ok() && st.code() != StatusCode::kTimedOut) return st;
-  }
 }
 
 // Applies frames as they arrive and acknowledges them (D9, D19). A link silent for repl-timeout drops.
