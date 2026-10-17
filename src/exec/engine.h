@@ -221,6 +221,16 @@ class Engine {
   bool SlotFenced(uint16_t slot) const { return fence_.Test(slot); }
   SlotBits FencedSlots() const { return fence_.Bits(); }
 
+  // ---- Migration-internal writers (M7b D22) ----
+  // One txn of `ops` (a target's remapped import chunk; an eraser step) under the shared gate (BUSY applies:
+  // the caller retries or fails), refused while loading, without key stripes: nothing else writes an
+  // importing or erasing range (clients are MOVEd or fenced, the reaper skips it, ASKING writes answer
+  // TRYAGAIN). Committed through the ReplLog, so this node's replicas get it, a fenced log refuses it
+  // (READONLY) and the R12 cap applies; the slot fence never applies. Range deletes and modified meta keys
+  // are reported as RunTxn reports them. kInternal inside a batch; empty ops commit nothing.
+  Status ApplyImport(const std::vector<encoding::ReplOp>& ops);
+  Status WriteInternal(const std::vector<encoding::ReplOp>& ops);
+
  private:
   // M6b D6: whether a call that now holds the gate is refused because a load runs.
   bool LoadingRefuses(bool read) const;
@@ -240,6 +250,7 @@ class Engine {
   bool Observing() const { return observer_ != nullptr && !observer_->Idle(); }
   void Report(const std::vector<DbKey>& keys);                       // under the gate, after commit
   uint64_t ChangeFence(const std::function<void(SlotBits&)>& edit);  // under the exclusive barrier
+  Status CommitInternal(const std::vector<encoding::ReplOp>& ops);   // ApplyImport / WriteInternal (D22)
 
   Storage& storage_;
   LockManager& locks_;
