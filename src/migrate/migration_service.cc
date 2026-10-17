@@ -69,8 +69,10 @@ Status MigrationService::PrepareRestore(uint64_t wanted, cluster::SlotStates& s,
     return Status::Ok();
   }
   Status st = RestoreInto(s, stored, out);
-  if (st.ok() || strict) return st;
-  // Writer's note 6: the node keeps empty states; one bad restore never fails later edits.
+  // A transient load error fails this edit and leaves the restore pending: empty states would let the next
+  // persisting edit overwrite a still-valid record (controller ruling, fix round 2).
+  if (st.ok() || strict || st.code() != StatusCode::kCorruption) return st;
+  // Writer's note 6: a damaged record leaves empty states; it never fails later edits.
   spdlog::critical("cannot restore the slot migration states after a promotion: {}", st.ToString());
   s = cluster::SlotStates{};
   *stored = cluster::MigrationRecord{};
@@ -121,8 +123,8 @@ void MigrationService::OnPromoted() {
 bool MigrationService::NewImportOverlaps(cluster::SlotRange range) const {
   const std::shared_ptr<const cluster::SlotStates> s = deps_.cluster.States();
   const std::optional<cluster::ImportJob>& import = s->import;
-  return import.has_value() && import->state == cluster::ImportState::kStart &&
-         cluster::Overlaps(import->range, range);
+  const cluster::ImportJob restored{range, cluster::ImportState::kError};  // what the restore left
+  return import.has_value() && !(*import == restored) && cluster::Overlaps(import->range, range);
 }
 
 void MigrationService::RunHalfImportErase(cluster::SlotRange range) {

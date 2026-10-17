@@ -60,8 +60,8 @@ class MigrationService {
   // released. On a failure (the edit's, the write's) the fence moves back and nothing is published. While a
   // promotion's restore is pending, the copy is first rebuilt from the record (cheaply: no erase here, see
   // Restore), so an edit that lands before the posted restore neither overwrites the record nor is
-  // overwritten by it. That rebuild never fails the edit: on a replica it is skipped, and a record that
-  // cannot be loaded is logged at critical and leaves empty states (Writer's note 6).
+  // overwritten by it. On a replica it is skipped; a damaged record is logged at critical and leaves empty
+  // states (Writer's note 6); a transient load error fails the edit and the restore stays pending.
   Status Mutate(const FallibleEdit& edit, bool persist = true, uint64_t* fence_seq = nullptr) {
     return MutateImpl(edit, persist, fence_seq, /*strict_restore=*/false);
   }
@@ -110,19 +110,21 @@ class MigrationService {
     return restore_requested_.load(std::memory_order_acquire) !=
            restore_applied_.load(std::memory_order_acquire);
   }
-  // Under record_mu_, for generation `wanted`: skipped on a replica; a failure is returned when strict, else
-  // logged at critical with `s` left empty. Marks `wanted` applied unless it rebuilt `s` (`out->ran`: the
-  // caller marks it once its commit succeeded) or failed strictly.
+  // Under record_mu_, for generation `wanted`: skipped on a replica; a failure is returned when strict or not
+  // Corruption (the restore stays pending); a Corruption otherwise is logged at critical with `s` left empty.
+  // Marks `wanted` applied unless it rebuilt `s` (`out->ran`: the caller marks it once its commit succeeded)
+  // or failed strictly.
   Status PrepareRestore(uint64_t wanted, cluster::SlotStates& s, cluster::MigrationRecord* stored,
                         Restored* out, bool strict);
   // Under record_mu_: `s` becomes the record's states, a half import -> error; `stored` gets the record as
   // found (empty when absent).
   Status RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored, Restored* out);
   void PostRestored(const Restored& r);  // the cleanups and the half-import erase, to the worker
-  // On the worker: erases what an import left in start (D8). Stops when a new import in start overlaps it
-  // (that import erases its range itself, D9), on a replica, or on Shutdown; failures retry after 1 s.
+  // On the worker: erases what an import left in start (D8). Stops for good once any other import overlaps it
+  // (start, success or error: that import erased its range itself, D9), on a replica, or on Shutdown;
+  // failures retry after 1 s.
   void RunHalfImportErase(cluster::SlotRange range);
-  bool NewImportOverlaps(cluster::SlotRange range) const;
+  bool NewImportOverlaps(cluster::SlotRange range) const;  // an import other than the restored one
   // Under record_mu_: moves the fence from `cur_fenced`, writes RecordOf(next) unless it equals `stored`,
   // publishes `next`.
   Status Commit(const SlotBits& cur_fenced, const cluster::MigrationRecord& stored,

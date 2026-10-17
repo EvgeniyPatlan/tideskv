@@ -18,6 +18,7 @@ class FaultyStorage final : public Storage {
   std::atomic<int> fail_savepoint_in{-1};
   std::atomic<int> fail_rollback_to_savepoint_in{-1};
   std::atomic<int> fail_release_savepoint_in{-1};
+  std::atomic<int> fail_begin_read_in{-1};  // BeginRead (M7b: a transient sys/migration load error)
   // Successful Savepoint calls minus successful ReleaseSavepoint calls, over every transaction.
   std::atomic<int> unreleased_savepoints{0};
   // Write transactions alive now, the most ever alive at once, and successful commits.
@@ -30,7 +31,10 @@ class FaultyStorage final : public Storage {
     if (!txn.ok()) return txn.status();
     return std::unique_ptr<WriteTxn>(std::make_unique<Txn>(std::move(txn).value(), *this));
   }
-  Result<std::unique_ptr<ReadView>> BeginRead() override { return inner_.BeginRead(); }
+  Result<std::unique_ptr<ReadView>> BeginRead() override {
+    if (Trip(fail_begin_read_in)) return Status::IOError("injected read failure");
+    return inner_.BeginRead();
+  }
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
   std::shared_ptr<const InMemoryStorage::Tables> Current() const {
     return inner_.Current();

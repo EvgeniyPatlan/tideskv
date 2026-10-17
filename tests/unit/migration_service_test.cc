@@ -313,9 +313,9 @@ TEST_F(ServiceTest, APromotionUndoneBeforeTheRestoreLeavesLaterMutatesWorking) {
   EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1));
 }
 
-// Fix round 1 (c): a restore failure at promotion is logged, leaves empty states and never fails an edit,
-// not even one that reaches the restore before the worker does.
-TEST_F(ServiceTest, ARestoreFailureAtPromotionKeepsEmptyStatesAndLaterMutatesProceed) {
+// Fix round 1 (c) as refined in round 2: a damaged record at promotion is logged, leaves empty states and
+// never fails an edit, not even one that reaches the restore before the worker does.
+TEST_F(ServiceTest, ADamagedRecordAtPromotionKeepsEmptyStatesAndLaterMutatesProceed) {
   ASSERT_TRUE(h.services.repl_log_
                   .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
                                       std::string(cluster::kSysMigration), "garbage"}})
@@ -331,6 +331,53 @@ TEST_F(ServiceTest, ARestoreFailureAtPromotionKeepsEmptyStatesAndLaterMutatesPro
   ASSERT_TRUE(svc->AwaitIdle(5s));
   ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) { s.job->state = MigrateState::kFail; }).ok());
   EXPECT_EQ(Record()->job->state, MigrateState::kFail) << "the next edit replaces the damaged record";
+}
+
+// Fix round 2: a transient load error fails that edit and keeps the restore pending, so the valid record is
+// neither lost nor overwritten; the next Mutate restores it.
+TEST_F(ServiceTest, ATransientLoadErrorAtPromotionFailsTheEditAndTheRestoreIsRetried) {
+  cluster::MigrationRecord r;
+  r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
+  Persist(r);
+  auto svc = Make();
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  h.services.storage_.fail_begin_read_in = 1;  // the record load
+  EXPECT_EQ(svc->Mutate(StartJob).code(), StatusCode::kIOError);
+  EXPECT_FALSE(c.manager->States()->job.has_value());
+  EXPECT_EQ(Record()->migrated.size(), 1u) << "the record is untouched";
+  ASSERT_TRUE(svc->Mutate(StartJob).ok());
+  const std::shared_ptr<const cluster::SlotStates> s = c.manager->States();
+  EXPECT_EQ(s->migrated, r.migrated) << "restored once the error cleared";
+  EXPECT_TRUE(h.services.engine_.SlotFenced(3300));
+  EXPECT_EQ(s->job->state, MigrateState::kStart);
+  EXPECT_EQ(Record()->migrated, r.migrated);
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+}
+
+// Fix round 2: an overlapping import that reached success before the posted erase ran supersedes it.
+TEST_F(ServiceTest, AHalfImportEraseNeverDeletesALaterImportsData) {
+  HalfImport();
+  auto svc = Make();
+  auto release = BlockWorker(*svc);
+  svc->OnPromoted();
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {  // the new IMPORT start (it erased its range itself)
+                   s.import = cluster::ImportJob{{12182, 12182}, cluster::ImportState::kStart};
+                 })
+                  .ok());
+  ASSERT_TRUE(h.services.engine_
+                  .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
+                                 encoding::MetaKeyFor(0, "foo"), encoding::EncodeMetadata({}, "imported")}})
+                  .ok());
+  ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {  // IMPORT success
+                   s.import->state = cluster::ImportState::kSuccess;
+                   s.imported.push_back({12182, 12182});
+                 })
+                  .ok());
+  *release = true;
+  ASSERT_TRUE(svc->AwaitIdle(5s));
+  EXPECT_EQ(h.Run({"CLUSTER", "COUNTKEYSINSLOT", "12182"}), Int(1)) << "the imported data survives";
 }
 
 // Fix round 1 (c), on the worker alone.
