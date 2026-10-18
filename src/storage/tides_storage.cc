@@ -337,16 +337,28 @@ void SetPipeline(tidesdb_column_family_config_t* cfg, Compression c) {
   cfg->encoding_count = 1;
 }
 
-// Existing families keep the pipeline persisted in the manifest unless we change it.
+// The per-family settings TidesKV chooses; everything else stays as created or persisted.
+struct FamilySettings {
+  Compression compression = Compression::kNone;
+  int l1_file_count_trigger = 0;  // 0 = keep (default at creation)
+};
+
+void ApplySettings(tidesdb_column_family_config_t* cfg, const FamilySettings& f) {
+  SetPipeline(cfg, f.compression);
+  if (f.l1_file_count_trigger > 0) cfg->l1_file_count_trigger = f.l1_file_count_trigger;
+}
+
+// Existing families keep the config persisted in the manifest unless we change it.
 // The update contends with background compaction (TDB_ERR_LOCKED); if it never wins, Open must
-// not fail, so we keep the persisted pipeline (new data is still readable either way).
-Status ApplyPipeline(tidesdb_t* db, tidesdb_column_family_t* cf, Compression c) {
+// not fail, so we keep the persisted config (new data is still readable either way).
+Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const FamilySettings& f) {
   tidesdb_cf_stats_t st{};
   if (int rc = tidesdb_get_cf_stats(cf, &st); rc != TDB_SUCCESS) return FromTdb(rc, "get_cf_stats");
   tidesdb_column_family_config_t cfg = st.config;
-  SetPipeline(&cfg, c);
+  ApplySettings(&cfg, f);
   const bool same = cfg.encoding_count == st.config.encoding_count &&
-                    (cfg.encoding_count == 0 || cfg.encoding_pipeline[0] == st.config.encoding_pipeline[0]);
+                    (cfg.encoding_count == 0 || cfg.encoding_pipeline[0] == st.config.encoding_pipeline[0]) &&
+                    cfg.l1_file_count_trigger == st.config.l1_file_count_trigger;
   if (same) return Status::Ok();
   constexpr int kAttempts = 10;
   int rc = TDB_ERR_LOCKED;
@@ -355,18 +367,19 @@ Status ApplyPipeline(tidesdb_t* db, tidesdb_column_family_t* cf, Compression c) 
     rc = tidesdb_cf_update_runtime_config(db, cf, &cfg, /*persist_to_disk=*/1);
   }
   if (rc == TDB_ERR_LOCKED) {
-    spdlog::warn("column family is busy compacting; keeping its persisted compression pipeline");
+    spdlog::warn("column family is busy compacting; keeping its persisted settings");
     return Status::Ok();
   }
   return FromTdb(rc, "cf_update_runtime_config");
 }
 
-Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, Compression c, tidesdb_column_family_t** out) {
+Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, const FamilySettings& f,
+                          tidesdb_column_family_t** out) {
   const std::string name(ColumnFamilyName(cf));
   *out = tidesdb_get_column_family(db, name.c_str());
-  if (*out != nullptr) return ApplyPipeline(db, *out, c);
+  if (*out != nullptr) return ApplyFamilySettings(db, *out, f);
   tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
-  SetPipeline(&cfg, c);
+  ApplySettings(&cfg, f);
   const int rc = tidesdb_create_column_family(db, name.c_str(), &cfg);
   if (rc != TDB_SUCCESS && rc != TDB_ERR_EXISTS) return FromTdb(rc, "create column family " + name);
   *out = tidesdb_get_column_family(db, name.c_str());
@@ -403,6 +416,7 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
   if (o.memtable_size != 0) cfg.memtable_write_buffer_size = o.memtable_size;
   if (o.flush_threads != 0) cfg.num_flush_threads = o.flush_threads;
   if (o.compaction_threads != 0) cfg.num_compaction_threads = o.compaction_threads;
+  if (o.l0_stall_threshold != 0) cfg.memtable_l0_queue_stall_threshold = o.l0_stall_threshold;
 
   const int rc = tidesdb_open(&cfg, &impl->db);
   if (rc == TDB_ERR_LOCKED) {
@@ -410,8 +424,9 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
   }
   if (rc != TDB_SUCCESS) return FromTdb(rc, "open " + o.path);
   const Compression comp = Effective(o.compression);
+  const FamilySettings settings{comp, o.l1_file_count_trigger};
   for (ColumnFamily cf : kAllColumnFamilies) {
-    if (Status st = EnsureColumnFamily(impl->db, cf, comp, &impl->cfs[CfIndex(cf)]); !st.ok()) return st;
+    if (Status st = EnsureColumnFamily(impl->db, cf, settings, &impl->cfs[CfIndex(cf)]); !st.ok()) return st;
   }
   impl->compression = comp;
   return std::unique_ptr<TidesStorage>(new TidesStorage(std::move(impl)));
@@ -487,7 +502,8 @@ Result<StorageStats> TidesStorage::Stats() {
     if (int rc = tidesdb_get_cf_stats(impl_->cfs[CfIndex(cf)], &st); rc != TDB_SUCCESS) {
       return FromTdb(rc, "get_cf_stats");
     }
-    out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count};
+    out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count,
+                           st.config.l1_file_count_trigger};
   }
   return out;
 }

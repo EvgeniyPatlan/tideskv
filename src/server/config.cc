@@ -108,6 +108,12 @@ std::vector<Option> BaseOptions() {
          return Status::Ok();
        },
        [](const ConfigValues& c) { return c.logfile; }},
+      {"l0-stall-threshold", false,
+       [](ConfigValues& c, std::string_view v) { return SetInt(v, 2, 1024, &c.l0_stall_threshold); },
+       [](const ConfigValues& c) { return std::to_string(c.l0_stall_threshold); }},
+      {"l1-file-count-trigger", false,
+       [](ConfigValues& c, std::string_view v) { return SetInt(v, 1, 1024, &c.l1_file_count_trigger); },
+       [](const ConfigValues& c) { return std::to_string(c.l1_file_count_trigger); }},
       {"loglevel", false,
        [](ConfigValues& c, std::string_view v) {
          return Choice(v, {"debug", "verbose", "notice", "warning"}, &c.loglevel);

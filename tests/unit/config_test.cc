@@ -33,6 +33,8 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(v.maxclients, 10000);
   EXPECT_EQ(v.client_query_buffer_limit, 1ULL << 30);
   EXPECT_TRUE(v.requirepass.empty());
+  EXPECT_EQ(v.l1_file_count_trigger, 8);
+  EXPECT_EQ(v.l0_stall_threshold, 32);
 }
 
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
@@ -104,9 +106,24 @@ TEST(Config, ValidatesValues) {
                                                         {"workers", "2000"},
                                                         {"block-cache-size", "lots"},
                                                         {"bind", ""},
-                                                        {"client-query-buffer-limit", "1k"}}) {
+                                                        {"client-query-buffer-limit", "1k"},
+                                                        {"l1-file-count-trigger", "0"},
+                                                        {"l1-file-count-trigger", "1025"},
+                                                        {"l0-stall-threshold", "1"},
+                                                        {"l0-stall-threshold", "1025"}}) {
     EXPECT_FALSE(c.Set(name, value, false).ok()) << name << "=" << value;
   }
+}
+
+// M8: the TidesDB compaction and backpressure knobs; set at startup only (TidesDB reads them at open).
+TEST(Config, StorageTuningIsParsedAndStartupOnly) {
+  Config c;
+  ASSERT_TRUE(c.Set("l1-file-count-trigger", "16", false).ok());
+  ASSERT_TRUE(c.Set("l0-stall-threshold", "64", false).ok());
+  EXPECT_EQ(c.Snapshot().l1_file_count_trigger, 16);
+  EXPECT_EQ(c.Snapshot().l0_stall_threshold, 64);
+  EXPECT_FALSE(c.Set("l1-file-count-trigger", "4", true).ok());
+  EXPECT_FALSE(c.Set("l0-stall-threshold", "16", true).ok());
 }
 
 TEST(Config, SetManyIsAtomic) {
@@ -123,7 +140,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 42u);
+  EXPECT_EQ(c.Get("*").size(), 44u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {

@@ -172,6 +172,36 @@ TEST(TidesStorageMaint, ReopenWithSameCompressionKeepsData) {
   }
 }
 
+// M8: l1_file_count_trigger reaches every column family, new ones at creation and existing ones on
+// reopen; 0 leaves TidesDB's default (4).
+TEST(TidesStorageMaint, L1FileCountTriggerAppliesToNewAndExistingFamilies) {
+  TempDir dir;
+  StorageOptions o = OptionsFor(dir);
+  {
+    o.l1_file_count_trigger = 12;
+    o.l0_stall_threshold = 48;
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 12);
+  }
+  {
+    o.l1_file_count_trigger = 20;
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 20);
+  }
+  TempDir fresh;
+  auto s = MustOpen(OptionsFor(fresh));
+  ASSERT_NE(s, nullptr);
+  auto st = s->Stats();
+  ASSERT_TRUE(st.ok());
+  for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 4);
+}
+
 TEST(TidesStorageMaint, StatsCountKeysAndTombstonesAfterFlush) {
   TempDir dir;
   auto s = MustOpen(OptionsWith(dir, Compression::kNone));

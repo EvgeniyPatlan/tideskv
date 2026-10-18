@@ -20,6 +20,7 @@ struct CfStats {
   uint64_t total_keys = 0;        // in sstables (not the memtable)
   uint64_t total_tombstones = 0;  // point + range tombstones in sstables
   uint64_t compaction_count = 0;
+  int l1_file_count_trigger = 0;  // as configured on the family
 };
 
 struct StorageStats {
@@ -37,6 +38,11 @@ struct StorageOptions {
   size_t memtable_size = 0;     // 0 = engine default
   int flush_threads = 0;        // 0 = engine default
   int compaction_threads = 0;   // 0 = engine default
+  // M8: flush-tier tables per family that trigger a merge, and the backlog (unflushed memtables, or
+  // flush-tier tables) at which commits are throttled from half and blocked at the full value.
+  // TidesDB's defaults (4, 16) throttle every writer while a merge rewrites a large level. 0 = default.
+  int l1_file_count_trigger = 0;
+  int l0_stall_threshold = 0;
   Compression compression = Compression::kLz4;
 };
 

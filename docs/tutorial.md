@@ -443,6 +443,8 @@ Settings are read in this order, and later sources win:
 | `sync-interval-us` | `1000000` | no | fsync period for `interval` |
 | `block-cache-size` | `4gb` | no | TidesDB read cache |
 | `memtable-size` | `64mb` | no | TidesDB write buffer |
+| `l1-file-count-trigger` | `8` | no | Flush-tier tables per column family that start a merge |
+| `l0-stall-threshold` | `32` | no | Write backpressure: throttle from half this backlog (unflushed memtables or flush-tier tables), block at it |
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |
 | `requirepass` | empty | yes | Password for `AUTH` |
 | `maxclients` | `10000` | yes | Connection limit |

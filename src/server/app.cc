@@ -67,6 +67,8 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   so.sync_interval_us = v.sync_interval_us;
   so.block_cache_size = v.block_cache_size;
   so.memtable_size = v.memtable_size;
+  so.l1_file_count_trigger = v.l1_file_count_trigger;
+  so.l0_stall_threshold = v.l0_stall_threshold;
   so.compression = v.compression == "zstd" ? Compression::kZstd
                    : v.compression == "no" ? Compression::kNone
                                            : Compression::kLz4;

@@ -93,6 +93,8 @@ These are the most used settings. `CONFIG GET *` lists all of them with their cu
 | `sync-interval-us` | `1000000` | fsync period for `interval` |
 | `block-cache-size` | `4gb` | TidesDB block cache |
 | `memtable-size` | `64mb` | TidesDB memtable size |
+| `l1-file-count-trigger` | `8` | Flush-tier tables per column family that start a merge |
+| `l0-stall-threshold` | `32` | Write backpressure: throttle from half this backlog, block at it |
 | `compression` | `lz4` | `no`, `lz4` or `zstd` |
 | `requirepass` | empty | Password for `AUTH` |
 | `maxclients` | `10000` | Connection limit |

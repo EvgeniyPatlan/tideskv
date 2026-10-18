@@ -27,6 +27,10 @@ struct ConfigValues {
   uint64_t sync_interval_us = 1'000'000;
   uint64_t block_cache_size = 4ULL << 30;
   uint64_t memtable_size = 64ULL << 20;
+  // M8: TidesDB merge trigger (flush-tier tables) and write backpressure threshold; see StorageOptions.
+  // Raised from TidesDB's 4 and 16, which stalled every writer while a merge rewrote a large level.
+  int l1_file_count_trigger = 8;
+  int l0_stall_threshold = 32;
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   int64_t busy_reply_threshold_ms = 5000;  // busy-reply-threshold / lua-time-limit (M5b)
