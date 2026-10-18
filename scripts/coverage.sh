@@ -6,7 +6,9 @@ BUILD=build/coverage
 cmake --preset coverage ${TIDESKV_CMAKE_ARGS:-} >/dev/null
 cmake --build --preset coverage -j
 rm -rf "$BUILD/profiles" && mkdir -p "$BUILD/profiles"
-LLVM_PROFILE_FILE="$PWD/$BUILD/profiles/%p-%m.profraw" ctest --preset coverage
+# %4m merges every process of one binary into a pool of 4 files online. One file per process (%p) came to
+# 4256 files and 14.4 GB, 1482 of them 8.7 MB unit_tests runs, which filled the CI runner's disk.
+LLVM_PROFILE_FILE="$PWD/$BUILD/profiles/%4m.profraw" ctest --preset coverage
 llvm-profdata-18 merge -sparse "$BUILD"/profiles/*.profraw -o "$BUILD/merged.profdata"
 
 bins=()

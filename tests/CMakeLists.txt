@@ -40,7 +40,30 @@ if(INTEGRATION_SOURCES AND TARGET tideskv-server)
   target_compile_definitions(integration_tests PRIVATE TIDESKV_SERVER_BIN="$<TARGET_FILE:tideskv-server>")
   add_dependencies(integration_tests tideskv-server)
   tideskv_defaults(integration_tests)
-  gtest_discover_tests(integration_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 60)
+  # Throughput-bound tests whose work cannot shrink without losing what they check, slow under a
+  # sanitizer (Debug, clang, everything instrumented). Seconds measured with taskset -c 0-3 (two SMT
+  # pairs, like the 4-vCPU CI runner), sanitized, beside three other heavy tests; the CI runners are
+  # about 1.7x slower again over the whole suite and up to 3.5x for one test:
+  #   CollectionConcurrencyIT.ConcurrentCreatesCrossALeaseBoundary  39 s TSan (72000 HSETs: > one oid lease)
+  #   CompactionIT.FlushDbPhysicallyReclaimsThatDbsKeys             40 s TSan, 37 s of it the 60000-key fill
+  #   ScriptingIT.KillDuringEvalIsAllOrNothing                      41 s TSan (11 server starts, 6 scripts)
+  #   ListZsetIT.LargeListAcrossManyFlushes                         22 s TSan in the full suite; 58 s in CI
+  # In CI run 39108774940 the first two timed out at 60 s under ASan and TSan, the third under ASan (34 s
+  # under TSan), and the last passed both with 2 s to spare.
+  set(SLOW_INTEGRATION_TESTS
+      CollectionConcurrencyIT.ConcurrentCreatesCrossALeaseBoundary
+      CompactionIT.FlushDbPhysicallyReclaimsThatDbsKeys
+      ScriptingIT.KillDuringEvalIsAllOrNothing
+      ListZsetIT.LargeListAcrossManyFlushes)
+  list(JOIN SLOW_INTEGRATION_TESTS ":" slow_filter)
+  set(slow_timeout 60)
+  if(TIDESKV_SANITIZE)
+    set(slow_timeout 300)
+  endif()
+  gtest_discover_tests(integration_tests DISCOVERY_MODE PRE_TEST TEST_FILTER "-${slow_filter}"
+                       PROPERTIES TIMEOUT 60)
+  gtest_discover_tests(integration_tests DISCOVERY_MODE PRE_TEST TEST_FILTER "${slow_filter}"
+                       PROPERTIES TIMEOUT ${slow_timeout})
 endif()
 
 if(TIDESKV_FUZZ)

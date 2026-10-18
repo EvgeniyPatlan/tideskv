@@ -398,8 +398,10 @@ TEST_F(ServiceTest, ATransientLoadErrorInThePostedRestoreIsRetriedOnTheWorker) {
   auto svc = std::make_unique<migrate::MigrationService>(std::move(deps));
   h.services.storage_.fail_begin_read_in = 1;  // the posted restore's record load
   svc->OnPromoted();
+  // Wait for the publish, Commit's last step: the fence is assigned before the record save and the publish,
+  // so a test that waits for the fence alone can read the states before the retried restore published them.
   const auto deadline = std::chrono::steady_clock::now() + 5s;
-  while (!h.services.engine_.SlotFenced(3300) && std::chrono::steady_clock::now() < deadline) {
+  while (c.manager->States()->migrated != r.migrated && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(5ms);
   }
   EXPECT_EQ(h.services.storage_.fail_begin_read_in.load(), -1) << "the injected failure was hit";

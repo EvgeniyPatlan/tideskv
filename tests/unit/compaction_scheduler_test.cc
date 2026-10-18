@@ -108,16 +108,48 @@ TEST(CompactionScheduler, QueuedJobsAreDeduplicatedPerColumnFamily) {
   EXPECT_EQ(s.pending(), 2u);
 }
 
-TEST(CompactionScheduler, BusyIsRetriedThenCountedAsAFailure) {
+// Busy means another compaction (TidesDB's own, usually) holds the CF. It ends by itself, however long a
+// big CF or a slow machine makes it, so it is waited out: it never uses an attempt and is never a failure
+// (a give-up would drop the FLUSHDB reclaim and report a failure that did not happen).
+TEST(CompactionScheduler, BusyIsWaitedOutAndNeverCountedAsAFailure) {
   FakeCompactor c;
-  c.busy_left = 100;
+  c.busy_left = 10;
   auto o = Opts(1000);
   o.max_attempts = 3;
   CompactionScheduler s(c, o);
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
-  EXPECT_EQ(s.RunPending(), 0u);  // attempt 1: requeued
-  EXPECT_EQ(s.RunPending(), 0u);  // attempt 2: requeued
-  EXPECT_EQ(s.RunPending(), 1u);  // attempt 3: given up
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(s.RunPending(), 0u) << "busy round " << i << ": requeued";
+    EXPECT_EQ(s.pending(), 1u);
+  }
+  EXPECT_EQ(s.RunPending(), 1u);
+  EXPECT_EQ(s.completed(), 1u);
+  EXPECT_EQ(s.failed(), 0u);
+}
+
+class FailingCompactor final : public Compactor {
+ public:
+  Status Checkpoint() override { return Status::Ok(); }
+  Status Compact(ColumnFamily) override {
+    ++compacts;
+    return busy_first-- > 0 ? Status::Busy("compaction running") : Status::IOError("injected");
+  }
+  int compacts = 0;
+  int busy_first = 0;
+};
+
+TEST(CompactionScheduler, AnErrorIsRetriedThenCountedAsAFailureAndBusyRoundsDoNotCount) {
+  FailingCompactor c;
+  c.busy_first = 4;
+  auto o = Opts(1000);
+  o.max_attempts = 3;
+  CompactionScheduler s(c, o);
+  s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
+  for (int i = 0; i < 4; ++i) EXPECT_EQ(s.RunPending(), 0u);  // busy: waited out
+  EXPECT_EQ(s.RunPending(), 0u);                              // attempt 1: requeued
+  EXPECT_EQ(s.RunPending(), 0u);                              // attempt 2: requeued
+  EXPECT_EQ(s.RunPending(), 1u);                              // attempt 3: given up
+  EXPECT_EQ(c.compacts, 7);
   EXPECT_EQ(s.failed(), 1u);
   EXPECT_EQ(s.pending(), 0u);
 }

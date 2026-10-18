@@ -44,8 +44,9 @@ int64_t IntValue(RespClient& c, const std::string& key) {
 
 // Task 13: batch writes are linear now, so the script can be long: about 0.6 s on a release server.
 // Debug servers are 10x slower and sanitizer servers slower still (TSan: about 4 s per run, 20 s for the
-// test unloaded, three times that beside the multinode suite), so they run fewer iterations: the test
-// stays well inside its ctest timeout on a loaded machine (F10).
+// test unloaded, three times that beside the multinode suite), so they run fewer iterations (F10). Its
+// 11 server starts still take over 60 s on a loaded 4-vCPU runner, so sanitized builds give it a longer
+// ctest timeout (SLOW_INTEGRATION_TESTS in tests/CMakeLists.txt).
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define TIDESKV_IT_SANITIZED 1
 #elif defined(__has_feature)
