@@ -82,14 +82,9 @@ void Fill(RespClient& c, const std::string& tag, int count) {  // 512-byte eleme
     ASSERT_EQ(c.Command({"RPUSH", "{" + tag + "}filler", value}).integer, i + 1);
 }
 
-// A tag in the range whose slot holds no key on `c` yet (the ack load lands in some of the range's slots), so
-// a count of 1 there means the filler's meta has arrived.
-std::string EmptySlotTag(RespClient& c) {
-  for (const std::string& t : TagsInRange(kFirst, kLast, 64)) {
-    if (c.Command({"CLUSTER", "COUNTKEYSINSLOT", std::to_string(KeySlot(t))}).integer == 0) return t;
-  }
-  ADD_FAILURE() << "every candidate slot holds a key";
-  return "t0";
+// How many keys `c` holds in the slot (the ack load lands in some of the range's slots, possibly in all).
+int64_t KeysInSlot(RespClient& c, const std::string& slot) {
+  return c.Command({"CLUSTER", "COUNTKEYSINSLOT", slot}).integer;
 }
 
 // The range is gone from `s`: its digest is empty and the tags' slots count no key (D9).
@@ -203,15 +198,17 @@ TEST(Migration, AFailoverOfTheTargetMidImportErasesTheHalfImport) {
   std::this_thread::sleep_for(1s);
   acks.Stop();
   auto src = Client(*n.ptrs[0]);
-  const std::vector<std::string> tags = {EmptySlotTag(*src)};
+  const std::vector<std::string> tags = TagsInRange(kFirst, kLast, 1);
   ASSERT_NO_FATAL_FAILURE(Fill(*src, tags[0], 4000));
+  const std::string slot = std::to_string(KeySlot(tags[0]));
+  const int64_t slot_keys = KeysInSlot(*src, slot);  // the filler plus any ack keys; the load has stopped
   ASSERT_NO_FATAL_FAILURE(
       Config(*src, {{"migrate-batch-rate-limit-mb", "1"}, {"migrate-batch-size-kb", "1"}}));
   ASSERT_EQ(src->Command({"CLUSTERX", "MIGRATE", kRange, NodeId(2)}).str, "OK");
   auto target_replica = Client(*n.ptrs[3]);
-  const std::string slot = std::to_string(KeySlot(tags[0]));
-  ASSERT_TRUE(WaitFor(
-      [&] { return target_replica->Command({"CLUSTER", "COUNTKEYSINSLOT", slot}).integer == 1; }, 30s))
+  // Metas stream before subkeys, so every meta of the slot (the filler's included) arrives while most of the
+  // filler's 2 MB still has to follow at 1 MB/s.
+  ASSERT_TRUE(WaitFor([&] { return KeysInSlot(*target_replica, slot) == slot_keys; }, 30s))
       << "the import replicates (D21)";
   const std::vector<NodeLine> swapped = {{0, -1, "0-8191"}, {1, 0, ""}, {3, -1, "8192-16383"}, {2, 3, ""}};
   ASSERT_NO_FATAL_FAILURE(PushTopology(n.ptrs, NodesString(n.ptrs, swapped), 2));
