@@ -48,6 +48,7 @@ calls=(); wl_run W3 record
 check w3-hget "$(has "${calls[0]}" "--command=HGET h:5 __key__")" yes
 check w3-count "$(grep -o -- '--command=' <<<"${calls[0]}" | wc -l)" 10
 calls=(); wl_run W4 record
+check w4-incr "$(has "${calls[0]}" "--command=ZINCRBY z:1 1 __key__")" yes
 check w4-range "$(has "${calls[0]}" "--command=ZRANGEBYSCORE z:1 __key__ +inf LIMIT 0 10")" yes
 calls=(); wl_run W5 record
 check w5-lpop "$(has "${calls[0]}" "--command=LPOP l:1")" yes
@@ -69,6 +70,18 @@ done
 calls=(); wl_load strings record
 check strings-threads "$(has "${calls[0]}" "--threads=4")" yes
 
+# memtier's __data__ is a fixed pattern unless --random-data is set; fixed values make rewrites no-ops
+for ds in $DATASETS; do
+  calls=(); wl_load "$ds" record
+  for c in "${calls[@]}"; do
+    [[ $c == *--data-size* ]] && check "load-$ds-random-data" "$(has "$c" "--random-data")" yes
+  done
+done
+for w in $WORKLOADS; do
+  calls=(); wl_run "$w" record
+  [[ ${calls[0]} == *--data-size* ]] && check "run-$w-random-data" "$(has "${calls[0]}" "--random-data")" yes
+done
+check probe-w4 "$(wl_probe W4 | head -1)" "ZINCRBY z:1 1 2"
 for w in $WORKLOADS; do
   check "probe-$w-nonempty" "$( [[ -n $(wl_probe "$w") ]] && echo yes || echo no)" yes
 done

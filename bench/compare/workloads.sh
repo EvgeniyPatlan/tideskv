@@ -31,11 +31,11 @@ wl_load() {
   case $ds in
     strings)
       # shellcheck disable=SC2046
-      "$cb" "--ratio=1:0" "--data-size=$VALUE_SIZE" "--key-prefix=s:" $(_seq "$S_KEYS") ;;
+      "$cb" "--ratio=1:0" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=s:" $(_seq "$S_KEYS") ;;
     hashes)
       for ((i = 1; i <= H_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=HSET h:$i __key__ __data__" "--data-size=$VALUE_SIZE" \
+        "$cb" "--command=HSET h:$i __key__ __data__" "--data-size=$VALUE_SIZE" "--random-data" \
           "--key-prefix=f:" $(_cseq "$H_FIELDS")
       done ;;
     zsets)
@@ -46,14 +46,14 @@ wl_load() {
     lists)
       for ((i = 1; i <= L_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=LPUSH l:$i __data__" "--data-size=$VALUE_SIZE" $(_cseq "$L_ELEMS")
+        "$cb" "--command=LPUSH l:$i __data__" "--data-size=$VALUE_SIZE" "--random-data" $(_cseq "$L_ELEMS")
       done ;;
     bighashes)
       # one hash per key bh:<n>, BH_FIELDS fields each, via HSET with BH_FIELDS field/value pairs
       local args=() f
       for ((f = 1; f <= BH_FIELDS; f++)); do args+=("f$f" "__data__"); done
       # shellcheck disable=SC2046
-      "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=$VALUE_SIZE" \
+      "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=$VALUE_SIZE" "--random-data" \
         "--key-prefix=bh:" $(_cseq "$BH_COUNT") ;;
     *) echo "wl_load: unknown dataset $ds" >&2; return 2 ;;
   esac
@@ -66,20 +66,20 @@ wl_run() {
   case $w in
     W1|W6)
       # shellcheck disable=SC2046
-      "$cb" "--ratio=1:1" "--data-size=$VALUE_SIZE" "--key-prefix=s:" "--key-pattern=R:R" $(_random "$S_KEYS") ;;
+      "$cb" "--ratio=1:1" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=s:" "--key-pattern=R:R" $(_random "$S_KEYS") ;;
     W2)
       # shellcheck disable=SC2046
-      "$cb" "--ratio=1:10" "--data-size=$VALUE_SIZE" "--key-prefix=s:" "--key-pattern=R:R" $(_random "$S_KEYS") ;;
+      "$cb" "--ratio=1:10" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=s:" "--key-pattern=R:R" $(_random "$S_KEYS") ;;
     W3)
       for ((i = 1; i <= H_COUNT; i++)); do
         args+=("--command=HSET h:$i __key__ __data__" "--command-ratio=1" "--command-key-pattern=R"
                "--command=HGET h:$i __key__" "--command-ratio=1" "--command-key-pattern=R")
       done
       # shellcheck disable=SC2046
-      "$cb" "${args[@]}" "--data-size=$VALUE_SIZE" "--key-prefix=f:" $(_random "$H_FIELDS") ;;
+      "$cb" "${args[@]}" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=f:" $(_random "$H_FIELDS") ;;
     W4)
       for ((i = 1; i <= Z_COUNT; i++)); do
-        args+=("--command=ZADD z:$i __key__ __key__" "--command-ratio=1" "--command-key-pattern=R"
+        args+=("--command=ZINCRBY z:$i 1 __key__" "--command-ratio=1" "--command-key-pattern=R"
                "--command=ZRANGEBYSCORE z:$i __key__ +inf LIMIT 0 10" "--command-ratio=1" "--command-key-pattern=R")
       done
       # shellcheck disable=SC2046
@@ -88,7 +88,7 @@ wl_run() {
       for ((i = 1; i <= L_COUNT; i++)); do
         args+=("--command=LPUSH l:$i __data__" "--command-ratio=1" "--command=LPOP l:$i" "--command-ratio=1")
       done
-      "$cb" "${args[@]}" "--data-size=$VALUE_SIZE" ;;
+      "$cb" "${args[@]}" "--data-size=$VALUE_SIZE" "--random-data" ;;
     *) echo "wl_run: unknown workload $w" >&2; return 2 ;;
   esac
 }
@@ -105,7 +105,7 @@ wl_probe() {
   case $1 in
     W1|W2|W6) echo "SET s:1 $v"; echo "GET s:1" ;;
     W3) echo "HSET h:1 f:1 $v"; echo "HGET h:1 f:1" ;;
-    W4) echo "ZADD z:1 1 2"; echo "ZRANGEBYSCORE z:1 1 +inf LIMIT 0 10" ;;
+    W4) echo "ZINCRBY z:1 1 2"; echo "ZRANGEBYSCORE z:1 1 +inf LIMIT 0 10" ;;
     W5) echo "LPUSH l:1 $v"; echo "LPOP l:1" ;;
     *) echo "wl_probe: unknown workload $1" >&2; return 2 ;;
   esac
