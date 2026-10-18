@@ -45,6 +45,8 @@ The aim is a production alternative to Kvrocks: a dataset larger than RAM, durab
 
 Run `COMMAND LIST` against a server for the exact command set.
 
+For a guided demo and a tour of how TidesKV works, see the [tutorial](docs/tutorial.md).
+
 ## Quick start
 
 ### Build
