@@ -556,11 +556,54 @@ func TestClusterReset(t *testing.T) {
 	})
 
 	t.Run("cannot reset cluster if the db is importing the slot", func(t *testing.T) {
-		t.Skip("tideskv: CLUSTER IMPORT and CLUSTERX MIGRATE arrive in M7b")
+		slotNum := 1
+		require.Equal(t, "OK", rdb1.Do(ctx, "cluster", "import", slotNum, 0).Val())
+		clusterInfo := rdb1.ClusterInfo(ctx).Val()
+		require.Contains(t, clusterInfo, "importing_slot(s): 1")
+		require.Contains(t, clusterInfo, "import_state: start")
+		require.Contains(t, rdb1.ClusterResetHard(ctx).Err(), "Can't reset cluster while importing slot")
+		require.Equal(t, "OK", rdb1.Do(ctx, "cluster", "import", slotNum, 1).Val())
+		clusterInfo = rdb1.ClusterInfo(ctx).Val()
+		require.Contains(t, clusterInfo, "import_state: success")
+		require.NoError(t, rdb0.ClusterResetHard(ctx).Err())
+		require.EqualValues(t, "-1", rdb0.Do(ctx, "clusterx", "version").Val())
+		// reset the cluster topology to avoid breaking other test cases
+		require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 	})
 
 	t.Run("cannot reset cluster if the db is migrating the slot", func(t *testing.T) {
-		t.Skip("tideskv: CLUSTER IMPORT and CLUSTERX MIGRATE arrive in M7b")
+		slotNum := 2
+		// slow down the migration speed to ensure we can observe the "start" state
+		// before migration completes (especially on fast hardware like macOS ARM)
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+		// tideskv: the RPUSHes go to "my-list", not slot 2, so slot 2 is empty and migrates in microseconds;
+		// hold the job in its snapshot phase so "start" is observable (M7b D25)
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-delay-ms", "1000").Err())
+		value := strings.Repeat("a", 512)
+		for i := 0; i < 4096; i++ {
+			require.NoError(t, rdb0.RPush(ctx, "my-list", value).Err())
+		}
+
+		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slotNum, id1).Val())
+		clusterInfo := rdb0.ClusterInfo(ctx).Val()
+		require.Contains(t, clusterInfo, "migrating_slot(s): 2")
+		require.Contains(t, clusterInfo, "migrating_state: start")
+		require.Contains(t, rdb0.ClusterResetHard(ctx).Err(), "Can't reset cluster while migrating slot")
+
+		// wait for the migration to finish
+		require.Eventually(t, func() bool {
+			clusterInfo := rdb0.ClusterInfo(context.Background()).Val()
+			return strings.Contains(clusterInfo, fmt.Sprintf("migrating_state: %s", "success"))
+		}, 10*time.Second, 100*time.Millisecond)
+		// Need to flush keys in the source node since the success migration will not mean
+		// the keys are removed from the source node right now.
+		require.NoError(t, rdb0.FlushAll(ctx).Err())
+
+		require.NoError(t, rdb0.ClusterResetHard(ctx).Err())
+		require.EqualValues(t, "-1", rdb0.Do(ctx, "clusterx", "version").Val())
+		// reset the cluster topology to avoid breaking other test cases
+		require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 	})
 }
 
@@ -614,5 +657,44 @@ func TestClusterNodeFailFlag(t *testing.T) {
 }
 
 func TestClusterFlushSlots(t *testing.T) {
-	t.Skip("tideskv: CLUSTERX FLUSHSLOTS arrives in M7b (M7a D11)")
+	srv := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+	defer srv.Close()
+
+	rdb := srv.NewClient()
+	defer func() {
+		require.NoError(t, rdb.Close())
+	}()
+
+	ctx := context.Background()
+	nodeID := "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+	require.NoError(t, rdb.Do(ctx, "clusterx", "SETNODEID", nodeID).Err())
+	clusterNodes := fmt.Sprintf("%s %s %d master - 0-16383", nodeID, srv.Host(), srv.Port())
+	require.NoError(t, rdb.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+	slotKeys := []string{"{3560}key", "{22179}key", "{48756}key", "{2977}key", "{4569}key",
+		"{460}key", "{4384}key", "{41432}key", "{46920}key", "{9073}key"}
+	initKeys := func(cli *redis.Client) error {
+		if err := cli.FlushDB(ctx).Err(); err != nil {
+			return err
+		}
+		for _, key := range slotKeys {
+			if err := cli.Set(ctx, key, "value", 0).Err(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	t.Run("Flush slots", func(t *testing.T) {
+		require.NoError(t, initKeys(rdb))
+
+		r, err := rdb.Do(ctx, "clusterx", "flushslots", "0 2 4 6-9").Result()
+		require.NoError(t, err)
+		require.Equal(t, "OK", r)
+
+		expectedRemainingKeys := []string{slotKeys[1], slotKeys[3], slotKeys[5]}
+		keys, err := rdb.Keys(ctx, "*").Result()
+		require.NoError(t, err)
+		require.ElementsMatch(t, keys, expectedRemainingKeys)
+	})
 }

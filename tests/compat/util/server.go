@@ -30,6 +30,8 @@ var supportedConfigs = map[string]bool{
 	"repl-backlog-size": true, "replica-serve-stale-data": true, "min-replicas-to-write": true,
 	"min-replicas-max-lag": true, "key-load-delay": true, "rdb-key-save-delay": true,
 	"bind": true, "cluster-enabled": true, // tideskv: cluster knobs added in M7a
+	"migrate-type": true, "migrate-batch-size-kb": true, "migrate-batch-rate-limit-mb": true,
+	"migrate-sequence-gap": true, "migrate-delay-ms": true, // tideskv: migration knobs added in M7b
 } // tideskv: replication knobs added in M6b
 
 type KvrocksServer struct {

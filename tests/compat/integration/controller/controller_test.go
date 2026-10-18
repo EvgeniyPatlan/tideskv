@@ -91,6 +91,21 @@ func masterOf(s ctlShard) ctlNode {
 	return ctlNode{}
 }
 
+// ownsSlot: slot_ranges entries are "N" or "a-b" (C:store/slot.go:91-96).
+func ownsSlot(ranges []string, slot int) bool {
+	for _, r := range ranges {
+		var a, b int
+		if n, _ := fmt.Sscanf(r, "%d-%d", &a, &b); n == 2 {
+			if slot >= a && slot <= b {
+				return true
+			}
+		} else if n, _ := fmt.Sscanf(r, "%d", &a); n == 1 && a == slot {
+			return true
+		}
+	}
+	return false
+}
+
 // nodesString renders the controller's view of a cluster as a CLUSTERX SETNODES argument (one
 // "<id> <host> <port> <role> <master-id|-> [ranges]" line per node).
 func nodesString(t *testing.T, c ctlCluster) string {
@@ -139,6 +154,15 @@ func TestControllerDrivesATidesKVCluster(t *testing.T) {
 		servers[i] = util.StartServer(t, map[string]string{"cluster-enabled": "yes", "bind": "0.0.0.0"})
 		clients[i] = servers[i].NewClient()
 		addrs[i] = fmt.Sprintf("%s:%d", host, servers[i].Port())
+	}
+	clientAt := func(addr string) *redis.Client {
+		for i := range addrs {
+			if addrs[i] == addr {
+				return clients[i]
+			}
+		}
+		t.Fatalf("no node at %s", addr)
+		return nil
 	}
 	defer func() {
 		for i := range servers {
@@ -212,6 +236,46 @@ func TestControllerDrivesATidesKVCluster(t *testing.T) {
 		for i := 0; i < 200; i++ {
 			require.Equal(t, strconv.Itoa(i), cc.Get(ctx, fmt.Sprintf("key:%d", i)).Val())
 		}
+	})
+
+	t.Run("a migration moves slot 100 with its keys and cleans the source", func(t *testing.T) { // M7b D1, D7
+		keys := make([]string, 50)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("{%s}:%d", util.SlotTable[100], i)
+			require.NoError(t, cc.Set(ctx, keys[i], i, 0).Err())
+		}
+		source := clientAt(masterOf(ctl.cluster(ns).Shards[0]).Addr)
+		code, r := ctl.do(http.MethodPost, "/api/v1/namespaces/"+ns+"/clusters/c/migrate",
+			map[string]any{"target": 1, "slot": "100", "slot_only": false})
+		require.Equal(t, http.StatusOK, code, "%+v", r.Error)
+		require.Eventually(t, func() bool { // the controller polls the source's CLUSTER INFO every second
+			c := ctl.cluster(ns)
+			return ownsSlot(c.Shards[1].SlotRanges, 100) && !ownsSlot(c.Shards[0].SlotRanges, 100)
+		}, 60*time.Second, 500*time.Millisecond)
+		cc.ReloadState(ctx)
+		for i, k := range keys {
+			require.Equal(t, strconv.Itoa(i), cc.Get(ctx, k).Val(), k)
+		}
+		require.Eventually(t, func() bool {
+			return source.Do(ctx, "CLUSTER", "COUNTKEYSINSLOT", 100).Val() == int64(0)
+		}, 30*time.Second, 200*time.Millisecond)
+	})
+
+	t.Run("a slot_only move reassigns slot 101 and leaves its keys", func(t *testing.T) { // M7b D7, KM §4.2
+		key := fmt.Sprintf("{%s}:kept", util.SlotTable[101])
+		require.NoError(t, cc.Set(ctx, key, "v", 0).Err())
+		source := clientAt(masterOf(ctl.cluster(ns).Shards[0]).Addr)
+		code, r := ctl.do(http.MethodPost, "/api/v1/namespaces/"+ns+"/clusters/c/migrate",
+			map[string]any{"target": 1, "slot": "101", "slot_only": true})
+		require.Equal(t, http.StatusOK, code, "%+v", r.Error)
+		want := strconv.FormatInt(ctl.cluster(ns).Version, 10)
+		require.True(t, ownsSlot(ctl.cluster(ns).Shards[1].SlotRanges, 101))
+		require.Eventually(t, func() bool { return source.Do(ctx, "CLUSTERX", "VERSION").Val() == want },
+			30*time.Second, 200*time.Millisecond)
+		// tideskv: a slot lost without a migration keeps its data, as Kvrocks; CLUSTERX FLUSHSLOTS removes it
+		require.EqualValues(t, 1, source.Do(ctx, "CLUSTER", "COUNTKEYSINSLOT", 101).Val())
+		cc.ReloadState(ctx)
+		require.ErrorIs(t, cc.Get(ctx, key).Err(), redis.Nil)
 	})
 
 	t.Run("a dead master is failed over automatically", func(t *testing.T) {
