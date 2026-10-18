@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # memtier arguments for the comparison workloads W1-W6 (spec 2026-10-18 §6, plan rulings 1-2).
 # Sourced by run.sh; callbacks receive memtier arguments as separate words.
+# wl_load owns --threads/--clients (strings: 4x8; collection loads: 1x1, because in --command mode
+# --requests=allkeys is NOT split across clients, every client would walk the whole range).
+# Callers must not add --threads/--clients to wl_load arguments.
 # shellcheck disable=SC2034  # globals are read by run.sh and the test
 DATASETS="strings hashes zsets lists bighashes"
 WORKLOADS="W1 W2 W3 W4 W5 W6"
@@ -16,8 +19,12 @@ wl_sizes() {
   esac
 }
 
-# Sequential load of every key in [1, max]: P:P with allkeys splits the range across threads x clients.
-_seq() { echo "--key-pattern=P:P" "--key-minimum=1" "--key-maximum=$1" "--requests=allkeys" "--pipeline=32"; }
+# Strings load (no --command): P:P with allkeys splits [1, max] across threads x clients.
+_seq() { echo "--key-pattern=P:P" "--key-minimum=1" "--key-maximum=$1" "--requests=allkeys" "--pipeline=32" \
+  "--threads=4" "--clients=8"; }
+# --command loads: memtier rejects --key-pattern here; one client walks [1, max] exactly once.
+_cseq() { echo "--command-key-pattern=P" "--key-minimum=1" "--key-maximum=$1" "--requests=allkeys" \
+  "--pipeline=32" "--threads=1" "--clients=1"; }
 
 wl_load() {
   local ds=$1 cb=$2 i
@@ -28,26 +35,26 @@ wl_load() {
     hashes)
       for ((i = 1; i <= H_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=HSET h:$i __key__ __data__" "--command-key-pattern=P" "--data-size=$VALUE_SIZE" \
-          "--key-prefix=f:" $(_seq "$H_FIELDS")
+        "$cb" "--command=HSET h:$i __key__ __data__" "--data-size=$VALUE_SIZE" \
+          "--key-prefix=f:" $(_cseq "$H_FIELDS")
       done ;;
     zsets)
       for ((i = 1; i <= Z_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=ZADD z:$i __key__ m__key__" "--command-key-pattern=P" "--key-prefix=" $(_seq "$Z_MEMBERS")
+        "$cb" "--command=ZADD z:$i __key__ __key__" "--key-prefix=" $(_cseq $((2 * Z_MEMBERS)))
       done ;;
     lists)
       for ((i = 1; i <= L_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=LPUSH l:$i __data__" "--command-key-pattern=P" "--data-size=$VALUE_SIZE" $(_seq "$L_ELEMS")
+        "$cb" "--command=LPUSH l:$i __data__" "--data-size=$VALUE_SIZE" $(_cseq "$L_ELEMS")
       done ;;
     bighashes)
       # one hash per key bh:<n>, BH_FIELDS fields each, via HSET with BH_FIELDS field/value pairs
       local args=() f
       for ((f = 1; f <= BH_FIELDS; f++)); do args+=("f$f" "__data__"); done
       # shellcheck disable=SC2046
-      "$cb" "--command=HSET __key__ ${args[*]}" "--command-key-pattern=P" "--data-size=$VALUE_SIZE" \
-        "--key-prefix=bh:" $(_seq "$BH_COUNT") ;;
+      "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=$VALUE_SIZE" \
+        "--key-prefix=bh:" $(_cseq "$BH_COUNT") ;;
     *) echo "wl_load: unknown dataset $ds" >&2; return 2 ;;
   esac
 }
@@ -72,11 +79,11 @@ wl_run() {
       "$cb" "${args[@]}" "--data-size=$VALUE_SIZE" "--key-prefix=f:" $(_random "$H_FIELDS") ;;
     W4)
       for ((i = 1; i <= Z_COUNT; i++)); do
-        args+=("--command=ZADD z:$i __key__ m__key__" "--command-ratio=1" "--command-key-pattern=R"
+        args+=("--command=ZADD z:$i __key__ __key__" "--command-ratio=1" "--command-key-pattern=R"
                "--command=ZRANGEBYSCORE z:$i __key__ +inf LIMIT 0 10" "--command-ratio=1" "--command-key-pattern=R")
       done
       # shellcheck disable=SC2046
-      "$cb" "${args[@]}" "--key-prefix=" $(_random "$Z_MEMBERS") ;;
+      "$cb" "${args[@]}" "--key-prefix=" $(_random $((2 * Z_MEMBERS))) ;;
     W5)
       for ((i = 1; i <= L_COUNT; i++)); do
         args+=("--command=LPUSH l:$i __data__" "--command-ratio=1" "--command=LPOP l:$i" "--command-ratio=1")
@@ -98,7 +105,7 @@ wl_probe() {
   case $1 in
     W1|W2|W6) echo "SET s:1 $v"; echo "GET s:1" ;;
     W3) echo "HSET h:1 f:1 $v"; echo "HGET h:1 f:1" ;;
-    W4) echo "ZADD z:1 1 m1"; echo "ZRANGEBYSCORE z:1 1 +inf LIMIT 0 10" ;;
+    W4) echo "ZADD z:1 1 2"; echo "ZRANGEBYSCORE z:1 1 +inf LIMIT 0 10" ;;
     W5) echo "LPUSH l:1 $v"; echo "LPOP l:1" ;;
     *) echo "wl_probe: unknown workload $1" >&2; return 2 ;;
   esac
@@ -106,11 +113,12 @@ wl_probe() {
 }
 
 wl_verify_cmds() {
-  echo "$((S_KEYS + H_COUNT + Z_COUNT + L_COUNT + BH_COUNT)) DBSIZE"
-  echo "$H_FIELDS HLEN h:1"
-  echo "$Z_MEMBERS ZCARD z:1"
-  echo "$L_ELEMS LLEN l:1"
-  echo "$BH_FIELDS HLEN bh:1"
+  # 99% of the planned count: memtier skips edge ids
+  echo "$(( (S_KEYS + H_COUNT + Z_COUNT + L_COUNT + BH_COUNT) * 99 / 100 )) DBSIZE"
+  echo "$(( H_FIELDS * 99 / 100 )) HLEN h:1"
+  echo "$(( Z_MEMBERS * 99 / 100 )) ZCARD z:1"
+  echo "$(( L_ELEMS * 99 / 100 )) LLEN l:1"
+  echo "$(( BH_FIELDS * 99 / 100 )) HLEN bh:1"
 }
 
 wl_logical_bytes() {

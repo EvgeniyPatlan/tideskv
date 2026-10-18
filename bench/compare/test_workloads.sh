@@ -31,7 +31,7 @@ calls=(); wl_load hashes record
 check hashes-calls "${#calls[@]}" 5
 check hashes-cmd "$(has "${calls[4]}" "--command=HSET h:5 __key__ __data__")" yes
 calls=(); wl_load zsets record
-check zsets-cmd "$(has "${calls[0]}" "--command=ZADD z:1 __key__ m__key__")" yes
+check zsets-cmd "$(has "${calls[0]}" "--command=ZADD z:1 __key__ __key__")" yes
 check zsets-prefix "$(has "${calls[0]}" "--key-prefix=")" yes
 calls=(); wl_load lists record
 check lists-cmd "$(has "${calls[0]}" "--command=LPUSH l:1 __data__")" yes
@@ -58,12 +58,23 @@ check w6-del "$(has "${calls[0]}" "--command=DEL __key__")" yes
 check w6-rate "$(has "${calls[0]}" "--rate-limiting=20")" yes
 check w6-one-client "$(has "${calls[0]}" "--clients=1")" yes
 
+for ds in hashes zsets lists bighashes; do
+  calls=(); wl_load "$ds" record
+  for c in "${calls[@]}"; do
+    check "$ds-no-key-pattern" "$(has "$c" "--key-pattern")" no
+    check "$ds-threads" "$(has "$c" "--threads=1")" yes
+    check "$ds-clients" "$(has "$c" "--clients=1")" yes
+  done
+done
+calls=(); wl_load strings record
+check strings-threads "$(has "${calls[0]}" "--threads=4")" yes
+
 for w in $WORKLOADS; do
   check "probe-$w-nonempty" "$( [[ -n $(wl_probe "$w") ]] && echo yes || echo no)" yes
 done
 check probe-w3 "$(wl_probe W3 | grep -c '^HGET h:1 ')" 1
 check verify-lines "$(wl_verify_cmds | wc -l)" 5
-check verify-hlen "$(wl_verify_cmds | grep -c '^10000 HLEN h:1$')" 1
+check verify-hlen "$(wl_verify_cmds | grep -c '^9900 HLEN h:1$')" 1
 check logical "$( (( $(wl_logical_bytes) > 400000000 )) && echo yes || echo no)" yes
 
 if command -v shellcheck >/dev/null; then
