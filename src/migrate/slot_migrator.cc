@@ -118,13 +118,16 @@ Status SlotMigrator::Execute(const MigrateJob& job) {
 
 Status SlotMigrator::Open(const MigrateJob& job) {
   current_ = settings_();
-  auto t = connect_(job.dst_host, job.dst_port, current_.timeout, &cancel_);
+  // Kvrocks parity: a cancel (a FLUSH, a demotion) still connects and starts the import, so the target sees
+  // it fail (IMPORT <R> 2) and shows error; only a Stop (shutdown) skips the target.
+  auto t = connect_(job.dst_host, job.dst_port, current_.timeout, &stopped_);
   if (!t.ok()) return Stage(cluster::kErrStageConnect, t.status());
   {
     std::lock_guard lock(job_mu_);
     transport_ = std::move(t).value();
   }
-  if (Status st = Canceled(); !st.ok()) return st;  // a Stop that came before the transport was published
+  // a Stop that came before the transport was published
+  if (stopped_.load(std::memory_order_acquire)) return Err(cluster::kErrMigrationCanceled);
   if (!current_.requirepass.empty()) {
     if (Status st = transport_->Call({"AUTH", current_.requirepass}); !st.ok()) {
       return Stage(cluster::kErrStageAuth, st);

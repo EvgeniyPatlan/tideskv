@@ -100,6 +100,23 @@ TEST(SlotMigratorTest, ACancelFailsTheJobAndTellsTheTarget) {  // D10
   EXPECT_EQ(p.source.Run({"GET", "b"}), Bulk("1"));  // the source serves again (D1)
 }
 
+// Kvrocks parity (was D27): a cancel (a FLUSH or a demotion) that lands before the link connects still
+// starts the import on the target and then fails it there, so the target shows error, as Kvrocks does.
+TEST(SlotMigratorTest, ACancelBeforeTheLinkConnectsStillTellsTheTarget) {
+  MigrationPair p;
+  p.source_cluster.transport =
+      [&p](const std::string&, uint16_t, std::chrono::milliseconds,
+           const std::atomic<bool>*) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
+    p.source_migration().migrator().Cancel();
+    return std::unique_ptr<migrate::MigrationTransport>(std::make_unique<InProcessTransport>(p.target));
+  };
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
+  ASSERT_TRUE(p.target_cluster.manager->States()->import.has_value());
+  EXPECT_EQ(p.target_cluster.manager->States()->import->state, cluster::ImportState::kError);
+  EXPECT_EQ(p.source_cluster.manager->States()->job.value().state, MigrateState::kFail);
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
+}
+
 // A MigrationTransport into the target whose IMPORT <R> 1 fails; every other call goes through.
 class FailingImportEnd final : public migrate::MigrationTransport {
  public:

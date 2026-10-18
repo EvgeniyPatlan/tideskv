@@ -423,12 +423,6 @@ func TestSlotMigrateThreeNodes(t *testing.T) {
 		}
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id2).Val())
 		requireMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
-		// tideskv: a demotion that lands before the job has connected cancels it there, so the destination never
-		// hears of the import (Kvrocks connects and sends CLUSTER IMPORT start regardless, and fails it later);
-		// wait until the destination has started importing, so the demotion lands during the migration
-		require.Eventually(t, func() bool {
-			return strings.Contains(rdb2.ClusterInfo(ctx).Val(), "import_state: start")
-		}, 5*time.Second, 10*time.Millisecond)
 
 		// change source server to slave by set topology
 		clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id1, srv1.Host(), srv1.Port())
