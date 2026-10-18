@@ -106,9 +106,11 @@ class CollectRenderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             make_run(t)
             p = os.path.join(t, "tideskv", "relaxed", "W1.json")
-            d = json.load(open(p))
+            with open(p) as f:
+                d = json.load(f)
             d["ALL STATS"]["Totals"]["Count"] = 0
-            json.dump(d, open(p, "w"))
+            with open(p, "w") as f:
+                json.dump(d, f)
             bad = [c for c in report.collect(t) if c["error"]]
             self.assertEqual(bad[0]["error"], "memtier recorded no requests")
 
@@ -131,7 +133,8 @@ class CollectRenderTest(unittest.TestCase):
             make_run(t)
             self.assertEqual(report.main([t]), 0)
             self.assertTrue(os.path.exists(os.path.join(t, "report.md")))
-            summary = json.load(open(os.path.join(t, "summary.json")))
+            with open(os.path.join(t, "summary.json")) as f:
+                summary = json.load(f)
             self.assertEqual(len(summary["cells"]), 24)
 
     def test_exit_status_one_when_any_cell_err(self):
@@ -146,6 +149,101 @@ class CollectRenderTest(unittest.TestCase):
             make_run(t, servers=("tideskv",))
             cells = report.collect(t)
             self.assertEqual(len([c for c in cells if c["error"] == "not run"]), 12)
+
+
+class RobustnessTest(unittest.TestCase):
+    def _write(self, t, rel, text):
+        with open(os.path.join(t, *rel.split("/")), "w") as f:
+            f.write(text)
+
+    def _cell(self, cells, server="tideskv", level="relaxed", w="W1"):
+        return [c for c in cells if (c["server"], c["level"], c["workload"]) == (server, level, w)][0]
+
+    def test_empty_stats_file_keeps_ops_and_dashes(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/relaxed/W1.stats.jsonl", "")
+            c = self._cell(report.collect(t))
+            self.assertIsNone(c["error"])
+            self.assertIsNone(c["cpu_us_per_op"])
+            self.assertIsNone(c["mem_peak_bytes"])
+            self.assertEqual(report.main([t]), 0)
+
+    def test_truncated_stats_line_is_skipped(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/relaxed/W1.stats.jsonl",
+                        '{"CPUPerc":"200.00%","MemUsage":"2GiB / 8GiB"}\n{"CPUPerc":"15')
+            c = self._cell(report.collect(t))
+            self.assertIsNone(c["error"])
+            self.assertIsNotNone(c["cpu_us_per_op"])
+            self.assertEqual(c["mem_peak_bytes"], 2 << 30)
+
+    def test_dashes_in_stats_leave_dashes(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/relaxed/W1.stats.jsonl", '{"CPUPerc":"--","MemUsage":"-- / --"}\n')
+            c = self._cell(report.collect(t))
+            self.assertIsNone(c["error"])
+            self.assertIsNone(c["cpu_us_per_op"])
+            self.assertIsNone(c["mem_peak_bytes"])
+            self.assertEqual(report.main([t]), 0)
+
+    def test_empty_status_is_error(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/relaxed/W1.status", "\n")
+            c = self._cell(report.collect(t))
+            self.assertEqual(c["error"], "empty status")
+            self.assertEqual(report.main([t]), 1)
+            with open(os.path.join(t, "report.md")) as f:
+                self.assertIn("ERR", f.read())
+
+    def test_non_object_memtier_json_is_error(self):
+        for body in ("[]", "42", "{}", '{"ALL STATS": []}'):
+            with tempfile.TemporaryDirectory() as t:
+                make_run(t)
+                self._write(t, "tideskv/relaxed/W1.json", body)
+                c = self._cell(report.collect(t))
+                self.assertTrue(c["error"].startswith("unreadable memtier result: "), body)
+                self.assertEqual(report.main([t]), 1)
+
+    def test_bad_del_json_leaves_none(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/relaxed/W6-del.json", "{not json")
+            c = self._cell(report.collect(t), w="W6")
+            self.assertIsNone(c["error"])
+            self.assertIsNone(c["del_ops"])
+            self.assertEqual(report.main([t]), 0)
+
+    def test_missing_meta_still_writes_report(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            os.remove(os.path.join(t, "meta.json"))
+            self.assertEqual(report.main([t]), 0)
+            self.assertTrue(os.path.exists(os.path.join(t, "report.md")))
+            os.remove(os.path.join(t, "kvrocks", "strict", "W4.json"))
+            self.assertEqual(report.main([t]), 1)
+
+    def test_malformed_meta_still_writes_report(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "meta.json", "{broken")
+            self.assertEqual(report.main([t]), 0)
+            with open(os.path.join(t, "report.md")) as f:
+                self.assertIn("?", f.read())
+
+    def test_bad_and_missing_disk_rows(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            self._write(t, "tideskv/disk.json", "{bad")
+            os.remove(os.path.join(t, "kvrocks", "disk.json"))
+            self.assertEqual(report.main([t]), 0)
+            with open(os.path.join(t, "report.md")) as f:
+                md = f.read()
+            self.assertIn("| TidesKV | unreadable |", md)
+            self.assertIn("| Kvrocks | not run |", md)
 
 
 if __name__ == "__main__":

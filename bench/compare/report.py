@@ -12,6 +12,7 @@ SERVERS = ("tideskv", "kvrocks")
 LEVELS = ("relaxed", "strict")
 WORKLOADS = ("W1", "W2", "W3", "W4", "W5", "W6")
 NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks"}
+BAD_INPUT = (OSError, ValueError, KeyError, TypeError, AttributeError)
 UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40,
          "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
 
@@ -40,9 +41,14 @@ def parse_stats(path):
         for line in f:
             if not line.strip():
                 continue
-            s = json.loads(line)
-            cpus.append(float(s["CPUPerc"].rstrip("%")))
-            mems.append(parse_mem(s["MemUsage"]))
+            try:  # a truncated line or a "--" sample is skipped, the rest still count
+                s = json.loads(line)
+                cpu = float(s["CPUPerc"].rstrip("%"))
+                mem = parse_mem(s["MemUsage"])
+            except BAD_INPUT:
+                continue
+            cpus.append(cpu)
+            mems.append(mem)
     return {"cpu_mean_pct": sum(cpus) / len(cpus) if cpus else None,
             "mem_peak_bytes": max(mems) if mems else None}
 
@@ -66,13 +72,16 @@ def _cell(run_dir, server, level, w):
         cell["error"] = "not run"
         return cell
     status_path = os.path.join(d, w + ".status")
-    status = _read(status_path) if os.path.exists(status_path) else "no status"
+    try:
+        status = (_read(status_path) or "empty status") if os.path.exists(status_path) else "no status"
+    except OSError as e:
+        status = "unreadable status: " + str(e)
     if status != "ok":
         cell["error"] = status
         return cell
     try:
         m = parse_memtier(os.path.join(d, w + ".json"))
-    except (OSError, ValueError, KeyError) as e:
+    except BAD_INPUT as e:
         cell["error"] = "unreadable memtier result: " + str(e)
         return cell
     if m["count"] == 0:
@@ -81,11 +90,17 @@ def _cell(run_dir, server, level, w):
     cell.update({k: m[k] for k in ("ops", "p50", "p99", "p999")})
     stats_path = os.path.join(d, w + ".stats.jsonl")
     if os.path.exists(stats_path):
-        s = parse_stats(stats_path)
-        cell["cpu_us_per_op"] = cpu_us_per_op(s["cpu_mean_pct"], m["duration_s"], m["count"])
-        cell["mem_peak_bytes"] = s["mem_peak_bytes"]
+        try:
+            s = parse_stats(stats_path)
+            cell["cpu_us_per_op"] = cpu_us_per_op(s["cpu_mean_pct"], m["duration_s"], m["count"])
+            cell["mem_peak_bytes"] = s["mem_peak_bytes"]
+        except BAD_INPUT:
+            pass
     if w == "W6" and os.path.exists(os.path.join(d, "W6-del.json")):
-        cell["del_ops"] = parse_memtier(os.path.join(d, "W6-del.json"))["ops"]
+        try:
+            cell["del_ops"] = parse_memtier(os.path.join(d, "W6-del.json"))["ops"]
+        except BAD_INPUT:
+            pass
     return cell
 
 
@@ -94,40 +109,64 @@ def collect(run_dir):
 
 
 def load(run_dir):
-    with open(os.path.join(run_dir, "meta.json")) as f:
-        meta = json.load(f)
+    try:
+        with open(os.path.join(run_dir, "meta.json")) as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            meta = {}
+    except BAD_INPUT:
+        meta = {}
     disks, configs = {}, {}
     for s in SERVERS:
         p = os.path.join(run_dir, s, "disk.json")
         if os.path.exists(p):
-            with open(p) as f:
-                disks[s] = json.load(f)
+            try:
+                with open(p) as f:
+                    disks[s] = json.load(f)
+            except BAD_INPUT:
+                disks[s] = None
         p = os.path.join(run_dir, s, "config.txt")
         if os.path.exists(p):
-            configs[s] = _read(p)
+            try:
+                configs[s] = _read(p)
+            except BAD_INPUT:
+                pass
     return meta, collect(run_dir), disks, configs
 
 
 def _lat(c):
-    return "ERR" if c["error"] else "%.3f / %.3f / %.3f" % (c["p50"], c["p99"], c["p999"])
+    return "ERR" if c["error"] is not None else "%.3f / %.3f / %.3f" % (c["p50"], c["p99"], c["p999"])
 
 
 def _ops(c):
-    return "ERR" if c["error"] else "%d" % round(c["ops"])
+    return "ERR" if c["error"] is not None else "%d" % round(c["ops"])
 
 
 def _gib(n):
     return "%.2f GiB" % (n / float(1 << 30))
 
 
+def _disk_row(s, disks):
+    if s not in disks:
+        return "| %s | not run | – | – | – | – |" % NAMES[s]
+    d = disks[s]
+    try:
+        amp = "%.2f" % (d["end_bytes"] / float(d["logical_bytes"])) if d["logical_bytes"] else "–"
+        return "| %s | %s | %s | %s | %s | %ds |" % (NAMES[s], _gib(d["logical_bytes"]), _gib(d["after_load_bytes"]),
+                                                    _gib(d["end_bytes"]), amp, d["load_seconds"])
+    except BAD_INPUT:
+        return "| %s | unreadable | – | – | – | – |" % NAMES[s]
+
+
 def render(meta, cells, disks, configs):
     by = {(c["server"], c["level"], c["workload"]): c for c in cells}
     relaxed = meta.get("relaxed_mode", "none")
+    m = lambda k: meta.get(k, "?")
     out = ["# TidesKV vs Kvrocks", "",
            "TidesKV `%s`, `%s`, `%s`; size `%s`; warm-up %ss, timed %ss; server cpus `%s`, memory `%s`; host %s; %s." % (
-               meta["tideskv_sha"], meta["kvrocks_image"], meta["memtier_image"], meta["size"],
-               meta["warmup_s"], meta["duration_s"], meta["server_cpus"], meta["server_mem"],
-               meta["host"], meta["started_utc"]),
+               m("tideskv_sha"), m("kvrocks_image"), m("memtier_image"), m("size"),
+               m("warmup_s"), m("duration_s"), m("server_cpus"), m("server_mem"),
+               m("host"), m("started_utc")),
            "", "A ratio above 1 means TidesKV is ahead on throughput.", ""]
     titles = {"relaxed": "Relaxed durability (TidesKV `sync-mode %s` vs Kvrocks `rocksdb.write_options.sync no`)" % relaxed,
               "strict": "Strict durability (TidesKV `sync-mode full` vs Kvrocks `rocksdb.write_options.sync yes`)"}
@@ -138,10 +177,10 @@ def render(meta, cells, disks, configs):
         notes = []
         for w in WORKLOADS:
             t, k = by[("tideskv", lv, w)], by[("kvrocks", lv, w)]
-            ratio = "–" if t["error"] or k["error"] or not k["ops"] else "%.2f" % (t["ops"] / k["ops"])
+            ratio = "–" if t["error"] is not None or k["error"] is not None or not k["ops"] else "%.2f" % (t["ops"] / k["ops"])
             out.append("| %s | %s | %s | %s | %s | %s |" % (w, _ops(t), _ops(k), ratio, _lat(t), _lat(k)))
             for c in (t, k):
-                if c["error"]:
+                if c["error"] is not None:
                     notes.append("- %s %s: %s" % (NAMES[c["server"]], w, c["error"]))
         out += [""]
         out += ["| W | TidesKV CPU µs/op | Kvrocks CPU µs/op | TidesKV peak mem | Kvrocks peak mem |",
@@ -161,11 +200,7 @@ def render(meta, cells, disks, configs):
     out += ["## Disk and load", "", "| Server | logical | after load | end | space amp (end/logical) | load time |",
             "|---|---|---|---|---|---|"]
     for s in SERVERS:
-        d = disks.get(s)
-        if d:
-            amp = "%.2f" % (d["end_bytes"] / float(d["logical_bytes"])) if d["logical_bytes"] else "–"
-            out.append("| %s | %s | %s | %s | %s | %ds |" % (NAMES[s], _gib(d["logical_bytes"]), _gib(d["after_load_bytes"]),
-                                                           _gib(d["end_bytes"]), amp, d["load_seconds"]))
+        out.append(_disk_row(s, disks))
     out += ["", "## Fairness", "", "Settings read back from each running server with CONFIG GET.", ""]
     for s in SERVERS:
         if s in configs:
@@ -183,7 +218,7 @@ def main(argv):
         f.write(render(meta, cells, disks, configs))
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({"meta": meta, "cells": cells, "disks": disks}, f, indent=2)
-    return 1 if any(c["error"] for c in cells) else 0
+    return 1 if any(c["error"] is not None for c in cells) else 0
 
 
 if __name__ == "__main__":
