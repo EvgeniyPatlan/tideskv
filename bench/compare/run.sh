@@ -77,16 +77,23 @@ EOF
 _load_cb() { memtier "$CUR/load/$LOAD_NAME-$LOAD_N" "$@"; LOAD_N=$((LOAD_N + 1)); }
 
 load_all() {
-  local ds start line want got
+  local ds start line want got i
   start=$(date +%s)
   for ds in $DATASETS; do
     LOAD_NAME=$ds LOAD_N=1
     log "loading $ds"
     wl_load "$ds" _load_cb || { log "load of $ds failed; see $CUR/load/"; return 1; }
   done
+  # Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run; wait for the scan to land.
+  local tries=1
+  if [[ $SERVER_NAME == kvrocks ]]; then cli DBSIZE SCAN >/dev/null; tries=900; fi
   while read -r want line; do
-    # shellcheck disable=SC2086
-    got=$(cli $line)
+    for ((i = 0; i < tries; i++)); do
+      # shellcheck disable=SC2086
+      got=$(cli $line)
+      [[ $got =~ ^[0-9]+$ ]] && (( got >= want )) && break
+      sleep 2
+    done
     if ! [[ $got =~ ^[0-9]+$ ]] || (( got < want )); then log "load check failed: $line = [$got], want >= $want"; return 1; fi
   done < <(wl_verify_cmds)
   LOAD_SECONDS=$(( $(date +%s) - start ))
