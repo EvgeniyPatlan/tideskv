@@ -313,3 +313,103 @@ class RobustnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _set_meta(root, **kv):
+    p = os.path.join(root, "meta.json")
+    with open(p) as f:
+        meta = json.load(f)
+    meta.update(kv)
+    with open(p, "w") as f:
+        json.dump(meta, f)
+
+
+def _del_ops(root, server, level, ops):
+    with open(SETGET) as f:
+        d = json.load(f)
+    d["ALL STATS"]["Totals"]["Ops/sec"] = ops
+    with open(os.path.join(root, server, level, "W6-del.json"), "w") as f:
+        json.dump(d, f)
+
+
+def _write(root, rel, text):
+    with open(os.path.join(root, *rel.split("/")), "w") as f:
+        f.write(text)
+
+
+def _cellof(cells, server, level, w):
+    return [c for c in cells if (c["server"], c["level"], c["workload"]) == (server, level, w)][0]
+
+
+class FinalFixTest(unittest.TestCase):
+    def test_cpu_from_cgroup_delta_wins_over_stats(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.cpu", "9000000\n")  # usage_usec over the timed run
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertAlmostEqual(c["cpu_us_per_op"], 9000000 / 416298.0)
+            self.assertEqual(c["mem_peak_bytes"], 2 << 30)  # memory still comes from docker stats
+
+    def test_bad_cpu_file_falls_back_to_stats(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.cpu", "garbage\n")
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertAlmostEqual(c["cpu_us_per_op"], 200.0 / 100 * 3.0 * 1e6 / 416298)
+
+    def test_settle_column_in_cpu_table(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W2.settle", "7\n")
+            _write(t, "kvrocks/relaxed/W2.settle", "60 capped\n")
+            meta, cells, disks, configs = report.load(t)
+            c = _cellof(cells, "kvrocks", "relaxed", "W2")
+            self.assertEqual((c["settle_s"], c["settle_capped"]), (60, True))
+            md = report.render(meta, cells, disks, configs)
+            self.assertIn("| W | TidesKV CPU µs/op | Kvrocks CPU µs/op | TidesKV peak mem | Kvrocks peak mem "
+                          "| TidesKV settle s | Kvrocks settle s |", md)
+            self.assertIn("| 7 | ≥60 (cap) |", md)
+            self.assertIn("| – | – |", md)  # cells without a .settle file
+            self.assertEqual(report.main([t]), 0)  # a capped settle is not an error
+
+    def test_garbage_settle_is_dash(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.settle", "soon\n")
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertIsNone(c["settle_s"])
+
+    def test_load_and_restart_settle_in_disk_table(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/settle-load", "12\n")
+            _write(t, "tideskv/settle-restart", "600 capped\n")
+            md = report.render(*report.load(t))
+            self.assertIn("| settle after load | settle after restart |", md)
+            self.assertIn("| 60s | 12 | ≥600 (cap) |", md)
+
+    def test_w6_target_vs_achieved_and_shortfall_note(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _set_meta(t, w6_del_target_per_s=20, w6_del_clients=20)
+            _del_ops(t, "tideskv", "relaxed", 4.13)
+            _del_ops(t, "kvrocks", "relaxed", 19.6)
+            md = report.render(*report.load(t))
+            self.assertIn("W6 delete traffic (target 20 DEL/s over 20 connections): TidesKV 4.1, Kvrocks 19.6 DEL/s.", md)
+            self.assertIn("Note: TidesKV relaxed W6 reached 4.1 of the 20 DEL/s target (21%)", md)
+            self.assertNotIn("Note: Kvrocks relaxed W6", md)
+            self.assertEqual(report.main([t]), 0)  # a shortfall is a note, not an ERR
+
+    def test_header_shows_client_side_and_quiesce(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _set_meta(t, threads=4, clients=50, client_cpus="8-11",
+                      memtier_run_flags="--distinct-client-seed --randomize", server_nofile=65536,
+                      server_cores="0-3 = 2 physical cores", quiesce_cpu_pct=5, quiesce_window_s=5,
+                      quiesce_write_bytes=1048576, quiesce_max_s=60)
+            md = report.render(*report.load(t))
+            self.assertIn("memtier 4 threads × 50 clients on cpus `8-11`, flags `--distinct-client-seed --randomize`", md)
+            self.assertIn("Before each warm-up, after the load and after the strict restart, the harness waits until "
+                          "the server uses under 5% of one core and writes at most 1048576 bytes over 5 s "
+                          "(cap 60 s); the settle columns show that wait in seconds.", md)
+            self.assertIn("Both server containers: cpus `0-3` (0-3 = 2 physical cores), memory `8g`, open files 65536.", md)

@@ -68,6 +68,37 @@ def cpu_us_per_op(cpu_mean_pct, duration_s, count):
     return cpu_mean_pct / 100.0 * duration_s * 1e6 / count
 
 
+def parse_settle(text):
+    """'<seconds>' or '<seconds> capped' (run.sh's quiesce) -> (seconds, capped)."""
+    m = re.fullmatch(r"([0-9]+)( capped)?", text.strip())
+    if not m:
+        raise ValueError("unparsable settle time: %r" % (text,))
+    return int(m.group(1)), m.group(2) is not None
+
+
+def read_settle(path):
+    """(seconds, capped) from a .settle file, or (None, False) when it is missing or unreadable."""
+    try:
+        return parse_settle(_read(path))
+    except BAD_INPUT:
+        return None, False
+
+
+def _fmt_settle(seconds, capped):
+    if seconds is None:
+        return "–"
+    return "≥%d (cap)" % seconds if capped else "%d" % seconds
+
+
+def read_cpu_usec(path):
+    """Server cgroup CPU time (usage_usec delta) over the timed run, or None."""
+    try:
+        v = int(_read(path).split()[0])
+    except (BAD_INPUT + (IndexError,)):
+        return None
+    return v if v >= 0 else None
+
+
 def _read(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read().strip()
@@ -91,12 +122,14 @@ def log_tail(run_dir, server, n=20):
 
 def _cell(run_dir, server, level, w):
     cell = {"server": server, "level": level, "workload": w, "ops": None, "p50": None, "p99": None,
-            "p999": None, "cpu_us_per_op": None, "mem_peak_bytes": None, "del_ops": None, "error": None}
+            "p999": None, "cpu_us_per_op": None, "mem_peak_bytes": None, "del_ops": None,
+            "settle_s": None, "settle_capped": False, "error": None}
     d = os.path.join(run_dir, server, level)
     if not os.path.isdir(d):
         reason = failure_reason(run_dir, server)
         cell["error"] = "not run: " + reason if reason else "not run"
         return cell
+    cell["settle_s"], cell["settle_capped"] = read_settle(os.path.join(d, w + ".settle"))
     status_path = os.path.join(d, w + ".status")
     try:
         status = (_read(status_path) or "empty status") if os.path.exists(status_path) else "no status"
@@ -122,6 +155,10 @@ def _cell(run_dir, server, level, w):
             cell["mem_peak_bytes"] = s["mem_peak_bytes"]
         except BAD_INPUT:
             pass
+    # the cgroup CPU delta covers exactly the timed run; the docker stats mean is the fallback
+    usec = read_cpu_usec(os.path.join(d, w + ".cpu"))
+    if usec is not None:
+        cell["cpu_us_per_op"] = usec / float(m["count"])
     if w == "W6" and os.path.exists(os.path.join(d, "W6-del.json")):
         try:
             cell["del_ops"] = parse_memtier(os.path.join(d, "W6-del.json"))["ops"]
@@ -151,6 +188,10 @@ def load(run_dir):
                     disks[s] = json.load(f)
             except BAD_INPUT:
                 disks[s] = None
+        if isinstance(disks.get(s), dict):
+            for k in ("load", "restart"):
+                disks[s]["settle_%s_s" % k], disks[s]["settle_%s_capped" % k] = read_settle(
+                    os.path.join(run_dir, s, "settle-" + k))
         p = os.path.join(run_dir, s, "config.txt")
         if os.path.exists(p):
             try:
@@ -174,16 +215,39 @@ def _gib(n):
 
 def _disk_row(s, disks):
     if s not in disks:
-        return "| %s | not run | – | – | – | – |" % NAMES[s]
+        return "| %s | not run | – | – | – | – | – | – |" % NAMES[s]
     d = disks[s]
     try:
         for k in ("logical_bytes", "after_load_bytes", "end_bytes", "load_seconds"):
             _num(d[k])
         amp = "%.2f" % (d["end_bytes"] / float(d["logical_bytes"])) if d["logical_bytes"] else "–"
-        return "| %s | %s | %s | %s | %s | %ds |" % (NAMES[s], _gib(d["logical_bytes"]), _gib(d["after_load_bytes"]),
-                                                    _gib(d["end_bytes"]), amp, d["load_seconds"])
+        return "| %s | %s | %s | %s | %s | %ds | %s | %s |" % (
+            NAMES[s], _gib(d["logical_bytes"]), _gib(d["after_load_bytes"]), _gib(d["end_bytes"]), amp,
+            d["load_seconds"], _fmt_settle(d.get("settle_load_s"), d.get("settle_load_capped")),
+            _fmt_settle(d.get("settle_restart_s"), d.get("settle_restart_capped")))
     except BAD_INPUT:
-        return "| %s | unreadable | – | – | – | – |" % NAMES[s]
+        return "| %s | unreadable | – | – | – | – | – | – |" % NAMES[s]
+
+
+def _w6_lines(meta, by, lv):
+    got = [(s, by[(s, lv, "W6")]["del_ops"]) for s in SERVERS if by[(s, lv, "W6")]["del_ops"] is not None]
+    if not got:
+        return []
+    target = meta.get("w6_del_target_per_s")
+    try:
+        target = _num(target) if target is not None else None
+    except BAD_INPUT:
+        target = None
+    rates = ", ".join("%s %.1f" % (NAMES[s], ops) for s, ops in got)
+    if target is None:
+        return ["", "W6 delete traffic: " + rates + " DEL/s."]
+    lines = ["", "W6 delete traffic (target %d DEL/s over %s connections): %s DEL/s." % (
+        target, meta.get("w6_del_clients", "?"), rates)]
+    for s, ops in got:
+        if target and ops < 0.9 * target:
+            lines += ["", "Note: %s %s W6 reached %.1f of the %d DEL/s target (%d%%), so its reads ran against "
+                      "fewer deletes than planned." % (NAMES[s], lv, ops, target, round(100.0 * ops / target))]
+    return lines
 
 
 def render(meta, cells, disks, configs, run_dir=None):
@@ -195,7 +259,16 @@ def render(meta, cells, disks, configs, run_dir=None):
                m("tideskv_sha"), m("kvrocks_image"), m("memtier_image"), m("size"),
                m("warmup_s"), m("duration_s"), m("server_cpus"), m("server_mem"),
                m("host"), m("started_utc")),
-           "", "A ratio above 1 means TidesKV is ahead on throughput.", ""]
+           ""]
+    if "threads" in meta:
+        out += ["Client: memtier %s threads × %s clients on cpus `%s`, flags `%s`." % (
+            m("threads"), m("clients"), m("client_cpus"), m("memtier_run_flags")), ""]
+    if "quiesce_max_s" in meta:
+        out += ["Before each warm-up, after the load and after the strict restart, the harness waits until the server "
+                "uses under %s%% of one core and writes at most %s bytes over %s s (cap %s s); the settle columns show "
+                "that wait in seconds." % (m("quiesce_cpu_pct"), m("quiesce_write_bytes"), m("quiesce_window_s"),
+                                           m("quiesce_max_s")), ""]
+    out += ["A ratio above 1 means TidesKV is ahead on throughput.", ""]
     titles = {"relaxed": "Relaxed durability (TidesKV `sync-mode %s` vs Kvrocks `rocksdb.write_options.sync no`)" % relaxed,
               "strict": "Strict durability (TidesKV `sync-mode full` vs Kvrocks `rocksdb.write_options.sync yes`)"}
     for lv in LEVELS:
@@ -211,17 +284,16 @@ def render(meta, cells, disks, configs, run_dir=None):
                 if c["error"] is not None:
                     notes.append("- %s %s: %s" % (NAMES[c["server"]], w, c["error"]))
         out += [""]
-        out += ["| W | TidesKV CPU µs/op | Kvrocks CPU µs/op | TidesKV peak mem | Kvrocks peak mem |",
-                "|---|---|---|---|---|"]
+        out += ["| W | TidesKV CPU µs/op | Kvrocks CPU µs/op | TidesKV peak mem | Kvrocks peak mem "
+                "| TidesKV settle s | Kvrocks settle s |",
+                "|---|---|---|---|---|---|---|"]
         for w in WORKLOADS:
             t, k = by[("tideskv", lv, w)], by[("kvrocks", lv, w)]
             f = lambda c: "–" if c["cpu_us_per_op"] is None else "%.1f" % c["cpu_us_per_op"]
             g = lambda c: "–" if c["mem_peak_bytes"] is None else _gib(c["mem_peak_bytes"])
-            out.append("| %s | %s | %s | %s | %s |" % (w, f(t), f(k), g(t), g(k)))
-        dels = ["%s %d DEL/s" % (NAMES[s], round(by[(s, lv, "W6")]["del_ops"]))
-                for s in SERVERS if by[(s, lv, "W6")]["del_ops"] is not None]
-        if dels:
-            out += ["", "W6 delete traffic: " + ", ".join(dels) + "."]
+            h = lambda c: _fmt_settle(c["settle_s"], c["settle_capped"])
+            out.append("| %s | %s | %s | %s | %s | %s | %s |" % (w, f(t), f(k), g(t), g(k), h(t), h(k)))
+        out += _w6_lines(meta, by, lv)
         if notes:
             out += ["", "Errors:"] + notes
         out += [""]
@@ -231,11 +303,17 @@ def render(meta, cells, disks, configs, run_dir=None):
         for x in failed:
             out += ["### " + NAMES[x], "", failure_reason(run_dir, x), "", "Last 20 lines of server.log:", "",
                     "```", log_tail(run_dir, x), "```", ""]
-    out += ["## Disk and load", "", "| Server | logical | after load | end | space amp (end/logical) | load time |",
-            "|---|---|---|---|---|---|"]
+    out += ["## Disk and load", "", "| Server | logical | after load | end | space amp (end/logical) | load time "
+            "| settle after load | settle after restart |",
+            "|---|---|---|---|---|---|---|---|"]
     for s in SERVERS:
         out.append(_disk_row(s, disks))
-    out += ["", "## Fairness", "", "Settings read back from each running server with CONFIG GET.", ""]
+    out += ["", "## Fairness", ""]
+    if "server_nofile" in meta:
+        cores = " (%s)" % meta["server_cores"] if meta.get("server_cores") else ""
+        out += ["Both server containers: cpus `%s`%s, memory `%s`, open files %s." % (
+            m("server_cpus"), cores, m("server_mem"), m("server_nofile")), ""]
+    out += ["Settings read back from each running server with CONFIG GET.", ""]
     for s in SERVERS:
         if s in configs:
             out += ["### " + NAMES[s], "", "```", configs[s], "```", ""]

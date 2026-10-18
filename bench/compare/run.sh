@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # TidesKV vs Kvrocks comparison benchmark (notes spec 2026-10-18).
 # Usage: bench/compare/run.sh [--quick] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
-#   env: SERVER_CPUS SERVER_MEM CLIENT_CPUS WARMUP DURATION THREADS CLIENTS
+#   --relaxed-mode defaults to none; --out defaults to build/bench/<UTC timestamp> and must not hold a non-empty data/
+#   env (defaults): SERVER_CPUS 0-3, SERVER_MEM 8g, CLIENT_CPUS 8-11, THREADS 4, CLIENTS 50,
+#     WARMUP/DURATION 60/180 (quick 10/30), QUIESCE_MAX 600 (quick 60), all in seconds
 # shellcheck source-path=SCRIPTDIR disable=SC2034  # ROOT, SIZE and DIRTY are read by lib.sh and the phases Task 4 adds
 set -euo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 # shellcheck source=workloads.sh
 source "$HERE/workloads.sh"
@@ -16,10 +18,10 @@ while (($#)); do
   case $1 in
     --quick) SIZE=quick ;;
     --smoke) SMOKE=1 ;;
-    --relaxed-mode) RELAXED=$2; shift ;;
+    --relaxed-mode) RELAXED=${2:?--relaxed-mode needs a value}; shift ;;
     --dirty) DIRTY=1 ;;
-    --out) OUT_ARG=$2; shift ;;
-    -h|--help) sed -n 2,4p "$0"; exit 0 ;;
+    --out) OUT_ARG=${2:?--out needs a value}; shift ;;
+    -h|--help) sed -n 2,6p "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -46,7 +48,8 @@ run_smoke() {
   log "smoke ok: $OUT"
 }
 
-if [[ $SIZE == quick ]]; then WARMUP=${WARMUP:-10} DURATION=${DURATION:-30}; else WARMUP=${WARMUP:-60} DURATION=${DURATION:-180}; fi
+if [[ $SIZE == quick ]]; then WARMUP=${WARMUP:-10} DURATION=${DURATION:-30} QUIESCE_MAX=${QUIESCE_MAX:-60}
+else WARMUP=${WARMUP:-60} DURATION=${DURATION:-180} QUIESCE_MAX=${QUIESCE_MAX:-600}; fi
 THREADS=${THREADS:-4}
 CLIENTS=${CLIENTS:-50}
 
@@ -59,23 +62,45 @@ disk_check() {
   if (( free < need )); then log "not enough disk: need $need bytes, $free free under $OUT"; return 1; fi
 }
 
+# "N logical CPUs on M physical cores" for SERVER_CPUS (on this host 0-3 is 2 cores with SMT).
+server_cores() {
+  local part c cpus=() parts
+  IFS=, read -ra parts <<<"$SERVER_CPUS"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then for ((c = ${part%-*}; c <= ${part#*-}; c++)); do cpus+=("$c"); done; else cpus+=("$part"); fi
+  done
+  echo "${#cpus[@]} logical CPUs on $(lscpu -p=CPU,CORE | awk -F, -v l=" ${cpus[*]} " \
+    '!/^#/ && index(l, " " $1 " ") {print $2}' | sort -u | wc -l) physical cores"
+}
+
+# meta.json: one key=value argument per field, "#key=value" for integers.
 write_meta() {
-  local kv_digest
+  local kv_digest sha
   kv_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$KVROCKS_IMAGE" 2>/dev/null || echo "$KVROCKS_IMAGE")
-  python3 - "$OUT/meta.json" <<EOF
+  sha=$(git -C "$ROOT" rev-parse --short HEAD)
+  if ((DIRTY)); then sha+=-dirty; fi
+  python3 - "$OUT/meta.json" \
+    "tideskv_sha=$sha" "kvrocks_image=$kv_digest" "tideskv_image=$TIDESKV_IMAGE" "memtier_image=$MEMTIER_IMAGE" \
+    "size=$SIZE" "relaxed_mode=$RELAXED" "#warmup_s=$WARMUP" "#duration_s=$DURATION" \
+    "server_cpus=$SERVER_CPUS" "server_cores=$(server_cores)" "server_mem=$SERVER_MEM" "#server_nofile=$SERVER_NOFILE" \
+    "#threads=$THREADS" "#clients=$CLIENTS" "client_cpus=$CLIENT_CPUS" "memtier_run_flags=${MEMTIER_RUN_FLAGS[*]}" \
+    "#w6_del_target_per_s=$W6_DEL_RATE" "#w6_del_clients=$W6_DEL_CLIENTS" \
+    "#quiesce_window_s=$QUIESCE_WINDOW" "#quiesce_cpu_pct=$QUIESCE_CPU_PCT" \
+    "#quiesce_write_bytes=$QUIESCE_WRITE_BYTES" "#quiesce_max_s=$QUIESCE_MAX" \
+    "host=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)" "started_utc=$TS" <<'EOF'
 import json, sys
-json.dump({"tideskv_sha": "$(git -C "$ROOT" rev-parse --short HEAD)$( ((DIRTY)) && echo -dirty)",
-           "kvrocks_image": "$kv_digest", "tideskv_image": "$TIDESKV_IMAGE", "memtier_image": "$MEMTIER_IMAGE", "size": "$SIZE",
-           "relaxed_mode": "$RELAXED", "warmup_s": $WARMUP, "duration_s": $DURATION,
-           "server_cpus": "$SERVER_CPUS", "server_mem": "$SERVER_MEM",
-           "host": "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)",
-           "started_utc": "$TS"}, open(sys.argv[1], "w"), indent=2)
+meta = {}
+for arg in sys.argv[2:]:
+    key, value = arg.split("=", 1)
+    meta[key.lstrip("#")] = int(value) if key.startswith("#") else value
+with open(sys.argv[1], "w") as f:
+    json.dump(meta, f, indent=2)
 EOF
 }
 
 # wl_load supplies its own --threads/--clients (ruling T2-R1)
 # shellcheck disable=SC2317  # callbacks are invoked indirectly by wl_load / wl_run
-_load_cb() { memtier "$CUR/load/$LOAD_NAME-$LOAD_N" "$@"; LOAD_N=$((LOAD_N + 1)); }
+_load_cb() { memtier "$CUR/load/$LOAD_NAME-$LOAD_N" "$@" || return; LOAD_N=$((LOAD_N + 1)); }
 
 load_all() {
   local ds start line want got i
@@ -102,6 +127,23 @@ load_all() {
   LOAD_SECONDS=$(( $(date +%s) - start ))
 }
 
+# Waits for the server to go quiet and records the wait in $1.
+settle() {
+  local r
+  r=$(quiesce) || { log "cannot read $SERVER_CONTAINER's cgroup ($SERVER_CGROUP)"; return 1; }
+  echo "$r" >"$1"
+  log "$SERVER_NAME settled after ${r}s"
+}
+
+# Stops the docker stats loop and any sample still in flight, so no post-run sample is recorded.
+stop_sampler() {
+  kill -STOP "$1" 2>/dev/null || return 0
+  pkill -P "$1" 2>/dev/null || true
+  kill "$1" 2>/dev/null || true
+  kill -CONT "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
 # shellcheck disable=SC2317
 _run_cb() { RUN_ARGS=("$@"); }
 # shellcheck disable=SC2317
@@ -116,6 +158,7 @@ run_workload() {
     reply=$(cli $line 2>&1)
     if [[ $reply == ERR* || $reply == WRONGTYPE* ]]; then echo "probe: $reply" >"$OUT/$base.status"; return; fi
   done < <(wl_probe "$w")
+  settle "$OUT/$base.settle" || { echo "could not read the server's cgroup to wait for it to settle" >"$OUT/$base.status"; return; }
   wl_run "$w" _run_cb
   local common=(--threads="$THREADS" --clients="$CLIENTS" --pipeline=1 "${MEMTIER_RUN_FLAGS[@]}")
   memtier "$base.warmup" "${common[@]}" --test-time="$WARMUP" "${RUN_ARGS[@]}" || true
@@ -123,14 +166,19 @@ run_workload() {
     wl_run_w6_del _del_cb
     memtier "$CUR/$level/W6-del" --test-time="$DURATION" "${DEL_ARGS[@]}" & del_pid=$!
   fi
+  # docker stats gives peak memory; CPU is the cgroup's usage_usec delta over exactly the timed run
   ( while :; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
     >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
+  local cpu0 cpu1
+  cpu0=$(cg_sample) || cpu0=""
   if memtier "$base" "${common[@]}" --test-time="$DURATION" "${RUN_ARGS[@]}"; then
     echo ok >"$OUT/$base.status"
   else
     echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
   fi
-  kill "$stats_pid" 2>/dev/null || true; wait "$stats_pid" 2>/dev/null || true
+  cpu1=$(cg_sample) || cpu1=""
+  if [[ -n $cpu0 && -n $cpu1 ]]; then echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"; fi
+  stop_sampler "$stats_pid"
   if [[ -n $del_pid ]] && ! wait "$del_pid"; then
     echo "W6 DEL memtier failed; see $CUR/$level/W6-del.log" >>"$OUT/$base.status"
     if [[ $(head -1 "$OUT/$base.status") == ok ]]; then sed -i 1d "$OUT/$base.status"; fi
@@ -157,6 +205,7 @@ run_server() {
   start_server "$server" relaxed "$data" || { _server_failed "server did not start (relaxed)"; return 1; }
   parity_check "$server" relaxed || { _server_failed "parity check failed (relaxed); see $server/config.txt"; return 1; }
   load_all || { _server_failed "load failed or the load check did not pass; see $server/load/"; return 1; }
+  settle "$OUT/$server/settle-load" || { _server_failed "could not read the server's cgroup"; return 1; }
   after=$(_du "$data")
   # relaxed and strict deliberately share one data dir (spec §5 step 4)
   for level in relaxed strict; do
@@ -164,6 +213,7 @@ run_server() {
       stop_server
       start_server "$server" strict "$data" || { _server_failed "server did not start (strict)"; return 1; }
       parity_check "$server" strict || { _server_failed "parity check failed (strict); see $server/config.txt"; return 1; }
+      settle "$OUT/$server/settle-restart" || { _server_failed "could not read the server's cgroup"; return 1; }
     fi
     for w in $WORKLOADS; do
       log "$server $level $w"
@@ -196,7 +246,10 @@ run_full() {
   exit $rc
 }
 
-bench_init "$OUT_ARG"
-build_tideskv_image
-if ((SMOKE)); then run_smoke; exit; fi
-run_full
+# sourcing run.sh (the tests do) defines the helpers without running anything
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  bench_init "$OUT_ARG"
+  build_tideskv_image
+  if ((SMOKE)); then run_smoke; exit; fi
+  run_full
+fi

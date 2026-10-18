@@ -11,6 +11,9 @@ VALUE_SIZE=100
 # memtier's default seed is constant and shared by all clients: every client would send the same keys and values in
 # lockstep, and Kvrocks skips an HSET whose value is unchanged (no WAL write, no fsync).
 MEMTIER_RUN_FLAGS=(--distinct-client-seed --randomize)
+# memtier rate-limits per connection, so the W6 DEL rate is spread over W6_DEL_RATE / W6_DEL_PER_CONN connections:
+# at 1 DEL/s each, a connection keeps up as long as a DEL answers within 1 s.
+W6_DEL_PER_CONN=1
 
 wl_sizes() {
   case $1 in
@@ -20,6 +23,7 @@ wl_sizes() {
            L_COUNT=5 L_ELEMS=10000 BH_COUNT=1000 BH_FIELDS=1000 W6_DEL_RATE=20 ;;
     *) echo "wl_sizes: unknown size $1" >&2; return 2 ;;
   esac
+  W6_DEL_CLIENTS=$((W6_DEL_RATE / W6_DEL_PER_CONN))
 }
 
 # Strings load (no --command): P:P with allkeys splits [1, max] across threads x clients.
@@ -34,22 +38,22 @@ wl_load() {
   case $ds in
     strings)
       # shellcheck disable=SC2046
-      "$cb" "--ratio=1:0" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=s:" $(_seq "$S_KEYS") ;;
+      "$cb" "--ratio=1:0" "--data-size=$VALUE_SIZE" "--random-data" "--key-prefix=s:" $(_seq "$S_KEYS") || return ;;
     hashes)
       for ((i = 1; i <= H_COUNT; i++)); do
         # shellcheck disable=SC2046
         "$cb" "--command=HSET h:$i __key__ __data__" "--data-size=$VALUE_SIZE" "--random-data" \
-          "--key-prefix=f:" $(_cseq "$H_FIELDS")
+          "--key-prefix=f:" $(_cseq "$H_FIELDS") || return
       done ;;
     zsets)
       for ((i = 1; i <= Z_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=ZADD z:$i __key__ __key__" "--key-prefix=" $(_cseq $((2 * Z_MEMBERS)))
+        "$cb" "--command=ZADD z:$i __key__ __key__" "--key-prefix=" $(_cseq $((2 * Z_MEMBERS))) || return
       done ;;
     lists)
       for ((i = 1; i <= L_COUNT; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=LPUSH l:$i __data__" "--data-size=$VALUE_SIZE" "--random-data" $(_cseq "$L_ELEMS")
+        "$cb" "--command=LPUSH l:$i __data__" "--data-size=$VALUE_SIZE" "--random-data" $(_cseq "$L_ELEMS") || return
       done ;;
     bighashes)
       # one hash per key bh:<n>, BH_FIELDS fields each, via HSET with BH_FIELDS field/value pairs
@@ -57,7 +61,7 @@ wl_load() {
       for ((f = 1; f <= BH_FIELDS; f++)); do args+=("f$f" "__data__"); done
       # shellcheck disable=SC2046
       "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=$VALUE_SIZE" "--random-data" \
-        "--key-prefix=bh:" $(_cseq "$BH_COUNT") ;;
+        "--key-prefix=bh:" $(_cseq "$BH_COUNT") || return ;;
     *) echo "wl_load: unknown dataset $ds" >&2; return 2 ;;
   esac
 }
@@ -99,7 +103,7 @@ wl_run() {
 wl_run_w6_del() {
   # shellcheck disable=SC2046
   "$1" "--command=DEL __key__" "--command-key-pattern=R" "--key-prefix=bh:" $(_random "$BH_COUNT") \
-    "--threads=1" "--clients=1" "--rate-limiting=$W6_DEL_RATE" "--randomize"
+    "--threads=1" "--clients=$W6_DEL_CLIENTS" "--rate-limiting=$W6_DEL_PER_CONN" "--distinct-client-seed" "--randomize"
 }
 
 wl_probe() {
