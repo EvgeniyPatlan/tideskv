@@ -84,6 +84,13 @@ add_test(NAME engine_boundary
   COMMAND ${PROJECT_SOURCE_DIR}/scripts/check_engine_boundary.sh
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
+find_package(Python3 3.10 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME bench_report
+    COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_report.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+endif()
+
 option(TIDESKV_COMPAT "Run the Go compatibility suites (needs Go >= 1.22; first run downloads modules)" OFF)
 find_program(GO_EXECUTABLE go)
 if(TIDESKV_COMPAT AND NOT GO_EXECUTABLE)
