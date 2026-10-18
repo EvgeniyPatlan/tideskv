@@ -101,8 +101,10 @@ TEST(MigrationIT, MigrateRepliesBlocksAndMovedFollowKvrocks) {  // D1, D12, D15
   EXPECT_EQ(p.ac->Command({"DEL", "b"}).str, p.Moved(3300));
   EXPECT_EQ(p.bc->Command({"GET", "b"}).str, "1");  // served before any push (D1)
   EXPECT_EQ(p.bc->Command({"HGET", "{b}h", "f"}).str, "v");
-  EXPECT_EQ(p.ac->Command({"DEBUG", "DIGEST-SLOTS", "3300", "TTL"}).str,
-            p.bc->Command({"DEBUG", "DIGEST-SLOTS", "3300", "TTL"}).str);
+  const RespValue digest = p.ac->Command({"DEBUG", "DIGEST-SLOTS", "3300", "TTL"});
+  ASSERT_NE(digest.type, RespValue::Type::kError) << digest.str;  // two equal errors must not pass
+  EXPECT_NE(digest.str, std::string(40, '0')) << "the range holds data";
+  EXPECT_EQ(digest.str, p.bc->Command({"DEBUG", "DIGEST-SLOTS", "3300", "TTL"}).str);
   EXPECT_EQ(p.ac->Command({"CLUSTERX", "MIGRATE", "3300", Id('b')}).str,
             "ERR Can't migrate slot which has been migrated");
   EXPECT_EQ(CountKeys(*p.ac, 3300), 3) << "kept until a push moves the range (KM §5.5)";

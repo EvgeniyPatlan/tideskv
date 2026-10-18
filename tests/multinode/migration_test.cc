@@ -135,8 +135,10 @@ TEST(Migration, UnderLoadLosesNoAcknowledgedWrite) {
   ASSERT_EQ(src->Command({"SET", probe, "x"}).str, "OK")
       << "the loads must stop before the fence (more filler)";
   ASSERT_TRUE(WaitMigrate(*src, kRange, "success", 60s));
-  EXPECT_EQ(DigestSlots(*src, kRange), DigestSlots(*dst, kRange))
-      << "the fenced source and the target differ";
+  const RespValue digest = src->Command({"DEBUG", "DIGEST-SLOTS", kRange, "TTL"});
+  ASSERT_NE(digest.type, RespValue::Type::kError) << digest.str;  // two equal errors must not pass
+  EXPECT_NE(digest.str, kZeros) << "the range holds data";
+  EXPECT_EQ(digest.str, DigestSlots(*dst, kRange)) << "the fenced source and the target differ";
   ASSERT_NO_FATAL_FAILURE(PushTopology(n.ptrs, NodesString(n.ptrs, kMoved), 2));  // the controller's move
   acks.Start();  // stale slot maps: writes to the range follow MOVED to the new owner
   std::this_thread::sleep_for(1s);
@@ -186,6 +188,7 @@ TEST(Migration, AKill9OfTheSourceAfterSuccessKeepsMovedAndThePushCleansUp) {
   ExpectConverged(*n.ptrs[2], {n.ptrs[3]});
   ExpectRangeGone(*n.ptrs[0], tags);
   ExpectRangeGone(*n.ptrs[1], tags);
+  EXPECT_EQ(src->Command({"GET", "b"}).str, "outside") << "the cleanup stays inside the range";
 }
 
 // A controller failover of the target shard mid-import: the old target master is demoted (its next IMPORTDATA
@@ -207,7 +210,8 @@ TEST(Migration, AFailoverOfTheTargetMidImportErasesTheHalfImport) {
   ASSERT_EQ(src->Command({"CLUSTERX", "MIGRATE", kRange, NodeId(2)}).str, "OK");
   auto target_replica = Client(*n.ptrs[3]);
   // Metas stream before subkeys, so every meta of the slot (the filler's included) arrives while most of the
-  // filler's 2 MB still has to follow at 1 MB/s.
+  // filler's 2 MB still has to follow at 1 MB/s. The equality is not vacuous: IMPORT <R> 0 erases the slot on
+  // the target first, so every key counted here came through the import.
   ASSERT_TRUE(WaitFor([&] { return KeysInSlot(*target_replica, slot) == slot_keys; }, 30s))
       << "the import replicates (D21)";
   const std::vector<NodeLine> swapped = {{0, -1, "0-8191"}, {1, 0, ""}, {3, -1, "8192-16383"}, {2, 3, ""}};
@@ -272,6 +276,7 @@ TEST(Migration, TheControllerRaceKeepsRoutingAndCleansUp) {
     const std::string key = "{" + tag + "}" + std::to_string(i);
     EXPECT_EQ(reader.Command({"GET", key}, key).str, std::to_string(i));
   }
+  EXPECT_EQ(src->Command({"GET", "b"}).str, "outside") << "the cleanup stays inside the range";
   ExpectConverged(*n.ptrs[0], {n.ptrs[1]});
   ExpectConverged(*n.ptrs[2], {n.ptrs[3]});
 }
