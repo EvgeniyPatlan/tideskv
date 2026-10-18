@@ -284,13 +284,29 @@ TEST(ReplLogTest, WaitBeyondWakesOnCommitAndTimesOut) {
   EXPECT_GE(std::chrono::steady_clock::now() - before, std::chrono::milliseconds(50));
 }
 
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define TIDESKV_UNIT_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define TIDESKV_UNIT_SANITIZED 1
+#endif
+#endif
+
 TEST(ReplLogTest, ConcurrentCommitsProduceAGapFreeSequence) {
   InMemoryStorage s;
   FakeClock clock;
   ReplLog log(s, clock);
   ASSERT_TRUE(log.Recover().ok());
   constexpr int kThreads = 8;
+  // InMemoryStorage copies every table on each commit, so this test costs O(commits^2) node copies, all
+  // under the storage mutex. 4000 commits take 1 s in release, 10 s (ASan) and 15 s (TSan) alone on 4
+  // cores, 45 s beside three heavy tests, and over 60 s on a 4-vCPU CI runner; 1200 commits (8 x 150)
+  // still interleave every thread and take 1.9 s alone under either sanitizer.
+#ifdef TIDESKV_UNIT_SANITIZED
+  constexpr int kPerThread = 150;
+#else
   constexpr int kPerThread = 500;
+#endif
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&, t] {
