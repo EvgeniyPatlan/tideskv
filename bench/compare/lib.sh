@@ -31,20 +31,27 @@ bench_init() {
   NET_CREATED=1
 }
 
+# Everything the image is built from; the tag, the dirty check and the build context share this list.
+IMAGE_PATHS=(src cmake CMakeLists.txt CMakePresets.json third_party bench/compare/tideskv.Dockerfile)
+
 build_tideskv_image() {
-  local sha
-  sha=$(git -C "$ROOT" rev-parse --short HEAD)
-  if [[ -n $(git -C "$ROOT" status --porcelain -- src cmake CMakeLists.txt) ]]; then
-    if ((!DIRTY)); then log "uncommitted changes under src/ or cmake/; commit them or pass --dirty"; return 2; fi
-    TIDESKV_IMAGE=tideskv-bench:$sha-dirty
-    (cd "$ROOT" && git ls-files -z | tar --null -T - -c) \
+  local tag
+  if [[ -n $(git -C "$ROOT" status --porcelain -- "${IMAGE_PATHS[@]}") ]]; then
+    if ((!DIRTY)); then log "uncommitted changes under ${IMAGE_PATHS[*]}; commit them or pass --dirty"; return 2; fi
+    TIDESKV_IMAGE=tideskv-bench:$(git -C "$ROOT" rev-parse --short HEAD)-dirty
+    log "building $TIDESKV_IMAGE from the working tree"
+    (cd "$ROOT" && git ls-files -z -- "${IMAGE_PATHS[@]}" | tar --null -T - -c) \
       | docker build -q -t "$TIDESKV_IMAGE" -f bench/compare/tideskv.Dockerfile - >/dev/null
     return
   fi
-  TIDESKV_IMAGE=tideskv-bench:$sha
+  # tagged by content, so a commit that touches only bench scripts reuses the image
+  tag=$(cd "$ROOT" && git rev-parse HEAD:src HEAD:cmake HEAD:CMakeLists.txt HEAD:CMakePresets.json \
+          HEAD:third_party HEAD:bench/compare/tideskv.Dockerfile | sha256sum | cut -c1-12)
+  TIDESKV_IMAGE=tideskv-bench:$tag
   if ! docker image inspect "$TIDESKV_IMAGE" >/dev/null 2>&1; then
     log "building $TIDESKV_IMAGE"
-    git -C "$ROOT" archive HEAD | docker build -q -t "$TIDESKV_IMAGE" -f bench/compare/tideskv.Dockerfile - >/dev/null
+    git -C "$ROOT" archive HEAD -- "${IMAGE_PATHS[@]}" \
+      | docker build -q -t "$TIDESKV_IMAGE" -f bench/compare/tideskv.Dockerfile - >/dev/null
   fi
 }
 
@@ -91,7 +98,7 @@ stop_server() {
 }
 
 cli() {
-  docker run --rm --network "$NET" "$CLI_IMAGE" redis-cli -h "$SERVER_CONTAINER" -p "$SERVER_PORT" --raw "$@"
+  docker run --rm --name "tideskv-bench-cli-$TS-$RANDOM" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" "$CLI_IMAGE" redis-cli -h "$SERVER_CONTAINER" -p "$SERVER_PORT" --raw "$@"
 }
 
 # The keys and values each server must report back (spec §4 table).
