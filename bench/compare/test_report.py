@@ -151,6 +151,25 @@ class CollectRenderTest(unittest.TestCase):
             self.assertEqual(len([c for c in cells if c["error"] == "not run"]), 12)
 
 
+class FailedServerTest(unittest.TestCase):
+    def test_failed_server_shows_reason_and_log_tail(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t, servers=("tideskv",))
+            os.makedirs(os.path.join(t, "kvrocks"))
+            with open(os.path.join(t, "kvrocks", "run.failed"), "w") as f:
+                f.write("parity: kvrocks workers is [8], expected [4]\n")
+            with open(os.path.join(t, "kvrocks", "server.log"), "w") as f:
+                f.write("".join("log line %d\n" % i for i in range(1, 31)))
+            self.assertEqual(report.main([t]), 1)
+            with open(os.path.join(t, "report.md")) as f:
+                md = f.read()
+            self.assertIn("parity: kvrocks workers is [8], expected [4]", md)
+            self.assertIn("log line 30", md)
+            self.assertIn("log line 11", md)
+            self.assertNotIn("log line 10\n", md)
+            self.assertIn("not run: parity", md)
+
+
 class RobustnessTest(unittest.TestCase):
     def _write(self, t, rel, text):
         with open(os.path.join(t, *rel.split("/")), "w") as f:

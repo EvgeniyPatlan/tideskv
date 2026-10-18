@@ -57,6 +57,7 @@ check w6-main "$(has "${calls[0]}" "--ratio=1:1")" yes
 calls=(); wl_run_w6_del record
 check w6-del "$(has "${calls[0]}" "--command=DEL __key__")" yes
 check w6-rate "$(has "${calls[0]}" "--rate-limiting=20")" yes
+check w6-del-randomize "$(has "${calls[0]}" "--randomize")" yes
 check w6-one-client "$(has "${calls[0]}" "--clients=1")" yes
 
 for ds in hashes zsets lists bighashes; do
@@ -81,6 +82,7 @@ for w in $WORKLOADS; do
   calls=(); wl_run "$w" record
   [[ ${calls[0]} == *--data-size* ]] && check "run-$w-random-data" "$(has "${calls[0]}" "--random-data")" yes
 done
+check run-flags "${MEMTIER_RUN_FLAGS[*]}" "--distinct-client-seed --randomize"
 check probe-w4 "$(wl_probe W4 | head -1)" "ZINCRBY z:1 1 2"
 for w in $WORKLOADS; do
   check "probe-$w-nonempty" "$( [[ -n $(wl_probe "$w") ]] && echo yes || echo no)" yes

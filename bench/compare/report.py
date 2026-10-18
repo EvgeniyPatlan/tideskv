@@ -73,12 +73,29 @@ def _read(path):
         return f.read().strip()
 
 
+def failure_reason(run_dir, server):
+    """First line of <server>/run.failed, or None when the server's run did not fail."""
+    try:
+        text = _read(os.path.join(run_dir, server, "run.failed"))
+    except BAD_INPUT:
+        return None
+    return (text.splitlines() or ["failed (no reason recorded)"])[0]
+
+
+def log_tail(run_dir, server, n=20):
+    try:
+        return "\n".join(_read(os.path.join(run_dir, server, "server.log")).splitlines()[-n:])
+    except BAD_INPUT:
+        return "(no server.log)"
+
+
 def _cell(run_dir, server, level, w):
     cell = {"server": server, "level": level, "workload": w, "ops": None, "p50": None, "p99": None,
             "p999": None, "cpu_us_per_op": None, "mem_peak_bytes": None, "del_ops": None, "error": None}
     d = os.path.join(run_dir, server, level)
     if not os.path.isdir(d):
-        cell["error"] = "not run"
+        reason = failure_reason(run_dir, server)
+        cell["error"] = "not run: " + reason if reason else "not run"
         return cell
     status_path = os.path.join(d, w + ".status")
     try:
@@ -169,7 +186,7 @@ def _disk_row(s, disks):
         return "| %s | unreadable | – | – | – | – |" % NAMES[s]
 
 
-def render(meta, cells, disks, configs):
+def render(meta, cells, disks, configs, run_dir=None):
     by = {(c["server"], c["level"], c["workload"]): c for c in cells}
     relaxed = meta.get("relaxed_mode", "none")
     m = lambda k: meta.get(k, "?")
@@ -208,6 +225,12 @@ def render(meta, cells, disks, configs):
         if notes:
             out += ["", "Errors:"] + notes
         out += [""]
+    failed = [x for x in SERVERS if run_dir and failure_reason(run_dir, x)]
+    if failed:
+        out += ["## Failed runs", ""]
+        for x in failed:
+            out += ["### " + NAMES[x], "", failure_reason(run_dir, x), "", "Last 20 lines of server.log:", "",
+                    "```", log_tail(run_dir, x), "```", ""]
     out += ["## Disk and load", "", "| Server | logical | after load | end | space amp (end/logical) | load time |",
             "|---|---|---|---|---|---|"]
     for s in SERVERS:
@@ -226,7 +249,7 @@ def main(argv):
     run_dir = argv[0]
     meta, cells, disks, configs = load(run_dir)
     with open(os.path.join(run_dir, "report.md"), "w") as f:
-        f.write(render(meta, cells, disks, configs))
+        f.write(render(meta, cells, disks, configs, run_dir))
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({"meta": meta, "cells": cells, "disks": disks}, f, indent=2)
     return 1 if any(c["error"] is not None for c in cells) else 0

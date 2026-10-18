@@ -30,7 +30,7 @@ only bench scripts reuses the image.
 | W1 | SET/GET 1:1, 100 B values, random keys | strings |
 | W2 | SET/GET 1:10 | strings |
 | W3 | HSET/HGET on 10k-field hashes | hashes |
-| W4 | ZADD / ZRANGEBYSCORE LIMIT 10 | zsets |
+| W4 | ZINCRBY / ZRANGEBYSCORE LIMIT 10 | zsets |
 | W5 | LPUSH/LPOP | lists |
 | W6 | W1 traffic plus a second client deleting 1k-field hashes at a fixed rate | strings + bighashes |
 
@@ -48,6 +48,7 @@ Every workload runs at two durability levels:
 - Both servers use 4 workers, a 2 GB block cache, a 64 MB memtable and LZ4 compression.
 - The report's Fairness section shows the values read back from each running server. The run fails if any differs from the plan.
 - The data is loaded once per server at the relaxed level. The workloads run W1..W6 at relaxed, then again after a restart at strict. W5 and W6 remove data, so the strict pass sees what the relaxed pass left. Both servers go through the same sequence.
+- Every memtier client uses its own seed (`--distinct-client-seed --randomize`) and random data, so no workload replays identical keys or values.
 - No host ports are published. All containers are named `tideskv-bench-*` and are removed on exit, including Ctrl-C.
 
 ## Reading the report

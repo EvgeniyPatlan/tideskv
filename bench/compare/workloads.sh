@@ -8,6 +8,9 @@
 DATASETS="strings hashes zsets lists bighashes"
 WORKLOADS="W1 W2 W3 W4 W5 W6"
 VALUE_SIZE=100
+# memtier's default seed is constant and shared by all clients: every client would send the same keys and values in
+# lockstep, and Kvrocks skips an HSET whose value is unchanged (no WAL write, no fsync).
+MEMTIER_RUN_FLAGS=(--distinct-client-seed --randomize)
 
 wl_sizes() {
   case $1 in
@@ -96,7 +99,7 @@ wl_run() {
 wl_run_w6_del() {
   # shellcheck disable=SC2046
   "$1" "--command=DEL __key__" "--command-key-pattern=R" "--key-prefix=bh:" $(_random "$BH_COUNT") \
-    "--threads=1" "--clients=1" "--rate-limiting=$W6_DEL_RATE"
+    "--threads=1" "--clients=1" "--rate-limiting=$W6_DEL_RATE" "--randomize"
 }
 
 wl_probe() {

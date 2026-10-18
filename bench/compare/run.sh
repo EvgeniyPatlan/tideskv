@@ -50,10 +50,11 @@ if [[ $SIZE == quick ]]; then WARMUP=${WARMUP:-10} DURATION=${DURATION:-30}; els
 THREADS=${THREADS:-4}
 CLIENTS=${CLIENTS:-50}
 
-# Refuses when free disk is under 2.5x the logical dataset for both servers (spec §8). DISK_FREE_OVERRIDE is a test hook.
+# Refuses when free disk is under 2 x (3 x logical) + 32 GiB (spec §8, raised after the quick run). DISK_FREE_OVERRIDE is a test hook.
 disk_check() {
   local need free
-  need=$(( $(wl_logical_bytes) * 5 ))  # 2.5x per server, two servers
+  # Kvrocks measured ~8x end/logical in the quick run and its WAL retention is a fixed overhead: 3x per server, two servers, plus 32 GiB
+  need=$(( $(wl_logical_bytes) * 3 * 2 + 32 * 1024 * 1024 * 1024 ))
   free=${DISK_FREE_OVERRIDE:-$(df --output=avail -B1 "$OUT" | tail -1)}
   if (( free < need )); then log "not enough disk: need $need bytes, $free free under $OUT"; return 1; fi
 }
@@ -64,7 +65,7 @@ write_meta() {
   python3 - "$OUT/meta.json" <<EOF
 import json, sys
 json.dump({"tideskv_sha": "$(git -C "$ROOT" rev-parse --short HEAD)$( ((DIRTY)) && echo -dirty)",
-           "kvrocks_image": "$kv_digest", "memtier_image": "$MEMTIER_IMAGE", "size": "$SIZE",
+           "kvrocks_image": "$kv_digest", "tideskv_image": "$TIDESKV_IMAGE", "memtier_image": "$MEMTIER_IMAGE", "size": "$SIZE",
            "relaxed_mode": "$RELAXED", "warmup_s": $WARMUP, "duration_s": $DURATION,
            "server_cpus": "$SERVER_CPUS", "server_mem": "$SERVER_MEM",
            "host": "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)",
@@ -84,15 +85,17 @@ load_all() {
     log "loading $ds"
     wl_load "$ds" _load_cb || { log "load of $ds failed; see $CUR/load/"; return 1; }
   done
-  # Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run; wait for the scan to land.
-  local tries=1
-  if [[ $SERVER_NAME == kvrocks ]]; then cli DBSIZE SCAN >/dev/null; tries=900; fi
+  # Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run; poll only that line for the scan to land.
+  local tries
+  if [[ $SERVER_NAME == kvrocks ]]; then cli DBSIZE SCAN >/dev/null; fi
   while read -r want line; do
+    tries=1
+    if [[ $SERVER_NAME == kvrocks && $line == DBSIZE ]]; then tries=900; fi
     for ((i = 0; i < tries; i++)); do
       # shellcheck disable=SC2086
       got=$(cli $line)
       [[ $got =~ ^[0-9]+$ ]] && (( got >= want )) && break
-      sleep 2
+      if ((i + 1 < tries)); then sleep 2; fi
     done
     if ! [[ $got =~ ^[0-9]+$ ]] || (( got < want )); then log "load check failed: $line = [$got], want >= $want"; return 1; fi
   done < <(wl_verify_cmds)
@@ -114,7 +117,7 @@ run_workload() {
     if [[ $reply == ERR* || $reply == WRONGTYPE* ]]; then echo "probe: $reply" >"$OUT/$base.status"; return; fi
   done < <(wl_probe "$w")
   wl_run "$w" _run_cb
-  local common=(--threads="$THREADS" --clients="$CLIENTS" --pipeline=1)
+  local common=(--threads="$THREADS" --clients="$CLIENTS" --pipeline=1 "${MEMTIER_RUN_FLAGS[@]}")
   memtier "$base.warmup" "${common[@]}" --test-time="$WARMUP" "${RUN_ARGS[@]}" || true
   if [[ $w == W6 ]]; then
     wl_run_w6_del _del_cb
@@ -128,7 +131,10 @@ run_workload() {
     echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
   fi
   kill "$stats_pid" 2>/dev/null || true; wait "$stats_pid" 2>/dev/null || true
-  if [[ -n $del_pid ]]; then wait "$del_pid" || echo "W6 DEL memtier failed; see $CUR/$level/W6-del.log" >"$OUT/$base.status"; fi
+  if [[ -n $del_pid ]] && ! wait "$del_pid"; then
+    echo "W6 DEL memtier failed; see $CUR/$level/W6-del.log" >>"$OUT/$base.status"
+    if [[ $(head -1 "$OUT/$base.status") == ok ]]; then sed -i 1d "$OUT/$base.status"; fi
+  fi
   if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null) != true ]]; then
     echo "server stopped during the run (OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' "$SERVER_CONTAINER"))" >"$OUT/$base.status"
     return 1
@@ -137,20 +143,27 @@ run_workload() {
 
 _du() { du -sb "$1" | cut -f1; }
 
+# Records why a server's run failed, then stops it so it cannot keep the server cores during the other run.
+_server_failed() {
+  echo "$1" >"$OUT/$CUR/run.failed"
+  log "$CUR: $1"
+  stop_server
+}
+
 run_server() {
   local server=$1 level w after
   CUR=$server
   local data="$OUT/data/$server"
-  start_server "$server" relaxed "$data" || { echo "server did not start" >"$OUT/$server/relaxed.failed"; return 1; }
-  parity_check "$server" relaxed || return 1
-  load_all || return 1
+  start_server "$server" relaxed "$data" || { _server_failed "server did not start (relaxed)"; return 1; }
+  parity_check "$server" relaxed || { _server_failed "parity check failed (relaxed); see $server/config.txt"; return 1; }
+  load_all || { _server_failed "load failed or the load check did not pass; see $server/load/"; return 1; }
   after=$(_du "$data")
   # relaxed and strict deliberately share one data dir (spec §5 step 4)
   for level in relaxed strict; do
     if [[ $level == strict ]]; then
       stop_server
-      start_server "$server" strict "$data" || { echo "server did not start" >"$OUT/$server/strict.failed"; return 1; }
-      parity_check "$server" strict || return 1
+      start_server "$server" strict "$data" || { _server_failed "server did not start (strict)"; return 1; }
+      parity_check "$server" strict || { _server_failed "parity check failed (strict); see $server/config.txt"; return 1; }
     fi
     for w in $WORKLOADS; do
       log "$server $level $w"
@@ -172,8 +185,8 @@ remove_data() {
 run_full() {
   wl_sizes "$SIZE"
   disk_check
-  write_meta
   docker pull -q "$KVROCKS_IMAGE" >/dev/null; docker pull -q "$MEMTIER_IMAGE" >/dev/null; docker pull -q "$CLI_IMAGE" >/dev/null
+  write_meta
   local server
   for server in tideskv kvrocks; do run_server "$server" || log "$server: run failed, continuing"; done
   remove_data
