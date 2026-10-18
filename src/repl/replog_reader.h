@@ -19,7 +19,9 @@ class ReplogReader {
   // newer commits) positioned with Seek (tidesdb-replication constraint 8), until at least max_bytes of
   // payload went out; next() moves past every batch fn accepted. OK with nothing when next() > last.
   // NotFound "replog entry <n> is not retained" when next() <= last and replog[next()] is gone (trimmed,
-  // R16, D19). An error from fn stops the read and is returned; next() then still names that batch.
+  // R16, D19). An error from fn stops the read and is returned; next() then still names that batch. A gap
+  // after at least one batch ends the call with OK (a partial read); the next call starts at the gap and gets
+  // the NotFound, so a caller that loops on next() <= last sees every gap.
   Status Read(uint64_t last, size_t max_bytes, const BatchFn& fn);
   uint64_t next() const { return next_; }
 

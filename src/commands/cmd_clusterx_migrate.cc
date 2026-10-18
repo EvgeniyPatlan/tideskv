@@ -74,6 +74,7 @@ void RunMigrate(ExecContext& ctx, const std::vector<cluster::SlotRange>& slots, 
   Park(ctx, wait, timeout_s);
 }
 
+// Parity: the erase does not invalidate WATCH on the flushed keys, as Kvrocks ClearKeysOfSlotRange does not.
 void RunFlushSlots(ExecContext& ctx, const std::vector<cluster::SlotRange>& slots) {
   migrate::MigrationService* m = ctx.server.migration();
   if (m == nullptr) return ctx.reply.Error(cluster::kErrClusterNotEnabled);

@@ -31,6 +31,8 @@ OpClass ClassifySlotPrefixed(const ReplOp& op, cluster::SlotRange r) {
   }
   if (op.key.empty()) return OpClass::kDrop;
   if (op.key[0] != 0) return OpClass::kOutside;  // another db
+  // A DEL_PREFIX of 2 bytes or less covers the whole db-0 slot space (FLUSHDB of db 0): a flush, even though
+  // the range is only part of what it deletes.
   if (op.key.size() < 3) return op.type == ReplOpType::kDeletePrefix ? OpClass::kFlush : OpClass::kDrop;
   return InRange(coding::DecodeFixed16BE(op.key.data() + 1), r) ? OpClass::kInRange : OpClass::kOutside;
 }

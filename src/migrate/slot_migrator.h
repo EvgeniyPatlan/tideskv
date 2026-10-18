@@ -35,7 +35,10 @@ struct MigrateJob {
   uint16_t dst_port = 0;
 };
 
-using MigrateDone = std::function<void(const Status& outcome)>;  // Ok = success; UserError = the stage error
+// Ok = success; UserError = the stage error. Runs on the job's thread, after the outcome is published: it
+// must not call Start, Stop or WaitIdle, nor take MigrationService::migrate_mu_ (CLUSTERX MIGRATE holds it
+// while it starts the job). The production one (cmd_clusterx_migrate.cc, Deliverer) takes only its own locks.
+using MigrateDone = std::function<void(const Status& outcome)>;
 
 class SlotMigrator {
  public:

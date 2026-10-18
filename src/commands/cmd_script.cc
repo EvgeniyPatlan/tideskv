@@ -69,7 +69,9 @@ void EvalGeneric(ExecContext& ctx, const ArgList& argv, bool by_sha, bool read_o
   const std::vector<std::string> keys(argv.begin() + 3, split);
   const std::vector<std::string> args(split, argv.end());
   // M7b D4: plain EVAL is registered without the write flag, so any script that is neither EVAL_RO nor a
-  // shebang no-writes script counts as a write for the whole-call fence check.
+  // shebang no-writes script counts as a write for the whole-call fence check. Parity: so an EVALSHA of an
+  // unknown sha on a fenced slot answers TRYAGAIN, not NOSCRIPT; Kvrocks also refuses at dispatch, before the
+  // script lookup.
   const std::optional<ScriptFlags> f = ctx.server.scripts().PeekFlags(argv[1], by_sha);
   const bool writes = !read_only && !(f && f->shebang && f->no_writes);
   RunScript(ctx,

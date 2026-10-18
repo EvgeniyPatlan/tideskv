@@ -35,6 +35,7 @@ Result<std::vector<encoding::ReplOp>> DecodeLoadChunk(std::string_view chunk);
 // What a SnapshotChunker walks (M6b D3; M7b D2). The defaults are the full sync's: every key of meta, subkey,
 // zscore and expire, then sys/oid_hwm. The slot migrator walks meta/subkey/zscore of one range, no sys.
 struct ChunkerOptions {
+  // The same CFs as kLoadableCfs (full_sync_frames.cc): change both together.
   std::vector<ColumnFamily> cfs = {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore,
                                    ColumnFamily::kExpire};
   IterOptions bounds;  // applied to every CF's iterator; empty = the whole CF

@@ -31,6 +31,7 @@ class SlotFence {
     }
     return false;
   }
+  // A diagnostic snapshot: without the Engine gate it may mix two Assigns; exact only under the gate.
   SlotBits Bits() const {
     SlotBits out;
     for (size_t s = 0; s < kSlotCount; ++s) out[s] = Test(static_cast<uint16_t>(s));

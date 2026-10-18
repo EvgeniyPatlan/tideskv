@@ -131,7 +131,8 @@ void Exec(ExecContext& ctx, const ArgList&) {
     return ReplyError(ctx, batch.status());
   }
   // M7b D4: the slot became fenced between queueing and EXEC: one whole TRYAGAIN, nothing applied. A queued
-  // EVAL/EVALSHA (has_may_replicate) may write, so it counts as a write here.
+  // EVAL/EVALSHA (has_may_replicate) may write, so it counts as a write here. Conservative: a queued shebang
+  // no-writes EVAL is refused too, as Kvrocks refuses every EVAL on a fenced slot.
   const ArgList no_args;
   if (std::string e = FencedCallRefusal(ctx, CallKeys(ctx, *ctx.server.registry().Find("exec"), no_args),
                                         m.has_write || m.has_may_replicate);

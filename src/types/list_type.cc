@@ -12,6 +12,9 @@ namespace {
 
 constexpr auto kList = encoding::ValueType::kList;
 
+// Also what a half-imported list answers (M7b): its meta streams before its elements, so DEBUG DIGEST /
+// DIGEST-SLOTS and ASKING reads of an importing slot (D6 step 5) see the size first and reply ERR storage
+// error, logged. No client sends ASKING to TidesKV (there is no ASK), and DIGEST is test tooling.
 Status MissingElement() { return Status::Corruption("list holds fewer elements than its size"); }
 
 // Index argument -> position, or nullopt when outside [-len, len).

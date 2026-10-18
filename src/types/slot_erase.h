@@ -25,7 +25,8 @@ struct ExpireDeletes {
 Result<ExpireDeletes> CollectExpireDeletes(ReadView& view, uint16_t first, uint16_t last,
                                            std::string_view after, size_t limit);
 // Step 2: DeleteRange([0][first], [0][last+1]) in meta, subkey and zscore. Three range deletes stay under
-// TidesDB's 32-per-commit cap (storage.h); one DeletePrefix per slot would not.
+// TidesDB's 32-per-commit cap (storage.h); one DeletePrefix per slot would not. Parity: these range deletes
+// (cleanups, IMPORT erases, FLUSHSLOTS) do not invalidate WATCH, as Kvrocks ClearKeysOfSlotRange does not.
 std::vector<encoding::ReplOp> SlotRangeDeletes(uint16_t first, uint16_t last);
 
 }  // namespace tideskv

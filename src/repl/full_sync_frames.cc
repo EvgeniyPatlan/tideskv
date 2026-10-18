@@ -6,6 +6,7 @@
 namespace tideskv::repl {
 namespace {
 
+// The default ChunkerOptions::cfs (full_sync_frames.h) walks the same CFs: change both together.
 constexpr ColumnFamily kLoadableCfs[] = {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore,
                                          ColumnFamily::kExpire};
 constexpr size_t kOpOverhead = 16;  // op/cf bytes and the two varints, an upper bound
