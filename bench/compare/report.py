@@ -4,6 +4,7 @@
 Usage: report.py <run_dir>    exit 0 when every cell is ok, 1 otherwise.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -12,9 +13,15 @@ SERVERS = ("tideskv", "kvrocks")
 LEVELS = ("relaxed", "strict")
 WORKLOADS = ("W1", "W2", "W3", "W4", "W5", "W6")
 NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks"}
-BAD_INPUT = (OSError, ValueError, KeyError, TypeError, AttributeError)
+BAD_INPUT = (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, ZeroDivisionError)
 UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40,
          "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+
+
+def _num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError("not a finite number: %r" % (v,))
+    return v
 
 
 def parse_memtier(path):
@@ -22,9 +29,9 @@ def parse_memtier(path):
         stats = json.load(f)["ALL STATS"]
     totals = stats["Totals"]
     pct = totals["Percentile Latencies"]
-    return {"count": totals["Count"], "ops": totals["Ops/sec"], "p50": pct["p50.00"],
-            "p99": pct["p99.00"], "p999": pct["p99.90"],
-            "duration_s": stats["Runtime"]["Total duration"] / 1000.0}
+    return {"count": _num(totals["Count"]), "ops": _num(totals["Ops/sec"]), "p50": _num(pct["p50.00"]),
+            "p99": _num(pct["p99.00"]), "p999": _num(pct["p99.90"]),
+            "duration_s": _num(stats["Runtime"]["Total duration"]) / 1000.0}
 
 
 def parse_mem(text):
@@ -47,6 +54,8 @@ def parse_stats(path):
                 mem = parse_mem(s["MemUsage"])
             except BAD_INPUT:
                 continue
+            if not (math.isfinite(cpu) and math.isfinite(mem)):
+                continue
             cpus.append(cpu)
             mems.append(mem)
     return {"cpu_mean_pct": sum(cpus) / len(cpus) if cpus else None,
@@ -60,7 +69,7 @@ def cpu_us_per_op(cpu_mean_pct, duration_s, count):
 
 
 def _read(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         return f.read().strip()
 
 
@@ -74,7 +83,7 @@ def _cell(run_dir, server, level, w):
     status_path = os.path.join(d, w + ".status")
     try:
         status = (_read(status_path) or "empty status") if os.path.exists(status_path) else "no status"
-    except OSError as e:
+    except BAD_INPUT as e:
         status = "unreadable status: " + str(e)
     if status != "ok":
         cell["error"] = status
@@ -151,6 +160,8 @@ def _disk_row(s, disks):
         return "| %s | not run | – | – | – | – |" % NAMES[s]
     d = disks[s]
     try:
+        for k in ("logical_bytes", "after_load_bytes", "end_bytes", "load_seconds"):
+            _num(d[k])
         amp = "%.2f" % (d["end_bytes"] / float(d["logical_bytes"])) if d["logical_bytes"] else "–"
         return "| %s | %s | %s | %s | %s | %ds |" % (NAMES[s], _gib(d["logical_bytes"]), _gib(d["after_load_bytes"]),
                                                     _gib(d["end_bytes"]), amp, d["load_seconds"])

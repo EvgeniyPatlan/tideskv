@@ -245,6 +245,52 @@ class RobustnessTest(unittest.TestCase):
             self.assertIn("| TidesKV | unreadable |", md)
             self.assertIn("| Kvrocks | not run |", md)
 
+    def test_non_finite_or_wrong_typed_memtier_numbers_are_error(self):
+        for key, val in (("Ops/sec", "abc"), ("Ops/sec", None), ("Ops/sec", True),
+                         ("Ops/sec", float("nan")), ("Count", "x"), ("Count", float("inf"))):
+            with tempfile.TemporaryDirectory() as t:
+                make_run(t)
+                p = os.path.join(t, "tideskv", "relaxed", "W1.json")
+                with open(p) as f:
+                    d = json.load(f)
+                d["ALL STATS"]["Totals"][key] = val
+                with open(p, "w") as f:
+                    json.dump(d, f)
+                c = self._cell(report.collect(t))
+                self.assertTrue(str(c["error"]).startswith("unreadable memtier result: "), (key, val))
+                self.assertEqual(report.main([t]), 1)
+        with tempfile.TemporaryDirectory() as t:  # bad DEL ops leaves del_ops None
+            make_run(t)
+            p = os.path.join(t, "tideskv", "relaxed", "W6-del.json")
+            with open(p) as f:
+                d = json.load(f)
+            d["ALL STATS"]["Totals"]["Ops/sec"] = "x"
+            with open(p, "w") as f:
+                json.dump(d, f)
+            self.assertIsNone(self._cell(report.collect(t), w="W6")["del_ops"])
+            self.assertEqual(report.main([t]), 0)
+
+    def test_disk_json_overflow_and_wrong_types_are_unreadable(self):
+        for body in ('{"after_load_bytes":1,"end_bytes":1,"load_seconds":1e999,"logical_bytes":1}',
+                     '{"after_load_bytes":1,"end_bytes":1,"load_seconds":1,"logical_bytes":"0"}',
+                     '{"after_load_bytes":1,"end_bytes":1e999,"load_seconds":1,"logical_bytes":1e-999}'):
+            with tempfile.TemporaryDirectory() as t:
+                make_run(t)
+                self._write(t, "tideskv/disk.json", body)
+                self.assertEqual(report.main([t]), 0, body)
+                with open(os.path.join(t, "report.md")) as f:
+                    self.assertIn("| TidesKV | unreadable |", f.read())
+
+    def test_non_utf8_status_config_meta_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            for rel in ("tideskv/relaxed/W1.status", "tideskv/config.txt", "meta.json"):
+                with open(os.path.join(t, *rel.split("/")), "wb") as f:
+                    f.write(b"\x00\xff\xfe")
+            self.assertEqual(report.main([t]), 1)
+            self.assertIsNotNone(self._cell(report.collect(t))["error"])
+            self.assertTrue(os.path.exists(os.path.join(t, "report.md")))
+
 
 if __name__ == "__main__":
     unittest.main()
