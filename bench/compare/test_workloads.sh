@@ -78,9 +78,10 @@ check verify-hlen "$(wl_verify_cmds | grep -c '^9900 HLEN h:1$')" 1
 check logical "$( (( $(wl_logical_bytes) > 400000000 )) && echo yes || echo no)" yes
 
 if command -v shellcheck >/dev/null; then
-  shellcheck -x "$HERE/workloads.sh" "$HERE/test_workloads.sh" && echo "ok   shellcheck" || fail=1
+  shellcheck -x "$HERE/workloads.sh" "$HERE/test_workloads.sh" "$HERE/lib.sh" "$HERE/run.sh" && echo "ok   shellcheck" || fail=1
 else
   echo "skip shellcheck (not installed)"
 fi
 bash -n "$HERE/workloads.sh" || fail=1
+bash -n "$HERE/lib.sh" "$HERE/run.sh" || fail=1
 exit $fail
