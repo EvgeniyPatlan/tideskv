@@ -5,7 +5,7 @@
 
 ```bash
 bench/compare/run.sh --smoke   # start both servers at both durability levels, check parity, ~5 min
-bench/compare/run.sh --quick   # small dataset, 10 s warm-up, 30 s runs, about 20 min
+bench/compare/run.sh --quick   # small dataset, 10 s warm-up, 30 s runs, about 25 min
 bench/compare/run.sh           # full: ~24 GB dataset, 60 s warm-up, 180 s runs, ~3 h
 ```
 
