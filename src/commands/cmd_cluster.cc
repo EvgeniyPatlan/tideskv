@@ -159,9 +159,8 @@ void Reset(ExecContext& ctx, ClusterManager& cm, const Topology&, const ArgList&
   if (m != nullptr) {
     st = m->ResetCluster(reset);
   } else {  // no migration service: nothing else moves the fence
-    ctx.server.engine().HoldAllFenced();
+    const Engine::FenceHold hold(ctx.server.engine());
     st = reset();
-    ctx.server.engine().ReleaseAllFenced();
   }
   if (!st.ok()) return ReplyError(ctx, st);
   ctx.reply.SimpleString("OK");

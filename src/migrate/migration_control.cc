@@ -125,10 +125,10 @@ Status MigrationService::ResetCluster(const std::function<Status()>& reset) {
   std::lock_guard lock(migrate_mu_);
   if (MigrationRunning()) return Err(cluster::kErrResetWhileMigrating);
   if (ImportRunning()) return Err(cluster::kErrResetWhileImporting);
-  deps_.engine.HoldAllFenced();
+  // The release puts the fence back to the states' set (C11), whoever moved it meanwhile.
+  const Engine::FenceHold hold(deps_.engine);
   Status st = reset();
   if (st.ok()) st = OnReset();
-  deps_.engine.ReleaseAllFenced();  // the fence becomes the states' set (C11), whoever moved it meanwhile
   return st;
 }
 

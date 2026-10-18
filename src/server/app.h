@@ -2,6 +2,7 @@
 #include <asio.hpp>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "cluster/cluster_manager.h"
@@ -83,6 +84,10 @@ class App final : public ServerServices {
   // D18: trims the replog; its thread on a master, the replica client's applier on a replica. Created
   // with replication_ (each refers to the other); stopped first in Stop(), destroyed before repl_log_.
   std::unique_ptr<repl::BacklogTrimmer> trimmer_;
+  // RefreshRedirect's reads of the topology and the states and its SetRedirect, together (final review M1): a
+  // leaf below apply_mu_ and record_mu_ (its callers hold one of them), above BlockedClient::mu_ and
+  // BlockingRegistry::mu_ (SetRedirect takes those).
+  std::mutex redirect_mu_;
   // Its hooks call replication_, which outlives it; commands reach it through server_, destroyed first.
   std::unique_ptr<cluster::ClusterManager> cluster_;
   ScriptEngine scripts_;                            // before engine_: its busy guard refers to it

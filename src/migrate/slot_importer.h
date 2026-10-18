@@ -30,8 +30,8 @@ class SlotImporter {
   // fails the import (erase + error) and is returned. On a replica (demoted meanwhile) nothing is applied:
   // the import fails without an erase and kErrSlaveCantImport is returned.
   Status Data(uint64_t link, std::string_view chunk);
-  // IMPORT <R> 1 (success: imported, served) or 2 (fail: erase + error); idempotent for an import that
-  // already ended that way.
+  // IMPORT <R> 1 (success: imported, served) or 2 (fail: erase + error, also after a success: final review
+  // I1); idempotent for an import that already ended that way.
   Status Finish(cluster::SlotRange range, bool success);
   // ~Connection of `link`: if it is still importing, erase + error on the worker (no erase on a replica).
   void LinkClosed(uint64_t link);
@@ -48,6 +48,9 @@ class SlotImporter {
   // Under mu_: forgets the import, erases its range (unless !erase; BUSY waited out when background),
   // publishes error. An erase failure leaves the persisted start, which the next Restore erases.
   Status FailLocked(cluster::SlotRange range, bool erase, bool background);
+  // Under mu_: IMPORT <R> 2 for an import that reached success (see the .cc). kErrImportOwnSlot when this
+  // node owns a slot of R by now.
+  Status FailImported(cluster::SlotRange range);
   // On the worker: fails the running import if `link` is its link (any import when any_link).
   void FailOnWorker(uint64_t link, bool any_link, const char* why);
 

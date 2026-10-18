@@ -11,6 +11,21 @@ namespace {
 
 constexpr auto kPausePoll = std::chrono::milliseconds(10);
 
+// Ends one admitted write however the scope exits (final review M4, as BackgroundWrite): a WriteInternal that
+// throws never leaks a CLIENT PAUSE in-flight count.
+class AdmittedWrite {
+ public:
+  explicit AdmittedWrite(const SlotEraser::Hooks& hooks) : hooks_(hooks) {}
+  ~AdmittedWrite() {
+    if (hooks_.begin_write && hooks_.end_write) hooks_.end_write();
+  }
+  AdmittedWrite(const AdmittedWrite&) = delete;
+  AdmittedWrite& operator=(const AdmittedWrite&) = delete;
+
+ private:
+  const SlotEraser::Hooks& hooks_;
+};
+
 }  // namespace
 
 Status SlotEraser::Commit(const std::vector<encoding::ReplOp>& ops) {
@@ -20,9 +35,8 @@ Status SlotEraser::Commit(const std::vector<encoding::ReplOp>& ops) {
     if (!hooks_.begin_write || hooks_.begin_write()) break;
     std::this_thread::sleep_for(kPausePoll);
   }
-  const Status st = engine_.WriteInternal(ops);
-  if (hooks_.begin_write && hooks_.end_write) hooks_.end_write();
-  return st;
+  const AdmittedWrite admitted(hooks_);
+  return engine_.WriteInternal(ops);
 }
 
 Status SlotEraser::Erase(cluster::SlotRange range) {

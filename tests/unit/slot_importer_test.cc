@@ -134,6 +134,56 @@ TEST(SlotImporterTest, SuccessServesTheRangeAndFailureErasesIt) {  // D14
   EXPECT_EQ(p.target.Run({"GET", "b"}), Bulk("1")) << "an earlier import stays imported";
 }
 
+// Final review I1 (Kvrocks SlotImport::Fail, slot_import.cc:70-86): the source sends IMPORT <R> 2 after an
+// acked IMPORT <R> 1 when it cannot record its success. The target erases its copy and stops serving it, so
+// two masters never accept writes for R.
+TEST(SlotImporterTest, AFailAfterASuccessErasesTheImportedCopy) {
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  ASSERT_EQ(p.source.Run({"SET", "{b}t", "v", "PX", "60000"}), kOk);
+  ASSERT_EQ(p.target.Run({"SET", "foo", "mine"}), kOk);  // 12182, B's own slot
+  SecondClient link(p.target);
+  ASSERT_NO_FATAL_FAILURE(Import(p, link, "3300", {3300, 3300}, "1"));
+  ASSERT_EQ(p.target.Run({"GET", "b"}), Bulk("1"));
+  EXPECT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "2"}), kOk);
+  EXPECT_EQ(p.target.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(0));
+  EXPECT_NE(p.target.Run({"CLUSTER", "INFO"}).find("importing_slot(s): 3300\r\nimport_state: error\r\n"),
+            std::string::npos);
+  EXPECT_TRUE(p.target_cluster.manager->States()->imported.empty());
+  EXPECT_EQ(p.target.Run({"GET", "b"}), Err("MOVED 3300 127.0.0.1:7000")) << "the owner serves it again";
+  EXPECT_EQ(p.target.Run({"SET", "b", "2"}), Err("MOVED 3300 127.0.0.1:7000"));
+  auto record = cluster::LoadMigrationRecord(p.target.services.storage_);
+  ASSERT_TRUE(record.ok() && record->has_value());
+  EXPECT_EQ((*record)->import->state, ImportState::kError);
+  EXPECT_TRUE((*record)->imported.empty());
+  EXPECT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "2"}), kOk);  // idempotent
+  EXPECT_EQ(p.target.Run({"GET", "foo"}), Bulk("mine")) << "nothing outside the range is erased";
+  EXPECT_NE(p.target.Run({"DEBUG", "DIGEST-INDEX"}).find(":0\r\n:0\r\n:0\r\n"), std::string::npos)
+      << "no expire entry left behind";
+}
+
+// I1's guard: once a push granted R to this node, CheckImportable refuses IMPORT <R> 2, so owned data is
+// never erased.
+TEST(SlotImporterTest, AFailAfterAGrantedPushIsRefusedAndKeepsTheData) {
+  MigrationPair p;
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  SecondClient link(p.target);
+  ASSERT_NO_FATAL_FAILURE(Import(p, link, "3300", {3300, 3300}, "1"));
+  const std::string b_owns = kNodeA + " 127.0.0.1 7000 master - 0-3299 3301-8191\n" + kNodeB +
+                             " 127.0.0.1 7001 master - 3300 8192-16383\n" + kNodeC +
+                             " 127.0.0.1 7002 slave " + kNodeA + "\n";
+  p.target_cluster.Push(b_owns, 2);
+  ASSERT_TRUE(p.target_migration().AwaitIdle(5s));
+  EXPECT_EQ(link.Run({"CLUSTER", "IMPORT", "3300", "2"}), Err(cluster::kErrImportOwnSlot));
+  EXPECT_EQ(p.target.Run({"GET", "b"}), Bulk("1"));
+  EXPECT_EQ(p.target.Run({"CLUSTER", "COUNTKEYSINSLOT", "3300"}), Int(1));
+  EXPECT_EQ(p.target_cluster.manager->States()->import->state, ImportState::kSuccess);
+  // The importer re-checks ownership under its lock too, for a push that lands after the command's check.
+  EXPECT_EQ(p.target_migration().importer().Finish({3300, 3300}, false).message(),
+            cluster::kErrImportOwnSlot);
+  EXPECT_EQ(p.target.Run({"GET", "b"}), Bulk("1"));
+}
+
 TEST(SlotImporterTest, LinkLossWhileStartErasesAndReportsError) {  // D14, gocase: gone within 100 ms
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);

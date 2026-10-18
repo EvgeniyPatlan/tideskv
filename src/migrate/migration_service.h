@@ -52,6 +52,9 @@ struct MigrationDeps {
   std::function<MigrateSettings()> settings = {};  // required from Task 10: re-read before every chunk
   // D14: IMPORT start's bounded wait for the migrate worker (an overlapping cleanup). Tests shorten it.
   std::chrono::milliseconds import_worker_wait = std::chrono::seconds(10);
+  // The pause before the worker retries a failed write (a cleanup, a transition, an erase, a fail record, a
+  // promotion's restore). Tests shorten it.
+  std::chrono::milliseconds failure_retry = std::chrono::seconds(1);
 };
 
 class MigrationService {
@@ -90,12 +93,24 @@ class MigrationService {
   // migrated range the persisted topology already moved away is cleaned up.
   Status Restore();
   // The become_master hook (under apply_mu_): requests the restore and posts it; the first Mutate after it,
-  // on any thread, performs it (see Mutate). A second promotion before that is never lost (a generation).
+  // on any thread, performs it (see Mutate). A second promotion before that is never lost (a generation). A
+  // failed restore is retried on the worker after failure_retry while it is still pending (final review M5).
+  // Until it commits the promoted node has empty states and no fence, so for that window (the worker's
+  // wake-up, or a storage error that lasts) a migrated range it still owns in its topology accepts writes,
+  // which the cleanup after the push later erases. Accepted: closing it would raise the record's fence
+  // synchronously in become_master (legal, apply_mu_ -> gate), which needs its own test.
   void OnPromoted();
   // D9, on the worker: erases `range`, then drops its cleanup entry, its migrated entry and its fence
-  // (persisted). BUSY is waited out; another failure is retried after 1 s until Shutdown; a replica does
-  // nothing (its master resumes).
+  // (persisted). BUSY is waited out; another failure is retried after failure_retry until Shutdown; a replica
+  // does nothing (its master resumes).
   void RunCleanup(cluster::SlotRange range);
+  // D10's fail outcome, from SlotMigrator::PublishFailure (admitted already): the job block says fail and the
+  // range's fence is lowered (persisted). Final review I2: a failed write (the record's commit or
+  // make_durable) is retried on the worker after failure_retry, admitted as RunCleanup's, until it commits,
+  // Shutdown, a demotion (a replica owns no outcome, D21), or the block no longer holds this job in start (an
+  // edit superseded it: OnDemoted's clear; an overlapping IMPORT cannot start while this node owns the range,
+  // CheckImportable). Returns the first attempt's status.
+  Status PublishJobFailure(cluster::SlotRange range);
   // The eraser stopping on Shutdown, with the CLIENT PAUSE hooks (background) or without (inside an admitted
   // command, M7a D21). One attempt: BUSY is returned.
   Status EraseRange(cluster::SlotRange range, bool background);
@@ -122,7 +137,10 @@ class MigrationService {
   // returning; `done` (may be null) gets the outcome. Serialised by migrate_mu_.
   Status Migrate(const std::vector<cluster::SlotRange>& ranges, std::string_view dst_id, MigrateDone done);
   // FLUSHDB/FLUSHALL (D10, Writer's note 1): cancels a running job and fails a running import. Flags and a
-  // post only: it may run inside an EXEC or a script that holds the Engine gate.
+  // post only: it may run inside an EXEC or a script that holds the Engine gate. A FLUSH after the job's last
+  // cancel check and before IMPORT <R> 1 still fails it in PublishSuccess, and the target erases on the
+  // IMPORT <R> 2 that follows (final review I1). Left: a FLUSH whose OnFlush runs after PublishSuccess's
+  // halted() check; it lands after the slot moved, so it only clears the source's stale copy.
   void OnFlush();
   // D13: refused while a job is in start; the check and the erase run under migrate_mu_, so no MIGRATE starts
   // in between.
@@ -133,7 +151,7 @@ class MigrationService {
   // block goes, a fail block and the import block stay.
   Status OnReset();
   // CLUSTER RESET (D20), all under migrate_mu_ so no MIGRATE publishes start in between: refused while a job
-  // or an import is in start (Kvrocks order); then every slot held fenced (Engine::HoldAllFenced: no
+  // or an import is in start (Kvrocks order); then every slot held fenced (an Engine::FenceHold: no
   // concurrent Mutate can lower it) while `reset` (the emptiness check and ClusterManager::Reset, which takes
   // apply_mu_: migrate_mu_ -> apply_mu_) and, on success, OnReset run; the release puts the fence back to the
   // states' set. Never under apply_mu_ or the Engine gate.
@@ -155,7 +173,6 @@ class MigrationService {
 
  private:
   static constexpr std::chrono::milliseconds kBusyRetry{10};  // as the eraser polls CLIENT PAUSE
-  static constexpr std::chrono::seconds kFailureRetry{1};
 
   struct Restored {  // what a restore leaves for the worker once its Mutate committed
     bool ran = false;
@@ -179,10 +196,15 @@ class MigrationService {
   // found (empty when absent).
   Status RestoreInto(cluster::SlotStates& s, cluster::MigrationRecord* stored, Restored* out);
   void PostRestored(const Restored& r);  // the cleanups and the half-import erase, to the worker
+  // On the worker: OnPromoted's restore, as one no-op Mutate; a failure is retried after failure_retry while
+  // the restore is pending, until Shutdown (a replica's Mutate skips the restore, D21).
+  void RunPromotionRestore();
   // On the worker: erases what an import left in start (D8). Stops for good once any other import overlaps it
   // (start, success or error: that import erased its range itself, D9), or a range imported since the restore
-  // (not in `restored_imported`) does, on a replica, or on Shutdown; failures retry after 1 s.
+  // (not in `restored_imported`) does, on a replica, or on Shutdown; failures retry after failure_retry.
   void RunHalfImportErase(cluster::SlotRange range, std::vector<cluster::SlotRange> restored_imported);
+  // Equality with the restored {range, error} block is enough: IMPORT start's AwaitIdle lets this erase
+  // finish before any new import of an overlapping range can publish a block equal to it.
   bool NewImportOverlaps(cluster::SlotRange range,
                          const std::vector<cluster::SlotRange>& restored_imported) const;
   // Under record_mu_: moves the fence from `cur_fenced`, writes RecordOf(next) unless it equals `stored`,
@@ -193,6 +215,9 @@ class MigrationService {
   Status EraseWith(cluster::SlotRange range, bool background,
                    std::function<bool()> stop);  // EraseRange + stop
   void WorkerLoop();
+  // One attempt of D10's fail outcome; `retry`: only while the block still holds that job in start.
+  Status FailJob(cluster::SlotRange range, bool retry);
+  void RetryJobFailure(cluster::SlotRange range);         // on the worker: see PublishJobFailure
   void WaitBeforeRetry(std::chrono::milliseconds delay);  // cut short by Shutdown
   // On the worker (migration_transitions.cc): D7's table against the topology published now, inside one
   // Mutate (ruling S2(a)); then the cleanups it scheduled run inline, so CLUSTERX can wait for them.

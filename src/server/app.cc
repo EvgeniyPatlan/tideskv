@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <csignal>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -198,7 +199,11 @@ cluster::ClusterManager::Options App::ClusterOptions(const ConfigValues& v) {
   return o;
 }
 
+// on_publish (under apply_mu_) and on_states_publish (under record_mu_) can run at once: without
+// redirect_mu_, one could read (t0, s1), the other publish t1 and install (t1, s1), and the first then
+// install its stale pair last, so a blocked client of a slot t1 moved away is never MOVEd (final review M1).
 void App::RefreshRedirect() {
+  const std::lock_guard lock(redirect_mu_);
   const std::shared_ptr<const cluster::Topology> t = cluster_->Current();
   const std::shared_ptr<const cluster::SlotStates> s = cluster_->States();
   blocking_.SetRedirect([t, s](const BlockedClient& c) { return BlockedRedirect(*t, *s, c); });

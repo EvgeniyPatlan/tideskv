@@ -4,13 +4,20 @@
 
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "common/coding.h"
 #include "encoding/key_codec.h"
+#include "exec/commit_listener.h"
+#include "exec/engine.h"
+#include "exec/lock_manager.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
+#include "support/fake_clock.h"
 #include "support/replica_stack.h"
 #include "types/slot_erase.h"
 #include "types/slot_keys.h"
@@ -156,6 +163,31 @@ TEST(SlotEraser, WaitsWhilePausedAndStopsWhenAsked) {  // D9: CLIENT PAUSE holds
   stopping.stopping = [] { return true; };
   ASSERT_EQ(h.Run({"SET", "{b}again", "1", "PX", "100000"}), kOk);
   EXPECT_EQ(migrate::SlotEraser(h.services.engine_, stopping).Erase({3300, 3300}).message(), "stopped");
+}
+
+// Final review M4: a commit that throws (here the commit listener, after the range deletes committed) still
+// ends its admitted background write, so a later CLIENT PAUSE never waits on a leaked in-flight count.
+class ThrowingListener final : public CommitListener {
+ public:
+  void OnCommitted(const std::vector<RangeDelete>&) override { throw std::runtime_error("injected"); }
+};
+
+TEST(SlotEraser, AThrowingCommitEndsItsAdmittedWrite) {
+  InMemoryStorage storage;
+  LockManager locks;
+  FakeClock clock;
+  ThrowingListener listener;
+  Engine engine(storage, locks, clock, &listener);
+  int in_flight = 0;
+  migrate::SlotEraser::Hooks hooks;
+  hooks.begin_write = [&in_flight] {
+    ++in_flight;
+    return true;
+  };
+  hooks.end_write = [&in_flight] { --in_flight; };
+  migrate::SlotEraser eraser(engine, std::move(hooks));
+  EXPECT_THROW((void)eraser.Erase({3300, 3300}), std::runtime_error);
+  EXPECT_EQ(in_flight, 0);
 }
 
 }  // namespace

@@ -291,11 +291,10 @@ void SlotMigrator::PublishFailure(const MigrateJob& job) {
   const BackgroundWrite admitted(
       service_, [this, &is_replica] { return stopped_.load(std::memory_order_acquire) || is_replica(); });
   if (!admitted.admitted() && !is_replica()) return;  // Stop while paused: as a kill -9 here would (D8)
-  const Status st = service_.Mutate([&job](cluster::SlotStates& s) {
-    if (s.job && s.job->range == job.range) s.job->state = cluster::MigrateState::kFail;
-    cluster::SetFenced(s, job.range, false);
-  });
-  if (!st.ok()) spdlog::warn("cannot publish the failed migration: {}", st.ToString());
+  if (const Status st = service_.PublishJobFailure(job.range); !st.ok()) {
+    spdlog::warn("cannot publish the failed migration of slot(s) {}: {}; the migrate worker retries",
+                 cluster::FormatRange(job.range), st.ToString());
+  }
 }
 
 }  // namespace tideskv::migrate

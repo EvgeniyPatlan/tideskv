@@ -95,7 +95,7 @@ void MigrationService::ApplyTransition() {
   if (!st.ok()) {  // nothing was added
     if (stopping()) return;
     spdlog::warn("cannot record a topology transition: {}; retrying", st.ToString());
-    WaitBeforeRetry(kFailureRetry);
+    WaitBeforeRetry(deps_.failure_retry);
     OnTopology();
     return;
   }

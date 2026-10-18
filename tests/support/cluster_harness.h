@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,10 +64,11 @@ inline migrate::MigrationDeps MigrationDepsOf(CommandHarness& h, cluster::Cluste
 
 // A ClusterManager over the harness's storage whose role hooks drive its FakeReplication, and the node's
 // MigrationService; `port` picks which node of kThreeNodes this harness is (7000 = A, 7001 = B, 7002 = C);
-// `import_worker_wait` is the service's MigrationDeps::import_worker_wait.
+// `import_worker_wait` and `failure_retry` are the service's MigrationDeps fields of those names.
 struct ClusterHarness {
   explicit ClusterHarness(CommandHarness& h, uint16_t port = 7000,
-                          std::chrono::milliseconds import_worker_wait = std::chrono::seconds(10))
+                          std::chrono::milliseconds import_worker_wait = std::chrono::seconds(10),
+                          std::chrono::milliseconds failure_retry = std::chrono::seconds(1))
       : h_(h) {
     cluster::ClusterManager::Options o;
     o.port = port;
@@ -100,6 +102,7 @@ struct ClusterHarness {
           return transport(host, p, t, cancel);
         });
     deps.import_worker_wait = import_worker_wait;
+    deps.failure_retry = failure_retry;
     migration = std::make_unique<migrate::MigrationService>(std::move(deps));
     h.services.migration_service = migration.get();
   }
@@ -117,12 +120,14 @@ struct ClusterHarness {
 
   // What App::RefreshRedirect does (D16, M7b D18).
   void RefreshRedirect() {
+    const std::lock_guard lock(redirect_mu);
     const std::shared_ptr<const cluster::Topology> t = manager->Current();
     const std::shared_ptr<const cluster::SlotStates> s = manager->States();
     h_.services.blocking_.SetRedirect([t, s](const BlockedClient& c) { return BlockedRedirect(*t, *s, c); });
   }
 
   CommandHarness& h_;
+  std::mutex redirect_mu;  // App::redirect_mu_ (final review M1)
   std::unique_ptr<cluster::ClusterManager> manager;
   migrate::TransportFactory transport;                   // set by tests; none: connects fail
   std::unique_ptr<migrate::MigrationService> migration;  // over manager (M7b); null only while constructing

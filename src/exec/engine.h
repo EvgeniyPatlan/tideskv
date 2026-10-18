@@ -208,6 +208,8 @@ class Engine {
   };
 
   // ---- The slot write fence of a migrating source (M7b D4) ----
+  // Not ReplLog::fenced(): that one is the replog refusing every commit (a demoted master, READONLY); this
+  // one refuses writes to some slots (TRYAGAIN) while they migrate.
   // Each change takes the gate exclusively, the barrier BeginLoad uses: every write already holding the gate
   // commits (or fails) first, and every later Write/RunWrite sees the new fence and answers kErrTryAgain for
   // a fenced key. Returns repl_log()->last() read inside that barrier (0 without a log): no write to a newly
@@ -224,6 +226,18 @@ class Engine {
   // FenceSlots.
   void HoldAllFenced();
   void ReleaseAllFenced();
+  // One HoldAllFenced for a scope, released however it exits (final review M2): a reset that throws, which
+  // Connection::Execute catches, never leaves every slot fenced until a restart.
+  class FenceHold {
+   public:
+    explicit FenceHold(Engine& engine) : engine_(engine) { engine_.HoldAllFenced(); }
+    ~FenceHold() { engine_.ReleaseAllFenced(); }
+    FenceHold(const FenceHold&) = delete;
+    FenceHold& operator=(const FenceHold&) = delete;
+
+   private:
+    Engine& engine_;
+  };
   bool SlotFenced(uint16_t slot) const { return fence_.Test(slot); }
   SlotBits FencedSlots() const { return fence_.Bits(); }
 

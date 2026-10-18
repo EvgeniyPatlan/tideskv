@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -384,6 +385,37 @@ TEST_F(ServiceTest, ATransientLoadErrorAtPromotionFailsTheEditAndTheRestoreIsRet
   EXPECT_EQ(Record()->migrated, r.migrated);
   *release = true;
   ASSERT_TRUE(svc->AwaitIdle(5s));
+}
+
+// Final review M5: a transient load error in the restore a promotion posts is retried on the worker, so the
+// migrated range is fenced and MOVEd again without waiting for an unrelated Mutate.
+TEST_F(ServiceTest, ATransientLoadErrorInThePostedRestoreIsRetriedOnTheWorker) {
+  cluster::MigrationRecord r;
+  r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
+  Persist(r);
+  migrate::MigrationDeps deps = MigrationDepsOf(h, *c.manager, {});
+  deps.failure_retry = 10ms;
+  auto svc = std::make_unique<migrate::MigrationService>(std::move(deps));
+  h.services.storage_.fail_begin_read_in = 1;  // the posted restore's record load
+  svc->OnPromoted();
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!h.services.engine_.SlotFenced(3300) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  EXPECT_EQ(h.services.storage_.fail_begin_read_in.load(), -1) << "the injected failure was hit";
+  EXPECT_TRUE(h.services.engine_.SlotFenced(3300));
+  EXPECT_EQ(c.manager->States()->migrated, r.migrated);
+  EXPECT_EQ(h.Run({"SET", "b", "x"}), Err("MOVED 3300 127.0.0.1:7001"));
+}
+
+// Final review M2: CLUSTER RESET's fence hold is a scope guard, so a reset that throws (std::bad_alloc, which
+// Connection::Execute catches) never leaves every slot fenced.
+TEST_F(ServiceTest, AResetThatThrowsReleasesTheFenceHold) {
+  auto svc = Make();
+  EXPECT_THROW((void)svc->ResetCluster([]() -> Status { throw std::runtime_error("injected"); }),
+               std::runtime_error);
+  EXPECT_FALSE(h.services.engine_.SlotFenced(3300));
+  EXPECT_EQ(h.Run({"SET", "b", "1"}), kOk);
 }
 
 // Fix round 2: an overlapping import that reached success before the posted erase ran supersedes it.

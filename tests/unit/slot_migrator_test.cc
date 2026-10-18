@@ -8,9 +8,11 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "cluster/cluster_errors.h"
+#include "cluster/migration_record.h"
 #include "repl/backlog_trimmer.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
@@ -171,6 +173,33 @@ TEST(SlotMigratorTest, AFailedImportEndFailsTheJobAndLowersTheFence) {  // KM §
   EXPECT_EQ(RunJob(p, {3300, 3300}).message(), std::string(cluster::kErrStageImportStatus) + "ERR boom");
   ExpectFailedAfterTheFence(p);
   EXPECT_TRUE(p.source_cluster.manager->States()->migrated.empty());  // D8: nothing recorded
+}
+
+// Final review I2: the fail record's write fails once (the source's storage refuses it); the worker retries
+// it, as RunCleanup does, so the fence and the start block do not stay until a restart.
+TEST(SlotMigratorTest, AFailRecordThatCannotBeWrittenIsRetriedOnTheWorker) {
+  MigrationPair p(std::chrono::seconds(10), /*failure_retry=*/10ms);
+  p.source_cluster.transport =
+      [&p](const std::string&, uint16_t, std::chrono::milliseconds,
+           const std::atomic<bool>*) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
+    return std::unique_ptr<migrate::MigrationTransport>(std::make_unique<FailingImportEnd>(p.target));
+  };
+  ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
+  migrate::SlotMigrator::Hooks hooks;
+  hooks.after_fence = [&p] { p.source.services.storage_.fail_commit_in = 1; };  // the next commit: the record
+  p.source_migration().migrator().SetHooks(hooks);
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), std::string(cluster::kErrStageImportStatus) + "ERR boom");
+  const auto failed = [&p] {
+    const auto s = p.source_cluster.manager->States();
+    return s->job.has_value() && s->job->state == MigrateState::kFail;
+  };
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!failed() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+  EXPECT_EQ(p.source.services.storage_.fail_commit_in.load(), -1) << "the injected failure was hit";
+  ExpectFailedAfterTheFence(p);
+  auto record = cluster::LoadMigrationRecord(p.source.services.storage_);
+  ASSERT_TRUE(record.ok() && record->has_value());
+  EXPECT_EQ((*record)->job->state, MigrateState::kFail);
 }
 
 // The fence Mutate finds the range fenced already (it moves no fence and reports no seq): the final delta

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -148,7 +150,8 @@ Status SlotImporter::Finish(cluster::SlotRange range, bool success) {
   const std::optional<cluster::ImportJob> import = states->import;
   if (!import || import->range != range) return Mismatch(*states, range);
   const bool live = range_.has_value() && *range_ == range;
-  if (!success) return live ? FailLocked(range, /*erase=*/true, /*background=*/false) : Status::Ok();
+  if (!success && live) return FailLocked(range, /*erase=*/true, /*background=*/false);
+  if (!success) return import->state == cluster::ImportState::kSuccess ? FailImported(range) : Status::Ok();
   if (!live) {
     return import->state == cluster::ImportState::kSuccess ? Status::Ok()
                                                            : Err(cluster::kErrImportNotRunning);
@@ -163,6 +166,28 @@ Status SlotImporter::Finish(cluster::SlotRange range, bool success) {
   link_ = 0;
   remap_.Clear();
   return Status::Ok();
+}
+
+// Final review I1, Kvrocks SlotImport::Fail (slot_import.cc:70-86): the source sends IMPORT <R> 2 after an
+// acked IMPORT <R> 1 when it cannot record its success (a FLUSH or a demotion after its last cancel check, a
+// slot_only transition, a failed record write), then serves R again. The copy here is erased (command path,
+// admitted already) before the imported entry goes and the block says error, so two masters never accept
+// writes for R. An erase failure is returned with nothing published (Kvrocks order). Never a slot this node
+// owns: CheckImportable refuses IMPORT <R> 2 once a push granted R here, and the topology is checked again
+// under mu_. Residual: a source whose success record reached its replog but whose make_durable failed also
+// sends IMPORT <R> 2; after a crash it can boot with R migrated while this copy is gone. That takes a double
+// storage failure and a crash, and the source keeps its own copy until a push.
+Status SlotImporter::FailImported(cluster::SlotRange range) {
+  const std::shared_ptr<const cluster::Topology> t = service_.deps().cluster.Current();
+  const cluster::ClusterNode* me = t->Myself();
+  for (uint32_t s = range.start; s <= range.end; ++s) {
+    if (me != nullptr && t->OwnerOf(static_cast<uint16_t>(s)) == me) return Err(cluster::kErrImportOwnSlot);
+  }
+  if (Status st = service_.EraseRange(range, /*background=*/false); !st.ok()) return st;
+  return service_.Mutate([range](cluster::SlotStates& s) {
+    if (s.import && s.import->range == range) s.import->state = cluster::ImportState::kError;
+    std::erase_if(s.imported, [range](cluster::SlotRange r) { return cluster::Overlaps(r, range); });
+  });
 }
 
 Status SlotImporter::FailLocked(cluster::SlotRange range, bool erase, bool background) {

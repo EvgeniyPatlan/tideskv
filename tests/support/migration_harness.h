@@ -81,10 +81,12 @@ class InProcessTransport final : public migrate::MigrationTransport {
 
 struct MigrationPair {
   MigrationPair() : MigrationPair(std::chrono::seconds(10)) {}
-  // `import_worker_wait`: both nodes' MigrationDeps::import_worker_wait (tests that hold a worker shorten
-  // it).
-  explicit MigrationPair(std::chrono::milliseconds import_worker_wait)
-      : source_cluster(source, 7000, import_worker_wait), target_cluster(target, 7001, import_worker_wait) {
+  // `import_worker_wait`, `failure_retry`: both nodes' MigrationDeps fields of those names (tests that hold
+  // a worker shorten the first; tests that inject a storage failure shorten the second).
+  explicit MigrationPair(std::chrono::milliseconds import_worker_wait,
+                         std::chrono::milliseconds failure_retry = std::chrono::seconds(1))
+      : source_cluster(source, 7000, import_worker_wait, failure_retry),
+        target_cluster(target, 7001, import_worker_wait, failure_retry) {
     source_cluster.transport =
         [this](const std::string&, uint16_t, std::chrono::milliseconds,
                const std::atomic<bool>*) -> Result<std::unique_ptr<migrate::MigrationTransport>> {

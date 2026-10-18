@@ -11,6 +11,13 @@
 #include "migrate/slot_eraser.h"
 
 namespace tideskv::migrate {
+namespace {
+
+bool JobInStart(const cluster::SlotStates& s, cluster::SlotRange range) {
+  return s.job.has_value() && s.job->range == range && s.job->state == cluster::MigrateState::kStart;
+}
+
+}  // namespace
 
 MigrationService::MigrationService(MigrationDeps deps)
     : deps_(std::move(deps)),
@@ -121,12 +128,17 @@ Status MigrationService::Restore() {
 
 void MigrationService::OnPromoted() {
   restore_requested_.fetch_add(1, std::memory_order_acq_rel);
-  Post([this] {
-    if (!RestorePending()) return;  // an earlier Mutate restored already
-    if (Status st = Mutate([](cluster::SlotStates&) {}); !st.ok()) {
-      spdlog::error("cannot commit the slot migration states restored after a promotion: {}", st.ToString());
-    }
-  });
+  Post([this] { RunPromotionRestore(); });
+}
+
+void MigrationService::RunPromotionRestore() {
+  if (stopping() || !RestorePending()) return;  // an earlier Mutate restored already
+  const Status st = Mutate([](cluster::SlotStates&) {});
+  if (st.ok() || stopping()) return;
+  spdlog::error("cannot commit the slot migration states restored after a promotion: {}; retrying",
+                st.ToString());
+  WaitBeforeRetry(deps_.failure_retry);
+  Post([this] { RunPromotionRestore(); });
 }
 
 bool MigrationService::NewImportOverlaps(cluster::SlotRange range,
@@ -152,7 +164,7 @@ void MigrationService::RunHalfImportErase(cluster::SlotRange range,
   if (st.ok() || stopping() || superseded()) return;
   spdlog::warn("erasing the half import of slot(s) {} failed: {}; retrying", cluster::FormatRange(range),
                st.ToString());
-  WaitBeforeRetry(kFailureRetry);
+  WaitBeforeRetry(deps_.failure_retry);
   Post([this, range, imported = std::move(restored_imported)] { RunHalfImportErase(range, imported); });
 }
 
@@ -207,8 +219,38 @@ void MigrationService::RunCleanup(cluster::SlotRange range) {
   }
   if (st.ok() || stopping()) return;
   spdlog::warn("cleanup of slot(s) {} failed: {}; retrying", cluster::FormatRange(range), st.ToString());
-  WaitBeforeRetry(kFailureRetry);
+  WaitBeforeRetry(deps_.failure_retry);
   Post([this, range] { RunCleanup(range); });
+}
+
+Status MigrationService::FailJob(cluster::SlotRange range, bool retry) {
+  return Mutate([range, retry](cluster::SlotStates& s) {
+    if (retry && !JobInStart(s, range)) return;  // superseded meanwhile: nothing left to finish
+    if (s.job && s.job->range == range) s.job->state = cluster::MigrateState::kFail;
+    cluster::SetFenced(s, range, false);
+  });
+}
+
+Status MigrationService::PublishJobFailure(cluster::SlotRange range) {
+  const Status st = FailJob(range, /*retry=*/false);
+  if (!st.ok()) Post([this, range] { RetryJobFailure(range); });
+  return st;
+}
+
+void MigrationService::RetryJobFailure(cluster::SlotRange range) {
+  WaitBeforeRetry(deps_.failure_retry);
+  if (stopping() || deps_.is_replica() || !JobInStart(*deps_.cluster.States(), range)) return;
+  Status st;
+  {
+    const BackgroundWrite admitted(*this, deps_.is_replica);
+    // Shutdown while paused: as a kill -9 (D8). Demoted meanwhile: a replica owns no outcome (D21).
+    if (!admitted.admitted() || deps_.is_replica()) return;
+    st = FailJob(range, /*retry=*/true);
+  }
+  if (st.ok() || stopping()) return;
+  spdlog::warn("recording the failed migration of slot(s) {} failed: {}; retrying",
+               cluster::FormatRange(range), st.ToString());
+  Post([this, range] { RetryJobFailure(range); });
 }
 
 void MigrationService::WaitBeforeRetry(std::chrono::milliseconds delay) {
