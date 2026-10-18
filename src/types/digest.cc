@@ -116,7 +116,7 @@ Status XorObjectDigest(ReadView& view, uint8_t db, uint16_t slot, std::string_vi
     MixDigest(d, m.payload);
   } else {
     // Built from the meta record directly: LoadCollection would hide a logically expired key.
-    Collection c{db, std::string(key), slot, StoredObject{ObjectState::kLive, m.meta, {}}, true};
+    Collection c{db, std::string(key), slot, StoredObject{ObjectState::kLive, m.meta, {}}, true, {}};
     switch (m.meta.type) {
       case ValueType::kList:
         st = DigestList(view, c, d);

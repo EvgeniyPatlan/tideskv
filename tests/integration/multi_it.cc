@@ -296,5 +296,26 @@ TEST(MultiIT, DisconnectedClientsQueueNeverRuns) {  // Review Focus #5
   EXPECT_EQ(Transaction(*c, {{"SET", "k", "v"}}).type, RespValue::Type::kArray);
 }
 
+// An overwrite that leaves a collection's meta record unchanged skips rewriting it (M8 write stalls);
+// WATCH must still see the key as modified, here from inside a script declaring two keys.
+TEST(MultiIT, WatchSeesWritesThatLeaveTheMetaRecordUnchanged) {
+  TestServer s(TIDESKV_SERVER_BIN);
+  auto a = s.Connect();
+  auto b = s.Connect();
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(a->Command({"HSET", "h", "f", "v1"}).integer, 1);
+  ASSERT_EQ(a->Command({"ZADD", "z", "1", "m"}).integer, 1);
+  const std::vector<std::vector<std::string>> overwrites = {
+      {"EVAL", "return redis.call('HSET', KEYS[1], 'f', 'v2')", "2", "h", "other"},
+      {"EVAL", "return redis.call('ZINCRBY', KEYS[1], 1, 'm')", "2", "z", "other"}};
+  for (const auto& w : overwrites) {
+    a->Command({"WATCH", w[3]});
+    ASSERT_NE(b->Command(w).type, RespValue::Type::kError) << w[1];
+    EXPECT_EQ(Transaction(*a, {{"SET", "x", "1"}}).type, RespValue::Type::kNull) << w[1];
+  }
+  EXPECT_EQ(a->Command({"HGET", "h", "f"}).str, "v2");
+}
+
 }  // namespace
 }  // namespace tideskv::test

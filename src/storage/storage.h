@@ -84,6 +84,9 @@ class WriteTxn : public ReadView {
   virtual Status ReleaseSavepoint(std::string_view name) = 0;     // NotFound if unknown
   virtual Status Commit() = 0;
   virtual Status Rollback() = 0;
+  // Reports that key would have been rewritten with the bytes it already holds: nothing reaches
+  // storage, but a transaction that tracks its writes (RecordingTxn, for WATCH) counts it as one.
+  virtual void NoteRewrite(ColumnFamily /*cf*/, std::string_view /*key*/) {}
 };
 
 // ReadViews and WriteTxns must be destroyed before the Storage that created them.

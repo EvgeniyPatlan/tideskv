@@ -24,6 +24,8 @@ struct Collection {
   uint16_t slot = 0;
   StoredObject obj;     // state kLive or kMissing, never kExpired
   bool stored = false;  // a meta record exists for it in storage (set by the Load* functions)
+  // The meta record as stored (encoded); empty when none is. SaveCollection skips rewriting it unchanged.
+  std::string stored_meta;
 
   bool exists() const { return obj.live(); }
   uint64_t size() const { return exists() ? obj.meta.size : 0; }
@@ -42,8 +44,10 @@ Result<Collection> LoadCollectionForWrite(WriteTxn& txn, uint8_t db, std::string
 // SaveCollection; an oid taken by a command that then fails is simply never used.
 Status InitCollection(Collection* c, encoding::ValueType type, OidAllocator& oids);
 // Persists c after its size changed: the meta record, or, at size 0, deletes the key
-// (DeleteEmptyObject) if it was stored.
-Status SaveCollection(WriteTxn& txn, const Collection& c);
+// (DeleteEmptyObject) if it was stored. A meta record identical to the stored one is not rewritten
+// (txn.NoteRewrite still reports the key as written, for WATCH): those rewrites only fed the meta CF
+// small flushes that each cost a compaction of all the keyspace's metadata. Updates c.stored_meta.
+Status SaveCollection(WriteTxn& txn, Collection& c);
 // LoadCollectionForWrite, then InitCollection if the key is missing (HSET, SADD, ...).
 Result<Collection> OpenCollectionForWrite(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view key,
                                           encoding::ValueType type, int64_t now_ms);

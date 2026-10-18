@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "encoding/key_codec.h"
+#include "exec/recording_txn.h"
 #include "storage/memory_storage.h"
 #include "types/errors.h"
 #include "types/object_store.h"
@@ -217,6 +218,50 @@ TEST_F(CollectionTest, RandomElementsDistinctAndWithRepeats) {
   for (const Element& e : *rep) EXPECT_TRUE(e.field == "a" || e.field == "b" || e.field == "c");
   auto none = RandomElements(**view, *c, 0, rng);
   EXPECT_TRUE(none->empty());
+}
+
+// HSET of an existing field must not rewrite an unchanged meta record: every such write landed in the
+// meta CF, whose flushes then forced compactions of all the keyspace's metadata (M8 write stalls).
+// WATCH must still see the key, so it is reported as written.
+TEST_F(CollectionTest, SaveCollectionSkipsAnUnchangedMetaRecordButReportsTheKey) {
+  MakeHash("h", {{"a", "1"}, {"b", "2"}});
+  auto inner = storage.BeginWrite();
+  ASSERT_TRUE(inner.ok());
+  RecordingTxn rec(**inner);
+  rec.CaptureOps(true);
+  auto c = LoadCollectionForWrite(rec, 0, "h", ValueType::kHash, 0);
+  ASSERT_TRUE(c.ok());
+  auto created = PutElement(rec, *c, "a", "changed");
+  ASSERT_TRUE(created.ok());
+  EXPECT_FALSE(*created);
+  ASSERT_TRUE(SaveCollection(rec, *c).ok());
+  for (const auto& op : rec.ops()) EXPECT_NE(op.cf, ColumnFamily::kMeta) << "unchanged meta was rewritten";
+  ASSERT_EQ(rec.meta_keys().size(), 1u);
+  EXPECT_EQ(rec.meta_keys()[0].key, "h");
+  ASSERT_TRUE(rec.Commit().ok());
+  auto view = storage.BeginRead();
+  auto after = LoadCollection(**view, 0, "h", ValueType::kHash, 0);
+  ASSERT_TRUE(after.ok());
+  EXPECT_EQ(after->size(), 2u);
+  EXPECT_EQ(**GetElement(**view, *after, "a"), "changed");
+}
+
+TEST_F(CollectionTest, SaveCollectionWritesAChangedMetaRecord) {
+  MakeHash("h", {{"a", "1"}});
+  auto inner = storage.BeginWrite();
+  ASSERT_TRUE(inner.ok());
+  RecordingTxn rec(**inner);
+  rec.CaptureOps(true);
+  auto c = LoadCollectionForWrite(rec, 0, "h", ValueType::kHash, 0);
+  ASSERT_TRUE(c.ok());
+  ASSERT_TRUE(PutElement(rec, *c, "new", "v").ok());
+  ASSERT_TRUE(SaveCollection(rec, *c).ok());
+  int meta_ops = 0;
+  for (const auto& op : rec.ops()) meta_ops += op.cf == ColumnFamily::kMeta ? 1 : 0;
+  EXPECT_EQ(meta_ops, 1);
+  ASSERT_TRUE(rec.Commit().ok());
+  auto view = storage.BeginRead();
+  EXPECT_EQ(LoadCollection(**view, 0, "h", ValueType::kHash, 0)->size(), 2u);
 }
 
 }  // namespace

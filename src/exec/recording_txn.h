@@ -30,9 +30,10 @@ class RecordingTxn final : public WriteTxn {
   Status ReleaseSavepoint(std::string_view name) override;  // keeps the counts; forgets the savepoint
   Status Commit() override { return inner_.Commit(); }
   Status Rollback() override;
+  void NoteRewrite(ColumnFamily cf, std::string_view key) override { Wrote(cf, key); }  // not captured
 
   const std::vector<RangeDelete>& deletes() const { return deletes_; }
-  // Successful mutations (Put, Delete, DeletePrefix, DeleteRange), minus those rolled back.
+  // Successful mutations (Put, Delete, DeletePrefix, DeleteRange, NoteRewrite), minus those rolled back.
   size_t writes() const { return writes_; }
   // Keys whose meta record was put or deleted, in write order; may repeat (M5a plan G2).
   const std::vector<DbKey>& meta_keys() const { return meta_keys_; }

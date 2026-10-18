@@ -21,7 +21,10 @@ Result<Collection> Typed(Result<StoredObject> obj, uint8_t db, std::string_view 
   c.key = std::string(key);
   c.slot = KeySlot(key);
   c.stored = obj->live();
-  if (obj->live()) c.obj = std::move(obj).value();
+  if (obj->live()) {
+    c.obj = std::move(obj).value();
+    c.stored_meta = encoding::EncodeMetadata(c.obj.meta);
+  }
   return c;
 }
 
@@ -60,11 +63,22 @@ Status InitCollection(Collection* c, encoding::ValueType type, OidAllocator& oid
   c->obj.meta.oid = *oid;
   c->obj.meta.size = 0;
   c->stored = false;
+  c->stored_meta.clear();
   return Status::Ok();
 }
 
-Status SaveCollection(WriteTxn& txn, const Collection& c) {
-  if (c.obj.meta.size > 0) return PutObjectMeta(txn, c.db, c.key, c.obj.meta);
+Status SaveCollection(WriteTxn& txn, Collection& c) {
+  if (c.obj.meta.size > 0) {
+    std::string record = encoding::EncodeMetadata(c.obj.meta);
+    if (c.stored && record == c.stored_meta) {
+      txn.NoteRewrite(ColumnFamily::kMeta, encoding::MetaKeyFor(c.db, c.key));
+      return Status::Ok();
+    }
+    if (Status st = PutObjectMeta(txn, c.db, c.key, c.obj.meta); !st.ok()) return st;
+    c.stored_meta = std::move(record);
+    return Status::Ok();
+  }
+  c.stored_meta.clear();
   if (!c.stored) return Status::Ok();
   return DeleteEmptyObject(txn, c.db, c.key, c.obj.meta);
 }

@@ -27,6 +27,29 @@ TEST(RecordingTxn, RecordsSuccessfulRangeDeletesOnly) {
   EXPECT_EQ(*(*view)->Get(ColumnFamily::kMeta, "k"), "v");  // forwarded to the real txn
 }
 
+// A rewrite of bytes already stored is reported like a Put (a write, and its meta key for WATCH) but
+// reaches neither storage nor the replication capture; a savepoint rollback forgets it.
+TEST(RecordingTxn, NoteRewriteCountsAsAWriteWithoutWritingOrCapturing) {
+  InMemoryStorage s;
+  auto inner = s.BeginWrite();
+  RecordingTxn txn(**inner);
+  txn.CaptureOps(true);
+  const std::string key = encoding::MetaKeyFor(0, "k");
+  ASSERT_TRUE(txn.Savepoint("sp").ok());
+  txn.NoteRewrite(ColumnFamily::kMeta, key);
+  EXPECT_EQ(txn.writes(), 1u);
+  ASSERT_EQ(txn.meta_keys().size(), 1u);
+  EXPECT_EQ(txn.meta_keys()[0].key, "k");
+  EXPECT_TRUE(txn.ops().empty());
+  ASSERT_TRUE(txn.RollbackToSavepoint("sp").ok());
+  EXPECT_EQ(txn.writes(), 0u);
+  EXPECT_TRUE(txn.meta_keys().empty());
+  txn.NoteRewrite(ColumnFamily::kMeta, key);
+  ASSERT_TRUE(txn.Commit().ok());
+  auto view = s.BeginRead();
+  EXPECT_EQ((*view)->Get(ColumnFamily::kMeta, key).status().code(), StatusCode::kNotFound);
+}
+
 TEST(RecordingTxn, SavepointRollbackForgetsLaterDeletes) {
   InMemoryStorage s;
   auto inner = s.BeginWrite();
