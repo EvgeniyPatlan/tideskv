@@ -212,7 +212,7 @@ check help-defaults "$(has "$help" "WARMUP/DURATION 60/180") $(has "$help" "CLIE
 check dirty-untracked "$(grep -c 'ls-files -z --cached --others --exclude-standard' "$HERE/lib.sh")" 1
 
 if command -v shellcheck >/dev/null; then
-  shellcheck -x "$HERE/workloads.sh" "$HERE/test_workloads.sh" "$HERE/lib.sh" "$HERE/run.sh" && echo "ok   shellcheck" || fail=1
+  shellcheck -x -P "$HERE" "$HERE/workloads.sh" "$HERE/test_workloads.sh" "$HERE/lib.sh" "$HERE/run.sh" && echo "ok   shellcheck" || fail=1
 else
   echo "skip shellcheck (not installed)"
 fi

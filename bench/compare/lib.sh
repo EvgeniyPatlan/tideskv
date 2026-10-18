@@ -158,6 +158,10 @@ start_server() {
   for ((i = 0; i < 60; i++)); do
     if [[ $(cli PING 2>/dev/null) == PONG ]]; then
       SERVER_CGROUP=/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$(docker inspect -f '{{.State.Pid}}' "$SERVER_CONTAINER")/cgroup")
+      # cgroup v2 only: an empty path would read host-wide CPU and writes as the server's
+      if [[ $SERVER_CGROUP == /sys/fs/cgroup || $SERVER_CGROUP == /sys/fs/cgroup/ || ! -f $SERVER_CGROUP/cpu.stat ]]; then
+        log "cannot find $server's cgroup v2 directory ($SERVER_CGROUP)"; return 1
+      fi
       log "$server ($level) is up"; return 0
     fi
     if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null) != true ]]; then break; fi
