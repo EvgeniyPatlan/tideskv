@@ -48,6 +48,11 @@ size_t CompactionScheduler::RunPending() {
     if (st.ok()) {
       completed_.fetch_add(1, std::memory_order_relaxed);
       ++finished;
+    } else if (st.code() == StatusCode::kBusy) {
+      // Another compaction (TidesDB's own, usually) holds the CF. It ends by itself however long a big CF
+      // or a slow machine makes it, so it is waited out on later ticks: never an attempt, never a failure.
+      std::lock_guard lock(mu_);
+      EnqueueLocked(job);
     } else if (++job.attempts < options_.max_attempts) {
       std::lock_guard lock(mu_);
       EnqueueLocked(job);

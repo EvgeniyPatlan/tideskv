@@ -20,7 +20,8 @@ namespace tideskv {
 //  - an 11-byte subkey prefix (collection deleted) -> counted; at the threshold the whole subkey
 //    and zscore CFs are compacted and the count restarts.
 // Each batch of jobs starts with one Checkpoint (range tombstones still in the memtable are not
-// compacted). A failed job is retried on later ticks up to max_attempts, then counted as failed.
+// compacted). A failed job is retried on later ticks up to max_attempts, then counted as failed; Busy
+// (another compaction holds the CF) is retried on later ticks without using an attempt.
 // Queued jobs are deduplicated per CF.
 // All scheduler state is in memory only: queued compactions are lost on a crash or Stop (a startup
 // compaction pass is an M8 item).
