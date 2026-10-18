@@ -106,14 +106,32 @@ TEST(SlotMigratorTest, ACancelBeforeTheLinkConnectsStillTellsTheTarget) {
   MigrationPair p;
   p.source_cluster.transport =
       [&p](const std::string&, uint16_t, std::chrono::milliseconds,
-           const std::atomic<bool>*) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
+           const std::atomic<bool>* abort) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
     p.source_migration().migrator().Cancel();
+    EXPECT_FALSE(abort->load());  // a cancel does not cut the connect short
     return std::unique_ptr<migrate::MigrationTransport>(std::make_unique<InProcessTransport>(p.target));
   };
   EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
   ASSERT_TRUE(p.target_cluster.manager->States()->import.has_value());
   EXPECT_EQ(p.target_cluster.manager->States()->import->state, cluster::ImportState::kError);
   EXPECT_EQ(p.source_cluster.manager->States()->job.value().state, MigrateState::kFail);
+  EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
+}
+
+// Only a Stop (shutdown) skips the target: it aborts the connect, and a link it raced is never used.
+TEST(SlotMigratorTest, AStopDuringTheConnectNeverContactsTheTarget) {
+  MigrationPair p;
+  std::future<void> stopper;
+  p.source_cluster.transport =
+      [&p, &stopper](const std::string&, uint16_t, std::chrono::milliseconds,
+                     const std::atomic<bool>* abort) -> Result<std::unique_ptr<migrate::MigrationTransport>> {
+    stopper = std::async(std::launch::async, [&p] { p.source_migration().migrator().Stop(); });
+    while (!abort->load()) std::this_thread::yield();  // the connect's abort flag is the Stop's
+    return std::unique_ptr<migrate::MigrationTransport>(std::make_unique<InProcessTransport>(p.target));
+  };
+  EXPECT_EQ(RunJob(p, {3300, 3300}).message(), cluster::kErrMigrationCanceled);
+  stopper.get();
+  EXPECT_FALSE(p.target_cluster.manager->States()->import.has_value());
   EXPECT_FALSE(p.source.services.engine_.SlotFenced(3300));
 }
 
