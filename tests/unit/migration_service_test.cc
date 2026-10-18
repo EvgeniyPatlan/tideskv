@@ -24,7 +24,13 @@ using namespace std::chrono_literals;
 using cluster::MigrateState;
 
 struct ServiceTest : ::testing::Test {
-  ServiceTest() { c.Push(kThreeNodes, 1); }  // node A owns 0-8191 ("b" 3300, "bar" 5061)
+  // Node A owns 0-8191 ("b" 3300, "bar" 5061). The push posts work to the harness's own MigrationService
+  // (its promotion restore and transition): let it finish, or it can publish states over the ones a test's
+  // service publishes on the same ClusterManager.
+  ServiceTest() {
+    c.Push(kThreeNodes, 1);
+    EXPECT_TRUE(c.migration->AwaitIdle(5s));
+  }
   std::unique_ptr<migrate::MigrationService> Make() {
     return std::make_unique<migrate::MigrationService>(MigrationDepsOf(h, *c.manager, {}));
   }
