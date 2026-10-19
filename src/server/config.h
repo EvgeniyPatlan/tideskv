@@ -29,8 +29,10 @@ struct ConfigValues {
   uint64_t memtable_size = 64ULL << 20;
   // M8: TidesDB merge trigger (flush-tier tables) and write backpressure threshold; see StorageOptions.
   // Raised from TidesDB's 4 and 16, which stalled every writer while a merge rewrote a large level.
+  // 64, not 32: a list workload's meta rewrite holds both merge threads long enough for the replog's
+  // flush tier to reach 16 tables. The cost is a higher ceiling on queued memtables (64 x memtable-size).
   int l1_file_count_trigger = 8;
-  int l0_stall_threshold = 32;
+  int l0_stall_threshold = 64;
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   int64_t busy_reply_threshold_ms = 5000;  // busy-reply-threshold / lua-time-limit (M5b)

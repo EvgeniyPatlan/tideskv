@@ -34,7 +34,7 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(v.client_query_buffer_limit, 1ULL << 30);
   EXPECT_TRUE(v.requirepass.empty());
   EXPECT_EQ(v.l1_file_count_trigger, 8);
-  EXPECT_EQ(v.l0_stall_threshold, 32);
+  EXPECT_EQ(v.l0_stall_threshold, 64);
 }
 
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
@@ -119,9 +119,9 @@ TEST(Config, ValidatesValues) {
 TEST(Config, StorageTuningIsParsedAndStartupOnly) {
   Config c;
   ASSERT_TRUE(c.Set("l1-file-count-trigger", "16", false).ok());
-  ASSERT_TRUE(c.Set("l0-stall-threshold", "64", false).ok());
+  ASSERT_TRUE(c.Set("l0-stall-threshold", "96", false).ok());
   EXPECT_EQ(c.Snapshot().l1_file_count_trigger, 16);
-  EXPECT_EQ(c.Snapshot().l0_stall_threshold, 64);
+  EXPECT_EQ(c.Snapshot().l0_stall_threshold, 96);
   EXPECT_FALSE(c.Set("l1-file-count-trigger", "4", true).ok());
   EXPECT_FALSE(c.Set("l0-stall-threshold", "16", true).ok());
 }
