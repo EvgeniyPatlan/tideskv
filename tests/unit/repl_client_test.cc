@@ -334,6 +334,11 @@ TEST_F(ReplClientTest, AdoptsANewReplidAndPushesHistory) {
   ASSERT_TRUE(persisted.ok());
   EXPECT_EQ(persisted->replid, master_id());
   EXPECT_EQ(persisted->history, now.history);
+  // on_adopt runs after persist_identity, so the identity can be visible before the hook has fired
+  EXPECT_TRUE(WaitFor([&] {
+    std::lock_guard lock(mu);
+    return !adopted.empty();
+  }));
   std::lock_guard lock(mu);
   EXPECT_EQ(adopted, (std::vector<std::string>{master_id()}));
 }
