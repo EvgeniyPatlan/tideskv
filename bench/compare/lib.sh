@@ -21,7 +21,9 @@ NET_CREATED=0
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 bench_cleanup() {
-  local c
+  local c j
+  # background jobs (the stats sampler, a settle wait, W6's DEL memtier) would outlive an interrupted run
+  for j in $(jobs -p); do pkill -P "$j" 2>/dev/null; kill "$j" 2>/dev/null; done
   for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
   # containers started from background subshells (W6's DEL memtier) carry this run's $TS in their name
   for c in $(docker ps -aq --filter "name=tideskv-bench-.*-$TS"); do docker rm -f "$c" >/dev/null 2>&1 || true; done

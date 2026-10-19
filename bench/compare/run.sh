@@ -131,9 +131,16 @@ load_all() {
 # Waits for the server to go quiet and records the wait in $1.
 settle() {
   local r
-  r=$(quiesce) || { log "cannot read $SERVER_CONTAINER's cgroup ($SERVER_CGROUP)"; return 1; }
-  echo "$r" >"$1"
-  log "$SERVER_NAME settled after ${r}s"
+  # in the background so that a TERM or INT is handled now: bash runs a trap only once the foreground
+  # command returns, and a wait can last QUIESCE_MAX
+  quiesce >"$1" & wait $! || { log "cannot read $SERVER_CONTAINER's cgroup ($SERVER_CGROUP)"; return 1; }
+  r=$(<"$1")
+  log "$SERVER_NAME $(settle_text "$r")"
+}
+
+# "settled after 12s", or "did not settle within 600s" for a capped wait
+settle_text() {
+  if [[ $1 == *capped ]]; then echo "did not settle within ${1%% *}s"; else echo "settled after ${1}s"; fi
 }
 
 # Stops the docker stats loop and any sample still in flight, so no post-run sample is recorded.
@@ -168,7 +175,7 @@ run_workload() {
     memtier "$CUR/$level/W6-del" --test-time="$DURATION" "${DEL_ARGS[@]}" & del_pid=$!
   fi
   # docker stats gives peak memory; CPU is the cgroup's usage_usec delta over exactly the timed run
-  ( while :; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
+  ( while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
     >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
   local cpu0 cpu1
   cpu0=$(cg_sample) || cpu0=""

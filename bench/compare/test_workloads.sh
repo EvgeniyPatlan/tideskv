@@ -134,6 +134,8 @@ cg_sample() {
 }
 QUIESCE_MAX=60
 check quiesce-settles "$(quiesce)" 13
+check settle-text "$(settle_text 13)" "settled after 13s"
+check settle-text-capped "$(settle_text "600 capped")" "did not settle within 600s"
 # never quiet: capped at QUIESCE_MAX
 # shellcheck disable=SC2317
 cg_sample() { echo "$((Q_T * 1000000)) 0"; }
