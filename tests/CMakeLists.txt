@@ -34,6 +34,14 @@ if(CONTRACT_SOURCES)
   gtest_discover_tests(contract_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
+# TidesDB's own planner tests, run against the patched planner (cmake/patches): they fail if the patch
+# stops applying or a TidesDB bump changes the behaviour it fixes.
+add_executable(tidesdb_planner_tests ${tidesdb_SOURCE_DIR}/test/compaction_planner__tests.c)
+target_include_directories(tidesdb_planner_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
+target_compile_definitions(tidesdb_planner_tests PRIVATE _GNU_SOURCE)  # fallocate, as TidesDB builds it
+target_link_libraries(tidesdb_planner_tests PRIVATE tidesdb)
+add_test(NAME TidesDbPlanner COMMAND tidesdb_planner_tests)
+
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)
   add_executable(integration_tests ${INTEGRATION_SOURCES})

@@ -1,0 +1,82 @@
+diff --git a/src/compaction/compaction_planner.c b/src/compaction/compaction_planner.c
+index 79a43ca..db7cdf8 100644
+--- a/src/compaction/compaction_planner.c
++++ b/src/compaction/compaction_planner.c
+@@ -100,6 +100,21 @@ int compaction_planner_triggered(const compaction_state_t *st,
+     return 0;
+ }
+ 
++/* whether the largest level reaching its capacity is the only reason the plan is due. a merge
++ * into a smaller level leaves the largest level as full as it was, so in this state such a merge
++ * would be planned again on every pass and rewrite the same levels forever */
++static int ce_only_largest_full(const compaction_state_t *st, const compaction_planner_config_t *cfg,
++                                const uint64_t *caps)
++{
++    const int l = st->num_levels;
++    if (l < 1 || caps[l - 1] == 0 || st->size[l - 1] < caps[l - 1]) return 0;
++    if (cfg->force) return 0;
++    if (cfg->l1_file_count_trigger > 0 && st->file_count[0] >= cfg->l1_file_count_trigger) return 0;
++    for (int i = 1; i < l; i++)
++        if (caps[i - 1] > 0 && st->size[i - 1] >= caps[i - 1]) return 0;
++    return 1;
++}
++
+ /* ===== job generation ===== */
+ 
+ /* how many job slots to grow the plan by at a time */
+@@ -550,8 +565,12 @@ int compaction_planner_plan(const compaction_snapshot_t *snap,
+                  * instead, which is Spooky adding a level -- the step that keeps the level count at
+                  * about log_T(N/B) and that dynamic capacity adaptation exists to bound the space
+                  * cost of. without it a family stops deepening, the dividing level collapses onto
+-                 * the flush tier, and the tier grows a run per flush with nowhere to drain to */
+-                if (target == st.num_levels && st.num_levels < LEVEL_SET_MAX_LEVELS &&
++                 * the flush tier, and the tier grows a run per flush with nowhere to drain to. when
++                 * the full largest level is all that triggered the plan it deepens even if a smaller
++                 * level could take the merge, which would leave the trigger standing */
++                if ((target == st.num_levels || (ce_only_largest_full(&st, cfg, caps) &&
++                                                  !ce_density_due(snap, cfg))) &&
++                    st.num_levels < LEVEL_SET_MAX_LEVELS &&
+                     caps[st.num_levels - 1] > 0 &&
+                     st.size[st.num_levels - 1] >= caps[st.num_levels - 1])
+                     target = st.num_levels + 1;
+diff --git a/test/compaction_planner__tests.c b/test/compaction_planner__tests.c
+index c8112cf..11f883f 100644
+--- a/test/compaction_planner__tests.c
++++ b/test/compaction_planner__tests.c
+@@ -291,6 +291,28 @@ void test_plan_grows_a_level_when_the_largest_is_full(void)
+     compaction_plan_free(plan);
+ }
+ 
++/* the largest level over its capacity is a reason to deepen no matter which level the merge would
++ * otherwise target. a merge that fits a smaller level leaves the largest level as it was, so the
++ * trigger fires again on the next pass and the same levels are rewritten forever */
++void test_plan_grows_a_level_when_the_largest_is_full_and_a_smaller_level_fits(void)
++{
++    compaction_planner_config_t c = cfg();
++    c.dividing_level_offset = 0;
++
++    /* caps at base=100, T=10: C3 = 10000, C2 = L3/10. L3 is over its capacity, L2 holds far less
++     * than its cap and L1 is empty, so only the largest level's capacity triggers the plan */
++    const compaction_sstable_info_t ssts[] = {sst(1, 2, 50, "a", "z"), sst(2, 3, 10500, "a", "z")};
++    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 2, .num_levels = 3};
++
++    compaction_plan_t *plan = NULL;
++    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
++    ASSERT_EQ(compaction_plan_job_count(plan), 1);
++    const compaction_job_t *j = compaction_plan_job(plan, 0);
++    ASSERT_EQ(j->target_level, 4);
++    ASSERT_EQ(j->n_inputs, 2);
++    compaction_plan_free(plan);
++}
++
+ /* when the small levels merge into the dividing level, one job splits its output by the largest
+  * level's boundaries */
+ void test_plan_dividing(void)
+@@ -480,6 +502,7 @@ int main(int argc, char **argv)
+     RUN_TEST(test_plan_not_triggered, tests_passed);
+     RUN_TEST(test_plan_grow, tests_passed);
+     RUN_TEST(test_plan_grows_a_level_when_the_largest_is_full, tests_passed);
++    RUN_TEST(test_plan_grows_a_level_when_the_largest_is_full_and_a_smaller_level_fits, tests_passed);
+     RUN_TEST(test_plan_dividing, tests_passed);
+     RUN_TEST(test_plan_output_file_max, tests_passed);
+     RUN_TEST(test_plan_partitioned, tests_passed);
