@@ -6,6 +6,7 @@
 ```bash
 bench/compare/run.sh --smoke   # start both servers at both durability levels, check parity, ~5 min
 bench/compare/run.sh --quick   # small dataset, 10 s warm-up, 30 s runs, about 25 min
+bench/compare/run.sh --medium  # ~8 GB dataset, full's timings, needs ~85 GB free, ~2.5 h
 bench/compare/run.sh           # full: ~24 GB dataset, 60 s warm-up, 180 s runs, ~3 h
 ```
 
@@ -17,7 +18,7 @@ Options:
 Environment:
 - `SERVER_CPUS` (default `0-3`), `SERVER_MEM` (`8g`) and `CLIENT_CPUS` (`8-11`) set the limits.
   On this host (i9-12900HK) `0-3` is 2 physical cores with SMT, not 4 cores; meta.json records the core count.
-- `WARMUP` and `DURATION` are in seconds (defaults 60 and 180, quick 10 and 30).
+- `WARMUP` and `DURATION` are in seconds (defaults 60 and 180, quick 10 and 30, medium as full).
 - `THREADS` and `CLIENTS` are memtier's settings (defaults 4 and 50).
 - `QUIESCE_MAX` caps each wait for the server to go quiet, in seconds (default 600, quick 60).
 

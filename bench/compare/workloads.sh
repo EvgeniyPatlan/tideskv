@@ -19,6 +19,9 @@ wl_sizes() {
   case $1 in
     full) S_KEYS=180000000 H_COUNT=50 H_FIELDS=10000 Z_COUNT=50 Z_MEMBERS=100000
           L_COUNT=50 L_ELEMS=100000 BH_COUNT=30000 BH_FIELDS=1000 W6_DEL_RATE=100 ;;
+    # medium: full's timings on a dataset (~8 GB logical) that fits a disk with ~85 GB free
+    medium) S_KEYS=60000000 H_COUNT=20 H_FIELDS=10000 Z_COUNT=20 Z_MEMBERS=100000
+            L_COUNT=20 L_ELEMS=100000 BH_COUNT=10000 BH_FIELDS=1000 W6_DEL_RATE=50 ;;
     quick) S_KEYS=4000000 H_COUNT=5 H_FIELDS=10000 Z_COUNT=5 Z_MEMBERS=10000
            L_COUNT=5 L_ELEMS=10000 BH_COUNT=1000 BH_FIELDS=1000 W6_DEL_RATE=20 ;;
     *) echo "wl_sizes: unknown size $1" >&2; return 2 ;;

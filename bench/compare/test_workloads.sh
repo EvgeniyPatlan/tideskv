@@ -16,6 +16,10 @@ check quick-keys "$S_KEYS" 4000000
 check quick-hashes "$H_COUNT x $H_FIELDS" "5 x 10000"
 check quick-bh "$BH_COUNT x $BH_FIELDS" "1000 x 1000"
 check quick-del-rate "$W6_DEL_RATE" 20
+wl_sizes medium
+check medium-keys "$S_KEYS" 60000000
+check medium-bh "$BH_COUNT x $BH_FIELDS" "10000 x 1000"
+check medium-del-rate "$W6_DEL_RATE" 50
 wl_sizes full
 check full-keys "$S_KEYS" 180000000
 check full-bh "$BH_COUNT x $BH_FIELDS" "30000 x 1000"

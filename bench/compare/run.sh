@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # TidesKV vs Kvrocks comparison benchmark (notes spec 2026-10-18).
-# Usage: bench/compare/run.sh [--quick] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
+# Usage: bench/compare/run.sh [--quick|--medium] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
 #   --relaxed-mode defaults to none; --out defaults to build/bench/<UTC timestamp> and must not hold a non-empty data/
 #   env (defaults): SERVER_CPUS 0-3, SERVER_MEM 8g, CLIENT_CPUS 8-11, THREADS 4, CLIENTS 50,
-#     WARMUP/DURATION 60/180 (quick 10/30), QUIESCE_MAX 600 (quick 60), all in seconds
+#     WARMUP/DURATION 60/180 (quick 10/30; medium as full), QUIESCE_MAX 600 (quick 60), all in seconds
 # shellcheck source-path=SCRIPTDIR disable=SC2034  # ROOT, SIZE and DIRTY are read by lib.sh and the phases Task 4 adds
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -17,6 +17,7 @@ SIZE=full RELAXED=none DIRTY=0 SMOKE=0 OUT_ARG=""
 while (($#)); do
   case $1 in
     --quick) SIZE=quick ;;
+    --medium) SIZE=medium ;;
     --smoke) SMOKE=1 ;;
     --relaxed-mode) RELAXED=${2:?--relaxed-mode needs a value}; shift ;;
     --dirty) DIRTY=1 ;;
