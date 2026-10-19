@@ -343,9 +343,15 @@ struct FamilySettings {
   int l1_file_count_trigger = 0;  // 0 = keep (default at creation)
 };
 
+// TidesDB 10.1.1's default (1) puts the dividing level on the flush tier of a 3-level family, and then
+// a level over capacity is rewritten into itself forever, compacting with no writes at all. At 0 the
+// dividing level is L-1, so an over-capacity L-1 takes the partitioned merge into the largest level.
+constexpr int kDividingLevelOffset = 0;
+
 void ApplySettings(tidesdb_column_family_config_t* cfg, const FamilySettings& f) {
   SetPipeline(cfg, f.compression);
   if (f.l1_file_count_trigger > 0) cfg->l1_file_count_trigger = f.l1_file_count_trigger;
+  cfg->dividing_level_offset = kDividingLevelOffset;
 }
 
 // Existing families keep the config persisted in the manifest unless we change it.
@@ -358,7 +364,8 @@ Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const Fam
   ApplySettings(&cfg, f);
   const bool same = cfg.encoding_count == st.config.encoding_count &&
                     (cfg.encoding_count == 0 || cfg.encoding_pipeline[0] == st.config.encoding_pipeline[0]) &&
-                    cfg.l1_file_count_trigger == st.config.l1_file_count_trigger;
+                    cfg.l1_file_count_trigger == st.config.l1_file_count_trigger &&
+                    cfg.dividing_level_offset == st.config.dividing_level_offset;
   if (same) return Status::Ok();
   constexpr int kAttempts = 10;
   int rc = TDB_ERR_LOCKED;
@@ -503,7 +510,7 @@ Result<StorageStats> TidesStorage::Stats() {
       return FromTdb(rc, "get_cf_stats");
     }
     out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count,
-                           st.config.l1_file_count_trigger};
+                           st.config.l1_file_count_trigger, st.config.dividing_level_offset};
   }
   return out;
 }

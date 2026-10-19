@@ -11,6 +11,10 @@
 #include "storage/tides_storage.h"
 #include "support/temp_dir.h"
 
+extern "C" {
+#include <db.h>
+}
+
 namespace tideskv::test {
 namespace {
 
@@ -170,6 +174,29 @@ TEST(TidesStorageMaint, ReopenWithSameCompressionKeepsData) {
       EXPECT_EQ(*(*view)->Get(ColumnFamily::kMeta, "k"), "v");
     }
   }
+}
+
+// TidesDB 10.1.1's default dividing_level_offset (1) can rewrite an over-capacity level into itself
+// forever, compacting with no writes at all; TidesKV sets 0 on every family, existing ones included.
+TEST(TidesStorageMaint, EveryFamilyUsesDividingLevelOffsetZero) {
+  TempDir dir;
+  StorageOptions o = OptionsFor(dir);
+  {  // a family created by an older TidesKV, with TidesDB's default offset
+    tidesdb_config_t cfg = tidesdb_default_config();
+    cfg.db_path = o.path.data();
+    tidesdb_t* db = nullptr;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cf = tidesdb_default_column_family_config();
+    ASSERT_EQ(cf.dividing_level_offset, 1);
+    const std::string name(ColumnFamilyName(ColumnFamily::kMeta));
+    ASSERT_EQ(tidesdb_create_column_family(db, name.c_str(), &cf), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+  }
+  auto s = MustOpen(o);
+  ASSERT_NE(s, nullptr);
+  auto st = s->Stats();
+  ASSERT_TRUE(st.ok());
+  for (const CfStats& cf : st->cf) EXPECT_EQ(cf.dividing_level_offset, 0);
 }
 
 // M8: l1_file_count_trigger reaches every column family, new ones at creation and existing ones on

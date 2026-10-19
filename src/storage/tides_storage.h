@@ -21,6 +21,7 @@ struct CfStats {
   uint64_t total_tombstones = 0;  // point + range tombstones in sstables
   uint64_t compaction_count = 0;
   int l1_file_count_trigger = 0;  // as configured on the family
+  int dividing_level_offset = 0;  // as configured on the family
 };
 
 struct StorageStats {
