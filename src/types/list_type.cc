@@ -86,6 +86,17 @@ Status PushElement(WriteTxn& txn, Collection& c, ListEnd end, std::string_view v
 
 Status ReadListRange(ReadView& view, const Collection& c, uint64_t from, uint64_t to,
                      std::vector<std::string>* out) {
+  // A TidesDB iterator references every table and checks the range tombstones when it opens, which
+  // costs far more than a few point lookups: LPOP/RPOP of one element spent ~10% of the CPU there.
+  constexpr uint64_t kPointReadMax = 16;
+  if (to - from < kPointReadMax) {
+    for (uint64_t p = from; p <= to; ++p) {
+      auto v = ListElementAt(view, c, p);
+      if (!v.ok()) return v.status();
+      out->push_back(std::move(*v));
+    }
+    return Status::Ok();
+  }
   auto it = view.NewIterator(ColumnFamily::kSubkey, {ListElementKey(c, from), ListElementKey(c, to + 1)});
   if (!it.ok()) return it.status();
   const uint64_t want = to - from + 1;

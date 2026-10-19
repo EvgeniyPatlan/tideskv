@@ -108,6 +108,53 @@ TEST_F(ListTypeTest, PopsALargeCountFromEitherEndInOneRun) {
   EXPECT_EQ((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].size(), 400u);
 }
 
+// Counts the iterators a read opens: on TidesDB an iterator references every table and checks the range
+// tombstones, so a short run is read with point lookups instead.
+class CountingView final : public ReadView {
+ public:
+  explicit CountingView(ReadView& inner) : inner_(inner) {}
+  Result<std::string> Get(ColumnFamily cf, std::string_view key) override { return inner_.Get(cf, key); }
+  Result<std::unique_ptr<Iterator>> NewIterator(ColumnFamily cf, IterOptions opts) override {
+    ++iterators;
+    return inner_.NewIterator(cf, std::move(opts));
+  }
+  int iterators = 0;
+
+ private:
+  ReadView& inner_;
+};
+
+TEST_F(ListTypeTest, ShortRangesAreReadWithPointLookups) {
+  std::vector<std::string> values;
+  for (int i = 0; i < 100; ++i) values.push_back("v" + std::to_string(i));
+  ASSERT_EQ(Push(ListEnd::kRight, std::vector<std::string_view>(values.begin(), values.end())), 100);
+  auto view = storage.BeginRead();
+  auto c = LoadCollection(**view, 0, "l", encoding::ValueType::kList, 0);
+  ASSERT_TRUE(c.ok() && c->exists());
+  CountingView counting(**view);
+  Strings out;
+  ASSERT_TRUE(ReadListRange(counting, *c, 3, 3, &out).ok());
+  ASSERT_TRUE(ReadListRange(counting, *c, 10, 17, &out).ok());
+  EXPECT_EQ(counting.iterators, 0);
+  EXPECT_EQ(out, (Strings{"v3", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"}));
+  out.clear();
+  ASSERT_TRUE(ReadListRange(counting, *c, 0, 99, &out).ok());  // a long run still streams
+  EXPECT_EQ(counting.iterators, 1);
+  EXPECT_EQ(out, values);
+}
+
+TEST_F(ListTypeTest, AShortRangeMissingAnElementIsCorruption) {
+  Push(ListEnd::kRight, {"a", "b", "c"});
+  auto view = storage.BeginRead();
+  auto c = LoadCollection(**view, 0, "l", encoding::ValueType::kList, 0);
+  ASSERT_TRUE(c.ok() && c->exists());
+  ASSERT_TRUE(
+      Write([&](WriteTxn& t) { return t.Delete(ColumnFamily::kSubkey, ListElementKey(*c, 1)); }).ok());
+  auto fresh = storage.BeginRead();
+  Strings out;
+  EXPECT_EQ(ReadListRange(**fresh, *c, 0, 2, &out).code(), StatusCode::kCorruption);
+}
+
 TEST_F(ListTypeTest, RangeFollowsRedisIndexRules) {
   Push(ListEnd::kRight, {"a", "b", "c", "d", "e"});
   EXPECT_EQ(Range(1, 2), (Strings{"b", "c"}));
