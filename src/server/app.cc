@@ -17,6 +17,7 @@
 #include "commands/cluster_routing.h"
 #include "common/string_util.h"
 #include "common/version.h"
+#include "encoding/key_layout.h"
 #include "server/connection_block_handler.h"
 #include "types/errors.h"
 #include "types/format_version.h"
@@ -39,6 +40,23 @@ spdlog::level::level_enum ToLevel(const std::string& s) {
 
 int EffectiveWorkers(int configured) {
   return configured > 0 ? configured : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
+// The data dir's key layout (format_version), set for the whole process before anything encodes a key.
+Status OpenKeyLayout(Storage& storage, bool cluster_enabled) {
+  auto format = OpenFormat(storage, cluster_enabled);
+  if (!format.ok()) return format.status();
+  const std::string_view name = encoding::KeyLayoutName(format->layout);
+  if (format->outcome == FormatOutcome::kSwitched) {
+    spdlog::info("the data directory holds no key: it now uses the {} key layout (format {})", name,
+                 FormatVersionFor(format->layout));
+  } else if (format->outcome == FormatOutcome::kLegacy) {
+    spdlog::info(
+        "this data directory uses the slotted key layout (format 1): it is served as before, without the "
+        "standalone layout's locality, which a new or empty data directory gets");
+  }
+  if (!encoding::InitKeyLayout(format->layout)) return Status::Internal("the key layout was already chosen");
+  return Status::Ok();
 }
 
 }  // namespace
@@ -74,7 +92,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
                                            : Compression::kLz4;
   auto storage = TidesStorage::Open(so);
   if (!storage.ok()) return storage.status();
-  if (Status st = EnsureFormatVersion(**storage); !st.ok()) return st;
+  if (Status st = OpenKeyLayout(**storage, v.cluster_enabled); !st.ok()) return st;  // before the Engine
   std::unique_ptr<App> app(new App(std::move(config), std::move(storage).value()));
   if (Status st = app->repl_log_->Recover(); !st.ok()) return st;  // before any commit (the oid lease)
   if (app->repl_log_->load_incomplete()) {  // M6b D5: never serve a half-loaded keyspace

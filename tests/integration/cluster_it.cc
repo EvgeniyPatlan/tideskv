@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+#include "common/crc16.h"
+#include "encoding/meta_codec.h"
+#include "storage/tides_storage.h"
 #include "support/it_helpers.h"
 #include "support/temp_dir.h"
 #include "support/test_server.h"
@@ -62,13 +65,20 @@ TEST(ClusterIT, InfoAndHelloReportClusterMode) {
 
 TEST(ClusterIT, StartupRefusesKeysOutsideDb0) {  // D19
   TempDir dir("tideskv-cluster-db");
-  {
-    TestServer s(TIDESKV_SERVER_BIN, {.dir = dir.str()});
-    auto c = s.Connect();
-    ASSERT_EQ(c->Command({"SELECT", "3"}).str, "OK");
-    ASSERT_EQ(c->Command({"SET", "k", "v"}).str, "OK");
-    c.reset();
-    ASSERT_EQ(s.Terminate(), 0);
+  {  // a slotted dir (a standalone one is slotless, which cluster mode refuses first) with a key in db 3
+    StorageOptions o;
+    o.path = (dir.path() / "db").string();
+    o.sync_mode = SyncMode::kNone;
+    auto storage = TidesStorage::Open(o);
+    ASSERT_TRUE(storage.ok()) << storage.status().ToString();
+    auto txn = (*storage)->BeginWrite();
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kSys, "format_version", "1").ok());
+    encoding::Metadata m;
+    m.type = encoding::ValueType::kString;
+    const std::string key = std::string("\x03", 1) + static_cast<char>(KeySlot("k") >> 8) +
+                            static_cast<char>(KeySlot("k") & 0xff) + "k";
+    ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, key, encoding::EncodeMetadata(m, "v")).ok());
+    ASSERT_TRUE((*txn)->Commit().ok());
   }
   TestServer s(TIDESKV_SERVER_BIN, {.extra_args = ClusterArgs(), .dir = dir.str(), .wait_ready = false});
   EXPECT_EQ(s.Wait(), 2);

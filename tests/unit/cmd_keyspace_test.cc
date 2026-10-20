@@ -112,7 +112,7 @@ TEST_F(KeyspaceCmds, FlushDbClearsOnlyTheCurrentDb) {
 }
 
 TEST_F(KeyspaceCmds, FlushAllClearsEveryDbButNotSys) {
-  ASSERT_TRUE(EnsureFormatVersion(h.services.storage_).ok());
+  ASSERT_TRUE(OpenFormat(h.services.storage_, /*cluster_enabled=*/false).ok());
   EXPECT_EQ(h.Run({"SET", "a", "1"}), kOk);
   h.session.db = 15;
   EXPECT_EQ(h.Run({"SET", "z", "1", "PX", "100"}), kOk);
