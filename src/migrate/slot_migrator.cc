@@ -143,7 +143,9 @@ Status SlotMigrator::Open(const MigrateJob& job) {
 }
 
 Status SlotMigrator::SendSnapshot(const MigrateJob& job, uint64_t* next) {
-  auto snap = service_.deps().log.SnapshotAtLast();  // the view holds exactly the commits <= seq (M6b D2)
+  // The view holds exactly the commits <= seq (M6b D2). A dormant log (repl-backlog-lazy) is activated:
+  // CatchUp and the final delta read its records from seq + 1.
+  auto snap = service_.deps().log.ActivateAndSnapshot();
   if (!snap.ok()) return Stage(cluster::kErrStageExistingData, snap.status());
   *next = snap->seq + 1;
   next_seq_.store(*next, std::memory_order_release);

@@ -96,6 +96,10 @@ const std::vector<Option> BuildReplOptions() {
          return SetBounded(v, 0, std::numeric_limits<int64_t>::max(), &c.repl_backlog_ttl);
        },
        [](const ConfigValues& c) { return std::to_string(c.repl_backlog_ttl); }},
+      // Startup only: the replication log's mode is chosen when it is recovered.
+      {"repl-backlog-lazy", false,
+       [](ConfigValues& c, std::string_view v) { return ParseYesNo(v, &c.repl_backlog_lazy); },
+       [](const ConfigValues& c) { return std::string(c.repl_backlog_lazy ? "yes" : "no"); }},
       {"repl-timeout", true,
        [](ConfigValues& c, std::string_view v) { return SetBounded(v, 1, kIntMax, &c.repl_timeout); },
        [](const ConfigValues& c) { return std::to_string(c.repl_timeout); }},

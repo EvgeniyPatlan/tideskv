@@ -57,6 +57,7 @@ struct ReplicationStats {
   int64_t second_offset = -1;  // newest history end_seq + 1, or -1
   uint64_t master_offset = 0;  // the log's last seq
   uint64_t backlog_size_config = 0;
+  bool backlog_active = true;  // false while repl-backlog-lazy keeps the log dormant
   uint64_t first_retained = 1;
   uint64_t histlen = 0;
   uint64_t sync_full = 0;

@@ -92,6 +92,14 @@ std::string EncodeReplogBatch(const std::vector<ReplOp>& ops, int64_t timestamp_
   return out;
 }
 
+size_t ReplogBatchSize(const std::vector<ReplOp>& ops) {
+  size_t size = kReplogHeaderSize + kCrcSize;
+  for (const ReplOp& op : ops) {
+    size += 2 + VarintSize(op.key.size()) + op.key.size() + VarintSize(op.value.size()) + op.value.size();
+  }
+  return size;
+}
+
 bool PeekReplogHeader(std::string_view encoded, int64_t* timestamp_ms, uint64_t* cum_bytes) {
   if (encoded.size() < kReplogHeaderSize) return false;
   *timestamp_ms = static_cast<int64_t>(coding::DecodeFixed64BE(encoded.data() + 1));

@@ -451,6 +451,7 @@ Settings are read in this order, and later sources win:
 | `lua-time-limit` | `5000` ms | yes | When a long script starts answering `BUSY` |
 | `replicaof` | empty | no (use `REPLICAOF`) | `<host> <port>` to start as a replica |
 | `repl-backlog-size` | `1gb` | yes | Backlog kept for partial resync |
+| `repl-backlog-lazy` | `yes` | no | Keep no backlog until the first replica or slot migration needs one |
 | `min-replicas-to-write` | `0` | yes | Refuse writes without enough healthy replicas |
 | `cluster-enabled` | `no` | no | Cluster mode |
 

@@ -146,7 +146,7 @@ class ReplicationManager final : public Replication {
     std::unique_ptr<SyncSnapshot> snapshot;  // FULLRESYNC: what the sender streams first (D2)
   };
 
-  // PSYNC in two steps, so that ReplLog::SnapshotAtLast runs outside mu_ (CF-M6b-3).
+  // PSYNC in two steps, so that ReplLog::ActivateAndSnapshot runs outside mu_ (CF-M6b-3).
   PsyncResult Decide(const PsyncRequest& req, const ReplicaPeer& peer);
   PsyncResult RegisterFullSync(PsyncResult r, SyncSnapshot snap, const PsyncRequest& req,
                                const ReplicaPeer& peer);

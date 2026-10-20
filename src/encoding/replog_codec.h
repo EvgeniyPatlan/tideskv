@@ -39,6 +39,10 @@ bool DecodeReplogKey(std::string_view key, uint64_t* seq);
 std::string EncodeReplogBatch(const std::vector<ReplOp>& ops, int64_t timestamp_ms,
                               uint64_t cum_bytes_before);
 
+// EncodeReplogBatch(ops, ...).size() without encoding: a dormant log (repl-backlog-lazy) advances
+// cum_bytes and enforces R12 by it.
+size_t ReplogBatchSize(const std::vector<ReplOp>& ops);
+
 struct ReplogBatch {
   int64_t timestamp_ms = 0;
   uint64_t cum_bytes = 0;

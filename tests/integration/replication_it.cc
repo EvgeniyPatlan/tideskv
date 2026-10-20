@@ -159,7 +159,9 @@ TEST_F(ReplicationIT, InfoAndRoleAgreeOnLiveReplicas) {
     const RespValue role = m->Command({"ROLE"});
     return role.elements.size() == 3 ? static_cast<int64_t>(role.elements[2].elements.size()) : -1;
   };
-  ASSERT_EQ(role_replicas(), 1);
+  // A fully synchronised replica (a lazy master's dormant log) is listed once its first ACK says it is
+  // online.
+  ASSERT_TRUE(WaitFor([&] { return role_replicas() == 1; }, 5s));
   r.reset();
   replica->Kill9();
   ASSERT_TRUE(WaitFor([&] { return role_replicas() == 0; }, 5s));

@@ -83,7 +83,8 @@ class BacklogTrimmer {
   void Start();  // the master thread; it skips its ticks while local writes are fenced (a replica)
   void Stop();   // idempotent; joins the thread
 
-  // One master round: computes the trim point, drops replicas beyond the limits, trims, maybe compacts.
+  // One master round: persists a dormant log's head (ReplLog::PersistHead), computes the trim point, drops
+  // replicas beyond the limits, trims, maybe compacts.
   // A no-op once local writes are fenced: the fence (raised before a replica starts applying) is checked
   // under ReplLog::mu_ by every trim txn, so no master trim commits once a replica may apply.
   Status RunOnce();

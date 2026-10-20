@@ -550,6 +550,47 @@ TEST_F(RoleTest, RoleChangesAfterShutdownStartNothing) {
   EXPECT_FALSE(log.fenced());
 }
 
+// repl-backlog-lazy: every PSYNC activates a dormant log before deciding, so no CONTINUE is ever registered
+// on a log whose next commits would go unrecorded, and a full sync's snapshot holds the baseline record.
+TEST(ReplicationManagerLazy, PsyncActivatesADormantLogFirst) {
+  InMemoryStorage storage;
+  test::FakeClock clock;
+  ReplLog log{storage, clock, /*lazy=*/true};
+  ASSERT_TRUE(log.Recover().ok());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(
+        log.CommitStandalone({{ReplOpType::kPut, ColumnFamily::kMeta, "k" + std::to_string(i), "v"}}).ok());
+  }
+  ReplIdentity id;
+  id.replid = std::string(40, 'f');
+  ReplicationManager m(storage, log, id);
+  ASSERT_FALSE(log.active());
+  const PsyncResult cont = m.HandlePsync({id.replid, 4}, {});  // holds commit 3: nothing to resend
+  EXPECT_EQ(cont.decision, PsyncDecision::kContinue);
+  EXPECT_TRUE(log.active());
+  ASSERT_TRUE(log.CommitStandalone({{ReplOpType::kPut, ColumnFamily::kMeta, "k4", "v"}}).ok());
+  auto view = storage.BeginRead();
+  EXPECT_TRUE((*view)->Get(ColumnFamily::kReplog, encoding::ReplogKey(4)).ok());  // streamed to it
+  const PsyncResult behind = m.HandlePsync({id.replid, 3}, {});  // needs the unlogged commit 3
+  EXPECT_EQ(behind.decision, PsyncDecision::kFullResync);
+  EXPECT_EQ(behind.seq, 4u);
+}
+
+TEST(ReplicationManagerLazy, AFullResyncSnapshotHoldsTheBaselineRecord) {
+  InMemoryStorage storage;
+  test::FakeClock clock;
+  ReplLog log{storage, clock, /*lazy=*/true};
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(log.CommitStandalone({{ReplOpType::kPut, ColumnFamily::kMeta, "k", "v"}}).ok());
+  ReplicationManager m(storage, log, {std::string(40, 'f'), {}});
+  const PsyncResult full = m.HandlePsync({"?", 0}, {});
+  EXPECT_EQ(full.decision, PsyncDecision::kFullResync);
+  EXPECT_EQ(full.seq, 1u);
+  EXPECT_TRUE(log.active());
+  auto view = storage.BeginRead();
+  EXPECT_TRUE((*view)->Get(ColumnFamily::kReplog, encoding::ReplogKey(1)).ok());
+}
+
 TEST(ReplicationManagerStale, RefusesOnlyAsADisconnectedReplicaWithServeStaleNo) {
   InMemoryStorage s;
   test::FakeClock clock;

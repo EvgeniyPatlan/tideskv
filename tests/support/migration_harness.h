@@ -30,7 +30,7 @@ namespace tideskv::test {
 // range, no expire CF, no sys record.
 inline std::vector<std::string> RangeChunks(CommandHarness& source, cluster::SlotRange range,
                                             size_t max_bytes = 16 * 1024) {
-  auto snap = source.services.repl_log_.SnapshotAtLast();
+  auto snap = source.services.repl_log_.ActivateAndSnapshot();
   EXPECT_TRUE(snap.ok());
   if (!snap.ok()) return {};
   repl::ChunkerOptions o;

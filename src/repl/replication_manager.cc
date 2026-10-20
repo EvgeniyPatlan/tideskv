@@ -62,9 +62,17 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
 
 // D8 under mu_, then (FULLRESYNC) the snapshot outside it (D2, CF-M6b-3), then the hand-off registered.
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
+  // repl-backlog-lazy: a dormant log is activated before the bounds are read, so a CONTINUE never
+  // crosses its unlogged commits and the commits after it are all recorded for the sender.
+  if (Status st = log_.Activate(); !st.ok()) {
+    spdlog::error("activating the replication log failed: {}", st.ToString());
+    PsyncResult r;
+    r.error = std::string(kErrStorage);
+    return r;
+  }
   PsyncResult r = Decide(req, peer);  // refusals; a CONTINUE is registered and counted here
   if (!r.error.empty() || r.decision == PsyncDecision::kContinue) return r;
-  auto snap = log_.SnapshotAtLast();  // S and the view together
+  auto snap = log_.ActivateAndSnapshot();  // S and the view together
   if (!snap.ok()) {
     spdlog::error("full resynchronisation snapshot failed: {}", snap.status().ToString());
     r.error = std::string(kErrStorage);  // no engine detail in the reply

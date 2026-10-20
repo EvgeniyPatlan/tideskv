@@ -47,7 +47,7 @@ void MakePreReplicationDir(const TempDir& dir) {
                   ->DeleteRange(ColumnFamily::kReplog, encoding::ReplogKey(0),
                                 encoding::ReplogKey(std::numeric_limits<uint64_t>::max()))
                   .ok());
-  for (const char* key : {"repl_first", "repl_id", "repl_history"}) {
+  for (const char* key : {"repl_first", "repl_head", "repl_id", "repl_history"}) {
     ASSERT_TRUE((*txn)->Delete(ColumnFamily::kSys, key).ok());
   }
   ASSERT_TRUE((*txn)->Commit().ok());

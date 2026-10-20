@@ -140,7 +140,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 44u);
+  EXPECT_EQ(c.Get("*").size(), 45u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -298,6 +298,18 @@ TEST(ConfigRepl, Defaults) {
   Config c;
   EXPECT_EQ(GetOne(c, "replica-read-only"), "yes");
   EXPECT_EQ(GetOne(c, "repl-backlog-size"), "1073741824");
+}
+
+TEST(ConfigRepl, BacklogLazyIsAStartupYesNo) {
+  Config c;
+  EXPECT_TRUE(c.Snapshot().repl_backlog_lazy);
+  EXPECT_EQ(GetOne(c, "repl-backlog-lazy"), "yes");
+  EXPECT_FALSE(
+      c.Set("repl-backlog-lazy", "no", /*at_runtime=*/true).ok());  // the log's mode is chosen at boot
+  EXPECT_EQ(c.Set("repl-backlog-lazy", "maybe", false).message(), "argument must be 'yes' or 'no'");
+  ASSERT_TRUE(c.Set("repl-backlog-lazy", "NO", false).ok());
+  EXPECT_FALSE(c.Snapshot().repl_backlog_lazy);
+  EXPECT_EQ(GetOne(c, "repl-backlog-lazy"), "no");
 }
 
 TEST(ConfigRepl, MutableKeysRoundTrip) {
