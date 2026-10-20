@@ -301,6 +301,44 @@ TEST(EngineLoadLayout, BeginLoadAdoptsTheLayoutAndRestoresItOnFailure) {
   EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotted);
 }
 
+// A LoadingReadScope reader (DEBUG DIGEST) runs during a load: when the layout is adopted, the wipe commits
+// inside the exclusive barrier with the old layout still current, so no reader sees old data with the new
+// codec; the first reader after it sees the new layout.
+TEST(EngineLoadLayout, TheWipeCommitsInsideTheBarrierBeforeTheLayoutFlips) {
+  const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+  FaultyStorage storage;
+  ReplicaStack replica(storage);
+  std::atomic<bool> read{false};
+  std::atomic<encoding::KeyLayout> seen{encoding::KeyLayout::kSlotless};
+  bool read_during_commit = true;
+  encoding::KeyLayout layout_at_commit = encoding::KeyLayout::kSlotted;
+  std::thread reader;
+  storage.before_commit = [&] {
+    if (reader.joinable()) return;
+    reader = std::thread([&] {
+      const Engine::LoadingReadScope debug;
+      EXPECT_TRUE(replica.engine
+                      .Snapshot([&](ReadView&, int64_t) {
+                        seen = encoding::CurrentKeyLayout();
+                        read = true;
+                        return Status::Ok();
+                      })
+                      .ok());
+    });
+    std::this_thread::sleep_for(50ms);  // the reader waits for the barrier the start txn commits under
+    read_during_commit = read.load();
+    layout_at_commit = encoding::CurrentKeyLayout();
+  };
+  ASSERT_TRUE(replica.engine.BeginLoad({}, encoding::KeyLayout::kSlotted).ok());
+  reader.join();
+  storage.before_commit = nullptr;
+  EXPECT_FALSE(read_during_commit);
+  EXPECT_EQ(layout_at_commit, encoding::KeyLayout::kSlotless);
+  EXPECT_TRUE(read.load());
+  EXPECT_EQ(seen.load(), encoding::KeyLayout::kSlotted);
+  ASSERT_TRUE(replica.engine.AbortLoad().ok());
+}
+
 // G1: an abort whose commit fails changes nothing (still loading, marker kept, applies refused); the
 // retry discards.
 TEST(EngineLoadAbort, AFailedAbortKeepsTheLoadAndARetryDiscardsIt) {

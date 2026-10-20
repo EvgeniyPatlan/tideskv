@@ -28,6 +28,11 @@ inline constexpr std::string_view kErrPsyncLayoutUnknown =
     "ERR replica key layout slotted does not match this master's slotless layout (format 2); upgrade the "
     "replica, which then adopts the master's layout on a full resynchronisation";
 
+// TidesKV-only: this node's key layout changed between its REPLCONF key-layout reply and the PSYNC (a full
+// sync adopted another one); the replica reconnects and learns the new layout.
+inline constexpr std::string_view kErrPsyncLayoutChanged =
+    "ERR this node's key layout changed since REPLCONF key-layout; reconnect";
+
 // TidesKV-only (G5): a PSYNC that would need a full resynchronisation while the node shuts down; no
 // snapshot is streamed, so the replica keeps its data and retries elsewhere or later.
 inline constexpr std::string_view kErrPsyncShuttingDown = "ERR PSYNC refused: this node is shutting down";

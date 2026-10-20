@@ -223,6 +223,15 @@ TEST(ReplconfCmd, KeyLayoutIsAnsweredWithTheMastersLayout) {
   }
 }
 
+TEST(PsyncCmd, PassesTheLayoutAnnouncedByReplconf) {
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"REPLCONF", "key-layout", "slotless"}).substr(0, 1), "+");
+  EXPECT_EQ(h.session.replica_handshake.announced_layout, encoding::CurrentKeyLayout());
+  h.Run({"PSYNC", "?", "1"});
+  ASSERT_EQ(h.services.replication_.psyncs.size(), 1u);
+  EXPECT_EQ(h.services.replication_.psyncs[0].announced_layout, encoding::CurrentKeyLayout());
+}
+
 TEST(ReplconfCmd, AckAndGetackNeverReply) {
   ReplHarness h;
   EXPECT_EQ(h.Run({"REPLCONF", "ACK", "5"}), "");

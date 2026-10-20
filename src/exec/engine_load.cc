@@ -67,23 +67,43 @@ Status Engine::BeginLoad(const std::vector<encoding::ReplOp>& extra,
   if (repl_log_ == nullptr || !repl_log_->fenced())
     return Status::Internal("full-sync load needs a fenced log");
   if (ActiveBatch() != nullptr) return Status::Internal("full-sync load inside a batch");
-  const encoding::KeyLayout previous = encoding::CurrentKeyLayout();
+  if (layout) return BeginLoadAdopting(extra, *layout);
   {
     [[maybe_unused]] const engine_internal::ReentryCheck reentry;
     std::lock_guard barrier(gate_);  // every command holding the gate finishes first (D6), busy or not
     if (loading()) return Status::Internal("a full-sync load is already running");
     loading_.store(true, std::memory_order_release);
-    if (layout) encoding::AdoptKeyLayout(*layout);  // every command is refused (kErrLoading) from here on
   }
   const Status st = RunLoadTxn(
       WithWipe(extra), [this](WriteTxn& t) { return repl_log_->CommitLoadStart(t); },
       [this] {
         if (observer_ != nullptr) observer_->OnDatasetReplaced();
       });
-  if (!st.ok()) {
-    if (layout) encoding::AdoptKeyLayout(previous);  // nothing was wiped: the data is still in that layout
-    loading_.store(false, std::memory_order_release);
+  if (!st.ok()) loading_.store(false, std::memory_order_release);
+  return st;
+}
+
+// A LoadingReadScope reader (DEBUG DIGEST, WATCH) runs while loading, so the codec must never meet data of
+// the other layout: the wipe commits and the layout flips both inside the exclusive barrier, and a reader
+// sees either the old data with the old layout or the empty keyspace with the new one.
+Status Engine::BeginLoadAdopting(const std::vector<encoding::ReplOp>& extra, encoding::KeyLayout layout) {
+  Status st;
+  {
+    [[maybe_unused]] const engine_internal::ReentryCheck reentry;
+    std::lock_guard barrier(gate_);  // every command holding the gate finishes first (D6), busy or not
+    if (loading()) return Status::Internal("a full-sync load is already running");
+    loading_.store(true, std::memory_order_release);
+    auto txn = storage_.BeginWrite();
+    st = txn.status();
+    if (st.ok()) st = ApplyReplOps(**txn, WithWipe(extra));  // destroying the txn rolls it back
+    if (st.ok()) st = repl_log_->CommitLoadStart(**txn);
+    if (st.ok()) {
+      encoding::AdoptKeyLayout(layout);
+    } else {
+      loading_.store(false, std::memory_order_release);  // nothing was wiped: the old layout stays
+    }
   }
+  if (st.ok() && observer_ != nullptr) observer_->OnDatasetReplaced();
   return st;
 }
 

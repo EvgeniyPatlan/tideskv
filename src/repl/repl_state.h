@@ -1,11 +1,13 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/status.h"
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 #include "storage/storage.h"
 
@@ -71,6 +73,8 @@ struct PsyncRequest {
   uint64_t next_seq = 0;
   bool full_only = false;   // the replica's key layout is not this master's: never CONTINUE (it adopts ours)
   bool pre_layout = false;  // the replica sent no REPLCONF key-layout: it is slotted and cannot adopt another
+  // The layout the REPLCONF key-layout reply told the replica; refused if this node's changed since.
+  std::optional<encoding::KeyLayout> announced_layout = std::nullopt;
 };
 struct LogBounds {
   uint64_t first_retained = 1;

@@ -72,6 +72,10 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
     if (refused.error.empty() && req.pre_layout && encoding::Slotless()) {
       refused.error = std::string(kErrPsyncLayoutUnknown);  // it would load our keys in its slotted layout
     }
+    if (refused.error.empty() && req.announced_layout &&
+        *req.announced_layout != encoding::CurrentKeyLayout()) {
+      refused.error = std::string(kErrPsyncLayoutChanged);  // the replica would adopt the wrong layout
+    }
     if (!refused.error.empty()) return refused;
     if (Status st = log_.Activate(); !st.ok()) {
       spdlog::error("activating the replication log failed: {}", st.ToString());

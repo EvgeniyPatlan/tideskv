@@ -25,7 +25,8 @@ enum class OpClass : uint8_t {
   kDrop,     // sys and replog ops (oid leases, the migration record), malformed keys: never shipped
 };
 
-// Key bytes 1-2 (meta/subkey/zscore, the 11-byte DEL_PREFIX) or 9-10 (expire) give the slot (CI §2.2).
+// Slotted layout only (migration runs between cluster nodes, which are always slotted; asserted): key bytes
+// 1-2 (meta/subkey/zscore, the 11-byte DEL_PREFIX) or 9-10 (expire) give the slot (CI §2.2).
 OpClass ClassifyOp(const encoding::ReplOp& op, cluster::SlotRange range);
 // The in-range ops of one replog batch, in order; *flush becomes true when one of them is kFlush.
 std::vector<encoding::ReplOp> FilterBatch(const std::vector<encoding::ReplOp>& ops, cluster::SlotRange range,
@@ -47,15 +48,16 @@ class OidRemap {
   std::unordered_map<uint64_t, uint64_t> map_;
 };
 
-// D2 step 4: `op` with its oid rewritten wherever one appears (subkey/zscore keys and their 11-byte
-// DEL_PREFIX, a collection meta value, an expire value). nullopt for a DEL_PREFIX of an oid never seen:
-// nothing of that object reached this node. Corruption for an oid-bearing op too short to hold its oid.
+// D2 step 4 (slotted layout only, asserted): `op` with its oid rewritten wherever one appears (subkey/zscore
+// keys and their 11-byte DEL_PREFIX, a collection meta value, an expire value). nullopt for a DEL_PREFIX of
+// an oid never seen: nothing of that object reached this node. Corruption for an oid-bearing op too short to
+// hold its oid.
 Result<std::optional<encoding::ReplOp>> RemapOp(encoding::ReplOp op, OidRemap& remap);
 // D2 step 5: the expire entry an already remapped meta PUT with a TTL implies (EncodeExpireKey(0, expire_ms,
 // slot, key) -> ExpireValue(oid)); nullopt for any other op or a meta without a TTL.
 Result<std::optional<encoding::ReplOp>> DerivedExpire(const encoding::ReplOp& meta_put);
-// D2 step 2: Corruption unless `op` is a PUT or DEL of meta/subkey/zscore/expire, or an 11-byte subkey or
-// zscore DEL_PREFIX, of db 0 inside `range`. A defence against a broken or hostile source.
+// D2 step 2 (slotted layout only): Corruption unless `op` is a PUT or DEL of meta/subkey/zscore/expire, or an
+// 11-byte subkey or zscore DEL_PREFIX, of db 0 inside `range`. A defence against a broken or hostile source.
 Status CheckImportOp(const encoding::ReplOp& op, cluster::SlotRange range);
 
 // D3: replog-v1 batches of at most max_bytes of op bytes (key + value + 16 each); a larger op goes alone.

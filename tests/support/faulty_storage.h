@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -25,6 +26,7 @@ class FaultyStorage final : public Storage {
   std::atomic<int> open_txns{0};
   std::atomic<int> max_open_txns{0};
   std::atomic<int> commits{0};
+  std::function<void()> before_commit;  // optional: runs at the start of every Commit (set it before use)
 
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override {
     auto txn = inner_.BeginWrite();
@@ -90,6 +92,7 @@ class FaultyStorage final : public Storage {
       return st;
     }
     Status Commit() override {
+      if (owner_.before_commit) owner_.before_commit();
       if (Trip(owner_.fail_commit_in)) return Status::IOError("injected commit failure");
       Status st = inner_->Commit();
       if (st.ok()) ++owner_.commits;

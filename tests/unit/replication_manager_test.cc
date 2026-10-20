@@ -123,6 +123,19 @@ TEST_F(ManagerTest, ASlotlessMasterRefusesAPreLayoutReplica) {
   EXPECT_EQ(served.decision, PsyncDecision::kContinue);
 }
 
+// Defence in depth: a replica told one layout by REPLCONF key-layout must not get a PSYNC answered in another
+// (this node adopted a layout in between); it reconnects and learns the current one.
+TEST_F(ManagerTest, APsyncAfterTheAnnouncedLayoutChangedIsRefused) {
+  const encoding::ScopedKeyLayout restore(encoding::CurrentKeyLayout());
+  encoding::AdoptKeyLayout(encoding::KeyLayout::kSlotted);
+  auto m = Make();
+  repl::PsyncRequest req{id.replid, 2};
+  req.announced_layout = encoding::KeyLayout::kSlotted;
+  EXPECT_TRUE(m->HandlePsync(req, {}).error.empty());
+  req.announced_layout = encoding::KeyLayout::kSlotless;
+  EXPECT_EQ(m->HandlePsync(req, {}).error, kErrPsyncLayoutChanged);
+}
+
 TEST_F(ManagerTest, IsAMaster) {
   auto m = Make();
   EXPECT_EQ(m->role(), ReplRole::kMaster);

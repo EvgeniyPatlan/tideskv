@@ -16,7 +16,10 @@
 namespace tideskv {
 namespace {
 
-// Resolves the cursor to a position inside the current db (D9: unknown or foreign = restart).
+// Resolves the cursor to a position inside the current db (D9: unknown or foreign = restart). A saved
+// position is a raw meta key: one saved before a full sync that adopted the master's key layout resumes at a
+// key of the other layout, so that scan may skip or repeat keys (Redis gives no guarantee across a dataset
+// replace either).
 Status ResolveCursor(ExecContext& ctx, const std::string& arg, ScanPosition* position) {
   uint64_t cursor = 0;
   if (!ParseScanCursor(arg, &cursor)) return Status::UserError(std::string(kErrInvalidCursor));

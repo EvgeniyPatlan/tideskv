@@ -47,8 +47,9 @@ void Psync(ExecContext& ctx, const ArgList& argv) {
   // adopt ours; one that declared none is slotted and cannot (a slotless master refuses it).
   const std::optional<encoding::KeyLayout> layout = s.replica_handshake.key_layout;
   Replication& repl = ctx.server.replication();
-  const repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset),
-                               layout && *layout != encoding::CurrentKeyLayout(), !layout};
+  repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset),
+                         layout && *layout != encoding::CurrentKeyLayout(), !layout};
+  req.announced_layout = s.replica_handshake.announced_layout;
   const PsyncResult r = repl.HandlePsync(req, PeerOf(s));
   if (!r.error.empty()) return ctx.reply.Error(r.error);  // maxclients (F4), a replica (F8): no hand-off
   if (r.decision == repl::PsyncDecision::kFullResync) {
@@ -93,6 +94,7 @@ bool ApplyReplconf(ExecContext& ctx, std::string_view opt, const std::string& va
     const std::optional<encoding::KeyLayout> layout = encoding::ParseKeyLayout(ToLower(val));
     if (!layout) return fail(kErrReplconfKeyLayout);
     hs.key_layout = layout;
+    hs.announced_layout = encoding::CurrentKeyLayout();  // what Replconf answers, checked again at PSYNC
     o->key_layout = true;
   } else if (EqualsIgnoreCase(opt, "ack") || EqualsIgnoreCase(opt, "getack")) {
     o->getack = EqualsIgnoreCase(opt, "getack");

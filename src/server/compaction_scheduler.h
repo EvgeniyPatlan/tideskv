@@ -17,8 +17,9 @@ namespace tideskv {
 // Background compaction (M3 plan E6, M2 Task 3 verdict). Classifies committed range deletes:
 //  - a 1-byte prefix (FLUSHDB of that db) or a DeleteRange (FLUSHALL) -> compact that whole CF
 //    (a range compaction cannot reclaim a FLUSHDB: see TidesStorage::Compact);
-//  - an 11-byte subkey prefix (collection deleted) -> counted; at the threshold the whole subkey
-//    and zscore CFs are compacted and the count restarts.
+//  - a subkey prefix of encoding::ObjectPrefixSize() bytes (a collection deleted: 11 slotted, 9
+//    slotless) -> counted; at the threshold the whole subkey and zscore CFs are compacted and the count
+//    restarts.
 // Each batch of jobs starts with one Checkpoint (range tombstones still in the memtable are not
 // compacted). A failed job is retried on later ticks up to max_attempts, then counted as failed; Busy
 // (another compaction holds the CF) is retried on later ticks without using an attempt.

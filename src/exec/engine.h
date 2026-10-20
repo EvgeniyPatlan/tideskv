@@ -184,9 +184,9 @@ class Engine {
   // then commits one txn: the keyspace wipe + `extra` (the node's identity) through
   // ReplLog::CommitLoadStart; tells the observer the dataset is replaced. kInternal unless the ReplLog is
   // fenced, this thread has no batch and no load is running. On failure loading is cleared and nothing
-  // changed. `layout` (the master's, adopted with a format_version PUT in `extra`) becomes the process's key
-  // layout inside the barrier, when no command runs and none can start until the load ends; restored on
-  // failure.
+  // changed. `layout` (the master's, adopted with a format_version PUT in `extra`): the start txn commits
+  // inside the barrier and the process switches to that key layout there, so no reader (not even a
+  // LoadingReadScope one) sees data of one layout through the other's codec; unchanged on failure.
   Status BeginLoad(const std::vector<encoding::ReplOp>& extra,
                    std::optional<encoding::KeyLayout> layout = std::nullopt);
   // One txn of `ops` (puts from the master's snapshot), committed directly: no replog entry. kInternal
@@ -261,6 +261,7 @@ class Engine {
   bool LoadingRefuses(bool read) const;
   // One load txn under the shared gate: `ops` in order, committed by `commit`; on success `committed`
   // runs still under the gate (listener/observer contracts).
+  Status BeginLoadAdopting(const std::vector<encoding::ReplOp>& extra, encoding::KeyLayout layout);
   Status RunLoadTxn(const std::vector<encoding::ReplOp>& ops, const std::function<Status(WriteTxn&)>& commit,
                     const std::function<void()>& committed);
   void FinishLoad();         // under the gate, after EndLoad/AbortLoad committed

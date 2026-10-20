@@ -44,8 +44,10 @@ struct MultiState {
 struct ReplicaHandshake {
   int64_t listening_port = 0;  // REPLCONF listening-port (no range check, as in Redis)
   std::string ip_address;      // REPLCONF ip-address; empty = the peer address
-  std::optional<encoding::KeyLayout>
-      key_layout;  // REPLCONF key-layout; none = a pre-layout (slotted) replica
+  // REPLCONF key-layout: the replica's (none = a pre-layout, slotted replica), and the one this node
+  // answered.
+  std::optional<encoding::KeyLayout> key_layout;
+  std::optional<encoding::KeyLayout> announced_layout;
 };
 
 // Per-connection state. Owned by the connection; touched only on its worker thread.
