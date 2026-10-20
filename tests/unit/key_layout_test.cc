@@ -67,20 +67,23 @@ TEST(SlotlessCodec, MetaAndExpireBytes) {
 
 TEST(SlotlessCodec, MetaAndExpireDecode) {
   const ScopedKeyLayout slotless(KeyLayout::kSlotless);
+  const std::string db15_key(
+      "\x0f"
+      "key",
+      4);  // decoded views point into the input: keep it alive
   MetaKey mk;
-  ASSERT_TRUE(DecodeMetaKey(std::string("\x0f"
-                                        "key",
-                                        4),
-                            &mk));
+  ASSERT_TRUE(DecodeMetaKey(db15_key, &mk));
   EXPECT_EQ(mk.db, 15);
   EXPECT_EQ(mk.slot, 0);
   EXPECT_EQ(mk.user_key, "key");
-  ASSERT_TRUE(DecodeMetaKey(std::string("\x00", 1), &mk));  // the empty user key
+  const std::string empty_key("\x00", 1);
+  ASSERT_TRUE(DecodeMetaKey(empty_key, &mk));  // the empty user key
   EXPECT_EQ(mk.user_key, "");
   EXPECT_FALSE(DecodeMetaKey(std::string("\x10k", 2), &mk));  // db 16
   EXPECT_FALSE(DecodeMetaKey("", &mk));
+  const std::string expire_key = ExpireKeyFor(2, 77, "user");
   ExpireKey ek;
-  ASSERT_TRUE(DecodeExpireKey(ExpireKeyFor(2, 77, "user"), &ek));
+  ASSERT_TRUE(DecodeExpireKey(expire_key, &ek));
   EXPECT_EQ(ek.db, 2);
   EXPECT_EQ(ek.expire_ms, 77u);
   EXPECT_EQ(ek.slot, 0);
@@ -104,14 +107,16 @@ TEST(SlotlessCodec, ObjectKeysDropTheSlot) {
   EXPECT_EQ(SubkeyPrefix(2, 0x0102, 0x0A), std::string("\x02\0\0\0\0\0\0\0\x0A", 9));
   EXPECT_EQ(ZScorePrefix(2, 0x0102, 0x0A), SubkeyPrefix(2, 0, 0x0A));
   EXPECT_EQ(EncodeSubkey(4, 3, 42, "name"), SubkeyPrefix(4, 0, 42) + "name");
+  const std::string subkey = EncodeSubkey(4, 3, 42, "name");
   Subkey sk;
-  ASSERT_TRUE(DecodeSubkey(EncodeSubkey(4, 3, 42, "name"), &sk));
+  ASSERT_TRUE(DecodeSubkey(subkey, &sk));
   EXPECT_EQ(sk.db, 4);
   EXPECT_EQ(sk.slot, 0);
   EXPECT_EQ(sk.oid, 42u);
   EXPECT_EQ(sk.field, "name");
+  const std::string zscore_key = EncodeZScoreKey(3, 5, 77, -2.5, "m");
   ZScoreKey zk;
-  ASSERT_TRUE(DecodeZScoreKey(EncodeZScoreKey(3, 5, 77, -2.5, "m"), &zk));
+  ASSERT_TRUE(DecodeZScoreKey(zscore_key, &zk));
   EXPECT_EQ(zk.oid, 77u);
   EXPECT_EQ(zk.score, -2.5);
   EXPECT_EQ(zk.member, "m");
