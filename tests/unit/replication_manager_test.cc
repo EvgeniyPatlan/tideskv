@@ -576,6 +576,29 @@ TEST(ReplicationManagerLazy, PsyncActivatesADormantLogFirst) {
   EXPECT_EQ(behind.seq, 4u);
 }
 
+TEST(ReplicationManagerLazy, ARefusedPsyncLeavesTheLogDormant) {
+  InMemoryStorage storage;
+  test::FakeClock clock;
+  ReplLog log{storage, clock, /*lazy=*/true};
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(log.CommitStandalone({{ReplOpType::kPut, ColumnFamily::kMeta, "k", "v"}}).ok());
+  const ReplIdentity id{std::string(40, 'f'), {}};
+  {
+    ReplicationManager::Options o;
+    o.maxclients = [] { return uint64_t{0}; };
+    o.connected_clients = [] { return uint64_t{1}; };
+    ReplicationManager m(storage, log, id, std::move(o));
+    EXPECT_EQ(m.HandlePsync({"?", 0}, {}).error, kErrMaxClients);  // F4
+    EXPECT_FALSE(log.active());
+  }
+  ReplicationManager m(storage, log, id);
+  m.Shutdown();
+  EXPECT_EQ(m.HandlePsync({"?", 0}, {}).error, kErrPsyncShuttingDown);  // R18-a
+  EXPECT_FALSE(log.active());
+  auto view = storage.BeginRead();
+  EXPECT_FALSE((*view)->Get(ColumnFamily::kReplog, encoding::ReplogKey(1)).ok());
+}
+
 TEST(ReplicationManagerLazy, AFullResyncSnapshotHoldsTheBaselineRecord) {
   InMemoryStorage storage;
   test::FakeClock clock;

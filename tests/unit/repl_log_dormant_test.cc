@@ -13,6 +13,7 @@
 #include "repl/repl_state.h"
 #include "storage/memory_storage.h"
 #include "support/fake_clock.h"
+#include "types/errors.h"
 
 namespace tideskv {
 namespace {
@@ -201,6 +202,95 @@ TEST(ReplLogDormantTest, TheFirstUnloggedCommitPersistsTheHeadWithIt) {
   ASSERT_TRUE(again.Recover().ok());
   EXPECT_EQ(again.last(), 1u);  // commit 2 regressed (by at most a head interval), commit 1 did not
   EXPECT_EQ(again.first_retained(), 2u);
+}
+
+TEST(ReplLogDormantTest, ACrashRegressesToTheLastHeadAndTheLogStaysConsistent) {
+  InMemoryStorage s;
+  FakeClock clock;
+  uint64_t head_cum = 0;
+  {
+    ReplLog log(s, clock, kLazy);
+    ASSERT_TRUE(log.Recover().ok());
+    for (const char* k : {"a", "b"}) ASSERT_TRUE(CommitKey(s, log, k).ok());
+    ASSERT_TRUE(log.PersistHead().ok());  // H = 2
+    head_cum = log.cum_bytes();
+    for (const char* k : {"c", "d"}) ASSERT_TRUE(CommitKey(s, log, k).ok());
+    // a crash: commits 3 and 4 are in the keyspace, the head still says 2
+  }
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  EXPECT_EQ(log.last(), 2u);
+  EXPECT_EQ(log.cum_bytes(), head_cum);
+  EXPECT_EQ(log.first_retained(), 3u);
+  EXPECT_FALSE(log.active());
+  ASSERT_TRUE(CommitKey(s, log, "e").ok());
+  EXPECT_EQ(log.last(), 3u);  // seq 3 is taken again: it was never seen outside this node
+  auto snap = log.ActivateAndSnapshot();
+  ASSERT_TRUE(snap.ok());
+  EXPECT_EQ(snap->seq, 3u);
+  auto batch = encoding::DecodeReplogBatch(*snap->view->Get(ColumnFamily::kReplog, encoding::ReplogKey(3)));
+  ASSERT_TRUE(batch.ok());
+  EXPECT_EQ(batch->cum_bytes, log.cum_bytes());
+  EXPECT_EQ(log.first_retained(), 4u);
+  EXPECT_EQ(ReplFirstOnDisk(s), 4u);
+  EXPECT_EQ(Decide(log, 3), repl::PsyncDecision::kFullResync);
+  EXPECT_EQ(Decide(log, 4), repl::PsyncDecision::kContinue);
+}
+
+TEST(ReplLogDormantTest, AStaleHeadIsDeletedAtRecovery) {
+  InMemoryStorage s;
+  FakeClock clock;
+  {
+    ReplLog log(s, clock);
+    ASSERT_TRUE(log.Recover().ok());
+    for (const char* k : {"a", "b"}) ASSERT_TRUE(CommitKey(s, log, k).ok());
+  }
+  std::string head;
+  coding::PutFixed64BE(&head, 1);  // behind the newest record
+  coding::PutFixed64BE(&head, 10);
+  auto txn = s.BeginWrite();
+  ASSERT_TRUE((*txn)->Put(ColumnFamily::kSys, kSysReplHead, head).ok());
+  ASSERT_TRUE((*txn)->Commit().ok());
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  EXPECT_EQ(log.last(), 2u);
+  EXPECT_TRUE(log.active());
+  EXPECT_FALSE(HasSys(s, kSysReplHead));
+}
+
+TEST(ReplLogDormantTest, ADormantLogStillRefusesABatchTooLargeToReplicate) {  // R12
+  InMemoryStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(CommitKey(s, log, "a").ok());
+  const uint64_t cum = log.cum_bytes();
+  log.SetMaxBatchBytes(encoding::ReplogBatchSize(MetaPut("k", std::string(100, 'x'))) - 1);
+  const std::vector<ReplOp> big = MetaPut("k", std::string(100, 'x'));
+  auto txn = s.BeginWrite();
+  ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k", big[0].value).ok());
+  const Status st = log.Commit(**txn, big);
+  EXPECT_EQ(st.code(), StatusCode::kUserError);
+  EXPECT_EQ(st.message(), kErrTooLargeToReplicate);
+  EXPECT_EQ(log.last(), 1u);
+  EXPECT_EQ(log.cum_bytes(), cum);
+  EXPECT_FALSE(s.BeginRead().value()->Get(ColumnFamily::kMeta, "k").ok());
+}
+
+TEST(ReplLogDormantTest, ADemotedDormantLogStillPersistsItsHead) {
+  InMemoryStorage s;
+  FakeClock clock;
+  {
+    ReplLog log(s, clock, kLazy);
+    ASSERT_TRUE(log.Recover().ok());
+    for (const char* k : {"a", "b", "c"}) ASSERT_TRUE(CommitKey(s, log, k).ok());
+    log.FenceLocalWrites(true);
+    ASSERT_TRUE(log.PersistHead().ok());
+    EXPECT_FALSE(log.active());
+  }
+  ReplLog again(s, clock, kLazy);
+  ASSERT_TRUE(again.Recover().ok());
+  EXPECT_EQ(again.last(), 3u);
 }
 
 TEST(ReplLogDormantTest, AHeadAheadOfStaleRecordsWins) {

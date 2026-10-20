@@ -125,7 +125,11 @@ Status ReplLog::Recover() {
                               std::to_string(last + 1) + "]");
   }
   // Commits after the newest record went unlogged: the head has last and cum, and no record from before
-  // it may be offered for CONTINUE. A head at or below the newest record is stale.
+  // it may be offered for CONTINUE. A head at or below the newest record is stale (deleted below).
+  // A crash may lose the commits since the last head write, and their seqs are then taken again.
+  // Invariant: nothing outside this node's keyspace may persist a seq taken while dormant (no replica or
+  // migration target has seen one: both activate the log first, and the replid rotates at master start),
+  // so a reissued seq is never matched against another node's copy of the lost one.
   const bool unlogged = has_head && head_seq > last;
   if (unlogged) {
     last = head_seq;
@@ -142,6 +146,12 @@ Status ReplLog::Recover() {
   // A log with records through last was active when it stopped (it had a replica, or was not lazy): a
   // replica reconnecting now must find every commit since, so it stays active.
   active_.store(!unlogged && (last > 0 || !lazy_), std::memory_order_release);
+  if (has_head && !unlogged) {  // stale: left by an older format or a manual restore; it would only confuse
+    auto txn = storage_.BeginWrite();
+    if (!txn.ok()) return txn.status();
+    if (Status st = (*txn)->Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
+    if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  }
   return lazy_ ? Status::Ok() : ActivateLocked();
 }
 

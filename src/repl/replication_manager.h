@@ -148,6 +148,9 @@ class ReplicationManager final : public Replication {
 
   // PSYNC in two steps, so that ReplLog::ActivateAndSnapshot runs outside mu_ (CF-M6b-3).
   PsyncResult Decide(const PsyncRequest& req, const ReplicaPeer& peer);
+  // The PSYNC refusals (shutdown, F8, F4) as their error text; empty = none. RefusalLocked requires mu_.
+  std::string Refusal();
+  std::string RefusalLocked(uint64_t maxclients) const;
   PsyncResult RegisterFullSync(PsyncResult r, SyncSnapshot snap, const PsyncRequest& req,
                                const ReplicaPeer& peer);
   // Moves the hand-offs matching pred out of pending_ (requires mu_). The caller drops them after

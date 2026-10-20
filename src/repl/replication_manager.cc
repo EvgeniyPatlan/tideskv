@@ -62,13 +62,18 @@ std::chrono::milliseconds ReplicationManager::Timeout() const {
 
 // D8 under mu_, then (FULLRESYNC) the snapshot outside it (D2, CF-M6b-3), then the hand-off registered.
 PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const ReplicaPeer& peer) {
-  // repl-backlog-lazy: a dormant log is activated before the bounds are read, so a CONTINUE never
-  // crosses its unlogged commits and the commits after it are all recorded for the sender.
-  if (Status st = log_.Activate(); !st.ok()) {
-    spdlog::error("activating the replication log failed: {}", st.ToString());
-    PsyncResult r;
-    r.error = std::string(kErrStorage);
-    return r;
+  {
+    // repl-backlog-lazy: a dormant log is activated before Decide reads the bounds, so a CONTINUE never
+    // crosses its unlogged commits and the commits after it are all recorded for the sender. Not for a
+    // PSYNC that is refused anyway (a refusal that only arises meanwhile costs an early activation).
+    PsyncResult refused;
+    refused.error = Refusal();
+    if (!refused.error.empty()) return refused;
+    if (Status st = log_.Activate(); !st.ok()) {
+      spdlog::error("activating the replication log failed: {}", st.ToString());
+      refused.error = std::string(kErrStorage);
+      return refused;
+    }
   }
   PsyncResult r = Decide(req, peer);  // refusals; a CONTINUE is registered and counted here
   if (!r.error.empty() || r.decision == PsyncDecision::kContinue) return r;
@@ -81,27 +86,33 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
   return RegisterFullSync(std::move(r), std::move(snap).value(), req, peer);
 }
 
+std::string ReplicationManager::Refusal() {
+  const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
+  std::lock_guard lock(mu_);
+  return RefusalLocked(maxclients);
+}
+
+std::string ReplicationManager::RefusalLocked(uint64_t maxclients) const {
+  // Read under mu_ with the senders: a hand-off attaching meanwhile is then seen as a connection, not
+  // yet a sender (or, for the instant before its connection uncounts itself, as both: never neither).
+  const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
+  // R18-a: refuse before HandlePsync takes a snapshot, and register no CONTINUE
+  if (shut_down_) return std::string(kErrPsyncShuttingDown);
+  // F8: no chained replication (checked under mu_, as BecomeReplica)
+  if (role() == ReplRole::kReplica) return std::string(kErrPsyncOnReplica);
+  // F4: this caller's link would exceed maxclients
+  if (clients + LiveSendersLocked() > maxclients) return std::string(kErrMaxClients);
+  return {};
+}
+
 PsyncResult ReplicationManager::Decide(const PsyncRequest& req, const ReplicaPeer& peer) {
   const LogBounds bounds{log_.first_retained(), log_.last(),
                          baseline_unknown_.load(std::memory_order_acquire)};
   const uint64_t maxclients = options_.maxclients ? options_.maxclients() : UINT64_MAX;
   std::lock_guard lock(mu_);
-  // Read under mu_ with the senders: a hand-off attaching meanwhile is then seen as a connection, not
-  // yet a sender (or, for the instant before its connection uncounts itself, as both: never neither).
-  const uint64_t clients = options_.connected_clients ? options_.connected_clients() : 0;
   PsyncResult r;
-  if (shut_down_) {  // R18-a: refuse before HandlePsync takes a snapshot, and register no CONTINUE
-    r.error = std::string(kErrPsyncShuttingDown);
-    return r;
-  }
-  if (role() == ReplRole::kReplica) {  // F8: no chained replication (checked under mu_, as BecomeReplica)
-    r.error = std::string(kErrPsyncOnReplica);
-    return r;
-  }
-  if (clients + LiveSendersLocked() > maxclients) {  // F4: this caller's link would exceed maxclients
-    r.error = std::string(kErrMaxClients);
-    return r;
-  }
+  r.error = RefusalLocked(maxclients);  // again: the role or the links may have changed since HandlePsync
+  if (!r.error.empty()) return r;
   r.replid = identity_.replid;
   r.seq = bounds.last;
   r.decision = DecidePsync(identity_, bounds, req);
