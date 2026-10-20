@@ -1,0 +1,324 @@
+diff --git a/src/compaction/compaction_commit.c b/src/compaction/compaction_commit.c
+index de4a6a1..1247c74 100644
+--- a/src/compaction/compaction_commit.c
++++ b/src/compaction/compaction_commit.c
+@@ -154,6 +154,62 @@ int ce_commit(const compaction_ctx_t *cx, const compaction_job_t *job, sstable_t
+     return TDB_SUCCESS;
+ }
+ 
++/* put moved inputs back at the levels they came from and commit that, after a failed move */
++static void ce_rollback_move(const compaction_ctx_t *cx, sstable_t *const *inputs, const int *from,
++                             int n_moved)
++{
++    int restored = 1;
++    for (int i = 0; i < n_moved; i++)
++        if (tidesdb_manifest_move_sstable(cx->manifest, cx->cf->cf_id, inputs[i]->id, from[i]) != 0)
++            restored = 0;
++    const int durable = cx->sync_mode != BLOCK_MANAGER_SYNC_NONE;
++    if (!restored || tidesdb_manifest_commit(cx->manifest, cx->manifest_path, durable) != 0)
++        TDB_DEBUG_LOG(TDB_LOG_WARN,
++                      "could not roll a failed level move back on cf %s; the next open reads the "
++                      "files at the moved level, where they are equally valid",
++                      cx->cf->name);
++}
++
++int ce_commit_move(const compaction_ctx_t *cx, const compaction_job_t *job, sstable_t *const *inputs,
++                   const uint64_t *in_sizes, int n_inputs)
++{
++    if (level_set_count(cx->cf->levels, job->target_level) != 0) return TDB_SUCCESS;
++
++    int *from = calloc((size_t)n_inputs, sizeof(int));
++    int *to = malloc((size_t)n_inputs * sizeof(int));
++    if (!from || !to)
++    {
++        free(from);
++        free(to);
++        return TDB_ERR_MEMORY;
++    }
++    int rc = TDB_SUCCESS;
++    int moved = 0;
++    for (; moved < n_inputs; moved++)
++    {
++        from[moved] = tidesdb_manifest_find_level_by_id(cx->manifest, cx->cf->cf_id,
++                                                        inputs[moved]->id);
++        to[moved] = job->target_level;
++        if (from[moved] <= 0 || tidesdb_manifest_move_sstable(cx->manifest, cx->cf->cf_id,
++                                                              inputs[moved]->id,
++                                                              job->target_level) != 0)
++        {
++            rc = TDB_ERR_IO;
++            break;
++        }
++    }
++    const int durable = cx->sync_mode != BLOCK_MANAGER_SYNC_NONE;
++    if (rc == TDB_SUCCESS && tidesdb_manifest_commit(cx->manifest, cx->manifest_path, durable) != 0)
++        rc = TDB_ERR_IO;
++    if (rc == TDB_SUCCESS &&
++        level_set_swap(cx->cf->levels, inputs, n_inputs, inputs, to, in_sizes, n_inputs) != 0)
++        rc = TDB_ERR_MEMORY;
++    if (rc != TDB_SUCCESS) ce_rollback_move(cx, inputs, from, moved);
++    free(from);
++    free(to);
++    return rc;
++}
++
+ /**
+  * ce_interval_contained
+  * whether every sstable reaching into a fragment's range is one this merge is consuming, so no key
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+index bbf0198..6e9ea7f 100644
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -745,6 +745,22 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+         return resolved > 0 ? TDB_SUCCESS : resolved; /* a stale job is a no-op, not a failure */
+     }
+ 
++    if (job->is_move)
++    {
++        const int mrc = ce_commit_move(cx, job, inputs, in_sizes, n_inputs);
++        if (mrc == TDB_SUCCESS)
++        {
++            atomic_fetch_add_explicit(&cx->cf->compaction_count, 1, memory_order_relaxed);
++            TDB_DEBUG_LOG(TDB_LOG_INFO, "moved %d files of cf %s to level %d", n_inputs,
++                          cx->cf->name, job->target_level);
++        }
++        for (int i = 0; i < n_inputs; i++)
++            if (sstable_unref(inputs[i])) sstable_close(inputs[i]);
++        free(inputs);
++        free(in_sizes);
++        return mrc;
++    }
++
+     ce_sink_t sink;
+     memset(&sink, 0, sizeof(sink));
+     sink.cx = cx;
+diff --git a/src/compaction/compaction_internal.h b/src/compaction/compaction_internal.h
+index 8c68fe7..4a1c269 100644
+--- a/src/compaction/compaction_internal.h
++++ b/src/compaction/compaction_internal.h
+@@ -55,6 +55,21 @@ typedef struct
+ int ce_commit(const compaction_ctx_t *cx, const compaction_job_t *job, sstable_t *const *inputs,
+               const uint64_t *in_sizes, int n_inputs, ce_sink_t *sink);
+ 
++/**
++ * ce_commit_move
++ * re-point a move job's inputs at its target level: the manifest records a move for each (the files
++ * keep their names), then the level set publishes them at the new level. no data is read or written.
++ * a target level that already holds files means the job is stale, and it is skipped
++ * @param cx the compaction context
++ * @param job the move job
++ * @param inputs the resolved inputs, referenced by the caller
++ * @param in_sizes the on-disk size of each input
++ * @param n_inputs the number of inputs
++ * @return TDB_SUCCESS, or an error with the inputs left where they were
++ */
++int ce_commit_move(const compaction_ctx_t *cx, const compaction_job_t *job, sstable_t *const *inputs,
++                   const uint64_t *in_sizes, int n_inputs);
++
+ /**
+  * ce_union_intervals
+  * the union of the intervals this merge's inputs carry, for its outputs to carry in their place
+diff --git a/src/compaction/compaction_job.h b/src/compaction/compaction_job.h
+index 99860ee..5a3c35b 100644
+--- a/src/compaction/compaction_job.h
++++ b/src/compaction/compaction_job.h
+@@ -47,6 +47,9 @@ typedef enum
+  * subdividing those too would multiply the two. an unaligned merge is the case this exists for: its
+  * inputs span partitions so the planner could not split it, yet its output still rolls at the same
+  * boundaries, so the ranges between them are independent
++ * @param is_move the job re-points its inputs at the target level without reading or rewriting them.
++ * planned only to add a level beneath a full largest level, whose files then become the new largest
++ * level as they are -- they already form one non-overlapping run
+  */
+ typedef struct
+ {
+@@ -60,6 +63,7 @@ typedef struct
+     const size_t *boundary_sizes;
+     int n_boundaries;
+     int may_subdivide;
++    int is_move;
+ } compaction_job_t;
+ 
+ #endif /* __TIDESDB_COMPACTION_JOB_H__ */
+diff --git a/src/compaction/compaction_planner.c b/src/compaction/compaction_planner.c
+index db7cdf8..dcf5c54 100644
+--- a/src/compaction/compaction_planner.c
++++ b/src/compaction/compaction_planner.c
+@@ -298,6 +298,32 @@ static int ce_emit_simple(compaction_plan_t *p, const compaction_snapshot_t *sna
+     return ce_plan_add(p, &job);
+ }
+ 
++/* emit a move of the largest level's files one level down, which adds a level without rewriting
++ * anything: the files are one non-overlapping run already, and every level above stays as it is */
++static int ce_emit_move(compaction_plan_t *p, const compaction_snapshot_t *snap, int target)
++{
++    if (snap->n_sstables == 0) return TDB_SUCCESS;
++    uint64_t *ids = malloc((size_t)snap->n_sstables * sizeof(*ids));
++    if (!ids) return TDB_ERR_MEMORY;
++    const int cnt = ce_ids_in_range(snap, snap->num_levels, snap->num_levels, ids);
++    if (cnt == 0)
++    {
++        free(ids);
++        return TDB_SUCCESS;
++    }
++    uint64_t *kept = ce_plan_keep_ids(p, ids, cnt);
++    free(ids);
++    if (!kept) return TDB_ERR_MEMORY;
++    compaction_job_t job = {0};
++    job.input_ids = kept;
++    job.n_inputs = cnt;
++    job.target_level = target;
++    job.is_largest_level = 1;
++    job.split = COMPACTION_SPLIT_NONE;
++    job.is_move = 1;
++    return ce_plan_add(p, &job);
++}
++
+ /* the boundary partition a key falls in -- the count of boundaries at or below it */
+ static int ce_partition_of_key(const compaction_plan_t *p, const uint8_t *key, size_t key_size)
+ {
+@@ -567,16 +593,23 @@ int compaction_planner_plan(const compaction_snapshot_t *snap,
+                  * cost of. without it a family stops deepening, the dividing level collapses onto
+                  * the flush tier, and the tier grows a run per flush with nowhere to drain to. when
+                  * the full largest level is all that triggered the plan it deepens even if a smaller
+-                 * level could take the merge, which would leave the trigger standing */
+-                if ((target == st.num_levels || (ce_only_largest_full(&st, cfg, caps) &&
+-                                                  !ce_density_due(snap, cfg))) &&
++                 * level could take the merge, which would leave the trigger standing. that case is
++                 * a move rather than a merge: nothing above the largest level is due, so its files
++                 * go one level down as they are instead of the whole tree being rewritten */
++                const int only_largest =
++                    ce_only_largest_full(&st, cfg, caps) && !ce_density_due(snap, cfg);
++                if ((target == st.num_levels || only_largest) &&
+                     st.num_levels < LEVEL_SET_MAX_LEVELS &&
+                     caps[st.num_levels - 1] > 0 &&
+                     st.size[st.num_levels - 1] >= caps[st.num_levels - 1])
+                     target = st.num_levels + 1;
+-                rc = ce_emit_simple(
+-                    p, snap, target,
+-                    target == x ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE, file_max);
++                if (only_largest && target == st.num_levels + 1)
++                    rc = ce_emit_move(p, snap, target);
++                else
++                    rc = ce_emit_simple(
++                        p, snap, target,
++                        target == x ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE,
++                        file_max);
+             }
+         }
+     }
+diff --git a/test/compaction_exec__tests.c b/test/compaction_exec__tests.c
+index 3717972..3fa1a02 100644
+--- a/test/compaction_exec__tests.c
++++ b/test/compaction_exec__tests.c
+@@ -912,6 +912,85 @@ void test_compaction_concurrent_merges_return_every_reference(void)
+     }
+ }
+ 
++/* a move job re-points its inputs at the target level: no file is written, the ids stay, reads find
++ * the keys at the new level, and the manifest on disk names the new level */
++void test_compaction_move_relevels_without_rewriting(void)
++{
++    ce_db_t db;
++    ce_db_open(&db);
++    const ce_entry_t a[] = {{"a", "v-a", 1, 0}, {"c", "v-c", 2, 0}};
++    const uint64_t id0 = ce_flush(&db, a, 2, 1);
++    const compaction_ctx_t cx = {.cf = db.cf,
++                                 .manifest = db.manifest,
++                                 .manifest_path = db.manifest_path,
++                                 .next_sstable_id = &db.next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = db.value_threshold};
++    const uint64_t inputs[1] = {id0};
++    const compaction_job_t move = {.input_ids = inputs,
++                                   .n_inputs = 1,
++                                   .target_level = 3,
++                                   .is_largest_level = 1,
++                                   .split = COMPACTION_SPLIT_NONE,
++                                   .is_move = 1};
++    const uint64_t next_before = atomic_load(&db.next_id);
++    ASSERT_EQ(compaction_exec(&cx, &move), TDB_SUCCESS);
++
++    ASSERT_EQ(level_set_count(db.cf->levels, 1), 0);
++    ASSERT_EQ(level_set_count(db.cf->levels, 3), 1);
++    ASSERT_EQ(atomic_load(&db.next_id), next_before); /* no output was created */
++    ASSERT_EQ(atomic_load(&db.cf->compaction_bytes_written), 0);
++    ASSERT_EQ(tidesdb_manifest_find_level_by_id(db.manifest, 0, id0), 3);
++    ce_assert_read(db.cf, 3, "a", "v-a");
++    ce_assert_read(db.cf, 3, "c", "v-c");
++
++    /* the move is durable: a manifest reopened from disk names the new level */
++    tidesdb_manifest_t *again = tidesdb_manifest_open(db.manifest_path);
++    ASSERT_TRUE(again != NULL);
++    ASSERT_EQ(tidesdb_manifest_find_level_by_id(again, 0, id0), 3);
++    tidesdb_manifest_close(again);
++
++    ce_db_close(&db);
++}
++
++/* a move whose target level already holds files is stale and changes nothing */
++void test_compaction_move_into_occupied_level_is_skipped(void)
++{
++    ce_db_t db;
++    ce_db_open(&db);
++    const ce_entry_t a[] = {{"a", "v-a", 1, 0}};
++    const ce_entry_t b[] = {{"b", "v-b", 2, 0}};
++    const uint64_t id0 = ce_flush(&db, a, 1, 1);
++    const uint64_t id1 = ce_flush(&db, b, 1, 2);
++    const compaction_ctx_t cx = {.cf = db.cf,
++                                 .manifest = db.manifest,
++                                 .manifest_path = db.manifest_path,
++                                 .next_sstable_id = &db.next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = db.value_threshold};
++    const uint64_t first[1] = {id0};
++    const compaction_job_t to_l2 = {.input_ids = first,
++                                    .n_inputs = 1,
++                                    .target_level = 2,
++                                    .split = COMPACTION_SPLIT_NONE,
++                                    .is_move = 1};
++    ASSERT_EQ(compaction_exec(&cx, &to_l2), TDB_SUCCESS);
++    const uint64_t second[1] = {id1};
++    const compaction_job_t again = {.input_ids = second,
++                                    .n_inputs = 1,
++                                    .target_level = 2,
++                                    .split = COMPACTION_SPLIT_NONE,
++                                    .is_move = 1};
++    ASSERT_EQ(compaction_exec(&cx, &again), TDB_SUCCESS);
++    ASSERT_EQ(level_set_count(db.cf->levels, 1), 1); /* id1 stayed */
++    ASSERT_EQ(level_set_count(db.cf->levels, 2), 1);
++    ASSERT_EQ(tidesdb_manifest_find_level_by_id(db.manifest, 0, id1), 1);
++
++    ce_db_close(&db);
++}
++
+ int main(int argc, char **argv)
+ {
+     INIT_TEST_FILTER(argc, argv);
+@@ -933,6 +1012,8 @@ int main(int argc, char **argv)
+     RUN_TEST_HANDLE_BALANCED(test_compaction_empty_merge_carries_intervals, tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_compaction_concurrent_merges_return_every_reference,
+                              tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_compaction_move_relevels_without_rewriting, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_compaction_move_into_occupied_level_is_skipped, tests_passed);
+     PRINT_TEST_RESULTS(tests_passed, tests_failed);
+     return tests_failed > 0 ? 1 : 0;
+ }
+diff --git a/test/compaction_planner__tests.c b/test/compaction_planner__tests.c
+index 11f883f..4024ba7 100644
+--- a/test/compaction_planner__tests.c
++++ b/test/compaction_planner__tests.c
+@@ -309,7 +309,10 @@ void test_plan_grows_a_level_when_the_largest_is_full_and_a_smaller_level_fits(v
+     ASSERT_EQ(compaction_plan_job_count(plan), 1);
+     const compaction_job_t *j = compaction_plan_job(plan, 0);
+     ASSERT_EQ(j->target_level, 4);
+-    ASSERT_EQ(j->n_inputs, 2);
++    /* nothing above the largest level is due, so its file moves down as it is */
++    ASSERT_EQ(j->is_move, 1);
++    ASSERT_EQ(j->n_inputs, 1);
++    ASSERT_EQ(j->input_ids[0], 2);
+     compaction_plan_free(plan);
+ }
+ 

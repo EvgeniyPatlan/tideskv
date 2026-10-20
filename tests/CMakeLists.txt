@@ -34,13 +34,17 @@ if(CONTRACT_SOURCES)
   gtest_discover_tests(contract_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
-# TidesDB's own planner tests, run against the patched planner (cmake/patches): they fail if the patch
-# stops applying or a TidesDB bump changes the behaviour it fixes.
-add_executable(tidesdb_planner_tests ${tidesdb_SOURCE_DIR}/test/compaction_planner__tests.c)
-target_include_directories(tidesdb_planner_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
-target_compile_definitions(tidesdb_planner_tests PRIVATE _GNU_SOURCE)  # fallocate, as TidesDB builds it
-target_link_libraries(tidesdb_planner_tests PRIVATE tidesdb)
+# TidesDB's own planner and compaction tests, run against the patched sources (cmake/patches): they fail if
+# a patch stops applying or a TidesDB bump changes the behaviour it fixes.
+foreach(suite planner exec)
+  add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/compaction_${suite}__tests.c)
+  target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
+  target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)  # fallocate, as TidesDB builds it
+  target_link_libraries(tidesdb_${suite}_tests PRIVATE tidesdb)
+endforeach()
 add_test(NAME TidesDbPlanner COMMAND tidesdb_planner_tests)
+# the exec suite writes its scratch database under the working directory
+add_test(NAME TidesDbCompactionExec COMMAND tidesdb_exec_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)
