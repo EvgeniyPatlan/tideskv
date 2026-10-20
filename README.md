@@ -101,6 +101,7 @@ These are the most used settings. `CONFIG GET *` lists all of them with their cu
 | `lua-time-limit` | `5000` ms | When a long script starts answering `BUSY` |
 | `replicaof` | empty | `<host> <port>` to start as a replica |
 | `repl-backlog-size` | `1gb` | Backlog kept for partial resync |
+| `repl-backlog-lazy` | `yes` | Keep no backlog until the first replica or slot migration (startup only) |
 | `min-replicas-to-write` | `0` | Refuse writes without enough healthy replicas |
 | `cluster-enabled` | `no` | Cluster mode (startup only) |
 

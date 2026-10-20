@@ -57,7 +57,7 @@ TEST(ReplLogLoadNames, MarkerAndBaselineKeysAreTheSharedNames) {
   EXPECT_EQ(repl::kSysReplBaselineUnknown, "repl_baseline_unknown");  // repl_log.cc uses this literal
 }
 
-TEST_F(LoadLog, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) {
+TEST_F(LoadLog, ActivateAndSnapshotIsAnExactCutUnderConcurrentCommits) {
   constexpr uint64_t kStep = 40;  // commits granted per round (InMemoryStorage copies its tables per commit)
   test::PacedWriters writers(
       4, [&](int w, uint64_t i) { return CommitKey(log, s, std::to_string(w) + ":" + std::to_string(i)); });
@@ -67,11 +67,11 @@ TEST_F(LoadLog, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) {
     const uint64_t mid = round * kStep + kStep / 2;  // cut while commits are in flight
     ASSERT_GT(log.WaitBeyond(mid, std::chrono::seconds(30)), mid) << "writers stalled in round " << round;
     for (int i = 0; i < 100 && log.last() < (round + 1) * kStep; ++i) {
-      auto probe = log.SnapshotAtLast();
+      auto probe = log.ActivateAndSnapshot();
       ASSERT_TRUE(probe.ok());
       if (!CutBoundaryHolds(*probe)) ++bad_probes;
     }
-    auto snap = log.SnapshotAtLast();
+    auto snap = log.ActivateAndSnapshot();
     ASSERT_TRUE(snap.ok());
     EXPECT_EQ(CountCf(*snap->view, ColumnFamily::kReplog), snap->seq);  // replog 1..seq and nothing more
     EXPECT_EQ(CountCf(*snap->view, ColumnFamily::kMeta), snap->seq);    // one key per batch

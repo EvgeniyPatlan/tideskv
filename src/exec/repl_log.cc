@@ -17,6 +17,13 @@ constexpr std::string_view kBaselineUnknownKey = "repl_baseline_unknown";
 // With an empty hi (= to the end): every key of a CF.
 constexpr std::string_view kWholeCfLo("\x00", 1);
 
+std::string EncodeHead(uint64_t seq, uint64_t cum) {
+  std::string out;
+  coding::PutFixed64BE(&out, seq);
+  coding::PutFixed64BE(&out, cum);
+  return out;
+}
+
 Status ApplyOp(WriteTxn& txn, const encoding::ReplOp& op) {
   switch (op.type) {
     case encoding::ReplOpType::kPut:
@@ -84,34 +91,92 @@ Status ReplLog::RecoverLoadMarker(ReadView& view, bool* incomplete) {
   return raw.status();
 }
 
+Status ReplLog::RecoverHead(ReadView& view, bool* found, uint64_t* seq, uint64_t* cum) {
+  auto raw = view.Get(ColumnFamily::kSys, kSysReplHead);
+  *found = raw.ok();
+  if (!raw.ok()) return raw.status().IsNotFound() ? Status::Ok() : raw.status();
+  std::string_view in = *raw;
+  if (in.size() != 16 || !coding::GetFixed64BE(&in, seq) || !coding::GetFixed64BE(&in, cum)) {
+    return Status::Corruption("sys/repl_head is not a valid 16-byte seq and cum_bytes");
+  }
+  return Status::Ok();
+}
+
 Status ReplLog::Recover() {
-  auto view = storage_.BeginRead();
-  if (!view.ok()) return view.status();
   uint64_t last = 0;
   uint64_t cum = 0;
   uint64_t first = 1;
   bool incomplete = false;
-  if (Status st = RecoverLast(**view, &last, &cum); !st.ok()) return st;
-  if (Status st = RecoverFirst(**view, last, &first); !st.ok()) return st;
-  if (Status st = RecoverLoadMarker(**view, &incomplete); !st.ok()) return st;
+  bool has_head = false;
+  uint64_t head_seq = 0;
+  uint64_t head_cum = 0;
+  {
+    auto view = storage_.BeginRead();
+    if (!view.ok()) return view.status();
+    if (Status st = RecoverLast(**view, &last, &cum); !st.ok()) return st;
+    if (Status st = RecoverFirst(**view, last, &first); !st.ok()) return st;
+    if (Status st = RecoverLoadMarker(**view, &incomplete); !st.ok()) return st;
+    if (Status st = RecoverHead(**view, &has_head, &head_seq, &head_cum); !st.ok()) return st;
+  }
   // CF3: trimming keeps the newest batch, so first <= last; last + 1 means everything up to last is
   // gone (a full sync's baseline, M6b). Anything else is a damaged sys/repl_first.
   if (first == 0 || first > last + 1) {
     return Status::Corruption("sys/repl_first " + std::to_string(first) + " is outside [1, " +
                               std::to_string(last + 1) + "]");
   }
+  // Commits after the newest record went unlogged: the head has last and cum, and no record from before
+  // it may be offered for CONTINUE. A head at or below the newest record is stale (deleted below).
+  // A crash may lose the commits since the last head write, and their seqs are then taken again.
+  // Invariant: nothing outside this node's keyspace may persist a seq taken while dormant (no replica or
+  // migration target has seen one: both activate the log first, and the replid rotates at master start),
+  // so a reissued seq is never matched against another node's copy of the lost one.
+  const bool unlogged = has_head && head_seq > last;
+  if (unlogged) {
+    last = head_seq;
+    cum = head_cum;
+    first = last + 1;
+  }
   std::lock_guard lock(mu_);
   cum_ = cum;
   first_.store(first, std::memory_order_release);
   last_.store(last, std::memory_order_release);
   load_incomplete_.store(incomplete, std::memory_order_release);
-  return Status::Ok();
+  unlogged_ = unlogged;
+  head_seq_ = unlogged ? head_seq : 0;
+  // A log with records through last was active when it stopped (it had a replica, or was not lazy): a
+  // replica reconnecting now must find every commit since, so it stays active.
+  active_.store(!unlogged && (last > 0 || !lazy_), std::memory_order_release);
+  if (has_head && !unlogged) {  // stale: left by an older format or a manual restore; it would only confuse
+    auto txn = storage_.BeginWrite();
+    if (!txn.ok()) return txn.status();
+    if (Status st = (*txn)->Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
+    if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  }
+  return lazy_ ? Status::Ok() : ActivateLocked();
 }
 
 Status ReplLog::AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum) {
   if (Status st = txn.Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), record); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
   cum_ = cum;
+  last_.store(seq, std::memory_order_release);
+  advanced_.notify_all();
+  return Status::Ok();
+}
+
+// Dormant: the seq, cum and publication of AppendAndCommit without the record. first_retained() follows
+// last()+1. The first unlogged commit carries sys/repl_head, so a crash before PersistHead never lets
+// recovery offer the records before it for CONTINUE.
+Status ReplLog::CommitUnlogged(WriteTxn& txn, uint64_t seq, size_t size) {
+  const uint64_t cum = cum_ + size;
+  if (!unlogged_) {
+    if (Status st = txn.Put(ColumnFamily::kSys, kSysReplHead, EncodeHead(seq, cum)); !st.ok()) return st;
+  }
+  if (Status st = txn.Commit(); !st.ok()) return st;
+  if (!unlogged_) head_seq_ = seq;
+  unlogged_ = true;
+  cum_ = cum;
+  first_.store(seq + 1, std::memory_order_release);
   last_.store(seq, std::memory_order_release);
   advanced_.notify_all();
   return Status::Ok();
@@ -125,10 +190,16 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
   // FenceLocalWrites(true) is a barrier (CF1).
   if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
   const uint64_t seq = last_.load(std::memory_order_relaxed) + 1;
-  const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
-  // R12: a batch no replica would accept is refused like a fenced commit: nothing taken, nothing written.
-  if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
-  if (Status st = AppendAndCommit(txn, seq, record, cum_ + record.size()); !st.ok()) return st;
+  if (active()) {
+    const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
+    // R12: a batch no replica would accept is refused like a fenced commit: nothing taken, nothing written.
+    if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
+    if (Status st = AppendAndCommit(txn, seq, record, cum_ + record.size()); !st.ok()) return st;
+  } else {
+    const size_t size = encoding::ReplogBatchSize(ops);
+    if (size > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
+    if (Status st = CommitUnlogged(txn, seq, size); !st.ok()) return st;
+  }
   engine_internal::t_last_commit_seq = seq;  // this thread's write, for WAIT (M6b D9)
   ++engine_internal::t_commit_count;         // M7a D24: detect a write by count, not by seq change
   return Status::Ok();
@@ -170,6 +241,7 @@ Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view p
     return Status::Corruption("replicated batch " + std::to_string(seq) + " has cum_bytes " +
                               std::to_string(cum) + ", expected " + std::to_string(cum_ + payload.size()));
   }
+  if (Status st = ActivateLocked(); !st.ok()) return st;
   return AppendAndCommit(txn, seq, payload, cum);
 }
 
@@ -201,8 +273,7 @@ Status ReplLog::TrimLocked(uint64_t up_to) {
   if (!txn.ok()) return txn.status();
   std::string next;
   coding::PutFixed64BE(&next, up_to + 1);
-  if (Status st = (*txn)->DeleteRange(ColumnFamily::kReplog, encoding::ReplogKey(first),
-                                      encoding::ReplogKey(up_to + 1));
+  if (Status st = (*txn)->DeleteRange(ColumnFamily::kReplog, kWholeCfLo, encoding::ReplogKey(up_to + 1));
       !st.ok()) {
     return st;
   }
@@ -226,14 +297,61 @@ Status ReplLog::TrimUnlessFenced(uint64_t up_to, bool* trimmed) {
   return Status::Ok();
 }
 
-Result<SyncSnapshot> ReplLog::SnapshotAtLast() {
+Status ReplLog::ActivateLocked() {
+  if (active()) return Status::Ok();
+  if (unlogged_) {
+    const uint64_t seq = last_.load(std::memory_order_relaxed);
+    const size_t size = encoding::ReplogBatchSize({});
+    if (cum_ < size) return Status::Internal("dormant replication log: cum_bytes below one batch");
+    const std::string baseline = encoding::EncodeReplogBatch({}, clock_.NowMs(), cum_ - size);
+    std::string first;
+    coding::PutFixed64BE(&first, seq + 1);
+    auto txn = storage_.BeginWrite();
+    if (!txn.ok()) return txn.status();
+    if (Status st = (*txn)->DeleteRange(ColumnFamily::kReplog, kWholeCfLo, encoding::ReplogKey(seq));
+        !st.ok()) {
+      return st;
+    }
+    if (Status st = (*txn)->Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), baseline); !st.ok())
+      return st;
+    if (Status st = (*txn)->Put(ColumnFamily::kSys, kReplFirstKey, first); !st.ok()) return st;
+    if (Status st = (*txn)->Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
+    if (Status st = (*txn)->Commit(); !st.ok()) return st;
+    unlogged_ = false;
+    head_seq_ = 0;
+  }
+  active_.store(true, std::memory_order_release);
+  return Status::Ok();
+}
+
+Status ReplLog::Activate() {
   std::lock_guard lock(mu_);
+  return ActivateLocked();
+}
+
+Status ReplLog::PersistHead() {
+  std::lock_guard lock(mu_);
+  const uint64_t seq = last_.load(std::memory_order_relaxed);
+  if (active() || !unlogged_ || head_seq_ == seq) return Status::Ok();
+  auto txn = storage_.BeginWrite();
+  if (!txn.ok()) return txn.status();
+  if (Status st = (*txn)->Put(ColumnFamily::kSys, kSysReplHead, EncodeHead(seq, cum_)); !st.ok()) return st;
+  if (Status st = (*txn)->Commit(); !st.ok()) return st;
+  head_seq_ = seq;
+  return Status::Ok();
+}
+
+Result<SyncSnapshot> ReplLog::ActivateAndSnapshot() {
+  std::lock_guard lock(mu_);
+  if (Status st = ActivateLocked(); !st.ok()) return st;
   auto view = storage_.BeginSnapshot();
   if (!view.ok()) return view.status();
   return SyncSnapshot{std::move(view).value(), last_.load(std::memory_order_relaxed)};
 }
 
 void ReplLog::SetBaselineLocked(uint64_t last, uint64_t cum, uint64_t first) {
+  unlogged_ = false;  // every load step deletes sys/repl_head
+  head_seq_ = 0;
   cum_ = cum;
   first_.store(first, std::memory_order_release);
   last_.store(last, std::memory_order_release);
@@ -246,9 +364,11 @@ Status ReplLog::CommitLoadStart(WriteTxn& txn) {
   if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kBaselineUnknownKey); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
   if (Status st = txn.Put(ColumnFamily::kSys, kSysReplLoadIncomplete, "1"); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
   SetBaselineLocked(0, 0, 1);
+  active_.store(true, std::memory_order_release);  // a replica's log: its batches are always recorded
   load_incomplete_.store(true, std::memory_order_release);
   return Status::Ok();
 }
@@ -272,6 +392,7 @@ Status ReplLog::CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view reco
   if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplLoadIncomplete); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
   SetBaselineLocked(seq, cum, seq == 0 ? 1 : seq);
+  active_.store(true, std::memory_order_release);
   load_incomplete_.store(false, std::memory_order_release);
   return Status::Ok();
 }
@@ -284,6 +405,7 @@ Status ReplLog::CommitLoadAbort(WriteTxn& txn) {
   if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kBaselineUnknownKey); !st.ok()) return st;
+  if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kSysReplLoadIncomplete); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
   SetBaselineLocked(0, 0, 1);

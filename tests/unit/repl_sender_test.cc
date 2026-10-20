@@ -349,7 +349,7 @@ TEST_F(SenderTest, ConcurrentCommitsArriveStrictlyConsecutive) {
 
 TEST_F(SenderTest, StreamsTheSnapshotThenTheLiveTail) {
   Commit(5);
-  auto snap = log.SnapshotAtLast();
+  auto snap = log.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   ASSERT_EQ(snap->seq, 5u);
   Commit(2);  // after the cut: only BATCH frames carry these
@@ -376,7 +376,7 @@ TEST_F(SenderTest, StreamsTheSnapshotThenTheLiveTail) {
 
 // PF9: at S = 0 the replica's first ACK is 0, which advances nothing but still means it loaded.
 TEST_F(SenderTest, SnapshotOfAnEmptyStoreIsAnEmptyLoadEnd) {
-  auto snap = log.SnapshotAtLast();
+  auto snap = log.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   int fds[2] = {-1, -1};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
@@ -405,7 +405,7 @@ TEST_F(SenderTest, ASenderWithoutASnapshotIsOnlineAtStart) {
 
 TEST_F(SenderTest, SlowKeysAreKeptAliveWithPingAndStopIsPrompt) {
   Commit(5);
-  auto snap = log.SnapshotAtLast();
+  auto snap = log.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   int fds[2] = {-1, -1};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);

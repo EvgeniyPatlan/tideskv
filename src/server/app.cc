@@ -90,7 +90,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
 
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
-  repl_log_ = std::make_unique<ReplLog>(*storage_, clock_);
+  repl_log_ = std::make_unique<ReplLog>(*storage_, clock_, config_->Snapshot().repl_backlog_lazy);
   oids_ = std::make_unique<OidAllocator>(
       *storage_, [this] { return storage_->Checkpoint(); },
       [this](const std::vector<encoding::ReplOp>& ops) { return repl_log_->CommitStandalone(ops); });
@@ -348,8 +348,13 @@ void App::Stop() {
   scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
   oids_.reset();       // likewise (its persist hook checkpoints storage_)
   trimmer_.reset();    // its thread and the replica client (its other caller) are stopped
-  repl_log_.reset();   // engine_ and oids_ committed through it
-  storage_.reset();    // flushes and closes TidesDB
+  if (repl_log_) {     // nothing writes any more: a dormant log's final last and cum (repl-backlog-lazy)
+    if (Status st = repl_log_->PersistHead(); !st.ok()) {
+      spdlog::warn("cannot persist the replication head: {}", st.ToString());
+    }
+  }
+  repl_log_.reset();  // engine_ and oids_ committed through it
+  storage_.reset();   // flushes and closes TidesDB
 }
 
 namespace {
@@ -457,6 +462,7 @@ void App::FillReplStats(ServerStats& s, const ConfigValues& v) const {
     r.second_offset = static_cast<int64_t>(id.history.front().end_seq) + 1;
   }
   r.master_offset = r.applied_seq = r.read_seq = repl_log_->last();
+  r.backlog_active = repl_log_->active();
   r.first_retained = repl_log_->first_retained();
   r.histlen = r.master_offset >= r.first_retained ? r.master_offset - r.first_retained + 1 : 0;
   r.backlog_size_config = v.repl_backlog_size;

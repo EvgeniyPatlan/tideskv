@@ -131,6 +131,11 @@ Status BacklogTrimmer::RunOnReplica() { return Run(/*master=*/false); }
 
 Status BacklogTrimmer::Run(bool master) {
   std::lock_guard lock(run_mu_);
+  // repl-backlog-lazy: the head interval. A dormant log's last and cum, which no record carries; a no-op
+  // once the log is active. Before the fence check: a demoted dormant log still has to keep its seqs.
+  if (master) {
+    if (Status st = log_.PersistHead(); !st.ok()) return st;
+  }
   if (master && log_.fenced()) return Status::Ok();  // a replica: its applier trims
   const uint64_t needed = master && hooks_.oldest_needed ? hooks_.oldest_needed() : kNoReplicaNeeds;
   auto point = TrimPoint(needed);

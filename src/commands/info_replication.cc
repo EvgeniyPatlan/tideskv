@@ -35,8 +35,8 @@ void AddReplicaFields(std::string& out, const ReplicationStats& r) {
 
 }  // namespace
 
-// repl_backlog_active is always 1 (the replog always exists), a documented divergence; the backlog
-// offsets are seqs and histlen counts retained batches.
+// repl_backlog_active is 0 while repl-backlog-lazy keeps the replog dormant (no replica yet, as Redis
+// creates its backlog for the first one); the backlog offsets are seqs and histlen counts retained batches.
 std::string FormatReplicationSection(const ReplicationStats& r) {
   std::string out = "# Replication\r\n";
   Add(out, "role", r.replica ? "slave" : "master");
@@ -54,7 +54,7 @@ std::string FormatReplicationSection(const ReplicationStats& r) {
   Add(out, "master_replid2", r.replid2.empty() ? std::string(r.replid.size(), '0') : r.replid2);
   Add(out, "master_repl_offset", std::to_string(r.master_offset));
   Add(out, "second_repl_offset", std::to_string(r.second_offset));
-  Add(out, "repl_backlog_active", "1");
+  Add(out, "repl_backlog_active", r.backlog_active ? "1" : "0");
   Add(out, "repl_backlog_size", std::to_string(r.backlog_size_config));
   Add(out, "repl_backlog_first_byte_offset", std::to_string(r.first_retained));
   Add(out, "repl_backlog_histlen", std::to_string(r.histlen));

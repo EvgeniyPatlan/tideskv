@@ -22,7 +22,9 @@ using Type = RespValue::Type;
 using namespace std::chrono_literals;
 
 struct ReplicationMasterIT : ::testing::Test {
-  TestServer s{TIDESKV_SERVER_BIN};
+  // An active log from the start: these cases CONTINUE over batches committed before any replica came
+  // (repl-backlog-lazy would leave those unlogged; replication_lazy_it.cc covers that mode).
+  TestServer s{TIDESKV_SERVER_BIN, {.extra_args = {"--repl-backlog-lazy", "no"}}};
   std::unique_ptr<RespClient> Client() {
     auto c = s.Connect();
     EXPECT_NE(c, nullptr);

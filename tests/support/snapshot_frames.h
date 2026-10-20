@@ -30,7 +30,7 @@ struct SnapshotStream {
 // The stream of `log`'s snapshot at its last seq, as Task 7's master produces it (chunk timestamp 1).
 inline SnapshotStream SnapshotFrames(ReplLog& log) {
   SnapshotStream s;
-  auto snap = log.SnapshotAtLast();
+  auto snap = log.ActivateAndSnapshot();
   EXPECT_TRUE(snap.ok()) << snap.status().ToString();
   if (!snap.ok()) return s;
   s.seq = snap->seq;

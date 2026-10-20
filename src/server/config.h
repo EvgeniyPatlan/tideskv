@@ -47,7 +47,8 @@ struct ConfigValues {
   bool replica_read_only = true;  // only "yes" accepted in M6a (D12)
   uint64_t repl_backlog_size = 1ULL << 30;
   int64_t repl_backlog_ttl = 3600;  // seconds, 0 = never trim by age
-  int64_t repl_timeout = 60;        // seconds, min 1
+  bool repl_backlog_lazy = true;  // no replog records until a replica or migration needs them (startup only)
+  int64_t repl_timeout = 60;      // seconds, min 1
   std::string replica_announce_ip;  // REPLCONF ip-address
   int replica_announce_port = 0;    // 0 = use port
   int replica_priority = 100;       // shown in INFO only

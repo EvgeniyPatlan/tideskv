@@ -1,5 +1,5 @@
-// The exact snapshot cut over the real engine (M6b D2, spike s_snapcut): ReplLog::SnapshotAtLast takes the
-// TidesDB snapshot and the watermark S together under the commit-section mutex, so while writers keep
+// The exact snapshot cut over the real engine (M6b D2, spike s_snapcut): ReplLog::ActivateAndSnapshot takes
+// the TidesDB snapshot and the watermark S together under the commit-section mutex, so while writers keep
 // committing (a small memtable: rotations and flushes underneath the open snapshot) the view holds every
 // batch 1..S, each complete, and nothing after S. Also a replica's load transactions (M6b D5) on TidesDB.
 #include <gtest/gtest.h>
@@ -75,14 +75,14 @@ uint64_t CountCf(ReadView& v, ColumnFamily cf) {
 // then waits for `until`. Fatal failures: call it under ASSERT_NO_FATAL_FAILURE.
 void ProbeUntil(ReplLog& log, uint64_t until, int* good, int* bad) {
   for (int i = 0; i < kProbes && log.last() < until; ++i) {
-    auto probe = log.SnapshotAtLast();
+    auto probe = log.ActivateAndSnapshot();
     ASSERT_TRUE(probe.ok()) << probe.status().ToString();
     ++(CutBoundaryHolds(*probe) ? *good : *bad);
   }
   ASSERT_GE(log.WaitBeyond(until - 1, 30s), until) << "writers stalled before " << until;
 }
 
-TEST(ReplLogSnapshotCutTides, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) {
+TEST(ReplLogSnapshotCutTides, ActivateAndSnapshotIsAnExactCutUnderConcurrentCommits) {
   TempDir dir("tideskv-snapcut");
   auto s = TidesStorage::Open(Opts(dir, kMemtableBytes));
   ASSERT_TRUE(s.ok()) << s.status().ToString();
@@ -103,7 +103,7 @@ TEST(ReplLogSnapshotCutTides, SnapshotAtLastIsAnExactCutUnderConcurrentCommits) 
     writers.Grant((round + 1) * kStep);  // second half: one full-scan cut amid these commits
     ASSERT_GT(log.WaitBeyond(half + kStep / 4, 30s), half + kStep / 4)
         << "writers stalled in round " << round;
-    auto snap = log.SnapshotAtLast();
+    auto snap = log.ActivateAndSnapshot();
     ASSERT_TRUE(snap.ok()) << snap.status().ToString();
     EXPECT_EQ(CountCf(*snap->view, ColumnFamily::kReplog), snap->seq) << "round " << round;
     EXPECT_EQ(CountCf(*snap->view, ColumnFamily::kMeta), snap->seq * kKeysPerBatch) << "round " << round;

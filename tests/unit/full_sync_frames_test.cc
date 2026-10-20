@@ -128,7 +128,7 @@ TEST(SnapshotChunker, AWalkBoundedToASlotRangeSkipsOtherSlotsTheExpireCfAndSys) 
   ASSERT_EQ(h.Run({"ZADD", "{b}z", "1", "m"}), test::Int(1));
   ASSERT_EQ(h.Run({"SET", "foo", "1"}), test::kOk);  // slot 12182
   ASSERT_EQ(h.Run({"HSET", "{foo}h", "f", "v"}), test::Int(1));
-  auto snap = h.services.repl_log_.SnapshotAtLast();
+  auto snap = h.services.repl_log_.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   ChunkerOptions o;
   o.cfs = {ColumnFamily::kMeta, ColumnFamily::kSubkey, ColumnFamily::kZScore};
@@ -159,7 +159,7 @@ TEST(SnapshotChunker, SetMaxBytesSplitsTheNextChunks) {
   test::CommandHarness h;
   for (int i = 0; i < 20; ++i)
     ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), std::string(100, 'v')}), test::kOk);
-  auto snap = h.services.repl_log_.SnapshotAtLast();
+  auto snap = h.services.repl_log_.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   ChunkerOptions o;
   o.cfs = {ColumnFamily::kMeta};
@@ -190,7 +190,7 @@ TEST(SnapshotChunker, TheMigrationRecordIsStreamedAfterTheOidLeaseAndLoadable) {
   cluster::MigrationRecord r;
   r.imported = {{1, 2}};
   ASSERT_TRUE(h.services.repl_log_.CommitStandalone({cluster::MigrationRecordPut(r)}).ok());
-  auto snap = h.services.repl_log_.SnapshotAtLast();
+  auto snap = h.services.repl_log_.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   SnapshotChunker chunker(*snap->view, 0);
   std::vector<encoding::ReplOp> ops;

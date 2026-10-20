@@ -226,6 +226,17 @@ TEST(InfoReplication, MasterWithoutReplicasIsExact) {
                 "repl_backlog_histlen:14\r\n");
 }
 
+TEST(InfoReplication, ADormantBacklogIsInactive) {  // repl-backlog-lazy before the first replica
+  ReplicationStats r = MasterRepl();
+  r.backlog_active = false;
+  r.first_retained = 16;
+  r.histlen = 0;
+  const std::string info = Repl(r);
+  EXPECT_NE(info.find("repl_backlog_active:0\r\n"), std::string::npos) << info;
+  EXPECT_NE(info.find("repl_backlog_first_byte_offset:16\r\n"), std::string::npos);
+  EXPECT_NE(info.find("repl_backlog_histlen:0\r\n"), std::string::npos);
+}
+
 TEST(InfoReplication, EmptyLogHasZeroHistlen) {
   ReplicationStats r = MasterRepl();
   r.master_offset = 0;

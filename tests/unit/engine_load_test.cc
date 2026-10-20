@@ -139,7 +139,7 @@ TEST_F(EngineLoadTest, ACommandWaitingForTheGateNeverSeesAPartialLoad) {
 
 TEST_F(EngineLoadTest, ChunksAndEndInstallTheMastersStateAndStreamingContinues) {
   ASSERT_TRUE(replica.engine.BeginLoad({}).ok());
-  auto snap = master.services.repl_log_.SnapshotAtLast();
+  auto snap = master.services.repl_log_.ActivateAndSnapshot();
   ASSERT_TRUE(snap.ok());
   const std::vector<ReplOp> puts = SnapshotPuts(*snap->view);
   const size_t half = puts.size() / 2;
@@ -249,7 +249,7 @@ TEST_F(EngineLoadTest, StartupDiscardsAnInterruptedLoad) {
   {
     ReplicaStack crashed(replica_storage);  // a process that dies mid-load: no AbortLoad, no EndLoad
     ASSERT_TRUE(crashed.engine.BeginLoad({}).ok());
-    auto snap = master.services.repl_log_.SnapshotAtLast();
+    auto snap = master.services.repl_log_.ActivateAndSnapshot();
     ASSERT_TRUE(snap.ok());
     const std::vector<ReplOp> puts = SnapshotPuts(*snap->view);
     ASSERT_TRUE(crashed.engine.LoadChunk({puts.begin(), puts.begin() + 3}).ok());
@@ -310,7 +310,7 @@ TEST_F(EngineLoadTest, RestartAfterAnAbortLeavesASeqZeroNode) {
   {
     ReplicaStack crashed(replica_storage);
     ASSERT_TRUE(crashed.engine.BeginLoad({}).ok());
-    auto snap = master.services.repl_log_.SnapshotAtLast();
+    auto snap = master.services.repl_log_.ActivateAndSnapshot();
     ASSERT_TRUE(snap.ok());
     const std::vector<ReplOp> puts = SnapshotPuts(*snap->view);
     ASSERT_TRUE(crashed.engine.LoadChunk({puts.begin(), puts.begin() + 3}).ok());
