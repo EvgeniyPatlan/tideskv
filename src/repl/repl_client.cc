@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/string_util.h"
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 
 namespace tideskv::repl {
@@ -201,6 +202,36 @@ Status ReplClient::Handshake(RespConn& conn, const ConfigValues& cfg) {
       spdlog::warn("master {}:{} refused REPLCONF {}: -{}", host_, port_, option[1], r->str);
     }
   }
+  return ExchangeKeyLayouts(conn, cfg);
+}
+
+// Slotless key layout: REPLCONF key-layout <mine> is answered with the master's layout, or -ERR by a master
+// that predates layouts (slotted). Decisive, unlike the options above: a cluster node is slotted and cannot
+// follow a slotless master, so it stops here, before PSYNC and so before any full sync wipes its data. Any
+// other layout difference is resolved by a full resynchronisation that adopts the master's layout.
+Status ReplClient::ExchangeKeyLayouts(RespConn& conn, const ConfigValues& cfg) {
+  const encoding::KeyLayout mine = encoding::CurrentKeyLayout();
+  auto r = conn.Command({"REPLCONF", "key-layout", encoding::KeyLayoutName(mine)});
+  if (!r.ok()) return r.status();
+  if (r->type == ReplyNode::Type::kError) {
+    master_layout_ = encoding::KeyLayout::kSlotted;
+  } else {
+    const std::optional<encoding::KeyLayout> theirs =
+        r->type == ReplyNode::Type::kStatus ? encoding::ParseKeyLayout(r->str) : std::nullopt;
+    if (!theirs) return Status::IOError("protocol error: unexpected reply to REPLCONF key-layout");
+    master_layout_ = *theirs;
+  }
+  if (cfg.cluster_enabled && master_layout_ == encoding::KeyLayout::kSlotless) {
+    return Status::InvalidArgument(
+        "the master uses the standalone key layout (format 2), and cluster mode needs the slotted layout "
+        "(format 1): this replica does not synchronise from it");
+  }
+  if (master_layout_ != mine) {
+    spdlog::warn(
+        "master {}:{} uses the {} key layout and this replica the {} one: a full resynchronisation "
+        "will replace this replica's data and adopt the master's layout",
+        host_, port_, encoding::KeyLayoutName(master_layout_), encoding::KeyLayoutName(mine));
+  }
   return Status::Ok();
 }
 
@@ -209,13 +240,18 @@ Status ReplClient::Handshake(RespConn& conn, const ConfigValues& cfg) {
 Status ReplClient::Psync(RespConn& conn, PsyncOutcome* out) {
   const uint64_t last = log_.last();
   const bool unknown = baseline_unknown_.load(std::memory_order_acquire);
-  const std::string replid = last == 0 && !unknown ? "?" : cb_.identity().replid;  // F5
+  std::string replid = last == 0 && !unknown ? "?" : cb_.identity().replid;  // F5
+  // Another key layout: no history of the master can describe this data, and a master that predates layouts
+  // could still answer "?" with +CONTINUE. An id no node has (40 zeros) always gets +FULLRESYNC.
+  const bool other_layout = master_layout_ != encoding::CurrentKeyLayout();
+  if (other_layout) replid = std::string(kReplIdLength, '0');
   const std::string next = std::to_string(last + 1);
   auto r = conn.Command({"PSYNC", replid, next});
   if (!r.ok()) return r.status();
   if (r->type == ReplyNode::Type::kError) return Status::IOError("the master refused PSYNC: -" + r->str);
   const std::string_view reply = r->str;
   if (r->type == ReplyNode::Type::kStatus && reply.starts_with("CONTINUE ")) {
+    if (other_layout) return Status::IOError("protocol error: +CONTINUE from a master of another key layout");
     return AdoptReplid(reply.substr(9));
   }
   if (r->type == ReplyNode::Type::kStatus && reply.starts_with("FULLRESYNC ")) {
@@ -247,7 +283,9 @@ Status ReplClient::FullSync(int fd, const PsyncOutcome& o) {
   } const end_progress{this};
   // Before Begin: BeginLoad raises Engine::loading(), and INFO must never show loading:1 with no start time.
   loading_start_ms_.store(UnixMs(), std::memory_order_release);
-  FullSyncLoader loader(engine_, o.replid, o.seq, LoaderHooks());
+  std::optional<encoding::KeyLayout> adopt;
+  if (master_layout_ != encoding::CurrentKeyLayout()) adopt = master_layout_;
+  FullSyncLoader loader(engine_, o.replid, o.seq, LoaderHooks(), adopt);
   if (Status st = loader.Begin(); !st.ok()) return st;
   struct MidLoad {  // D22: a Stop between the start txn and LOADEND leaves the keyspace wiped or partial
     ReplClient* c;

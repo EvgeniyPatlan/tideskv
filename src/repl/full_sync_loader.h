@@ -1,11 +1,13 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/status.h"
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "repl/repl_state.h"
 
@@ -24,7 +26,10 @@ class FullSyncLoader {
     std::function<int()> key_load_delay_us;                     // optional: key-load-delay (D14)
     std::function<bool()> stopping;                             // optional: cuts the key-load-delay short
   };
-  FullSyncLoader(Engine& engine, std::string master_replid, uint64_t seq, Hooks hooks);
+  // adopt: the master's key layout when it is not this node's; the load's start txn then writes its
+  // format_version with the wipe, and the process switches to it under the Engine's load barrier.
+  FullSyncLoader(Engine& engine, std::string master_replid, uint64_t seq, Hooks hooks,
+                 std::optional<encoding::KeyLayout> adopt = std::nullopt);
   ~FullSyncLoader();
   FullSyncLoader(const FullSyncLoader&) = delete;
   FullSyncLoader& operator=(const FullSyncLoader&) = delete;
@@ -44,6 +49,7 @@ class FullSyncLoader {
   std::string master_replid_;
   uint64_t seq_;
   Hooks hooks_;
+  std::optional<encoding::KeyLayout> adopt_;
   bool begun_ = false;
   bool finished_ = false;
   uint64_t ops_ = 0;

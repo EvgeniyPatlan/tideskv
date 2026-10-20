@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 #include "repl/repl_state.h"
 #include "storage/memory_storage.h"
@@ -282,6 +283,22 @@ TEST_F(EngineLoadTest, ApplyReplicatedIsRefusedWhileLoadingOrMarked) {
   EXPECT_EQ(restarted.log.last(), 0u);
   ASSERT_TRUE(restarted.engine.AbortLoad().ok());
   EXPECT_TRUE(restarted.engine.ApplyReplicated(1, *first).ok());
+}
+
+// Slotless key layout: a replica adopting its master's layout switches the process inside the load barrier,
+// and back when the start txn fails (nothing was wiped, so the data is still in the old layout).
+TEST(EngineLoadLayout, BeginLoadAdoptsTheLayoutAndRestoresItOnFailure) {
+  const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+  FaultyStorage storage;
+  ReplicaStack replica(storage);
+  storage.fail_commit_in = 1;
+  EXPECT_EQ(replica.engine.BeginLoad({}, encoding::KeyLayout::kSlotted).code(), StatusCode::kIOError);
+  EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotless);
+  EXPECT_FALSE(replica.engine.loading());
+  ASSERT_TRUE(replica.engine.BeginLoad({}, encoding::KeyLayout::kSlotted).ok());
+  EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotted);
+  ASSERT_TRUE(replica.engine.AbortLoad().ok());  // an abort keeps it: the keyspace is empty in any layout
+  EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotted);
 }
 
 // G1: an abort whose commit fails changes nothing (still loading, marker kept, applies refused); the

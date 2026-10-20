@@ -259,5 +259,13 @@ INSTANTIATE_TEST_SUITE_P(
         Case{"? with a position", {1, 100, false}, {"?", 5}, PsyncDecision::kFullResync},
         Case{"empty master, ? 1", {1, 0, false}, {"?", 1}, PsyncDecision::kContinue}));
 
+TEST(DecidePsync, AReplicaOfAnotherKeyLayoutAlwaysGetsAFullResync) {
+  const ReplIdentity me{std::string(40, 'a'), {}};
+  const LogBounds log{1, 10, false};
+  EXPECT_EQ(DecidePsync(me, log, {me.replid, 5}), PsyncDecision::kContinue);
+  EXPECT_EQ(DecidePsync(me, log, {me.replid, 5, /*full_only=*/true}), PsyncDecision::kFullResync);
+  EXPECT_EQ(DecidePsync(me, {1, 0, false}, {"?", 1, true}), PsyncDecision::kFullResync);
+}
+
 }  // namespace
 }  // namespace tideskv::repl

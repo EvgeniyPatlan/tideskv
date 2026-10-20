@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "exec/repl_log.h"
 #include "repl/full_sync_loader.h"
@@ -104,6 +105,7 @@ class ReplClient {
   bool Publish(int fd);  // false when Stop() came first
   void Unpublish();
   Status Handshake(RespConn& conn, const ConfigValues& cfg);
+  Status ExchangeKeyLayouts(RespConn& conn, const ConfigValues& cfg);
   Status Psync(RespConn& conn, PsyncOutcome* out);
   Status FullSync(int fd, const PsyncOutcome& o);        // the load, until LOADEND committed
   Status LoadUntilDone(int fd, FullSyncLoader& loader);  // reads and loads frames until LOADEND
@@ -140,6 +142,8 @@ class ReplClient {
   SteadyClock::time_point last_trim_{};
   bool ack_due_ = false;
   uint64_t acked_ = 0;
+  encoding::KeyLayout master_layout_ =
+      encoding::KeyLayout::kSlotted;  // the current link's, from the handshake
 
   std::atomic<ReplicaLinkState> state_{ReplicaLinkState::kConnect};
   std::atomic<int64_t> last_io_ms_{0};

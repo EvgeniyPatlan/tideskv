@@ -9,12 +9,14 @@
 #include <vector>
 
 #include "cluster/migration_record.h"
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 #include "repl/full_sync_frames.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
 #include "support/replica_stack.h"
 #include "support/snapshot_frames.h"
+#include "types/format_version.h"
 
 namespace tideskv::repl {
 namespace {
@@ -206,6 +208,40 @@ TEST_F(LoaderTest, BeginDropsAStaleMigrationRecord) {  // M7b D8: only the maste
   auto view = storage.BeginRead();
   ASSERT_TRUE(view.ok());
   EXPECT_TRUE((*view)->Get(ColumnFamily::kSys, cluster::kSysMigration).status().IsNotFound());
+}
+
+// Slotless key layout (decision 1): a replica of another layout adopts the master's on the full sync; the
+// start txn writes the format version together with the wipe.
+TEST(LoaderLayout, AFullSyncAdoptsTheMastersKeyLayout) {
+  const encoding::ScopedKeyLayout restore(encoding::CurrentKeyLayout());
+  for (const auto& [master_layout, replica_layout] :
+       {std::pair{encoding::KeyLayout::kSlotted, encoding::KeyLayout::kSlotless},
+        std::pair{encoding::KeyLayout::kSlotless, encoding::KeyLayout::kSlotted}}) {
+    encoding::AdoptKeyLayout(master_layout);
+    test::CommandHarness master;
+    master.Run({"HSET", "h", "f", "v"});
+    master.Run({"ZADD", "z", "1", "m"});
+    master.Run({"SET", "s", "1", "EX", "1000"});
+    const std::string master_digest = test::DigestOf(master.services.engine_);
+    test::SnapshotStream snap = test::SnapshotFrames(master.services.repl_log_);
+    encoding::AdoptKeyLayout(replica_layout);
+    InMemoryStorage storage;
+    test::ReplicaStack replica{storage};
+    FullSyncLoader::Hooks h;
+    h.identity = [] { return ReplIdentity{std::string(40, 'c'), {}}; };
+    h.publish_identity = [](const ReplIdentity&) {};
+    FullSyncLoader loader(replica.engine, std::string(40, 'a'), snap.seq, h, master_layout);
+    ASSERT_TRUE(loader.Begin().ok());
+    EXPECT_EQ(encoding::CurrentKeyLayout(), master_layout);
+    {
+      auto view = storage.BeginRead();
+      EXPECT_EQ(*(*view)->Get(ColumnFamily::kSys, kFormatVersionKey), FormatVersionFor(master_layout));
+    }
+    bool done = false;
+    for (const Args& f : snap.frames) ASSERT_TRUE(loader.HandleFrame(f, &done).ok());
+    ASSERT_TRUE(done);
+    EXPECT_EQ(test::DigestOf(replica.engine), master_digest);
+  }
 }
 
 }  // namespace

@@ -20,6 +20,14 @@ inline constexpr std::string_view kErrReplicaofFromReplica =
 inline constexpr std::string_view kReplyAlreadyConnected =
     "OK Already connected to specified master";  // status
 
+// TidesKV-only (slotless key layout): REPLCONF key-layout <slotted|slotless>, and the PSYNC of a replica that
+// sent none (it predates key layouts, so it is slotted and cannot adopt another one) to a slotless master.
+inline constexpr std::string_view kErrReplconfKeyLayout =
+    "ERR REPLCONF key-layout must be slotted or slotless";
+inline constexpr std::string_view kErrPsyncLayoutUnknown =
+    "ERR replica key layout slotted does not match this master's slotless layout (format 2); upgrade the "
+    "replica, which then adopts the master's layout on a full resynchronisation";
+
 // TidesKV-only (G5): a PSYNC that would need a full resynchronisation while the node shuts down; no
 // snapshot is streamed, so the replica keeps its data and retries elsewhere or later.
 inline constexpr std::string_view kErrPsyncShuttingDown = "ERR PSYNC refused: this node is shutting down";

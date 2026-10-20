@@ -9,6 +9,7 @@
 #include "commands/all_commands.h"
 #include "commands/server_services.h"
 #include "common/string_util.h"
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "repl/repl_errors.h"
 #include "repl/replication.h"
@@ -42,8 +43,13 @@ void Psync(ExecContext& ctx, const ArgList& argv) {
   }
   int64_t offset = 0;
   if (!ParseInt64(argv[2], &offset)) return ctx.reply.Error(kErrNotInteger);
+  // Slotless key layout: a replica that declared no layout is slotted and cannot adopt ours; one that
+  // declared another layout gets a full resynchronisation, which makes it adopt ours.
+  const std::optional<encoding::KeyLayout> layout = s.replica_handshake.key_layout;
+  if (!layout && encoding::Slotless()) return ctx.reply.Error(kErrPsyncLayoutUnknown);
   Replication& repl = ctx.server.replication();
-  const repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset)};
+  const repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset),
+                               layout && *layout != encoding::CurrentKeyLayout()};
   const PsyncResult r = repl.HandlePsync(req, PeerOf(s));
   if (!r.error.empty()) return ctx.reply.Error(r.error);  // maxclients (F4), a replica (F8): no hand-off
   if (r.decision == repl::PsyncDecision::kFullResync) {
@@ -84,6 +90,11 @@ bool ApplyReplconf(ExecContext& ctx, std::string_view opt, const std::string& va
     o->ip_address = val;
   } else if (EqualsIgnoreCase(opt, "capa")) {
     o->capa.push_back(val);  // eof and psync2 are recognised; others are ignored, as in Redis
+  } else if (EqualsIgnoreCase(opt, "key-layout")) {
+    const std::optional<encoding::KeyLayout> layout = encoding::ParseKeyLayout(ToLower(val));
+    if (!layout) return fail(kErrReplconfKeyLayout);
+    hs.key_layout = layout;
+    o->key_layout = true;
   } else if (EqualsIgnoreCase(opt, "ack") || EqualsIgnoreCase(opt, "getack")) {
     o->getack = EqualsIgnoreCase(opt, "getack");
     *silent = true;  // a replica's ACK reaches its ReplSender, not this command
@@ -93,7 +104,9 @@ bool ApplyReplconf(ExecContext& ctx, std::string_view opt, const std::string& va
   return true;
 }
 
-// REPLCONF <option> <value> ... (replconfCommand, rp:1169): pairwise, +OK once at the end.
+// REPLCONF <option> <value> ... (replconfCommand, rp:1169): pairwise, +OK once at the end. TidesKV: with
+// key-layout among the options the reply is this master's layout (+slotted or +slotless) instead, so the
+// replica learns it before PSYNC; a master that predates layouts answers -ERR (and is slotted).
 void Replconf(ExecContext& ctx, const ArgList& argv) {
   if (argv.size() % 2 == 0) return ctx.reply.Error(kErrSyntax);
   ReplconfOptions o;
@@ -102,7 +115,8 @@ void Replconf(ExecContext& ctx, const ArgList& argv) {
     if (!ApplyReplconf(ctx, argv[i], argv[i + 1], &o, &silent)) return;
   }
   ctx.server.replication().OnReplconf(ctx.session, o);
-  if (!silent) ctx.reply.SimpleString("OK");
+  if (silent) return;
+  ctx.reply.SimpleString(o.key_layout ? encoding::KeyLayoutName(encoding::CurrentKeyLayout()) : "OK");
 }
 
 // Runs a role change now, or after the batch inside EXEC: the change joins threads that may wait for the

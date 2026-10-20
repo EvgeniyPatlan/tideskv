@@ -25,6 +25,7 @@
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
 #include "support/fake_clock.h"
+#include "support/fake_master_reply.h"
 #include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "support/snapshot_frames.h"
@@ -684,7 +685,7 @@ class OneLinkMaster {
       if (ps == resp::ParseStatus::kCommand) {
         const std::string name = parser.args()[0];
         if (name == "PSYNC") return Send("+" + psync_reply + "\r\n");
-        Send(name == "PING" ? "+PONG\r\n" : "+OK\r\n");
+        Send(test::FakeMasterReply(parser.args()));
         continue;
       }
       const Status st = ReadSome(link_.get(), &in, 20ms);

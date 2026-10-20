@@ -9,11 +9,17 @@
 #include "common/string_util.h"
 #include "encoding/replog_codec.h"
 #include "repl/full_sync_frames.h"
+#include "types/format_version.h"
 
 namespace tideskv::repl {
 
-FullSyncLoader::FullSyncLoader(Engine& engine, std::string master_replid, uint64_t seq, Hooks hooks)
-    : engine_(engine), master_replid_(std::move(master_replid)), seq_(seq), hooks_(std::move(hooks)) {}
+FullSyncLoader::FullSyncLoader(Engine& engine, std::string master_replid, uint64_t seq, Hooks hooks,
+                               std::optional<encoding::KeyLayout> adopt)
+    : engine_(engine),
+      master_replid_(std::move(master_replid)),
+      seq_(seq),
+      hooks_(std::move(hooks)),
+      adopt_(adopt) {}
 
 FullSyncLoader::~FullSyncLoader() {
   if (!begun_ || finished_) return;
@@ -30,7 +36,15 @@ Status FullSyncLoader::Begin() {
   // survive.
   extra.push_back(
       {encoding::ReplOpType::kDelete, ColumnFamily::kSys, std::string(cluster::kSysMigration), ""});
-  if (Status st = engine_.BeginLoad(extra); !st.ok()) return st;
+  if (adopt_) {  // the wipe leaves nothing in the old layout; the snapshot arrives in the master's
+    extra.push_back({encoding::ReplOpType::kPut, ColumnFamily::kSys, std::string(kFormatVersionKey),
+                     std::string(FormatVersionFor(*adopt_))});
+  }
+  if (Status st = engine_.BeginLoad(extra, adopt_); !st.ok()) return st;
+  if (adopt_) {
+    spdlog::info("this replica now uses the master's {} key layout (format {})",
+                 encoding::KeyLayoutName(*adopt_), FormatVersionFor(*adopt_));
+  }
   begun_ = true;
   hooks_.publish_identity(cleared);
   if (hooks_.on_baseline_known) hooks_.on_baseline_known();

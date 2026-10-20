@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "exec/engine_internal.h"
 
@@ -61,22 +62,28 @@ Status Engine::RunLoadTxn(const std::vector<encoding::ReplOp>& ops,
   return Status::Ok();
 }
 
-Status Engine::BeginLoad(const std::vector<encoding::ReplOp>& extra) {
+Status Engine::BeginLoad(const std::vector<encoding::ReplOp>& extra,
+                         std::optional<encoding::KeyLayout> layout) {
   if (repl_log_ == nullptr || !repl_log_->fenced())
     return Status::Internal("full-sync load needs a fenced log");
   if (ActiveBatch() != nullptr) return Status::Internal("full-sync load inside a batch");
+  const encoding::KeyLayout previous = encoding::CurrentKeyLayout();
   {
     [[maybe_unused]] const engine_internal::ReentryCheck reentry;
     std::lock_guard barrier(gate_);  // every command holding the gate finishes first (D6), busy or not
     if (loading()) return Status::Internal("a full-sync load is already running");
     loading_.store(true, std::memory_order_release);
+    if (layout) encoding::AdoptKeyLayout(*layout);  // every command is refused (kErrLoading) from here on
   }
   const Status st = RunLoadTxn(
       WithWipe(extra), [this](WriteTxn& t) { return repl_log_->CommitLoadStart(t); },
       [this] {
         if (observer_ != nullptr) observer_->OnDatasetReplaced();
       });
-  if (!st.ok()) loading_.store(false, std::memory_order_release);
+  if (!st.ok()) {
+    if (layout) encoding::AdoptKeyLayout(previous);  // nothing was wiped: the data is still in that layout
+    loading_.store(false, std::memory_order_release);
+  }
   return st;
 }
 

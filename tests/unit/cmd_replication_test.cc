@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "encoding/key_layout.h"
+#include "repl/repl_errors.h"
 #include "repl/replication_manager.h"
 #include "script/sha1hex.h"
 #include "support/cluster_harness.h"
@@ -22,9 +24,11 @@ std::string ScriptSuffix(const std::string& code) {
   return " script: " + Sha1Hex(code) + ", on @user_script:1.";
 }
 
+// A connection that already declared this master's key layout (REPLCONF key-layout), as a replica does.
 struct ReplHarness : CommandHarness {
   ReplHarness() {
     for (int i = 0; i < 3; ++i) Run({"SET", "k" + std::to_string(i), "v"});
+    session.replica_handshake.key_layout = encoding::CurrentKeyLayout();
   }
   const std::string& myid() const { return services.replication_.identity.replid; }
   uint64_t last() const { return services.repl_log_.last(); }
@@ -144,6 +148,33 @@ TEST(PsyncCmd, ARefusalRepliesTheErrorWithoutAHandOff) {
   EXPECT_EQ(h.Run({"PING"}), "+PONG\r\n");
 }
 
+// Slotless key layout: a replica that declared no layout predates layouts (slotted, cannot adopt): a slotless
+// master refuses it. One that declared another layout always gets a full resynchronisation.
+TEST(PsyncCmd, TheKeyLayoutDecidesBetweenARefusalAndAFullResync) {
+  {
+    const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+    ReplHarness h;
+    h.session.replica_handshake.key_layout.reset();
+    EXPECT_EQ(h.Run({"PSYNC", "?", "1"}), Err(kErrPsyncLayoutUnknown));
+    EXPECT_FALSE(h.session.takeover);
+    EXPECT_TRUE(h.services.replication_.psyncs.empty());
+    ReplHarness same;
+    EXPECT_EQ(same.Run({"PSYNC", same.myid(), "4"}), "+CONTINUE " + same.myid() + "\r\n");
+    ReplHarness other;
+    other.session.replica_handshake.key_layout = encoding::KeyLayout::kSlotted;
+    EXPECT_EQ(other.Run({"PSYNC", other.myid(), "4"}), "+FULLRESYNC " + other.myid() + " 3\r\n");
+    ASSERT_EQ(other.services.replication_.psyncs.size(), 1u);
+    EXPECT_TRUE(other.services.replication_.psyncs[0].full_only);
+  }
+  const encoding::ScopedKeyLayout slotted(encoding::KeyLayout::kSlotted);
+  ReplHarness old;  // a pre-layout replica of a slotted master: as before
+  old.session.replica_handshake.key_layout.reset();
+  EXPECT_EQ(old.Run({"PSYNC", old.myid(), "4"}), "+CONTINUE " + old.myid() + "\r\n");
+  ReplHarness other;
+  other.session.replica_handshake.key_layout = encoding::KeyLayout::kSlotless;
+  EXPECT_EQ(other.Run({"PSYNC", "?", "1"}), "+FULLRESYNC " + other.myid() + " 3\r\n");  // never CONTINUE
+}
+
 TEST(SyncCmd, IsNotSupported) {
   ReplHarness h;
   EXPECT_EQ(h.Run({"SYNC"}), Err("ERR SYNC is not supported, use PSYNC"));
@@ -173,6 +204,21 @@ TEST(ReplconfCmd, Errors) {
   EXPECT_EQ(h.Run({"REPLCONF", "listening-port", "7002", "foo", "x"}),
             Err("ERR Unrecognized REPLCONF option: foo"));
   EXPECT_EQ(h.session.replica_handshake.listening_port, 7002);
+}
+
+TEST(ReplconfCmd, KeyLayoutIsAnsweredWithTheMastersLayout) {
+  for (const auto mine : {encoding::KeyLayout::kSlotted, encoding::KeyLayout::kSlotless}) {
+    const encoding::ScopedKeyLayout scoped(mine);
+    const std::string reply = "+" + std::string(encoding::KeyLayoutName(mine)) + "\r\n";
+    CommandHarness h;
+    EXPECT_EQ(h.Run({"REPLCONF", "key-layout", "slotless"}), reply);
+    EXPECT_EQ(h.session.replica_handshake.key_layout, encoding::KeyLayout::kSlotless);
+    EXPECT_EQ(h.Run({"REPLCONF", "listening-port", "7000", "KEY-LAYOUT", "Slotted"}), reply);
+    EXPECT_EQ(h.session.replica_handshake.key_layout, encoding::KeyLayout::kSlotted);
+    EXPECT_EQ(h.Run({"REPLCONF", "key-layout", "cluster"}), Err(kErrReplconfKeyLayout));
+    EXPECT_EQ(h.session.replica_handshake.key_layout, encoding::KeyLayout::kSlotted);
+    EXPECT_EQ(h.Run({"REPLCONF", "listening-port", "7001"}), kOk);
+  }
 }
 
 TEST(ReplconfCmd, AckAndGetackNeverReply) {

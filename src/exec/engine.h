@@ -4,12 +4,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/clock.h"
 #include "common/status.h"
+#include "encoding/key_layout.h"
 #include "exec/commit_listener.h"
 #include "exec/gate.h"
 #include "exec/lock_manager.h"
@@ -182,8 +184,11 @@ class Engine {
   // then commits one txn: the keyspace wipe + `extra` (the node's identity) through
   // ReplLog::CommitLoadStart; tells the observer the dataset is replaced. kInternal unless the ReplLog is
   // fenced, this thread has no batch and no load is running. On failure loading is cleared and nothing
-  // changed.
-  Status BeginLoad(const std::vector<encoding::ReplOp>& extra);
+  // changed. `layout` (the master's, adopted with a format_version PUT in `extra`) becomes the process's key
+  // layout inside the barrier, when no command runs and none can start until the load ends; restored on
+  // failure.
+  Status BeginLoad(const std::vector<encoding::ReplOp>& extra,
+                   std::optional<encoding::KeyLayout> layout = std::nullopt);
   // One txn of `ops` (puts from the master's snapshot), committed directly: no replog entry. kInternal
   // unless loading.
   Status LoadChunk(const std::vector<encoding::ReplOp>& ops);

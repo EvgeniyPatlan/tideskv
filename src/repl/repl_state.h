@@ -69,6 +69,7 @@ Result<bool> LoadOrDetectBaselineUnknown(Storage& storage, uint64_t last_seq);
 struct PsyncRequest {
   std::string replid;  // "?" = unknown
   uint64_t next_seq = 0;
+  bool full_only = false;  // the replica's key layout is not this master's: never CONTINUE (it adopts ours)
 };
 struct LogBounds {
   uint64_t first_retained = 1;

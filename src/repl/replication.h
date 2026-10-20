@@ -79,6 +79,7 @@ struct ReplconfOptions {
   std::optional<std::string> ip_address;
   std::vector<std::string> capa;  // every capa value, recognised or not
   bool getack = false;
+  bool key_layout = false;  // key-layout was among the options (TidesKV)
 };
 
 // What command handlers ask of replication (M6a). Implemented by repl::ReplicationManager and

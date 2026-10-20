@@ -157,6 +157,7 @@ Result<bool> LoadOrDetectBaselineUnknown(Storage& storage, uint64_t last_seq) {
 }
 
 PsyncDecision DecidePsync(const ReplIdentity& me, const LogBounds& log, const PsyncRequest& req) {
+  if (req.full_only) return PsyncDecision::kFullResync;
   const bool in_backlog = req.next_seq >= log.first_retained && req.next_seq <= log.last + 1;
   if (!in_backlog) return PsyncDecision::kFullResync;
   if (req.replid == "?") {  // an empty replica: only a log that starts at seq 1 over no data can serve it

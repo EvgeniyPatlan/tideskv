@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/string_util.h"
+#include "encoding/key_layout.h"
 #include "repl/backlog_trimmer.h"
 #include "repl/full_sync_frames.h"
 #include "repl/repl_sender.h"
@@ -26,6 +27,7 @@
 #include "resp/request_parser.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
+#include "support/fake_master_reply.h"
 #include "support/faulty_storage.h"
 #include "support/replica_stack.h"
 #include "support/resp_client.h"
@@ -175,8 +177,9 @@ struct ReplClientTest : ::testing::Test {
     EXPECT_TRUE(l.valid()) << "the client did not connect";
     return l;
   }
-  // Answers the handshake (+PONG to PING, +OK to the rest) up to PSYNC, which gets `psync_reply`.
-  std::vector<Args> Handshake(Link& l, const std::string& psync_reply) {
+  // Answers the handshake (+PONG to PING, the key layout to REPLCONF key-layout: `layout`, else this
+  // process's; +OK to the rest) up to PSYNC, which gets `psync_reply`.
+  std::vector<Args> Handshake(Link& l, const std::string& psync_reply, const char* layout = nullptr) {
     std::vector<Args> seen;
     for (int i = 0; i < 10; ++i) {
       auto cmd = l.Next();
@@ -187,7 +190,7 @@ struct ReplClientTest : ::testing::Test {
         l.Send("+" + psync_reply + "\r\n");
         break;
       }
-      l.Send(name == "ping" ? "+PONG\r\n" : "+OK\r\n");
+      l.Send(test::FakeMasterReply(*cmd, layout));
     }
     return seen;
   }
@@ -237,9 +240,11 @@ TEST_F(ReplClientTest, HandshakeSendsTheExpectedCommands) {
   StartClient();
   Link l = AcceptLink();
   const auto seen = Handshake(l, "FULLRESYNC " + master_id() + " 0");
+  const std::string layout(encoding::KeyLayoutName(encoding::CurrentKeyLayout()));
   EXPECT_EQ(seen, (std::vector<Args>{{"PING"},
                                      {"REPLCONF", "listening-port", "7001"},
                                      {"REPLCONF", "capa", "psync2"},
+                                     {"REPLCONF", "key-layout", layout},
                                      {"PSYNC", "?", "1"}}));
   client->Stop();
   {
@@ -257,6 +262,7 @@ TEST_F(ReplClientTest, HandshakeSendsTheExpectedCommands) {
                                {"REPLCONF", "listening-port", "7100"},
                                {"REPLCONF", "ip-address", "10.0.0.7"},
                                {"REPLCONF", "capa", "psync2"},
+                               {"REPLCONF", "key-layout", layout},
                                {"PSYNC", "?", "1"}}));
   client.reset();
   {
@@ -357,6 +363,80 @@ TEST_F(ReplClientTest, AnInvalidMasterReplidIsAProtocolError) {  // CF5
   }
 }
 
+// Slotless key layout: the handshake learns the master's layout before PSYNC.
+TEST_F(ReplClientTest, AMasterThatPredatesKeyLayoutsIsSlotted) {
+  const encoding::ScopedKeyLayout restore(encoding::CurrentKeyLayout());
+  for (const auto layout : {encoding::KeyLayout::kSlotted, encoding::KeyLayout::kSlotless}) {
+    encoding::AdoptKeyLayout(layout);
+    StartClient();
+    Link l = AcceptLink();
+    std::vector<Args> seen;
+    for (auto cmd = l.Next(); cmd; cmd = l.Next()) {
+      seen.push_back(*cmd);
+      if (ToLower((*cmd)[0]) == "psync") break;
+      l.Send(cmd->size() >= 2 && (*cmd)[1] == "key-layout"
+                 ? "-ERR Unrecognized REPLCONF option: key-layout\r\n"
+                 : test::FakeMasterReply(*cmd));
+    }
+    ASSERT_FALSE(seen.empty());
+    // A slotless replica asks for a full resynchronisation with an id no master has, which adopts slotted.
+    const std::string replid =
+        layout == encoding::KeyLayout::kSlotted ? "?" : std::string(kReplIdLength, '0');
+    EXPECT_EQ(seen.back(), (Args{"PSYNC", replid, "1"}));
+    client.reset();
+  }
+}
+
+TEST_F(ReplClientTest, AClusterReplicaNeverSynchronisesFromASlotlessMaster) {
+  const encoding::ScopedKeyLayout slotted(encoding::KeyLayout::kSlotted);
+  {
+    std::lock_guard lock(mu);
+    cfg.cluster_enabled = true;
+  }
+  StartClient();
+  for (int attempt = 0; attempt < 2; ++attempt) {  // refused before PSYNC, then retried after the backoff
+    Link l = AcceptLink();
+    const auto seen = Handshake(l, "FULLRESYNC " + master_id() + " 0", "slotless");
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back(), (Args{"REPLCONF", "key-layout", "slotted"}));
+    EXPECT_TRUE(l.Closed());
+  }
+  EXPECT_FALSE(SawState(ReplicaLinkState::kSync));
+  EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotted);
+}
+
+TEST_F(ReplClientTest, AContinueFromAMasterOfAnotherLayoutDropsTheLink) {
+  const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+  StartClient();
+  Link l = AcceptLink();
+  const auto seen = Handshake(l, "CONTINUE " + master_id(), "slotted");
+  EXPECT_EQ(seen.back(), (Args{"PSYNC", std::string(kReplIdLength, '0'), "1"}));
+  EXPECT_TRUE(l.Closed());
+  EXPECT_FALSE(SawState(ReplicaLinkState::kConnected));
+  EXPECT_TRUE(adopted.empty());
+}
+
+TEST_F(ReplClientTest, AFullResyncAdoptsTheMastersLayout) {
+  const encoding::ScopedKeyLayout restore(encoding::CurrentKeyLayout());
+  encoding::AdoptKeyLayout(encoding::KeyLayout::kSlotted);  // the master's data, in its layout
+  for (int i = 0; i < 10; ++i) Write({"HSET", "h" + std::to_string(i % 3), "f" + std::to_string(i), "v"});
+  Write({"SET", "s", "v", "EX", "1000"});
+  encoding::AdoptKeyLayout(encoding::KeyLayout::kSlotless);  // the replica starts slotless
+  StartClient();
+  Link l = AcceptLink();
+  const auto seen =
+      Handshake(l, "FULLRESYNC " + master_id() + " " + std::to_string(master_last()), "slotted");
+  ASSERT_GE(seen.size(), 2u);
+  EXPECT_EQ(seen[seen.size() - 2], (Args{"REPLCONF", "key-layout", "slotless"}));
+  const uint64_t s = SendSnapshot(l);
+  EXPECT_TRUE(WaitAck(l, s));
+  EXPECT_EQ(encoding::CurrentKeyLayout(), encoding::KeyLayout::kSlotted);
+  auto view = replica_storage.BeginRead();
+  ASSERT_TRUE(view.ok());
+  EXPECT_EQ(*(*view)->Get(ColumnFamily::kSys, "format_version"), "1");
+  EXPECT_EQ(test::DigestOf(replica.engine), test::DigestOf(master.services.engine_));
+}
+
 TEST_F(ReplClientTest, ARefusedPsyncGoesToBackoff) {
   StartClient();
   Link l = AcceptLink();
@@ -365,9 +445,10 @@ TEST_F(ReplClientTest, ARefusedPsyncGoesToBackoff) {
   Link l2 = AcceptLink();
   ASSERT_EQ(l2.Next(), (Args{"PING"}));
   l2.Send("+PONG\r\n");
-  for (int i = 0; i < 2; ++i) {
-    ASSERT_TRUE(l2.Next().has_value());
-    l2.Send("+OK\r\n");
+  for (int i = 0; i < 3; ++i) {
+    const auto cmd = l2.Next();
+    ASSERT_TRUE(cmd.has_value());
+    l2.Send(test::FakeMasterReply(*cmd));
   }
   ASSERT_EQ(l2.Next(), (Args{"PSYNC", "?", "1"}));
   l2.Send("-LOADING Redis is loading the dataset in memory\r\n");
@@ -502,7 +583,7 @@ TEST_F(ReplClientTest, StopIsPromptDuringConnectAndBackoff) {
   slow.backoff_initial = 30s;
   StartClient(slow);
   Link l = AcceptLink();
-  ASSERT_EQ(Handshake(l, "").size(), 4u);  // an unreadable PSYNC answer: now waiting 30 s before retrying
+  ASSERT_EQ(Handshake(l, "").size(), 5u);  // an unreadable PSYNC answer: now waiting 30 s before retrying
   ASSERT_TRUE(l.Closed());
   start = std::chrono::steady_clock::now();
   client->Stop();
