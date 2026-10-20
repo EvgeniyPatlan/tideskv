@@ -62,6 +62,7 @@ TEST(ReplicationBaselineIT, APreReplicationMasterNeverContinuesAnEmptyReplica) {
   auto c = master.Connect();
   ASSERT_NE(c, nullptr);
   EXPECT_EQ(c->Command({"GET", "old"}).str, "v");
+  ASSERT_EQ(DeclareSlotless(*c), "slotless");
   const RespValue r = c->Command({"PSYNC", "?", "1"});
   EXPECT_EQ(r.type, Type::kSimple);
   EXPECT_EQ(r.str.rfind("FULLRESYNC ", 0), 0u) << r.str;
@@ -73,6 +74,7 @@ TEST(ReplicationBaselineIT, APreReplicationMasterNeverContinuesAnEmptyReplica) {
   master.Restart();
   c = master.Connect();
   ASSERT_NE(c, nullptr);
+  ASSERT_EQ(DeclareSlotless(*c), "slotless");
   EXPECT_EQ(c->Command({"PSYNC", "?", "1"}).str.rfind("FULLRESYNC ", 0), 0u);
 }
 

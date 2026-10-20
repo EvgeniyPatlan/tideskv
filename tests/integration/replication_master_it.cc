@@ -55,6 +55,7 @@ TEST_F(ReplicationMasterIT, ContinueStreamsTheBacklogThenLiveBatches) {
   auto replica = Client();
   ASSERT_TRUE(replica->Send({"REPLCONF", "listening-port", "7777"}));
   ASSERT_EQ(replica->Read()->str, "OK");
+  ASSERT_EQ(DeclareSlotless(*replica), "slotless");
   // PSYNC and an ACK in one write: the ACK belongs to the stream and gets no reply.
   ASSERT_TRUE(replica->SendRaw(EncodeCommand({"PSYNC", id, std::to_string(last + 1)}) +
                                EncodeCommand({"REPLCONF", "ACK", std::to_string(last)})));
@@ -87,6 +88,7 @@ TEST_F(ReplicationMasterIT, FullResyncStreamsTheSnapshotThenTheTail) {
   auto replica = Client();
   ASSERT_TRUE(replica->Send({"REPLCONF", "listening-port", "7778"}));
   ASSERT_EQ(replica->Read()->str, "OK");
+  ASSERT_EQ(DeclareSlotless(*replica), "slotless");
   ASSERT_TRUE(replica->Send({"PSYNC", std::string(40, '0'), "1"}));
   const auto full = replica->Read();
   ASSERT_TRUE(full.has_value());
@@ -132,6 +134,7 @@ TEST(ReplicationLimitIT, ReplicaLinksCountAgainstMaxclients) {
   // At the limit (2 connections): the first link is handed off, leaving 1 connection + 1 link, and
   // the second fits too.
   for (auto& link : links) {
+    ASSERT_EQ(DeclareSlotless(*link), "slotless");
     const RespValue r = link->Command({"PSYNC", "?", "1"});
     ASSERT_EQ(r.str.rfind("CONTINUE ", 0), 0u) << r.str;
     if (&link == &links.front()) {
@@ -143,6 +146,7 @@ TEST(ReplicationLimitIT, ReplicaLinksCountAgainstMaxclients) {
     c = s.Connect();
     return c != nullptr && InfoField(*c, "clients", "connected_clients") == 1;
   }));
+  ASSERT_EQ(DeclareSlotless(*c), "slotless");
   const RespValue refused = c->Command({"PSYNC", "?", "1"});
   EXPECT_EQ(refused.type, Type::kError);
   EXPECT_EQ(refused.str, "ERR max number of clients reached");

@@ -148,18 +148,20 @@ TEST(PsyncCmd, ARefusalRepliesTheErrorWithoutAHandOff) {
   EXPECT_EQ(h.Run({"PING"}), "+PONG\r\n");
 }
 
-// Slotless key layout: a replica that declared no layout predates layouts (slotted, cannot adopt): a slotless
-// master refuses it. One that declared another layout always gets a full resynchronisation.
-TEST(PsyncCmd, TheKeyLayoutDecidesBetweenARefusalAndAFullResync) {
+// Slotless key layout: a replica that declared no layout predates layouts (slotted, cannot adopt; the manager
+// refuses it when slotless). One that declared another layout always gets a full resynchronisation.
+TEST(PsyncCmd, TheDeclaredKeyLayoutReachesThePsyncDecision) {
   {
     const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
     ReplHarness h;
     h.session.replica_handshake.key_layout.reset();
-    EXPECT_EQ(h.Run({"PSYNC", "?", "1"}), Err(kErrPsyncLayoutUnknown));
-    EXPECT_FALSE(h.session.takeover);
-    EXPECT_TRUE(h.services.replication_.psyncs.empty());
+    h.Run({"PSYNC", "?", "1"});
+    ASSERT_EQ(h.services.replication_.psyncs.size(), 1u);
+    EXPECT_TRUE(h.services.replication_.psyncs[0].pre_layout);
+    EXPECT_FALSE(h.services.replication_.psyncs[0].full_only);
     ReplHarness same;
     EXPECT_EQ(same.Run({"PSYNC", same.myid(), "4"}), "+CONTINUE " + same.myid() + "\r\n");
+    EXPECT_FALSE(same.services.replication_.psyncs[0].pre_layout);
     ReplHarness other;
     other.session.replica_handshake.key_layout = encoding::KeyLayout::kSlotted;
     EXPECT_EQ(other.Run({"PSYNC", other.myid(), "4"}), "+FULLRESYNC " + other.myid() + " 3\r\n");

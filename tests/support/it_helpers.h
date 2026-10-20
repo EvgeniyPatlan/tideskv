@@ -26,6 +26,12 @@ inline std::string InfoString(RespClient& c, const std::string& section, const s
   return info.substr(from, info.find("\r\n", from) - from);
 }
 
+// What a TidesKV replica sends before PSYNC (REPLCONF key-layout): a test acting as a replica of a standalone
+// (slotless) server declares the same layout, or the PSYNC is refused. The master's layout is the reply.
+inline std::string DeclareSlotless(RespClient& c) {
+  return c.Command({"REPLCONF", "key-layout", "slotless"}).str;
+}
+
 // Polls cond every 5 ms until it holds or `timeout` passes; its last value.
 inline bool WaitFor(const std::function<bool()>& cond,
                     std::chrono::milliseconds timeout = std::chrono::seconds(5)) {

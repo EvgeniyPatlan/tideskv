@@ -43,13 +43,12 @@ void Psync(ExecContext& ctx, const ArgList& argv) {
   }
   int64_t offset = 0;
   if (!ParseInt64(argv[2], &offset)) return ctx.reply.Error(kErrNotInteger);
-  // Slotless key layout: a replica that declared no layout is slotted and cannot adopt ours; one that
-  // declared another layout gets a full resynchronisation, which makes it adopt ours.
+  // Slotless key layout: a replica that declared another layout gets a full resynchronisation, which makes it
+  // adopt ours; one that declared none is slotted and cannot (a slotless master refuses it).
   const std::optional<encoding::KeyLayout> layout = s.replica_handshake.key_layout;
-  if (!layout && encoding::Slotless()) return ctx.reply.Error(kErrPsyncLayoutUnknown);
   Replication& repl = ctx.server.replication();
   const repl::PsyncRequest req{argv[1], offset < 0 ? 0 : static_cast<uint64_t>(offset),
-                               layout && *layout != encoding::CurrentKeyLayout()};
+                               layout && *layout != encoding::CurrentKeyLayout(), !layout};
   const PsyncResult r = repl.HandlePsync(req, PeerOf(s));
   if (!r.error.empty()) return ctx.reply.Error(r.error);  // maxclients (F4), a replica (F8): no hand-off
   if (r.decision == repl::PsyncDecision::kFullResync) {

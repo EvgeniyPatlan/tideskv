@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 #include "exec/repl_log.h"
 #include "repl/backlog_trimmer.h"
@@ -102,6 +103,25 @@ struct ManagerTest : ::testing::Test {
   ReplLog log{storage, clock};
   ReplIdentity id;
 };
+
+// Slotless key layout: a replica that sent no key-layout predates layouts (slotted): a slotless master
+// refuses it before anything else happens; a slotted master serves it as before.
+TEST_F(ManagerTest, ASlotlessMasterRefusesAPreLayoutReplica) {
+  const encoding::ScopedKeyLayout restore(encoding::CurrentKeyLayout());
+  encoding::AdoptKeyLayout(encoding::KeyLayout::kSlotless);
+  auto m = Make();
+  repl::PsyncRequest old{id.replid, 2};
+  old.pre_layout = true;
+  const PsyncResult refused = m->HandlePsync(old, {});
+  EXPECT_EQ(refused.error, kErrPsyncLayoutUnknown);
+  EXPECT_EQ(m->HandlePsync({id.replid, 2}, {}).decision, PsyncDecision::kContinue);
+  repl::PsyncRequest other{id.replid, 2, /*full_only=*/true};
+  EXPECT_EQ(m->HandlePsync(other, {}).decision, PsyncDecision::kFullResync);
+  encoding::AdoptKeyLayout(encoding::KeyLayout::kSlotted);
+  const PsyncResult served = m->HandlePsync(old, {});
+  EXPECT_TRUE(served.error.empty()) << served.error;
+  EXPECT_EQ(served.decision, PsyncDecision::kContinue);
+}
 
 TEST_F(ManagerTest, IsAMaster) {
   auto m = Make();

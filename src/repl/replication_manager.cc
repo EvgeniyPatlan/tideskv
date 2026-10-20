@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "common/string_util.h"
+#include "encoding/key_layout.h"
 #include "repl/repl_errors.h"
 #include "types/errors.h"
 
@@ -68,6 +69,9 @@ PsyncResult ReplicationManager::HandlePsync(const PsyncRequest& req, const Repli
     // PSYNC that is refused anyway (a refusal that only arises meanwhile costs an early activation).
     PsyncResult refused;
     refused.error = Refusal();
+    if (refused.error.empty() && req.pre_layout && encoding::Slotless()) {
+      refused.error = std::string(kErrPsyncLayoutUnknown);  // it would load our keys in its slotted layout
+    }
     if (!refused.error.empty()) return refused;
     if (Status st = log_.Activate(); !st.ok()) {
       spdlog::error("activating the replication log failed: {}", st.ToString());

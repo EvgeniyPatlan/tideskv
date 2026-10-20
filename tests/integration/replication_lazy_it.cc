@@ -118,6 +118,7 @@ TEST(ReplicationLazyIT, LazyNoKeepsTheLogActiveFromTheStart) {
   EXPECT_EQ(InfoField(*m, "replication", "repl_backlog_first_byte_offset"), 1);
   EXPECT_EQ(InfoField(*m, "replication", "repl_backlog_histlen"),
             InfoField(*m, "replication", "master_repl_offset"));
+  ASSERT_EQ(DeclareSlotless(*m), "slotless");
   const RespValue r = m->Command({"PSYNC", "?", "1"});  // an empty replica continues a full log
   EXPECT_EQ(r.str.rfind("CONTINUE", 0), 0u) << r.str;
 }
