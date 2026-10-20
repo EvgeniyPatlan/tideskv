@@ -5,22 +5,27 @@
 
 #include <cmath>
 
+#include "encoding/key_layout.h"
+
 namespace tideskv::encoding {
 namespace {
 
 TEST(ObjectCodec, PrefixIsElevenBytesDbSlotOid) {
-  EXPECT_EQ(SubkeyPrefix(1, 42, 9).size(), kObjectPrefixSize);
-  EXPECT_EQ(ZScorePrefix(1, 42, 9).size(), kObjectPrefixSize);
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
+  EXPECT_EQ(SubkeyPrefix(1, 42, 9).size(), kSlottedObjectPrefixSize);
+  EXPECT_EQ(ZScorePrefix(1, 42, 9).size(), kSlottedObjectPrefixSize);
   EXPECT_EQ(SubkeyPrefix(2, 0x0102, 0x0A), std::string("\x02\x01\x02\0\0\0\0\0\0\0\x0A", 11));
 }
 
 TEST(ObjectCodec, SubkeyStartsWithItsPrefixAndDbPrefix) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   const std::string enc = EncodeSubkey(4, 3, 42, "name");
   EXPECT_EQ(enc.rfind(SubkeyPrefix(4, 3, 42), 0), 0u);
   EXPECT_EQ(enc[0], '\x04');  // FLUSHDB's DeletePrefix([db]) covers it
 }
 
 RC_GTEST_PROP(ObjectCodecProp, SubkeyRoundTrips, (uint64_t oid, std::string field)) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   const std::string enc = EncodeSubkey(0, 100, oid, field);
   Subkey sk;
   RC_ASSERT(DecodeSubkey(enc, &sk));
@@ -31,12 +36,14 @@ RC_GTEST_PROP(ObjectCodecProp, SubkeyRoundTrips, (uint64_t oid, std::string fiel
 
 // Deleting object A by prefix must never touch object B.
 RC_GTEST_PROP(ObjectCodecProp, DistinctOidsNeverSharePrefix, (uint64_t a, uint64_t b, std::string field)) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   RC_PRE(a != b);
   RC_ASSERT(EncodeSubkey(0, 7, a, field).rfind(SubkeyPrefix(0, 7, b), 0) != 0u);
 }
 
 RC_GTEST_PROP(ObjectCodecProp, ZScoreOrdersByScoreThenMember,
               (double s1, double s2, std::string m1, std::string m2)) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   RC_PRE(!std::isnan(s1) && !std::isnan(s2));
   const std::string k1 = EncodeZScoreKey(0, 1, 9, s1, m1);
   const std::string k2 = EncodeZScoreKey(0, 1, 9, s2, m2);
@@ -50,6 +57,7 @@ RC_GTEST_PROP(ObjectCodecProp, ZScoreOrdersByScoreThenMember,
 }
 
 TEST(ObjectCodec, ZScoreRoundTrips) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   const std::string enc = EncodeZScoreKey(3, 5, 77, -2.5, std::string("m\0x", 3));
   ZScoreKey zk;
   ASSERT_TRUE(DecodeZScoreKey(enc, &zk));
@@ -61,6 +69,7 @@ TEST(ObjectCodec, ZScoreRoundTrips) {
 }
 
 TEST(ObjectCodec, DecodeRejectsShortInput) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   Subkey sk;
   ZScoreKey zk;
   EXPECT_FALSE(DecodeSubkey("short", &sk));
@@ -68,6 +77,7 @@ TEST(ObjectCodec, DecodeRejectsShortInput) {
 }
 
 TEST(ObjectCodec, ListIndexOrderingAndRoundTrip) {
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   EXPECT_LT(EncodeListIndex(kListInitialIndex - 1), EncodeListIndex(kListInitialIndex));
   uint64_t idx = 0;
   ASSERT_TRUE(DecodeListIndex(EncodeListIndex(kListInitialIndex + 5), &idx));
@@ -76,6 +86,7 @@ TEST(ObjectCodec, ListIndexOrderingAndRoundTrip) {
 }
 
 TEST(ObjectCodec, PeeksAndRewritesTheOidOfSubkeyAndZscoreKeys) {  // M7b D2
+  const ScopedKeyLayout slotted(KeyLayout::kSlotted);
   std::string sub = EncodeSubkey(0, 3300, 42, "field");
   uint64_t oid = 0;
   ASSERT_TRUE(PeekObjectOid(sub, &oid));

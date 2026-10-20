@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <set>
 
-#include "common/crc16.h"
+#include "encoding/key_layout.h"
 #include "types/collection.h"
 #include "types/object_store.h"
 
@@ -114,7 +114,7 @@ Result<int64_t> SetCombineStore(WriteTxn& txn, OidAllocator& oids, uint8_t db, S
   Collection c;
   c.db = db;
   c.key = std::string(dst);
-  c.slot = KeySlot(dst);
+  c.slot = encoding::LayoutSlot(dst);
   if (Status st = InitCollection(&c, kSet, oids); !st.ok()) return st;
   for (const std::string& m : *members) {
     if (Status st = txn.Put(ColumnFamily::kSubkey, c.SubkeyFor(m), {}); !st.ok()) return st;

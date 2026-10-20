@@ -8,6 +8,7 @@
 #include "encoding/key_codec.h"
 #include "encoding/meta_codec.h"
 #include "encoding/object_codec.h"
+#include "support/key_layout_skip.h"
 #include "types/object_store.h"
 
 namespace tideskv::migrate {
@@ -52,6 +53,7 @@ Metadata Hash(uint64_t oid, int64_t expire_ms) {
 }
 
 TEST(MigrateFrames, ClassifiesKeyspaceOpsBySlot) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   EXPECT_EQ(ClassifyOp(Put(kMeta, encoding::MetaKeyFor(0, "b"), "x"), kB), OpClass::kInRange);
   EXPECT_EQ(ClassifyOp(Put(kMeta, encoding::MetaKeyFor(0, "foo"), "x"), kB), OpClass::kOutside);
   EXPECT_EQ(ClassifyOp(Put(kMeta, encoding::MetaKeyFor(3, "b"), "x"), kB), OpClass::kOutside);  // db 3
@@ -70,6 +72,7 @@ TEST(MigrateFrames, ClassifiesKeyspaceOpsBySlot) {
 }
 
 TEST(MigrateFrames, FlushOpsCancelAndOtherRangeDeletesAreIgnored) {  // D10, Writer's note 2
+  TIDESKV_SKIP_IF_SLOTLESS();
   for (ColumnFamily cf : {kMeta, kSubkey, kZScore, kExpire}) {
     EXPECT_EQ(ClassifyOp(DelPrefix(cf, encoding::DbPrefix(0)), kB), OpClass::kFlush);  // FLUSHDB
     EXPECT_EQ(ClassifyOp(DelRange(cf, encoding::DbPrefix(0), encoding::DbPrefix(16)), kB),
@@ -98,6 +101,7 @@ TEST(MigrateFrames, FlushOpsCancelAndOtherRangeDeletesAreIgnored) {  // D10, Wri
 }
 
 TEST(MigrateFrames, RemapsEveryOidSite) {  // D2 step 4
+  TIDESKV_SKIP_IF_SLOTLESS();
   Counter c;
   OidRemap remap(c.Fn());
   auto sub = RemapOp(Put(kSubkey, encoding::EncodeSubkey(0, 3300, 42, "f"), "v"), remap);
@@ -143,6 +147,7 @@ TEST(MigrateFrames, RemapsEveryOidSite) {  // D2 step 4
 }
 
 TEST(MigrateFrames, ADelPrefixOfAnUnseenOidIsDropped) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   Counter c;
   OidRemap remap(c.Fn());
   auto dp = RemapOp(DelPrefix(kSubkey, encoding::SubkeyPrefix(0, 3300, 77)), remap);
@@ -153,6 +158,7 @@ TEST(MigrateFrames, ADelPrefixOfAnUnseenOidIsDropped) {
 }
 
 TEST(MigrateFrames, AllocationIsLazyAndOrderIndependent) {  // a batch puts subkeys before the meta
+  TIDESKV_SKIP_IF_SLOTLESS();
   Counter c;
   OidRemap remap(c.Fn());
   auto sub = RemapOp(Put(kSubkey, encoding::EncodeSubkey(0, 3300, 42, "f"), "v"), remap);
@@ -164,12 +170,14 @@ TEST(MigrateFrames, AllocationIsLazyAndOrderIndependent) {  // a batch puts subk
 }
 
 TEST(MigrateFrames, AFailedAllocationFailsTheOp) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   OidRemap remap([]() -> Result<uint64_t> { return Status::IOError("lease failed"); });
   auto sub = RemapOp(Put(kSubkey, encoding::EncodeSubkey(0, 3300, 42, "f"), "v"), remap);
   EXPECT_EQ(sub.status().code(), StatusCode::kIOError);
 }
 
 TEST(MigrateFrames, DerivesTheExpireEntryOfAMetaWithATtl) {  // D2 step 5
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto coll = DerivedExpire(Put(kMeta, encoding::MetaKeyFor(0, "b"), EncodeMetadata(Hash(1000, 9000))));
   ASSERT_TRUE(coll.ok() && coll->has_value());
   EXPECT_EQ(**coll, Put(kExpire, encoding::ExpireKeyFor(0, 9000, "b"), ExpireValue(1000)));
@@ -186,6 +194,7 @@ TEST(MigrateFrames, DerivesTheExpireEntryOfAMetaWithATtl) {  // D2 step 5
 }
 
 TEST(MigrateFrames, TheImporterAcceptsOnlyInRangeKeyspaceOps) {  // D2 step 2
+  TIDESKV_SKIP_IF_SLOTLESS();
   EXPECT_TRUE(CheckImportOp(Put(kMeta, encoding::MetaKeyFor(0, "b"), "x"), kB).ok());
   EXPECT_TRUE(CheckImportOp(Del(kSubkey, encoding::EncodeSubkey(0, 3300, 1, "f")), kB).ok());
   EXPECT_TRUE(CheckImportOp(Put(kExpire, encoding::ExpireKeyFor(0, 1, "b"), ExpireValue(1)), kB).ok());
@@ -199,6 +208,7 @@ TEST(MigrateFrames, TheImporterAcceptsOnlyInRangeKeyspaceOps) {  // D2 step 2
 }
 
 TEST(MigrateFrames, ChunksRespectTheByteBudgetAndRoundTrip) {  // D3
+  TIDESKV_SKIP_IF_SLOTLESS();
   std::vector<ReplOp> ops;
   for (int i = 0; i < 10; ++i) {  // each 20 + 14 + 16 = 50 budget bytes
     ops.push_back(Put(kMeta, std::string(20, static_cast<char>('a' + i)), std::string(14, 'v')));

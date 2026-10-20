@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/replog_codec.h"
 #include "storage/memory_storage.h"
 
@@ -65,6 +66,7 @@ TEST(RecordingTxn, SavepointRollbackForgetsLaterDeletes) {
 }
 
 TEST(RecordingTxn, CountsWritesAndDecodesMetaKeys) {
+  const encoding::ScopedKeyLayout slotted(encoding::KeyLayout::kSlotted);  // "\x01" is a key when slotless
   InMemoryStorage s;
   auto inner = s.BeginWrite();
   RecordingTxn txn(**inner);

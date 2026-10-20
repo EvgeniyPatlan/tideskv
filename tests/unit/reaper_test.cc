@@ -16,6 +16,7 @@
 #include "exec/engine.h"
 #include "exec/lock_manager.h"
 #include "support/command_harness.h"
+#include "support/key_layout_skip.h"
 #include "types/errors.h"
 #include "types/object_store.h"
 
@@ -343,6 +344,7 @@ TEST_F(ReaperTest, AFencedReplicaReapsNothingAndStaysQuiet) {
 }
 
 TEST(Reaper, LeavesTheSlotsItIsToldToSkip) {  // M7b D20
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ASSERT_EQ(h.Run({"SET", "b", "v", "PX", "10"}), kOk);    // slot 3300
   ASSERT_EQ(h.Run({"SET", "foo", "v", "PX", "10"}), kOk);  // slot 12182

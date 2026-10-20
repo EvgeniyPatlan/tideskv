@@ -14,6 +14,7 @@
 #include "cluster/cluster_errors.h"
 #include "cluster/migration_record.h"
 #include "repl/backlog_trimmer.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
 #include "types/keyspace.h"
@@ -28,6 +29,7 @@ using cluster::MigrateState;
 // the instant before the barrier) is on the target after success; a write during the fence answers TRYAGAIN
 // and is applied nowhere.
 TEST(SlotMigratorTest, AWriteJustBeforeTheFenceReachesTheTarget) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(
       p.source.services.config_.Set("migrate-sequence-gap", "1", true).ok());  // force a catch-up round
@@ -67,6 +69,7 @@ TEST(SlotMigratorTest, AWriteJustBeforeTheFenceReachesTheTarget) {
 }
 
 TEST(SlotMigratorTest, StageErrorsFailTheJobAndLowerTheFence) {  // KM §2.3
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   p.source_cluster.transport =
       [](const std::string&, uint16_t, std::chrono::milliseconds,
@@ -88,6 +91,7 @@ TEST(SlotMigratorTest, StageErrorsFailTheJobAndLowerTheFence) {  // KM §2.3
 }
 
 TEST(SlotMigratorTest, ACancelFailsTheJobAndTellsTheTarget) {  // D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   migrate::SlotMigrator::Hooks hooks;
@@ -103,6 +107,7 @@ TEST(SlotMigratorTest, ACancelFailsTheJobAndTellsTheTarget) {  // D10
 // Kvrocks parity (was D27): a cancel (a FLUSH or a demotion) that lands before the link connects still
 // starts the import on the target and then fails it there, so the target shows error, as Kvrocks does.
 TEST(SlotMigratorTest, ACancelBeforeTheLinkConnectsStillTellsTheTarget) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   p.source_cluster.transport =
       [&p](const std::string&, uint16_t, std::chrono::milliseconds,
@@ -120,6 +125,7 @@ TEST(SlotMigratorTest, ACancelBeforeTheLinkConnectsStillTellsTheTarget) {
 
 // Only a Stop (shutdown) skips the target: it aborts the connect, and a link it raced is never used.
 TEST(SlotMigratorTest, AStopDuringTheConnectNeverContactsTheTarget) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   std::future<void> stopper;
   p.source_cluster.transport =
@@ -160,6 +166,7 @@ void ExpectFailedAfterTheFence(MigrationPair& p) {
 }
 
 TEST(SlotMigratorTest, ACancelDuringTheFenceFailsTheJobBeforeImportEnd) {  // D10: the check before IMPORT 1
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   bool was_fenced = false;
@@ -180,6 +187,7 @@ TEST(SlotMigratorTest, ACancelDuringTheFenceFailsTheJobBeforeImportEnd) {  // D1
 // the job up front (Task 11's OnFlush, FlushDuringMigration.* in cmd_clusterx_migrate_test.cc), which would
 // end it before the fence and leave this path unreached.
 TEST(SlotMigratorTest, AFlushInTheFinalDeltaFailsTheJob) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   Status flushed = Status::IOError("not run");
@@ -198,6 +206,7 @@ TEST(SlotMigratorTest, AFlushInTheFinalDeltaFailsTheJob) {
 }
 
 TEST(SlotMigratorTest, AFailedImportEndFailsTheJobAndLowersTheFence) {  // KM §2.3, D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   p.source_cluster.transport =
       [&p](const std::string&, uint16_t, std::chrono::milliseconds,
@@ -213,6 +222,7 @@ TEST(SlotMigratorTest, AFailedImportEndFailsTheJobAndLowersTheFence) {  // KM §
 // Final review I2: the fail record's write fails once (the source's storage refuses it); the worker retries
 // it, as RunCleanup does, so the fence and the start block do not stay until a restart.
 TEST(SlotMigratorTest, AFailRecordThatCannotBeWrittenIsRetriedOnTheWorker) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p(std::chrono::seconds(10), /*failure_retry=*/10ms);
   p.source_cluster.transport =
       [&p](const std::string&, uint16_t, std::chrono::milliseconds,
@@ -240,6 +250,7 @@ TEST(SlotMigratorTest, AFailRecordThatCannotBeWrittenIsRetriedOnTheWorker) {
 // The fence Mutate finds the range fenced already (it moves no fence and reports no seq): the final delta
 // still ships every write acknowledged before that earlier fence.
 TEST(SlotMigratorTest, AnAlreadyFencedRangeStillShipsItsFinalDelta) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "snapshot"}), kOk);
   SecondClient writer(p.source);
@@ -259,6 +270,7 @@ TEST(SlotMigratorTest, AnAlreadyFencedRangeStillShipsItsFinalDelta) {
 }
 
 TEST(SlotMigratorTest, AFlushSeenInTheCatchUpCancelsTheJob) {  // D2, D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-sequence-gap", "1", true).ok());
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
@@ -271,6 +283,7 @@ TEST(SlotMigratorTest, AFlushSeenInTheCatchUpCancelsTheJob) {  // D2, D10
 }
 
 TEST(SlotMigratorTest, TheBacklogPinFollowsTheJob) {  // D19
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   migrate::SlotMigrator& migrator = p.source_migration().migrator();
@@ -289,6 +302,7 @@ TEST(SlotMigratorTest, TheBacklogPinFollowsTheJob) {  // D19
 }
 
 TEST(SlotMigratorTest, ABacklogTrimmedPastTheJobFailsIt) {  // D19, D24.4
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-sequence-gap", "1", true).ok());
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
@@ -306,6 +320,7 @@ TEST(SlotMigratorTest, ABacklogTrimmedPastTheJobFailsIt) {  // D19, D24.4
 }
 
 TEST(SlotMigratorTest, TheDelayKnobHoldsTheSnapshotPhaseAndTheFence) {  // D25
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "200", true).ok());
   const auto start = std::chrono::steady_clock::now();
@@ -314,6 +329,7 @@ TEST(SlotMigratorTest, TheDelayKnobHoldsTheSnapshotPhaseAndTheFence) {  // D25
 }
 
 TEST(SlotMigratorTest, OneJobAtATimeAndStopEndsAJobAtOnce) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   auto done = std::make_shared<std::promise<Status>>();

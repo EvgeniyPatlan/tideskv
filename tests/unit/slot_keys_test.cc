@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "support/command_harness.h"
+#include "support/key_layout_skip.h"
 
 namespace tideskv::test {
 namespace {
@@ -23,6 +24,7 @@ bool Empty(CommandHarness& h) {
 }
 
 TEST(SlotKeys, DbZeroKeysAreNotOutsideAndAnyKeyMakesTheKeyspaceNonEmpty) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   EXPECT_TRUE(Empty(h));
   EXPECT_FALSE(Outside(h));
@@ -35,6 +37,7 @@ TEST(SlotKeys, DbZeroKeysAreNotOutsideAndAnyKeyMakesTheKeyspaceNonEmpty) {
 }
 
 TEST(SlotKeys, CountAndListOneSlotOfDbZeroInKeyOrder) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   for (const char* k : {"{b}2", "b", "{b}1", "foo"}) ASSERT_EQ(h.Run({"SET", k, "v"}), kOk);
   ASSERT_EQ(h.Run({"SELECT", "1"}), kOk);

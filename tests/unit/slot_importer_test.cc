@@ -16,6 +16,7 @@
 #include "encoding/meta_codec.h"
 #include "expire/reaper.h"
 #include "migrate/migrate_frames.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
 #include "types/object_store.h"
@@ -45,6 +46,7 @@ uint64_t OidOf(CommandHarness& h, const std::string& key) {
 // Review Focus #2: a TTL'd collection and string migrated mid-life keep their exact deadlines, and the
 // target's reaper reaps them: their expire entries carry the target's oids.
 TEST(SlotImporterTest, AnImportedCollectionWithATtlIsReapedOnTheTarget) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.target.Run({"HSET", "{foo}pad", "f", "v"}), Int(1));  // the target's oids are already in use
   ASSERT_EQ(p.source.Run({"HSET", "{b}h", "f1", "v1", "f2", "v2"}), Int(2));
@@ -74,6 +76,7 @@ TEST(SlotImporterTest, AnImportedCollectionWithATtlIsReapedOnTheTarget) {
 }
 
 TEST(SlotImporterTest, ImportStartErasesTheRangeAndPublishesStart) {  // D14
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.target.services.engine_
                   .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
@@ -93,6 +96,7 @@ TEST(SlotImporterTest, ImportStartErasesTheRangeAndPublishesStart) {  // D14
 }
 
 TEST(SlotImporterTest, EveryTypeArrivesIntactAndTheDigestsMatch) {  // D2 remap at every site
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.target.Run({"SADD", "{foo}pad", "x"}), Int(1));
   ASSERT_EQ(p.source.Run({"ZADD", "{b}z", "1.5", "m1", "-2", "m2"}), Int(2));
@@ -116,6 +120,7 @@ TEST(SlotImporterTest, EveryTypeArrivesIntactAndTheDigestsMatch) {  // D2 remap 
 }
 
 TEST(SlotImporterTest, SuccessServesTheRangeAndFailureErasesIt) {  // D14
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_EQ(p.source.Run({"SET", "bar", "2"}), kOk);  // 5061
@@ -138,6 +143,7 @@ TEST(SlotImporterTest, SuccessServesTheRangeAndFailureErasesIt) {  // D14
 // acked IMPORT <R> 1 when it cannot record its success. The target erases its copy and stops serving it, so
 // two masters never accept writes for R.
 TEST(SlotImporterTest, AFailAfterASuccessErasesTheImportedCopy) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_EQ(p.source.Run({"SET", "{b}t", "v", "PX", "60000"}), kOk);
@@ -165,6 +171,7 @@ TEST(SlotImporterTest, AFailAfterASuccessErasesTheImportedCopy) {
 // I1's guard: once a push granted R to this node, CheckImportable refuses IMPORT <R> 2, so owned data is
 // never erased.
 TEST(SlotImporterTest, AFailAfterAGrantedPushIsRefusedAndKeepsTheData) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   SecondClient link(p.target);
@@ -185,6 +192,7 @@ TEST(SlotImporterTest, AFailAfterAGrantedPushIsRefusedAndKeepsTheData) {
 }
 
 TEST(SlotImporterTest, LinkLossWhileStartErasesAndReportsError) {  // D14, gocase: gone within 100 ms
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   SecondClient link(p.target);
@@ -206,6 +214,7 @@ TEST(SlotImporterTest, LinkLossWhileStartErasesAndReportsError) {  // D14, gocas
 }
 
 TEST(SlotImporterTest, KvrocksRefusalsAndTexts) {  // cluster.cc:348-404, slot_import.cc
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   SecondClient link(p.target);
   EXPECT_EQ(link.Run({"CLUSTER", "IMPORT", "12182", "0"}), Err(cluster::kErrImportOwnSlot));
@@ -228,6 +237,7 @@ TEST(SlotImporterTest, KvrocksRefusalsAndTexts) {  // cluster.cc:348-404, slot_i
 }
 
 TEST(SlotImporterTest, ImportDataOutsideTheImportLinkIsRefused) {  // D14
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   SecondClient link(p.target);
   EXPECT_EQ(link.Run({"CLUSTER", "IMPORTDATA", "x"}), Err(cluster::kErrNotImportLink));
@@ -237,6 +247,7 @@ TEST(SlotImporterTest, ImportDataOutsideTheImportLinkIsRefused) {  // D14
 }
 
 TEST(SlotImporterTest, ImportIsAWriteForReadonlyAndClientPause) {  // D14, M7a D21
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   SecondClient link(p.target);
   p.target.services.replication_.set_role(ReplRole::kReplica);
@@ -250,6 +261,7 @@ TEST(SlotImporterTest, ImportIsAWriteForReadonlyAndClientPause) {  // D14, M7a D
 }
 
 TEST(SlotImporterTest, AnOpOutsideTheRangeFailsTheImport) {  // D2 step 2
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "bar", "1"}), kOk);  // 5061
   SecondClient link(p.target);
@@ -264,6 +276,7 @@ TEST(SlotImporterTest, AnOpOutsideTheRangeFailsTheImport) {  // D2 step 2
 }
 
 TEST(SlotImporterTest, AnOverlappingImportReleasesMyMigratedRangeAndBlock) {  // D14 step 3, D15
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;  // A migrated 3300 to B, B owns it now, and B migrates it back to A
   const std::string b_owns = kNodeA + " 127.0.0.1 7000 master - 0-3299 3301-8191\n" + kNodeB +
                              " 127.0.0.1 7001 master - 3300 8192-16383\n" + kNodeC +
@@ -290,6 +303,7 @@ TEST(SlotImporterTest, AnOverlappingImportReleasesMyMigratedRangeAndBlock) {  //
 // Task 2 review: RemapOp passes a malformed collection meta through unremapped; DerivedExpire rejects it, so
 // the import fails instead of storing a source oid. The chunk is applied all or nothing.
 TEST(SlotImporterTest, AMalformedMetaFailsTheImport) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   encoding::Metadata hash;
   hash.type = encoding::ValueType::kHash;
@@ -311,6 +325,7 @@ TEST(SlotImporterTest, AMalformedMetaFailsTheImport) {
 
 // Writer's note 7: FLUSH* on the target fails a running import on the worker (erase + error).
 TEST(SlotImporterTest, AFlushFailsTheRunningImportOnTheWorker) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   SecondClient link(p.target);
@@ -339,6 +354,7 @@ std::shared_ptr<std::atomic<bool>> BlockWorker(migrate::MigrationService& m) {
 // erase a promotion's restore posts, before it erases its range, so that erase never lands after the new
 // import's chunks.
 TEST(SlotImporterTest, ImportStartWaitsForAPromotionsHalfImportEraseBeforeErasing) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.target.services.engine_
                   .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
@@ -375,6 +391,7 @@ TEST(SlotImporterTest, ImportStartWaitsForAPromotionsHalfImportEraseBeforeErasin
 // Controller ruling S2(b): an overlapping cleanup is waited for on the worker; IMPORT start proceeds once it
 // is done.
 TEST(SlotImporterTest, ImportStartWaitsForAnOverlappingCleanup) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   migrate::MigrationService& m = p.target_migration();
   ASSERT_TRUE(m.Mutate([](cluster::SlotStates& s) { s.cleanup.push_back({3300, 3300}); }).ok());
@@ -392,6 +409,7 @@ TEST(SlotImporterTest, ImportStartWaitsForAnOverlappingCleanup) {
 }
 
 TEST(SlotImporterTest, ACleanupThatNeverEndsAnswersCleanupPending) {  // S2(b)
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   migrate::MigrationService& m = p.target_migration();
   ASSERT_TRUE(m.Mutate([](cluster::SlotStates& s) { s.cleanup.push_back({3300, 3301}); }).ok());
@@ -405,6 +423,7 @@ TEST(SlotImporterTest, ACleanupThatNeverEndsAnswersCleanupPending) {  // S2(b)
 // Fix round 1 (Task 12): a demotion fails the import on the worker, which may be busy; meanwhile IMPORTDATA
 // on the old link is refused and applies nothing (a replica has one committer). The data is kept (no erase).
 TEST(SlotImporterTest, ImportDataIsRefusedOnceTheTargetIsDemoted) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   const std::vector<std::string> chunks = RangeChunks(p.source, {3300, 3300});
@@ -433,6 +452,7 @@ TEST(SlotImporterTest, ImportDataIsRefusedOnceTheTargetIsDemoted) {
 }
 
 TEST(SlotImporterTest, TheReaperLeavesAnImportingSlotAlone) {  // D20: clock skew must not corrupt an import
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1", "PX", "10"}), kOk);
   SecondClient link(p.target);
@@ -451,6 +471,7 @@ TEST(SlotImporterTest, TheReaperLeavesAnImportingSlotAlone) {  // D20: clock ske
 }
 
 TEST(SlotImporterTest, AFailureRecordOnTheWorkerWaitsForClientUnpause) {  // D9, ruling S5
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   SecondClient link(p.target);

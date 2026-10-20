@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_errors.h"
 #include "support/controller_info.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 
 namespace tideskv::test {
@@ -29,6 +30,7 @@ std::string InfoOf(CommandHarness& h) {
 }
 
 TEST(MigrationTransitions, ASlotOnlyReassignmentMidJobCancelsItAndKeepsTheData) {  // D7, D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
@@ -45,6 +47,7 @@ TEST(MigrationTransitions, ASlotOnlyReassignmentMidJobCancelsItAndKeepsTheData) 
 }
 
 TEST(MigrationTransitions, AnUnrelatedPushChangesNothing) {  // D7: never cancel on the controller's v+1
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "300", true).ok());
   auto done = std::make_shared<std::promise<Status>>();
@@ -57,6 +60,7 @@ TEST(MigrationTransitions, AnUnrelatedPushChangesNothing) {  // D7: never cancel
 }
 
 TEST(MigrationTransitions, ADemotionStopsTheJobAndClearsTheStates) {  // D7, gocase TestSlotMigrateThreeNodes
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   auto done = std::make_shared<std::promise<Status>>();
@@ -82,6 +86,7 @@ TEST(MigrationTransitions, ADemotionStopsTheJobAndClearsTheStates) {  // D7, goc
 
 TEST(MigrationTransitions,
      TheSuccessBlockSurvivesEveryPushUnderTheControllersParser) {  // D15, Review Focus #5
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
   for (int64_t v : {2, 3}) {
@@ -100,6 +105,7 @@ TEST(MigrationTransitions,
 // shortened here, times out) and releases the migrated entry. The transition must then not clean R up: it
 // holds the import's (non-empty) data.
 TEST(MigrationTransitions, AnImportThatLandsBeforeTheTransitionKeepsItsData) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p(100ms);
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
@@ -127,6 +133,7 @@ TEST(MigrationTransitions, AnImportThatLandsBeforeTheTransitionKeepsItsData) {
 }
 
 TEST(MigrationTransitions, TheCleanupWaitsWhileClientsArePaused) {  // D9, M7a D21: sequence holds still
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());
@@ -142,6 +149,7 @@ TEST(MigrationTransitions, TheCleanupWaitsWhileClientsArePaused) {  // D9, M7a D
 }
 
 TEST(MigrationTransitions, TheSuccessRecordWaitsWhileClientsArePaused) {  // D9, ruling S5
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   std::atomic<uint64_t> seq{0};
@@ -185,6 +193,7 @@ const std::string kSwapped = kNodeA + " 127.0.0.1 7000 slave " + kNodeC + "\n" +
 // D9 + D10 (fix round 1): a manual failover pauses the source while its success publish waits; the demotion
 // still stops the job, and the replica publishes no migrated range at UNPAUSE.
 TEST(MigrationTransitions, ADemotionWhileTheSuccessRecordWaitsStopsTheJob) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   migrate::SlotMigrator::Hooks hooks;
@@ -215,6 +224,7 @@ TEST(MigrationTransitions, ADemotionWhileTheSuccessRecordWaitsStopsTheJob) {
 }
 
 TEST(MigrationTransitions, ADemotionWhileATransitionWaitsForUnpauseReleasesTheWorker) {  // D9, fix round 1
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());

@@ -7,6 +7,7 @@
 #include "encoding/replog_codec.h"
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
+#include "support/key_layout_skip.h"
 #include "types/oid_allocator.h"
 #include "types/slot_keys.h"
 
@@ -122,6 +123,7 @@ TEST(FullSyncFrames, BetweenKeysRunsPerKeyAndItsErrorEndsTheWalk) {
 
 // M7b D2: the migrator's walk — meta, subkey, zscore of one slot range, no expire CF, no sys record.
 TEST(SnapshotChunker, AWalkBoundedToASlotRangeSkipsOtherSlotsTheExpireCfAndSys) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   test::CommandHarness h;
   ASSERT_EQ(h.Run({"SET", "b", "1", "PX", "100000"}), test::kOk);  // slot 3300, with a TTL
   ASSERT_EQ(h.Run({"HSET", "{b}h", "f", "v"}), test::Int(1));
@@ -156,6 +158,7 @@ TEST(SnapshotChunker, AWalkBoundedToASlotRangeSkipsOtherSlotsTheExpireCfAndSys) 
 }
 
 TEST(SnapshotChunker, SetMaxBytesSplitsTheNextChunks) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   test::CommandHarness h;
   for (int i = 0; i < 20; ++i)
     ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), std::string(100, 'v')}), test::kOk);
@@ -179,6 +182,7 @@ TEST(SnapshotChunker, SetMaxBytesSplitsTheNextChunks) {
 }
 
 TEST(SlotKeys, SlotRangeBoundsCoverTheLastSlot) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   const IterOptions b = SlotRangeBounds(16380, 16383);
   EXPECT_EQ(b.lower, encoding::MetaSlotPrefix(0, 16380));
   EXPECT_EQ(b.upper, std::string("\x00\x40\x00", 3));

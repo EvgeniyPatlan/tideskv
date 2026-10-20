@@ -16,6 +16,7 @@
 
 #include "cluster/migration_record.h"
 #include "support/cluster_harness.h"
+#include "support/key_layout_skip.h"
 #include "types/errors.h"
 
 namespace tideskv::test {
@@ -69,6 +70,7 @@ struct ServiceTest : ::testing::Test {
 };
 
 TEST_F(ServiceTest, MutateFencesPersistsThePersistedPartAndPublishes) {  // D8
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto svc = Make();
   ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {
                    s.job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, MigrateState::kStart};
@@ -95,6 +97,7 @@ TEST_F(ServiceTest, MutateFencesPersistsThePersistedPartAndPublishes) {  // D8
 }
 
 TEST_F(ServiceTest, APersistFailureLeavesTheStatesAndTheFenceUnchanged) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto svc = Make();
   h.services.storage_.fail_commit_in = 1;
   const Status st = svc->Mutate([](cluster::SlotStates& s) {
@@ -107,8 +110,9 @@ TEST_F(ServiceTest, APersistFailureLeavesTheStatesAndTheFenceUnchanged) {
 }
 
 TEST_F(ServiceTest, RestoreFencesMigratedRangesAndResumesTheCleanup) {  // D8 boot
-  ASSERT_EQ(h.Run({"SET", "bar", "stale"}), kOk);                       // 5061: cleanup pending
-  ASSERT_EQ(h.Run({"SET", "b", "migrated"}), kOk);                      // 3300: migrated, not yet pushed away
+  TIDESKV_SKIP_IF_SLOTLESS();
+  ASSERT_EQ(h.Run({"SET", "bar", "stale"}), kOk);   // 5061: cleanup pending
+  ASSERT_EQ(h.Run({"SET", "b", "migrated"}), kOk);  // 3300: migrated, not yet pushed away
   cluster::MigrationRecord r;
   r.job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, MigrateState::kSuccess};
   r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
@@ -130,7 +134,8 @@ TEST_F(ServiceTest, RestoreFencesMigratedRangesAndResumesTheCleanup) {  // D8 bo
 // Controller ruling S4: a migrated range the persisted topology already moved away (the push landed before
 // a restart) is cleaned up after the boot restore, as a push would have done.
 TEST_F(ServiceTest, RestoreCleansUpAMigratedRangeThePersistedTopologyMovedAway) {  // D7, D8
-  ASSERT_EQ(h.Run({"SET", "b", "migrated"}), kOk);                                 // 3300
+  TIDESKV_SKIP_IF_SLOTLESS();
+  ASSERT_EQ(h.Run({"SET", "b", "migrated"}), kOk);  // 3300
   cluster::MigrationRecord r;
   r.job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, MigrateState::kSuccess};
   r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
@@ -152,6 +157,7 @@ TEST_F(ServiceTest, RestoreCleansUpAMigratedRangeThePersistedTopologyMovedAway) 
 }
 
 TEST_F(ServiceTest, RestoreErasesAHalfImport) {  // D8: importing start -> erase + error
+  TIDESKV_SKIP_IF_SLOTLESS();
   ASSERT_EQ(h.services.engine_
                 .ApplyImport({{encoding::ReplOpType::kPut, ColumnFamily::kMeta,
                                encoding::MetaKeyFor(0, "foo"), encoding::EncodeMetadata({}, "partial")}})
@@ -169,6 +175,7 @@ TEST_F(ServiceTest, RestoreErasesAHalfImport) {  // D8: importing start -> erase
 }
 
 TEST_F(ServiceTest, ARecordThatFailsToDecodeStopsTheRestore) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   ASSERT_TRUE(h.services.repl_log_
                   .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
                                       std::string(cluster::kSysMigration), "garbage"}})
@@ -177,6 +184,7 @@ TEST_F(ServiceTest, ARecordThatFailsToDecodeStopsTheRestore) {
 }
 
 TEST_F(ServiceTest, OnPromotedRestoresOnTheWorker) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   cluster::MigrationRecord r;
   r.imported = {{12182, 12182}};
   Persist(r);
@@ -188,6 +196,7 @@ TEST_F(ServiceTest, OnPromotedRestoresOnTheWorker) {
 }
 
 TEST_F(ServiceTest, TheWorkerRunsTasksInOrderAndShutdownDropsLatePosts) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto svc = Make();
   std::vector<int> ran;
   for (int i = 0; i < 5; ++i) svc->Post([&ran, i] { ran.push_back(i); });
@@ -201,6 +210,7 @@ TEST_F(ServiceTest, TheWorkerRunsTasksInOrderAndShutdownDropsLatePosts) {
 }
 
 TEST_F(ServiceTest, ARestoreRewritesTheRecordOnlyWhenItChanges) {  // no replog write per boot
+  TIDESKV_SKIP_IF_SLOTLESS();
   cluster::MigrationRecord r;
   r.imported = {{12182, 12182}};
   Persist(r);
@@ -214,6 +224,7 @@ TEST_F(ServiceTest, ARestoreRewritesTheRecordOnlyWhenItChanges) {  // no replog 
 }
 
 TEST_F(ServiceTest, AFailingEditChangesNothing) {  // the fallible overload Restore uses
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto svc = Make();
   const Status st = svc->Mutate([](cluster::SlotStates& s) -> Status {
     s.migrated.push_back({{3300, 3300}, kNodeB, "127.0.0.1", 7001});
@@ -229,6 +240,7 @@ TEST_F(ServiceTest, AFailingEditChangesNothing) {  // the fallible overload Rest
 // Controller ruling S3: Restore loads the record inside one Mutate, so a MIGRATE or an IMPORT that lands
 // between OnPromoted's post and the restore is neither overwritten nor taken for a half import.
 TEST_F(ServiceTest, AMutateBetweenThePromotionAndTheRestoreIsKept) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   cluster::MigrationRecord r;
   r.imported = {{12182, 12182}};
   Persist(r);
@@ -279,7 +291,8 @@ class LogCapture {
 };
 
 TEST_F(ServiceTest, ACleanupWaitsOutABusyScriptWithoutFailing) {  // controller ruling: BUSY is retried
-  ASSERT_EQ(h.Run({"SET", "bar", "stale"}), kOk);                 // 5061
+  TIDESKV_SKIP_IF_SLOTLESS();
+  ASSERT_EQ(h.Run({"SET", "bar", "stale"}), kOk);  // 5061
   auto svc = Make();
   ASSERT_TRUE(svc->Mutate([](cluster::SlotStates& s) {
                    s.cleanup.push_back({5061, 5061});
@@ -312,6 +325,7 @@ TEST_F(ServiceTest, ACleanupWaitsOutABusyScriptWithoutFailing) {  // controller 
 // Fix round 1 (a): the first Mutate after a promotion only rebuilds the states; the half import's erase runs
 // on the worker, so a command thread is never held for it.
 TEST_F(ServiceTest, AMutateAfterAPromotionLeavesTheHalfImportEraseToTheWorker) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   HalfImport();
   auto svc = Make();
   auto release = BlockWorker(*svc);
@@ -328,6 +342,7 @@ TEST_F(ServiceTest, AMutateAfterAPromotionLeavesTheHalfImportEraseToTheWorker) {
 
 // Fix round 1 (b): a node demoted again before its restore ran skips it; later Mutates keep working.
 TEST_F(ServiceTest, APromotionUndoneBeforeTheRestoreLeavesLaterMutatesWorking) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   HalfImport();
   auto svc = Make();
   auto release = BlockWorker(*svc);
@@ -347,6 +362,7 @@ TEST_F(ServiceTest, APromotionUndoneBeforeTheRestoreLeavesLaterMutatesWorking) {
 // Fix round 1 (c) as refined in round 2: a damaged record at promotion is logged, leaves empty states and
 // never fails an edit, not even one that reaches the restore before the worker does.
 TEST_F(ServiceTest, ADamagedRecordAtPromotionKeepsEmptyStatesAndLaterMutatesProceed) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   ASSERT_TRUE(h.services.repl_log_
                   .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
                                       std::string(cluster::kSysMigration), "garbage"}})
@@ -367,6 +383,7 @@ TEST_F(ServiceTest, ADamagedRecordAtPromotionKeepsEmptyStatesAndLaterMutatesProc
 // Fix round 2: a transient load error fails that edit and keeps the restore pending, so the valid record is
 // neither lost nor overwritten; the next Mutate restores it.
 TEST_F(ServiceTest, ATransientLoadErrorAtPromotionFailsTheEditAndTheRestoreIsRetried) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   cluster::MigrationRecord r;
   r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
   Persist(r);
@@ -390,6 +407,7 @@ TEST_F(ServiceTest, ATransientLoadErrorAtPromotionFailsTheEditAndTheRestoreIsRet
 // Final review M5: a transient load error in the restore a promotion posts is retried on the worker, so the
 // migrated range is fenced and MOVEd again without waiting for an unrelated Mutate.
 TEST_F(ServiceTest, ATransientLoadErrorInThePostedRestoreIsRetriedOnTheWorker) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   cluster::MigrationRecord r;
   r.migrated = {{{3300, 3300}, kNodeB, "127.0.0.1", 7001}};
   Persist(r);
@@ -413,6 +431,7 @@ TEST_F(ServiceTest, ATransientLoadErrorInThePostedRestoreIsRetriedOnTheWorker) {
 // Final review M2: CLUSTER RESET's fence hold is a scope guard, so a reset that throws (std::bad_alloc, which
 // Connection::Execute catches) never leaves every slot fenced.
 TEST_F(ServiceTest, AResetThatThrowsReleasesTheFenceHold) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto svc = Make();
   EXPECT_THROW((void)svc->ResetCluster([]() -> Status { throw std::runtime_error("injected"); }),
                std::runtime_error);
@@ -422,6 +441,7 @@ TEST_F(ServiceTest, AResetThatThrowsReleasesTheFenceHold) {
 
 // Fix round 2: an overlapping import that reached success before the posted erase ran supersedes it.
 TEST_F(ServiceTest, AHalfImportEraseNeverDeletesALaterImportsData) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   HalfImport();
   auto svc = Make();
   auto release = BlockWorker(*svc);
@@ -447,6 +467,7 @@ TEST_F(ServiceTest, AHalfImportEraseNeverDeletesALaterImportsData) {
 // Controller ruling (Task 9): a range imported after the restore stays superseding once a later, disjoint
 // import replaces the importing block.
 TEST_F(ServiceTest, AHalfImportEraseNeverDeletesARangeImportedSinceTheRestore) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   HalfImport();
   auto svc = Make();
   auto release = BlockWorker(*svc);
@@ -472,6 +493,7 @@ TEST_F(ServiceTest, AHalfImportEraseNeverDeletesARangeImportedSinceTheRestore) {
 
 // The other side: a range the record already listed as imported does not stop the erase of the half import.
 TEST_F(ServiceTest, AnImportedRangeFromTheRecordDoesNotSupersedeTheHalfImportErase) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   HalfImport();
   cluster::MigrationRecord r = *Record();
   r.imported = {{12182, 12182}};
@@ -485,6 +507,7 @@ TEST_F(ServiceTest, AnImportedRangeFromTheRecordDoesNotSupersedeTheHalfImportEra
 
 // Fix round 1 (c), on the worker alone.
 TEST_F(ServiceTest, ARestoreFailureOnTheWorkerIsLoggedAndClearsThePromotion) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   ASSERT_TRUE(h.services.repl_log_
                   .CommitStandalone({{encoding::ReplOpType::kPut, ColumnFamily::kSys,
                                       std::string(cluster::kSysMigration), "garbage"}})

@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <memory>
 
-#include "common/crc16.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/object_codec.h"
 #include "types/errors.h"
 #include "types/sample.h"
@@ -19,7 +19,7 @@ Result<Collection> Typed(Result<StoredObject> obj, uint8_t db, std::string_view 
   Collection c;
   c.db = db;
   c.key = std::string(key);
-  c.slot = KeySlot(key);
+  c.slot = encoding::LayoutSlot(key);
   c.stored = obj->live();
   if (obj->live()) {
     c.obj = std::move(obj).value();

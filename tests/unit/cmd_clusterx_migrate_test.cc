@@ -8,6 +8,7 @@
 
 #include "cluster/cluster_errors.h"
 #include "support/controller_info.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
 
@@ -51,6 +52,7 @@ bool WaitImportState(CommandHarness& h, const char* state) {
 }
 
 TEST(ClusterxMigrate, ExecuteErrorsComeInKvrocksOrder) {  // cluster.cc:309-346, slot_migrate.cc:66-80
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   CommandHarness& a = p.source;
   EXPECT_EQ(a.Run({"CLUSTERX", "MIGRATE", "3300", std::string(40, 'z')}), Err(cluster::kErrNoDestination));
@@ -74,6 +76,7 @@ TEST(ClusterxMigrate, ExecuteErrorsComeInKvrocksOrder) {  // cluster.cc:309-346,
 }
 
 TEST(ClusterxMigrate, TheStartBlockIsPublishedBeforeOk) {  // D12, Review Focus #5 "no gap"
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
@@ -85,6 +88,7 @@ TEST(ClusterxMigrate, TheStartBlockIsPublishedBeforeOk) {  // D12, Review Focus 
 }
 
 TEST(ClusterxMigrate, SyncRepliesOkAfterSuccessAndTheStageErrorOnFailure) {  // KM §2.3
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   const std::string reply = p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB, "SYNC"});
@@ -110,6 +114,7 @@ TEST(ClusterxMigrate, SyncRepliesOkAfterSuccessAndTheStageErrorOnFailure) {  // 
 }
 
 TEST(ClusterxMigrate, SyncTimesOutWithNilAndTheJobContinues) {  // KM §2.3
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "1500", true).ok());
   EXPECT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB, "SYNC", "1"}), "");
@@ -121,6 +126,7 @@ TEST(ClusterxMigrate, SyncTimesOutWithNilAndTheJobContinues) {  // KM §2.3
 }
 
 TEST(ClusterxFlushSlots, ErasesTheRangesAndIsRefusedDuringAJob) {  // D13, gocase TestClusterFlushSlots
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   for (const char* k : {"b", "bar", "c", "k2"})
     ASSERT_EQ(p.source.Run({"SET", k, "1"}), kOk);  // 3300 5061 7365 449
@@ -141,6 +147,7 @@ TEST(ClusterxFlushSlots, ErasesTheRangesAndIsRefusedDuringAJob) {  // D13, gocas
 }
 
 TEST(FlushDuringMigration, AFlushCancelsARunningJobAndFailsARunningImport) {  // D10, Writer's notes 1 and 7
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
@@ -157,6 +164,7 @@ TEST(FlushDuringMigration, AFlushCancelsARunningJobAndFailsARunningImport) {  //
 }
 
 TEST(FlushDuringMigration, AFlushOfAMigratedFencedSlotRuns) {  // gocase "Migrate empty slot", Writer's note 1
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
@@ -170,6 +178,7 @@ TEST(FlushDuringMigration, AFlushOfAMigratedFencedSlotRuns) {  // gocase "Migrat
 // Task 10 review (controller ruling): a FLUSH during the fence commits after fence_seq, so the final delta
 // never carries it; it must fail the job, lift the fence and leave the target in error.
 TEST(FlushDuringMigration, AFlushWhileTheRangeIsFencedFailsTheJob) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   SecondClient flusher(p.source);

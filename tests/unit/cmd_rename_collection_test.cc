@@ -5,6 +5,7 @@
 
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/object_codec.h"
 #include "support/command_harness.h"
 
@@ -17,13 +18,30 @@ using test::CommandHarness;
 using test::Int;
 using test::kOk;
 
+// Copying entries to the new slot's prefix happens only in the slotted layout.
 struct RenameCollection : ::testing::Test {
   void SetUp() override {
     ASSERT_NE(KeySlot("src"), KeySlot("dst"));
     ASSERT_EQ(KeySlot("{t}a"), KeySlot("{t}b"));
   }
+  const encoding::ScopedKeyLayout slotted{encoding::KeyLayout::kSlotted};
   CommandHarness h;
 };
+
+TEST(RenameCollectionSlotless, RenameLeavesEveryEntryInPlace) {  // no slot in the keys: O(1) for any key
+  const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+  CommandHarness h;
+  EXPECT_EQ(h.Run({"HSET", "src", "f", "v", "g", "w"}), Int(2));
+  EXPECT_EQ(h.Run({"ZADD", "zsrc", "1", "a", "2", "b"}), Int(2));
+  const auto subkeys = h.Cf(ColumnFamily::kSubkey);
+  const auto scores = h.Cf(ColumnFamily::kZScore);
+  EXPECT_EQ(h.Run({"RENAME", "src", "dst"}), kOk);
+  EXPECT_EQ(h.Run({"RENAME", "zsrc", "zdst"}), kOk);
+  EXPECT_EQ(h.Cf(ColumnFamily::kSubkey), subkeys);
+  EXPECT_EQ(h.Cf(ColumnFamily::kZScore), scores);
+  EXPECT_EQ(h.Run({"HGET", "dst", "g"}), Bulk("w"));
+  EXPECT_EQ(h.Run({"ZSCORE", "zdst", "b"}), Bulk("2"));
+}
 
 TEST_F(RenameCollection, SetWithTtlKeepsMembersAndDeadline) {
   EXPECT_EQ(h.Run({"SADD", "src", "a", "b"}), Int(2));

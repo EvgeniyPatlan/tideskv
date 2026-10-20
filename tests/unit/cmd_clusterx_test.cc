@@ -5,12 +5,14 @@
 #include <vector>
 
 #include "support/cluster_harness.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 
 namespace tideskv::test {
 namespace {
 
 TEST(ClusterxCmd, ParsesBeforeRefusingWhenClusterModeIsOff) {  // cmd_cluster.cc:146-253
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   EXPECT_EQ(h.Run({"CLUSTERX", "VERSION"}), Err("ERR Cluster mode is not enabled"));
   EXPECT_EQ(h.Run({"CLUSTERX", "SETNODES", "a", "-1"}), Err("ERR Cluster mode is not enabled"));
@@ -19,6 +21,7 @@ TEST(ClusterxCmd, ParsesBeforeRefusingWhenClusterModeIsOff) {  // cmd_cluster.cc
 }
 
 TEST(ClusterxCmd, VersionAndMyIdBeforeAnyTopology) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   EXPECT_EQ(h.Run({"CLUSTERX", "VERSION"}), Bulk("-1"));
@@ -26,6 +29,7 @@ TEST(ClusterxCmd, VersionAndMyIdBeforeAnyTopology) {
 }
 
 TEST(ClusterxCmd, SetNodeIdThenSetNodes) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   EXPECT_EQ(h.Run({"CLUSTERX", "SETNODEID", kNodeA}), kOk);
@@ -38,6 +42,7 @@ TEST(ClusterxCmd, SetNodeIdThenSetNodes) {
 }
 
 TEST(ClusterxCmd, ASetnodesThatMakesThisNodeASlaveDrivesReplication) {  // D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h, 7002);
   EXPECT_EQ(h.Run({"CLUSTERX", "SETNODES", kThreeNodes, "1"}), kOk);
@@ -47,6 +52,7 @@ TEST(ClusterxCmd, ASetnodesThatMakesThisNodeASlaveDrivesReplication) {  // D10
 }
 
 TEST(ClusterxCmd, ParseErrorsAreKvrocks) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   const std::string usage =
@@ -79,6 +85,7 @@ TEST(ClusterxCmd, ParseErrorsAreKvrocks) {
 }
 
 TEST(ClusterxCmd, SetSlotMovesSlotsWithTheNextVersion) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -88,6 +95,7 @@ TEST(ClusterxCmd, SetSlotMovesSlotsWithTheNextVersion) {
 }
 
 TEST(ClusterxCmd, NeverRunsInsideATransactionOrAScript) {  // D8
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   ASSERT_EQ(h.Run({"MULTI"}), kOk);
@@ -100,6 +108,7 @@ TEST(ClusterxCmd, NeverRunsInsideATransactionOrAScript) {  // D8
 
 TEST(ClusterxCmd,
      SetslotWaitsForTheCleanupItTriggered) {  // gocase "... cleared after setslot", Writer's note 4
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), kOk);
   ASSERT_TRUE(RunJob(p, {3300, 3300}).ok());

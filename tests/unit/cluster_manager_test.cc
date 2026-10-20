@@ -14,6 +14,7 @@
 #include "cluster/cluster_store.h"
 #include "cluster/slot_states.h"
 #include "storage/memory_storage.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
 
@@ -70,6 +71,7 @@ struct ClusterManagerTest : ::testing::Test {
 };
 
 TEST_F(ClusterManagerTest, StartsUninitialised) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   EXPECT_EQ(m->Current()->version, kNoVersion);
   EXPECT_TRUE(m->Current()->myid.empty());
@@ -78,6 +80,7 @@ TEST_F(ClusterManagerTest, StartsUninitialised) {
 }
 
 TEST_F(ClusterManagerTest, VersionRulesAreKvrocks) {  // D5, cluster.cc:148-160
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   EXPECT_EQ(m->SetNodes(kNodes, -1, false).message(), kErrInvalidClusterVersion);
   EXPECT_EQ(m->SetNodes(kNodes, -1, true).message(), kErrInvalidClusterVersion);
@@ -92,6 +95,7 @@ TEST_F(ClusterManagerTest, VersionRulesAreKvrocks) {  // D5, cluster.cc:148-160
 }
 
 TEST_F(ClusterManagerTest, AParseErrorChangesNothing) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   ASSERT_TRUE(m->SetNodes(kNodes, 2, false).ok());
   EXPECT_EQ(m->SetNodes(kA + " h 1 master - 5-5", 3, false).message(), kErrSlotOutOfRange);
@@ -99,6 +103,7 @@ TEST_F(ClusterManagerTest, AParseErrorChangesNothing) {
 }
 
 TEST_F(ClusterManagerTest, MyIdIsTheFirstNodeOnThisPortAndBindInStringOrder) {  // D6
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7000);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
   EXPECT_EQ(m->Current()->myid, kA);
@@ -112,6 +117,7 @@ TEST_F(ClusterManagerTest, MyIdIsTheFirstNodeOnThisPortAndBindInStringOrder) {  
 }
 
 TEST_F(ClusterManagerTest, SetNodeIdWinsUntilAForcedSetnodes) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7000);
   EXPECT_EQ(m->SetNodeId("short").message(), kErrInvalidNodeId);
   ASSERT_TRUE(m->SetNodeId(kB).ok());
@@ -124,6 +130,7 @@ TEST_F(ClusterManagerTest, SetNodeIdWinsUntilAForcedSetnodes) {
 // Final review minor 3: a checkpoint excludes every commit, and the controller resends SETNODEID on every
 // sync, so an unchanged id re-applies the role but persists, checkpoints and publishes nothing.
 TEST_F(ClusterManagerTest, AnUnchangedNodeIdAppliesTheRoleWithoutACheckpoint) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
   ASSERT_TRUE(m->SetNodeId(kC).ok());
@@ -138,6 +145,7 @@ TEST_F(ClusterManagerTest, AnUnchangedNodeIdAppliesTheRoleWithoutACheckpoint) {
 }
 
 TEST_F(ClusterManagerTest, ASlaveFollowsItsMasterAndRepeatedPushesAreNoOps) {  // D10
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
   ASSERT_TRUE(m->SetNodes(kNodes, 2, false).ok());
@@ -148,6 +156,7 @@ TEST_F(ClusterManagerTest, ASlaveFollowsItsMasterAndRepeatedPushesAreNoOps) {  /
 }
 
 TEST_F(ClusterManagerTest, AMasterThatWasAReplicaIsPromoted) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   replica = true;
   auto m = Make(7000);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
@@ -155,6 +164,7 @@ TEST_F(ClusterManagerTest, AMasterThatWasAReplicaIsPromoted) {
 }
 
 TEST_F(ClusterManagerTest, ANodeRemovedFromTheTopologyStopsReplicating) {  // Kvrocks #2643
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
   ASSERT_TRUE(m->SetNodes(kA + " 127.0.0.1 7000 master - 0-16383", 2, false).ok());
@@ -163,12 +173,14 @@ TEST_F(ClusterManagerTest, ANodeRemovedFromTheTopologyStopsReplicating) {  // Kv
 }
 
 TEST_F(ClusterManagerTest, ASlaveOfAnUnknownMasterKeepsItsRole) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kC + " 127.0.0.1 7002 slave " + std::string(40, 'z'), 1, false).ok());
   EXPECT_TRUE(events.empty());
 }
 
 TEST_F(ClusterManagerTest, AFailedPromotionKeepsTheOldVersionInMemoryAndOnDisk) {  // D7
+  TIDESKV_SKIP_IF_SLOTLESS();
   replica = true;
   promote_status = Status::UserError(std::string(kErrLoading));
   auto m = Make(7000);
@@ -185,6 +197,7 @@ TEST_F(ClusterManagerTest, AFailedPromotionKeepsTheOldVersionInMemoryAndOnDisk) 
 }
 
 TEST_F(ClusterManagerTest, SlotsMissingFromANewTopologyAreNotServed) {  // D3: Kvrocks keeps stale owners
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   ASSERT_TRUE(m->SetNodes(kA + " 127.0.0.1 7000 master - 0-16383", 1, false).ok());
   ASSERT_TRUE(m->SetNodes(kA + " 127.0.0.1 7000 master - 0-8191", 2, false).ok());
@@ -194,6 +207,7 @@ TEST_F(ClusterManagerTest, SlotsMissingFromANewTopologyAreNotServed) {  // D3: K
 }
 
 TEST_F(ClusterManagerTest, SetSlotIsAStrictCasThatMovesOnlyTheNamedSlots) {  // D5, cluster.cc:81-146
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   EXPECT_EQ(m->SetSlot({{0, 0}}, kB, 0).message(), kErrInvalidClusterVersion);  // uninitialised
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
@@ -211,6 +225,7 @@ TEST_F(ClusterManagerTest, SetSlotIsAStrictCasThatMovesOnlyTheNamedSlots) {  // 
 }
 
 TEST_F(ClusterManagerTest, ResetNeedsAnEmptyKeyspaceThenForgetsEverything) {  // cluster.cc:960-1000
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodes(kNodes, 1, false).ok());
   EXPECT_EQ(m->Reset(/*keyspace_empty=*/false).message(), kErrResetNotEmpty);
@@ -222,6 +237,7 @@ TEST_F(ClusterManagerTest, ResetNeedsAnEmptyKeyspaceThenForgetsEverything) {  //
 }
 
 TEST_F(ClusterManagerTest, TheTopologyIsPersistedDurablyAndReloadedWithItsBootRole) {  // D20
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make(7002);
   ASSERT_TRUE(m->SetNodeId(kC).ok());
   ASSERT_TRUE(m->SetNodes(kNodes, 5, false).ok());
@@ -238,6 +254,7 @@ TEST_F(ClusterManagerTest, TheTopologyIsPersistedDurablyAndReloadedWithItsBootRo
 }
 
 TEST_F(ClusterManagerTest, ReadersOnOtherThreadsSeeEveryPublishInOrder) {  // D3
+  TIDESKV_SKIP_IF_SLOTLESS();
   auto m = Make();
   std::atomic<bool> stop{false};
   std::atomic<bool> monotonic{true};
@@ -257,6 +274,7 @@ TEST_F(ClusterManagerTest, ReadersOnOtherThreadsSeeEveryPublishInOrder) {  // D3
 }
 
 TEST_F(ClusterManagerTest, StatesArePublishedWithTheirOwnGenerationAndHook) {  // M7b D6
+  TIDESKV_SKIP_IF_SLOTLESS();
   std::vector<size_t> seen;
   ClusterManager::Options o;
   o.on_states_publish = [&](const std::shared_ptr<const SlotStates>& s) {
@@ -276,6 +294,7 @@ TEST_F(ClusterManagerTest, StatesArePublishedWithTheirOwnGenerationAndHook) {  /
 }
 
 TEST_F(ClusterManagerTest, StopMigrationRunsBeforeBecomeReplicaOnlyWhenAMasterIsDemoted) {  // M7b D7
+  TIDESKV_SKIP_IF_SLOTLESS();
   int stops = 0;
   ClusterManager::Options o;
   o.port = 7000;
@@ -303,6 +322,7 @@ TEST_F(ClusterManagerTest, StopMigrationRunsBeforeBecomeReplicaOnlyWhenAMasterIs
 }
 
 TEST_F(ClusterManagerTest, OnTransitionSeesThePreviousAndTheNewTopology) {  // M7b D7
+  TIDESKV_SKIP_IF_SLOTLESS();
   std::vector<std::pair<int64_t, int64_t>> seen;
   ClusterManager::Options o;
   o.on_transition = [&](const std::shared_ptr<const Topology>& prev,
@@ -320,6 +340,7 @@ TEST_F(ClusterManagerTest, OnTransitionSeesThePreviousAndTheNewTopology) {  // M
 // Review Focus #3: the controller's v+1 push lands after a fast success (an empty or tiny slot). It must not
 // revert routing or reopen writes on the source, and the v+2 push that moves the range must clean it up.
 TEST_F(ClusterManagerTest, APushAfterAFastSuccessKeepsMovedAndTheNextPushCleansUp) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   test::MigrationPair p;
   ASSERT_EQ(p.source.Run({"SET", "b", "1"}), test::kOk);
   ASSERT_TRUE(test::RunJob(p, {3300, 3300}).ok());  // success, before any push

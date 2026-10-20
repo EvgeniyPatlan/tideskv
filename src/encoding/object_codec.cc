@@ -1,6 +1,7 @@
 #include "encoding/object_codec.h"
 
 #include "common/coding.h"
+#include "encoding/key_layout.h"
 #include "encoding/score_codec.h"
 
 namespace tideskv::encoding {
@@ -10,16 +11,22 @@ bool DecodePrefix(std::string_view* in, uint8_t* db, uint16_t* slot, uint64_t* o
   if (in->empty()) return false;
   *db = static_cast<uint8_t>((*in)[0]);
   in->remove_prefix(1);
-  return coding::GetFixed16BE(in, slot) && coding::GetFixed64BE(in, oid);
+  *slot = 0;
+  if (!Slotless() && !coding::GetFixed16BE(in, slot)) return false;
+  return coding::GetFixed64BE(in, oid);
 }
+
+size_t OidOffset() { return ObjectPrefixSize() - 8; }  // after [db u8], and [slot u16] when slotted
 
 }  // namespace
 
+size_t ObjectPrefixSize() { return Slotless() ? kSlotlessObjectPrefixSize : kSlottedObjectPrefixSize; }
+
 std::string SubkeyPrefix(uint8_t db, uint16_t slot, uint64_t oid) {
   std::string out;
-  out.reserve(kObjectPrefixSize);
+  out.reserve(kSlottedObjectPrefixSize);
   out.push_back(static_cast<char>(db));
-  coding::PutFixed16BE(&out, slot);
+  if (!Slotless()) coding::PutFixed16BE(&out, slot);
   coding::PutFixed64BE(&out, oid);
   return out;
 }
@@ -63,16 +70,16 @@ bool DecodeListIndex(std::string_view field, uint64_t* index) {
 }
 
 bool PeekObjectOid(std::string_view key, uint64_t* oid) {
-  if (key.size() < kObjectPrefixSize) return false;
-  *oid = coding::DecodeFixed64BE(key.data() + 3);  // after [db u8][slot u16]
+  if (key.size() < ObjectPrefixSize()) return false;
+  *oid = coding::DecodeFixed64BE(key.data() + OidOffset());
   return true;
 }
 
 bool RewriteObjectOid(std::string* key, uint64_t oid) {
-  if (key->size() < kObjectPrefixSize) return false;
+  if (key->size() < ObjectPrefixSize()) return false;
   std::string be;
   coding::PutFixed64BE(&be, oid);
-  key->replace(3, 8, be);
+  key->replace(OidOffset(), 8, be);
   return true;
 }
 

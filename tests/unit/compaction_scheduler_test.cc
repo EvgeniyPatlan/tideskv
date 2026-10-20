@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/object_codec.h"
 
 namespace tideskv {
@@ -85,6 +86,18 @@ TEST(CompactionScheduler, CollectionDeletesTriggerAtTheThreshold) {
   s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});
   EXPECT_EQ(s.pending(), 2u);  // whole subkey and zscore CFs
   EXPECT_EQ(s.RunPending(), 2u);
+}
+
+TEST(CompactionScheduler, SlotlessCollectionDeletesAreCounted) {  // their prefix is 9 bytes, not 11
+  const encoding::ScopedKeyLayout slotless(encoding::KeyLayout::kSlotless);
+  FakeCompactor c;
+  CompactionScheduler s(c, Opts(2));
+  const std::string obj = encoding::SubkeyPrefix(0, 0, 42);
+  ASSERT_EQ(obj.size(), 9u);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});
+  EXPECT_EQ(s.pending(), 0u);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});
+  EXPECT_EQ(s.pending(), 2u);
 }
 
 TEST(CompactionScheduler, ThresholdZeroNeverCompactsForCollections) {

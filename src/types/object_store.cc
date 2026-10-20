@@ -5,8 +5,8 @@
 #include <vector>
 
 #include "common/coding.h"
-#include "common/crc16.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/object_codec.h"
 #include "types/errors.h"
 
@@ -74,7 +74,7 @@ Status DeleteObject(WriteTxn& txn, uint8_t db, std::string_view key, const Metad
   if (Status st = txn.Delete(ColumnFamily::kMeta, encoding::MetaKeyFor(db, key)); !st.ok()) return st;
   if (Status st = DeleteExpireEntry(txn, db, key, meta); !st.ok()) return st;
   if (!meta.IsCollection()) return Status::Ok();
-  const uint16_t slot = KeySlot(key);
+  const uint16_t slot = encoding::LayoutSlot(key);
   // One O(1) prefix tombstone per CF (M2 Task 3 spike, M3 E6); the CompactionScheduler counts
   // these deletes and periodically compacts the subkey/zscore CFs to drop the dead entries.
   if (Status st = txn.DeletePrefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(db, slot, meta.oid));
@@ -158,8 +158,8 @@ Status RehomeEntries(WriteTxn& txn, ColumnFamily cf, uint8_t db, uint16_t from_s
 
 Status MoveObject(WriteTxn& txn, uint8_t db, std::string_view src, std::string_view dst,
                   const StoredObject& obj) {
-  const uint16_t from_slot = KeySlot(src);
-  const uint16_t to_slot = KeySlot(dst);
+  const uint16_t from_slot = encoding::LayoutSlot(src);
+  const uint16_t to_slot = encoding::LayoutSlot(dst);  // both 0 when slotless: the entries never move
   if (obj.meta.IsCollection() && from_slot != to_slot) {
     if (Status st = RehomeEntries(txn, ColumnFamily::kSubkey, db, from_slot, to_slot, obj.meta.oid);
         !st.ok()) {

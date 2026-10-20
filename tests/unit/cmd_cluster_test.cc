@@ -8,6 +8,7 @@
 #include "cluster/cluster_errors.h"
 #include "cluster/slot_states.h"
 #include "support/cluster_harness.h"
+#include "support/key_layout_skip.h"
 #include "support/migration_harness.h"
 #include "types/errors.h"
 
@@ -15,12 +16,14 @@ namespace tideskv::test {
 namespace {
 
 TEST(ClusterCmd, DisabledModeAnswersRedisText) {  // cluster.c:5995
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   EXPECT_EQ(h.Run({"CLUSTER", "INFO"}), Err("ERR This instance has cluster support disabled"));
   EXPECT_EQ(h.Run({"CLUSTER", "KEYSLOT", "foo"}), Err("ERR This instance has cluster support disabled"));
 }
 
 TEST(ClusterCmd, BeforeAnyTopologyOnlyLocalSubcommandsWork) {  // D12
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   for (const char* sub : {"INFO", "NODES", "SLOTS", "SHARDS"}) {
@@ -33,6 +36,7 @@ TEST(ClusterCmd, BeforeAnyTopologyOnlyLocalSubcommandsWork) {  // D12
 }
 
 TEST(ClusterCmd, SubcommandAndArgumentErrors) {  // D18, cluster.c:6341-6375
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   EXPECT_EQ(h.Run({"CLUSTER", "NOPE"}),
@@ -48,6 +52,7 @@ TEST(ClusterCmd, SubcommandAndArgumentErrors) {  // D18, cluster.c:6341-6375
 }
 
 TEST(ClusterCmd, InfoAndNodesAreBulkInResp2AndVerbatimInResp3) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 4);
@@ -60,6 +65,7 @@ TEST(ClusterCmd, InfoAndNodesAreBulkInResp2AndVerbatimInResp3) {
 }
 
 TEST(ClusterCmd, SlotsUseKvrocksThreeElementNodes) {  // D12, cmd_cluster.cc:76-94
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -72,6 +78,7 @@ TEST(ClusterCmd, SlotsUseKvrocksThreeElementNodes) {  // D12, cmd_cluster.cc:76-
 }
 
 TEST(ClusterCmd, ShardsAreRedisMapsFlatInResp2) {  // redis cluster.c:5771-5876
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -88,6 +95,7 @@ TEST(ClusterCmd, ShardsAreRedisMapsFlatInResp2) {  // redis cluster.c:5771-5876
 }
 
 TEST(ClusterCmd, CountAndGetKeysInSlotReadThisNodesDbZero) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -100,6 +108,7 @@ TEST(ClusterCmd, CountAndGetKeysInSlotReadThisNodesDbZero) {
 }
 
 TEST(ClusterCmd, ResetNeedsAnEmptyKeyspace) {  // cluster.cc:960-1000
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -111,6 +120,7 @@ TEST(ClusterCmd, ResetNeedsAnEmptyKeyspace) {  // cluster.cc:960-1000
 }
 
 TEST(ClusterCmd, ReplicasAndHelp) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -123,6 +133,7 @@ TEST(ClusterCmd, ReplicasAndHelp) {
 }
 
 TEST(ClusterCmd, InfoShowsTheMigrationBlocksOfThePublishedStates) {  // D15
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   ClusterHarness c(h);
   c.Push(kThreeNodes, 1);
@@ -139,6 +150,7 @@ TEST(ClusterCmd, InfoShowsTheMigrationBlocksOfThePublishedStates) {  // D15
 }
 
 TEST(ClusterCmd, ResetIsRefusedWhileMigratingOrImporting) {  // D20, cluster.cc:963-965
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
@@ -152,7 +164,8 @@ TEST(ClusterCmd, ResetIsRefusedWhileMigratingOrImporting) {  // D20, cluster.cc:
 
 TEST(ClusterCmd,
      ResetChecksEmptinessUnderTheFenceAndClearsTheStates) {  // D20, gocase
-                                                             // TestClusterResetPreservesForbiddenSlot
+  TIDESKV_SKIP_IF_SLOTLESS();
+  // TestClusterResetPreservesForbiddenSlot
   MigrationPair p;
   ASSERT_EQ(p.source.Run({"CLUSTERX", "MIGRATE", "3300", kNodeB}), kOk);
   ASSERT_TRUE(p.source_migration().migrator().WaitIdle(std::chrono::seconds(10)));
@@ -174,6 +187,7 @@ TEST(ClusterCmd,
 // Task 11 fix round 1: a fence-changing Mutate (a cleanup finishing, a SETNODES) between RESET's fence and
 // cm.Reset never lowers the all-slots fence, so no write commits after the emptiness check.
 TEST(ClusterCmd, AFenceChangeDuringResetKeepsEverySlotFenced) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   migrate::MigrationService& m = p.source_migration();
   SecondClient writer(p.source);
@@ -193,6 +207,7 @@ TEST(ClusterCmd, AFenceChangeDuringResetKeepsEverySlotFenced) {
 // Task 11 fix round 1 (controller ruling): RESET's running checks, the reset and OnReset run under
 // migrate_mu_, so a MIGRATE cannot publish start in between (OnReset would then lift the job's fence).
 TEST(ClusterCmd, ResetAndMigrateAreSerialised) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   MigrationPair p;
   ASSERT_TRUE(p.source.services.config_.Set("migrate-delay-ms", "60000", true).ok());
   migrate::MigrationService& m = p.source_migration();

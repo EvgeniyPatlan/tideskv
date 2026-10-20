@@ -18,9 +18,12 @@ endif()
 
 file(GLOB UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cc)
 add_executable(unit_tests ${UNIT_SOURCES})
-target_link_libraries(unit_tests PRIVATE test_support tidesdb tideskv_lua GTest::gtest_main rapidcheck rapidcheck_gtest)
+target_link_libraries(unit_tests PRIVATE test_support tidesdb tideskv_lua GTest::gtest rapidcheck rapidcheck_gtest)
 tideskv_defaults(unit_tests)
 gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 60)
+# The whole suite again with the slotless key layout (unit_main.cc); cluster and migration tests skip there.
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST TEST_PREFIX "slotless."
+                     PROPERTIES TIMEOUT 60 ENVIRONMENT "TIDESKV_TEST_KEY_LAYOUT=slotless")
 
 file(GLOB CONTRACT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/contract/*.cc)
 if(CONTRACT_SOURCES)

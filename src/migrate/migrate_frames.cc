@@ -1,7 +1,10 @@
 #include "migrate/migrate_frames.h"
 
+#include <cassert>
+
 #include "common/coding.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/meta_codec.h"
 #include "encoding/object_codec.h"
 #include "types/object_store.h"
@@ -85,7 +88,10 @@ Result<std::optional<ReplOp>> RemapExpire(ReplOp op, OidRemap& remap) {
 
 }  // namespace
 
+// Migration runs between cluster nodes only, which are always slotted: the classifiers read the slot bytes
+// at fixed offsets and the remap rewrites the oid at offset 3.
 OpClass ClassifyOp(const ReplOp& op, cluster::SlotRange range) {
+  assert(!encoding::Slotless());
   switch (op.cf) {
     case ColumnFamily::kMeta:
     case ColumnFamily::kSubkey:
@@ -125,6 +131,7 @@ std::optional<uint64_t> OidRemap::Find(uint64_t src) const {
 }
 
 Result<std::optional<ReplOp>> RemapOp(ReplOp op, OidRemap& remap) {
+  assert(!encoding::Slotless());
   switch (op.cf) {
     case ColumnFamily::kSubkey:
     case ColumnFamily::kZScore:
@@ -157,7 +164,7 @@ Status CheckImportOp(const ReplOp& op, cluster::SlotRange range) {
   const bool point = op.type == ReplOpType::kPut || op.type == ReplOpType::kDelete;
   const bool object_prefix = op.type == ReplOpType::kDeletePrefix &&
                              (op.cf == ColumnFamily::kSubkey || op.cf == ColumnFamily::kZScore) &&
-                             op.key.size() == encoding::kObjectPrefixSize;
+                             op.key.size() == encoding::kSlottedObjectPrefixSize;
   if (!keyspace || (!point && !object_prefix) || ClassifyOp(op, range) != OpClass::kInRange) {
     return Status::Corruption("migration: an imported op outside slot(s) " + RangeText(range));
   }

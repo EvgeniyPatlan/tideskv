@@ -92,7 +92,7 @@ TEST_F(SetTypeTest, PopEverythingDeletesTheObjectWithOnePrefixTombstone) {
   ASSERT_EQ(deletes.size(), 1u);
   EXPECT_EQ(deletes[0].cf, ColumnFamily::kSubkey);
   EXPECT_TRUE(deletes[0].is_prefix);
-  EXPECT_EQ(deletes[0].lo.size(), encoding::kObjectPrefixSize);
+  EXPECT_EQ(deletes[0].lo.size(), encoding::ObjectPrefixSize());
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kMeta)].empty());
   EXPECT_TRUE((*storage.Current())[CfIndex(ColumnFamily::kSubkey)].empty());
 }

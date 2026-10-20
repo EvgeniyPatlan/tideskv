@@ -1,6 +1,6 @@
 #include "types/zset_query.h"
 
-#include "common/crc16.h"
+#include "encoding/key_layout.h"
 #include "encoding/object_codec.h"
 #include "types/collection.h"
 #include "types/list_type.h"  // NormalizeListRange: Redis applies the same index rule to zset ranks
@@ -63,7 +63,7 @@ Status StoreZset(WriteTxn& txn, OidAllocator& oids, uint8_t db, std::string_view
   Collection c;
   c.db = db;
   c.key = std::string(dst);
-  c.slot = KeySlot(dst);
+  c.slot = encoding::LayoutSlot(dst);
   if (Status st = InitCollection(&c, kZSet, oids); !st.ok()) return st;
   for (const ScoreMember& p : items) {
     auto prev = MemberScore(txn, c, p.member);

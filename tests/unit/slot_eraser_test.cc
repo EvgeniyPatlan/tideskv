@@ -18,6 +18,7 @@
 #include "storage/memory_storage.h"
 #include "support/command_harness.h"
 #include "support/fake_clock.h"
+#include "support/key_layout_skip.h"
 #include "support/replica_stack.h"
 #include "types/slot_erase.h"
 #include "types/slot_keys.h"
@@ -49,6 +50,7 @@ void SeedSlotB(CommandHarness& h) {
 }
 
 TEST(SlotErase, CollectsTheExpireDeletesOfTheRangeInResumableSteps) {  // D9 step 1
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   for (int i = 0; i < 5; ++i) ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), "v", "PX", "100000"}), kOk);
   ASSERT_EQ(h.Run({"SET", "{b}nottl", "v"}), kOk);
@@ -79,6 +81,7 @@ TEST(SlotErase, CollectsTheExpireDeletesOfTheRangeInResumableSteps) {  // D9 ste
 }
 
 TEST(SlotErase, TheWalkIsBoundedByMetasWalkedNotByTtlsFound) {  // a long TTL-less range is many short steps
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   for (int i = 0; i < 7; ++i) ASSERT_EQ(h.Run({"SET", "{b}" + std::to_string(i), "v"}), kOk);
   ASSERT_EQ(h.Run({"SET", "{b}ttl", "v", "PX", "100000"}), kOk);
@@ -102,6 +105,7 @@ TEST(SlotErase, TheWalkIsBoundedByMetasWalkedNotByTtlsFound) {  // a long TTL-le
 }
 
 TEST(SlotErase, RangeDeletesAreThreeAndBoundTheLastSlot) {  // D9 step 2, the 32-per-commit cap
+  TIDESKV_SKIP_IF_SLOTLESS();
   const auto ops = SlotRangeDeletes(16380, 16383);
   ASSERT_EQ(ops.size(), 3u);
   EXPECT_EQ(ops[0].cf, ColumnFamily::kMeta);
@@ -115,6 +119,7 @@ TEST(SlotErase, RangeDeletesAreThreeAndBoundTheLastSlot) {  // D9 step 2, the 32
 }
 
 TEST(SlotEraser, ErasesEveryCfOfTheRangeAndNothingElse) {  // D9
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   SeedSlotB(h);
   migrate::SlotEraser eraser(h.services.engine_);
@@ -130,6 +135,7 @@ TEST(SlotEraser, ErasesEveryCfOfTheRangeAndNothingElse) {  // D9
 }
 
 TEST(SlotEraser, IsIdempotentAndReplicated) {  // D9: a crash between steps is finished by the next run
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   SeedSlotB(h);
   InMemoryStorage replica_storage;
@@ -142,6 +148,7 @@ TEST(SlotEraser, IsIdempotentAndReplicated) {  // D9: a crash between steps is f
 }
 
 TEST(SlotEraser, WaitsWhilePausedAndStopsWhenAsked) {  // D9: CLIENT PAUSE holds the cleanup
+  TIDESKV_SKIP_IF_SLOTLESS();
   CommandHarness h;
   SeedSlotB(h);
   std::atomic<bool> paused{true};
@@ -173,6 +180,7 @@ class ThrowingListener final : public CommitListener {
 };
 
 TEST(SlotEraser, AThrowingCommitEndsItsAdmittedWrite) {
+  TIDESKV_SKIP_IF_SLOTLESS();
   InMemoryStorage storage;
   LockManager locks;
   FakeClock clock;

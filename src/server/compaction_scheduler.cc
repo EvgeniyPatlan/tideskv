@@ -16,7 +16,7 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
   for (const RangeDelete& d : deletes) {
     if (!d.is_prefix || d.lo.size() == 1) {
       EnqueueLocked({d.cf});
-    } else if (d.cf == ColumnFamily::kSubkey && d.lo.size() == encoding::kObjectPrefixSize) {
+    } else if (d.cf == ColumnFamily::kSubkey && d.lo.size() == encoding::ObjectPrefixSize()) {
       ++collection_deletes_;
     }
   }
