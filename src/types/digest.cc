@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,7 @@
 #include "common/score_format.h"
 #include "common/sha1.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "encoding/meta_codec.h"
 #include "types/collection.h"
 #include "types/list_type.h"
@@ -136,9 +138,10 @@ Status XorObjectDigest(ReadView& view, uint8_t db, uint16_t slot, std::string_vi
   return st;
 }
 
-// Adds every stored key of db in `range` to final; the db id is mixed in before its first key, and not at all
-// for an empty walk. with_ttl: M7b D23.
-Status DigestMetas(ReadView& view, uint8_t db, IterOptions range, bool with_ttl, Digest20& final_digest) {
+// Adds every stored key of db in `range` (and, with `keep`, only the keys it keeps) to final; the db id is
+// mixed in before its first key, and not at all for an empty walk. with_ttl: M7b D23.
+Status DigestMetas(ReadView& view, uint8_t db, IterOptions range, bool with_ttl, Digest20& final_digest,
+                   const std::function<bool(std::string_view)>& keep = nullptr) {
   auto it = view.NewIterator(ColumnFamily::kMeta, std::move(range));
   if (!it.ok()) return it.status();
   bool first = true;
@@ -146,6 +149,7 @@ Status DigestMetas(ReadView& view, uint8_t db, IterOptions range, bool with_ttl,
   for (; st.ok() && (*it)->Valid(); st = (*it)->Next()) {
     encoding::MetaKey mk;
     if (!encoding::DecodeMetaKey((*it)->key(), &mk)) return Status::Corruption("undecodable meta key");
+    if (keep && !keep(mk.user_key)) continue;
     auto meta = encoding::DecodeMetadata((*it)->value());
     if (!meta.ok()) return meta.status();
     if (first) {
@@ -186,13 +190,26 @@ Result<Digest20> ValueDigest(ReadView& view, uint8_t db, std::string_view key) {
   if (!raw.ok()) return raw.status().IsNotFound() ? Result<Digest20>(d) : Result<Digest20>(raw.status());
   auto meta = encoding::DecodeMetadata(*raw);
   if (!meta.ok()) return meta.status();
-  if (Status st = XorObjectDigest(view, db, KeySlot(key), key, *meta, d); !st.ok()) return st;
+  if (Status st = XorObjectDigest(view, db, encoding::LayoutSlot(key), key, *meta, d); !st.ok()) return st;
   return d;
 }
 
 Result<Digest20> SlotRangeDigest(ReadView& view, uint16_t first, uint16_t last, bool with_ttl) {
   Digest20 d{};
-  if (Status st = DigestMetas(view, 0, SlotRangeBounds(first, last), with_ttl, d); !st.ok()) return st;
+  if (!encoding::Slotless()) {
+    if (Status st = DigestMetas(view, 0, SlotRangeBounds(first, last), with_ttl, d); !st.ok()) return st;
+    return d;
+  }
+  // No slot in the keys: walk db 0 and keep the range's keys (O(db), debug only). The XOR of the per-key
+  // digests does not depend on the walk order, so the result equals the slotted one.
+  const auto in_range = [first, last](std::string_view key) {
+    const uint16_t slot = KeySlot(key);
+    return slot >= first && slot <= last;
+  };
+  if (Status st = DigestMetas(view, 0, {encoding::DbPrefix(0), encoding::DbPrefix(1)}, with_ttl, d, in_range);
+      !st.ok()) {
+    return st;
+  }
   return d;
 }
 

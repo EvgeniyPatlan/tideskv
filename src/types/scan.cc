@@ -4,6 +4,7 @@
 #include "common/glob.h"
 #include "common/string_util.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 
 namespace tideskv {
 namespace {
@@ -47,6 +48,36 @@ Status SeekPastTruncated(Iterator& it, const ScanPosition& pos) {
   }
   if (!st.ok()) return st;
   return it.Seek(pos.key);
+}
+
+// Up to kRandomKeyBatch live keys of db strictly after the meta key `after` (empty = from the first).
+Status LiveKeysAfter(ReadView& view, uint8_t db, const std::string& after, int64_t now_ms,
+                     std::vector<std::string>* out) {
+  out->clear();
+  auto it = view.NewIterator(ColumnFamily::kMeta, DbRange(db));
+  if (!it.ok()) return it.status();
+  Status st = after.empty() ? (*it)->SeekToFirst() : (*it)->Seek(after);
+  if (st.ok() && !after.empty() && (*it)->Valid() && (*it)->key() == after) st = (*it)->Next();
+  for (; st.ok() && (*it)->Valid() && out->size() < kRandomKeyBatch; st = (*it)->Next()) {
+    std::string key;
+    ValueType type{};
+    bool live = false;
+    if (Status cur = Current(**it, now_ms, &key, &type, &live); !cur.ok()) return cur;
+    if (live) out->push_back(std::move(key));
+  }
+  return st;
+}
+
+Result<std::optional<std::string>> RandomKeyFromCursor(ReadView& view, uint8_t db, int64_t now_ms,
+                                                       uint64_t random, std::string_view cursor) {
+  std::vector<std::string> keys;
+  const std::string after = cursor.empty() ? std::string() : encoding::MetaKeyFor(db, cursor);
+  if (Status st = LiveKeysAfter(view, db, after, now_ms, &keys); !st.ok()) return st;
+  if (keys.empty() && !after.empty()) {  // the end of the db: start over
+    if (Status st = LiveKeysAfter(view, db, std::string(), now_ms, &keys); !st.ok()) return st;
+  }
+  if (keys.empty()) return std::optional<std::string>();
+  return std::optional<std::string>(std::move(keys[random % keys.size()]));
 }
 
 }  // namespace
@@ -106,7 +137,9 @@ Status MatchingKeys(ReadView& view, uint8_t db, std::string_view pattern, int64_
   return st;
 }
 
-Result<std::optional<std::string>> RandomKey(ReadView& view, uint8_t db, int64_t now_ms, uint64_t random) {
+Result<std::optional<std::string>> RandomKey(ReadView& view, uint8_t db, int64_t now_ms, uint64_t random,
+                                             std::string_view cursor) {
+  if (encoding::Slotless()) return RandomKeyFromCursor(view, db, now_ms, random, cursor);
   const std::string start = encoding::MetaSlotPrefix(db, static_cast<uint16_t>(random % kSlotCount));
   auto it = view.NewIterator(ColumnFamily::kMeta, DbRange(db));
   if (!it.ok()) return it.status();

@@ -15,6 +15,7 @@
 
 #include "common/score_format.h"
 #include "common/sha1.h"
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "support/command_harness.h"
 
@@ -202,6 +203,34 @@ TEST(Digest, SlotRangeDigestCoversOnlyTheRangeAndIgnoresOids) {  // M7b D23
   ASSERT_EQ(b.Run({"PEXPIREAT", "b", "1800000000001"}), test::Int(1));
   EXPECT_EQ(digest(a, false), digest(b, false));  // Redis's digest: "has a TTL" only
   EXPECT_NE(digest(a, true), digest(b, true));    // TTL mode: the exact deadline
+}
+
+// The slotless walk keeps the same keys as the slotted prefix scan, so the digest is layout-independent.
+TEST(Digest, SlotRangeDigestIsTheSameInBothLayouts) {
+  const auto digest = [](encoding::KeyLayout layout, uint16_t first, uint16_t last) {
+    const encoding::ScopedKeyLayout scoped(layout);
+    test::CommandHarness h;
+    EXPECT_EQ(h.Run({"HSET", "{b}h", "f", "v"}), test::Int(1));
+    EXPECT_EQ(h.Run({"ZADD", "{b}z", "1", "m"}), test::Int(1));
+    EXPECT_EQ(h.Run({"SET", "b", "1", "PX", "100000"}), test::kOk);  // slot 3300
+    EXPECT_EQ(h.Run({"SET", "foo", "2"}), test::kOk);                // slot 12182
+    EXPECT_EQ(h.Run({"SET", "a", "3"}), test::kOk);                  // slot 15495
+    Digest20 d{};
+    EXPECT_TRUE(h.services.engine_
+                    .Snapshot([&](ReadView& v, int64_t) {
+                      return MoveInto(SlotRangeDigest(v, first, last, /*with_ttl=*/true), &d);
+                    })
+                    .ok());
+    return DigestHex(d);
+  };
+  for (const auto& [first, last] : {std::pair<uint16_t, uint16_t>{3300, 3300}, {0, 16383}, {3301, 15494}}) {
+    EXPECT_EQ(digest(encoding::KeyLayout::kSlotted, first, last),
+              digest(encoding::KeyLayout::kSlotless, first, last))
+        << first << "-" << last;
+  }
+  EXPECT_NE(digest(encoding::KeyLayout::kSlotless, 3300, 3300),
+            digest(encoding::KeyLayout::kSlotless, 0, 16383));
+  EXPECT_EQ(digest(encoding::KeyLayout::kSlotless, 1, 100), std::string(40, '0'));
 }
 
 }  // namespace

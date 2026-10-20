@@ -38,8 +38,14 @@ Status ScanKeys(ReadView& view, uint8_t db, const ScanPosition& position, size_t
                 const ScanFilter& filter, int64_t now_ms, ScanPage* out);
 Status MatchingKeys(ReadView& view, uint8_t db, std::string_view pattern, int64_t now_ms,
                     std::vector<std::string>* out);
-// A live key near a random slot, wrapping around; nullopt if db has no live key.
-Result<std::optional<std::string>> RandomKey(ReadView& view, uint8_t db, int64_t now_ms, uint64_t random);
+// Slotless RANDOMKEY: live keys examined per call (kvrocks redis_db.h RANDOM_KEY_SCAN_LIMIT).
+inline constexpr size_t kRandomKeyBatch = 60;
+// A random live key of db; nullopt if db has none. Slotted: the first live key from a random slot on,
+// wrapping around. Slotless (no slot to seek to; kvrocks Database::RandomKey): one of the next
+// kRandomKeyBatch live keys after the user key `cursor` (empty = from the first), from the first key when
+// none follows; the caller passes the key the previous call returned.
+Result<std::optional<std::string>> RandomKey(ReadView& view, uint8_t db, int64_t now_ms, uint64_t random,
+                                             std::string_view cursor = {});
 
 struct ElementPage {
   std::vector<std::string> items;  // fields, or field/value pairs flattened when with_values

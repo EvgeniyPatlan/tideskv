@@ -51,4 +51,15 @@ size_t CursorStore::bytes() const {
   return bytes_;
 }
 
+std::string CursorStore::RandomKeyCursor(uint8_t db) const {
+  std::lock_guard lock(mu_);
+  return db < random_key_cursors_.size() ? random_key_cursors_[db] : std::string();
+}
+
+void CursorStore::SetRandomKeyCursor(uint8_t db, std::string key) {
+  if (key.size() > kMaxPositionBytes) key.clear();
+  std::lock_guard lock(mu_);
+  if (db < random_key_cursors_.size()) random_key_cursors_[db] = std::move(key);
+}
+
 }  // namespace tideskv

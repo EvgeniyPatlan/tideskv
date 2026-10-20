@@ -3,9 +3,12 @@
 #include <set>
 
 #include "commands/reply_util.h"
+#include "encoding/key_layout.h"
+#include "exec/engine.h"
 #include "support/command_harness.h"
 #include "support/scan_reply.h"
 #include "types/cursor_store.h"
+#include "types/scan.h"
 
 namespace tideskv {
 namespace {
@@ -273,6 +276,63 @@ TEST_F(ScanCmds, RandomKey) {
   EXPECT_EQ(Run({"DEL", "only"}), test::Int(1));
   h.clock().Advance(1);
   EXPECT_EQ(Run({"RANDOMKEY"}), kNil);  // only an expired key remains
+}
+
+// Slotless: Kvrocks' RandomKey (redis_db.cc): a random one of the next kRandomKeyBatch live keys after the
+// cursor, from the first key when none follows.
+struct SlotlessRandomKey : ::testing::Test {
+  const encoding::ScopedKeyLayout slotless{encoding::KeyLayout::kSlotless};
+  CommandHarness h;
+  std::optional<std::string> Pick(std::string_view cursor, uint64_t random) {
+    std::optional<std::string> key;
+    EXPECT_TRUE(h.services.engine_
+                    .Snapshot([&](ReadView& v, int64_t now_ms) {
+                      return MoveInto(RandomKey(v, 0, now_ms, random, cursor), &key);
+                    })
+                    .ok());
+    return key;
+  }
+  static std::string Key(int i) {
+    std::string s = std::to_string(i);
+    return "k" + std::string(3 - s.size(), '0') + s;  // k000 .. k199 sort numerically
+  }
+};
+
+TEST_F(SlotlessRandomKey, PicksAmongTheBatchAfterTheCursorAndWraps) {
+  EXPECT_EQ(Pick("", 0), std::nullopt);
+  for (int i = 0; i < 200; ++i) h.Run({"SET", Key(i), "v"});
+  EXPECT_EQ(Pick("", 0), Key(0));
+  EXPECT_EQ(Pick("", kRandomKeyBatch - 1), Key(kRandomKeyBatch - 1));
+  EXPECT_EQ(Pick("", kRandomKeyBatch), Key(0));  // random % batch size
+  EXPECT_EQ(Pick(Key(50), 0), Key(51));          // strictly after the cursor
+  EXPECT_EQ(Pick(Key(150), 48), Key(199));       // a short last batch: 49 keys
+  EXPECT_EQ(Pick(Key(199), 3), Key(3));          // nothing after the cursor: from the first key
+  EXPECT_EQ(Pick("zzz", 1), Key(1));             // a cursor past every key (deleted since)
+}
+
+TEST_F(SlotlessRandomKey, SkipsExpiredKeys) {
+  h.Run({"SET", "a", "v", "PX", "1"});
+  h.Run({"SET", "b", "v"});
+  h.Run({"SET", "c", "v", "PX", "1"});
+  h.clock().Advance(1);
+  for (uint64_t r = 0; r < 4; ++r) EXPECT_EQ(Pick("", r), "b");
+  EXPECT_EQ(Pick("b", 0), "b");  // wraps onto the only live key
+  h.Run({"DEL", "b"});
+  EXPECT_EQ(Pick("", 0), std::nullopt);
+}
+
+TEST_F(SlotlessRandomKey, TheCommandWalksTheWholeDb) {  // the saved cursor advances, then wraps
+  for (int i = 0; i < 200; ++i) h.Run({"SET", Key(i), "v"});
+  std::set<std::string> seen;
+  for (int i = 0; i < 600; ++i) {
+    const std::string r = h.Run({"RANDOMKEY"});
+    ASSERT_EQ(r.substr(0, 4), "$4\r\n") << r;
+    seen.insert(r.substr(4, 4));
+  }
+  EXPECT_GT(seen.size(), 100u);  // far beyond one batch of 60
+  EXPECT_TRUE(seen.count(Key(199)) == 1 || seen.count(Key(198)) == 1 || seen.count(Key(197)) == 1);
+  h.session.db = 1;  // another db has its own cursor
+  EXPECT_EQ(h.Run({"RANDOMKEY"}), kNil);
 }
 
 }  // namespace

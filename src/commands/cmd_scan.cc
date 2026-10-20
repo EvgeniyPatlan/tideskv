@@ -8,6 +8,7 @@
 #include "commands/server_services.h"
 #include "common/string_util.h"
 #include "encoding/key_codec.h"
+#include "encoding/key_layout.h"
 #include "exec/engine.h"
 #include "types/cursor_store.h"
 #include "types/scan.h"
@@ -57,11 +58,16 @@ void Keys(ExecContext& ctx, const ArgList& argv) {
 
 void RandomKeyCmd(ExecContext& ctx, const ArgList&) {
   Engine& e = ctx.server.engine();
+  CursorStore& cursors = ctx.server.cursors();
+  const uint8_t db = ctx.session.db;
+  const std::string cursor = encoding::Slotless() ? cursors.RandomKeyCursor(db) : std::string();
   std::optional<std::string> key;
   const Status st = e.Snapshot([&](ReadView& v, int64_t now_ms) {
-    return MoveInto(RandomKey(v, ctx.session.db, now_ms, CommandRng()()), &key);
+    return MoveInto(RandomKey(v, db, now_ms, CommandRng()(), cursor), &key);
   });
   if (!st.ok()) return ReplyError(ctx, st);
+  if (encoding::Slotless())
+    cursors.SetRandomKeyCursor(db, key.value_or(std::string()));  // kvrocks: the result
   key ? ctx.reply.Bulk(*key) : ctx.reply.Null();
 }
 

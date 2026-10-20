@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -6,6 +7,7 @@
 #include <optional>
 #include <string>
 
+#include "encoding/key_codec.h"
 #include "types/scan_position.h"
 
 namespace tideskv {
@@ -36,6 +38,11 @@ class CursorStore {
   std::optional<ScanPosition> Load(uint64_t cursor, CursorKind kind = CursorKind::kKeys) const;
   size_t bytes() const;  // accounted size of the saved entries; never above kMaxBytes
 
+  // Slotless RANDOMKEY's cursor per db (the key it last returned; empty = from the first key), shared by all
+  // connections as in Kvrocks. A key longer than kMaxPositionBytes is not kept: the next call starts over.
+  std::string RandomKeyCursor(uint8_t db) const;
+  void SetRandomKeyCursor(uint8_t db, std::string key);
+
  private:
   struct Entry {
     uint64_t cursor = 0;
@@ -48,6 +55,7 @@ class CursorStore {
   std::deque<Entry> entries_;  // consecutive cursors, oldest first
   size_t bytes_ = 0;
   uint64_t last_ = 0;
+  std::array<std::string, encoding::kNumDatabases> random_key_cursors_;  // under mu_
 };
 
 }  // namespace tideskv
