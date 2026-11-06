@@ -1,5 +1,5 @@
 diff --git a/src/cache/cache.c b/src/cache/cache.c
-index 12eabc2..6a549f1 100644
+index 12eabc2..f812020 100644
 --- a/src/cache/cache.c
 +++ b/src/cache/cache.c
 @@ -71,6 +71,14 @@
@@ -17,7 +17,19 @@ index 12eabc2..6a549f1 100644
  /* frame lifecycle: FREE is reusable, LIVE is a gettable entry, DYING is evicted but still pinned by
   * a reader whose release will reclaim the payload and return the frame to FREE */
  #define CACHE_FRAME_FREE  0
-@@ -178,6 +186,8 @@ struct cache_entry
+@@ -166,7 +174,10 @@ struct cache_entry
+  * keys to frame indices for lookup, and the byte accounting and stats for its slice of the budget
+  * @param lock write lock for put and eviction; reads are lock-free
+  * @param frames the frame array of num_frames entries
+- * @param buckets the lookup table of num_buckets words, each a hash tag over a frame index
++ * @param buckets the published lookup table of num_buckets words, each a hash tag over a frame
++ * index; lock-free readers acquire it, and only a rebuild under the lock swaps it
++ * @param tables the two bucket arrays buckets alternates between, so a rebuild fills the one
++ * readers are not probing and publishes it whole; both live until the cache is destroyed
+  * @param num_frames frame count, a power of two
+  * @param num_buckets bucket count, a power of two
+  * @param frame_mask num_frames - 1
+@@ -178,12 +189,15 @@ struct cache_entry
   * @param misses gets that found nothing
   * @param evictions entries evicted
   * @param entries current live entries
@@ -26,7 +38,15 @@ index 12eabc2..6a549f1 100644
   */
  struct cache_shard
  {
-@@ -195,6 +205,8 @@ struct cache_shard
+     cache_spinlock_t lock;
+     cache_entry_t *frames;
+-    _Atomic(uint32_t) *buckets;
++    _Atomic(_Atomic(uint32_t) *) buckets;
++    _Atomic(uint32_t) *tables[2];
+     int num_frames;
+     int num_buckets;
+     int frame_mask;
+@@ -195,6 +209,8 @@ struct cache_shard
      _Atomic(uint64_t) misses;
      _Atomic(uint64_t) evictions;
      _Atomic(uint64_t) entries;
@@ -35,16 +55,52 @@ index 12eabc2..6a549f1 100644
  };
  
  /**
-@@ -319,22 +331,56 @@ int cache_get(cache_t *cache, uint64_t file_id, uint64_t offset, void **payload,
+@@ -251,6 +267,21 @@ static uint32_t cache_bucket_pack(const uint32_t tag, const int frame_idx)
+     return (tag << CACHE_BUCKET_INDEX_BITS) | (uint32_t)frame_idx;
+ }
+ 
++/* the table a lock-free reader probes. the acquire pairs with the release a rebuild publishes its
++ * table with, so the reader sees every bucket the rebuild wrote. a reader still on the table a
++ * rebuild replaced keeps probing it safely: its words stay atomic and name frames, and a hit is
++ * decided by the frame itself, so a stale table can only cost a miss */
++static _Atomic(uint32_t) *cache_table_read(cache_shard_t *shard)
++{
++    return atomic_load_explicit(&shard->buckets, memory_order_acquire);
++}
++
++/* the table a lock holder edits; only a lock holder swaps it, so a relaxed load is current */
++static _Atomic(uint32_t) *cache_table_locked(cache_shard_t *shard)
++{
++    return atomic_load_explicit(&shard->buckets, memory_order_relaxed);
++}
++
+ /* reclaim a frame's payload exactly once and return the frame to FREE; runs on the last reference
+  * drop, on whichever thread observed it. safe without the shard lock -- every field it touches is
+  * atomic and the FREE store publishes the completed reclaim to a locked reuse. */
+@@ -278,11 +309,12 @@ int cache_get(cache_t *cache, uint64_t file_id, uint64_t offset, void **payload,
+     cache_shard_t *shard = &cache->shards[h & (uint64_t)cache->shard_mask];
+     const int start = cache_bucket_start(shard, h);
+     const uint32_t tag = cache_bucket_tag(h);
++    _Atomic(uint32_t) *table = cache_table_read(shard);
+ 
+     for (int k = 0; k <= shard->bucket_mask; k++)
+     {
+         const int b = (start + k) & shard->bucket_mask;
+-        const uint32_t word = atomic_load_explicit(&shard->buckets[b], memory_order_acquire);
++        const uint32_t word = atomic_load_explicit(&table[b], memory_order_acquire);
+         const uint32_t fi = cache_bucket_index(word);
+         if (fi == CACHE_BUCKET_EMPTY) break; /* probe chain ends -> miss */
+         if (fi == CACHE_BUCKET_TOMBSTONE) continue;
+@@ -319,45 +351,116 @@ int cache_get(cache_t *cache, uint64_t file_id, uint64_t offset, void **payload,
      return 0;
  }
  
 -/* tombstone the bucket mapping that points at frame_idx for the given key; the shard lock is held
-+/* the frame index in bucket b; the shard lock is held, so the relaxed read sees every locked store
-  */
-+static uint32_t cache_bucket_index_at(const cache_shard_t *shard, const int b)
+- */
++/* the frame index in bucket b of table; under the shard lock, so a relaxed read is current */
++static uint32_t cache_bucket_index_at(_Atomic(uint32_t) *table, const int b)
 +{
-+    return cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
++    return cache_bucket_index(atomic_load_explicit(&table[b], memory_order_relaxed));
 +}
 +
 +/* adjust the shard's tombstone count; only called under the shard lock, the atomic is for the
@@ -65,48 +121,59 @@ index 12eabc2..6a549f1 100644
 + * here. otherwise the bucket becomes a TOMBSTONE, which a reader skips, and the shard counts it */
  static void cache_bucket_remove(cache_shard_t *shard, const uint64_t h, int frame_idx)
  {
++    _Atomic(uint32_t) *table = cache_table_locked(shard);
      const int start = cache_bucket_start(shard, h);
      for (int k = 0; k <= shard->bucket_mask; k++)
      {
          const int b = (start + k) & shard->bucket_mask;
 -        const uint32_t fi =
 -            cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
-+        const uint32_t fi = cache_bucket_index_at(shard, b);
++        const uint32_t fi = cache_bucket_index_at(table, b);
          if (fi == CACHE_BUCKET_EMPTY) return;
 -        if (fi == (uint32_t)frame_idx)
 +        if (fi != (uint32_t)frame_idx) continue;
 +
-+        if (cache_bucket_index_at(shard, (b + 1) & shard->bucket_mask) != CACHE_BUCKET_EMPTY)
++        if (cache_bucket_index_at(table, (b + 1) & shard->bucket_mask) != CACHE_BUCKET_EMPTY)
          {
-             atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_TOMBSTONE, memory_order_release);
+-            atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_TOMBSTONE, memory_order_release);
++            atomic_store_explicit(&table[b], CACHE_BUCKET_TOMBSTONE, memory_order_release);
 +            cache_tombstones_add(shard, 1);
              return;
          }
-+        atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_EMPTY, memory_order_release);
++        atomic_store_explicit(&table[b], CACHE_BUCKET_EMPTY, memory_order_release);
 +        /* walk back over the tombstone run that now ends at an EMPTY bucket; bounded by the table,
 +         * which always holds at least the EMPTY bucket just written */
 +        for (int p = (b - 1) & shard->bucket_mask;
-+             p != b && cache_bucket_index_at(shard, p) == CACHE_BUCKET_TOMBSTONE;
++             p != b && cache_bucket_index_at(table, p) == CACHE_BUCKET_TOMBSTONE;
 +             p = (p - 1) & shard->bucket_mask)
 +        {
-+            atomic_store_explicit(&shard->buckets[p], CACHE_BUCKET_EMPTY, memory_order_release);
++            atomic_store_explicit(&table[p], CACHE_BUCKET_EMPTY, memory_order_release);
 +            cache_tombstones_add(shard, -1);
 +        }
 +        return;
      }
  }
  
-@@ -346,18 +392,49 @@ static void cache_bucket_insert(cache_shard_t *shard, const uint64_t h, int fram
+-/* map frame_idx into the first empty or tombstone bucket of the key's probe chain; the shard lock
+- * is held */
+-static void cache_bucket_insert(cache_shard_t *shard, const uint64_t h, int frame_idx)
++/* map frame_idx into the first empty or tombstone bucket of the key's probe chain in table, the
++ * published one or the spare a rebuild fills; the shard lock is held */
++static void cache_bucket_insert(cache_shard_t *shard, _Atomic(uint32_t) *table, const uint64_t h,
++                                int frame_idx)
+ {
+     const int start = cache_bucket_start(shard, h);
      for (int k = 0; k <= shard->bucket_mask; k++)
      {
          const int b = (start + k) & shard->bucket_mask;
 -        const uint32_t fi =
 -            cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
-+        const uint32_t fi = cache_bucket_index_at(shard, b);
++        const uint32_t fi = cache_bucket_index_at(table, b);
          if (fi == CACHE_BUCKET_EMPTY || fi == CACHE_BUCKET_TOMBSTONE)
          {
-             atomic_store_explicit(&shard->buckets[b],
-                                   cache_bucket_pack(cache_bucket_tag(h), frame_idx),
+-            atomic_store_explicit(&shard->buckets[b],
+-                                  cache_bucket_pack(cache_bucket_tag(h), frame_idx),
++            atomic_store_explicit(&table[b], cache_bucket_pack(cache_bucket_tag(h), frame_idx),
                                    memory_order_release);
 +            if (fi == CACHE_BUCKET_TOMBSTONE) cache_tombstones_add(shard, -1);
              return;
@@ -114,14 +181,17 @@ index 12eabc2..6a549f1 100644
      }
  }
  
-+/* rebuild the bucket table once tombstones pass their share of it: empty every bucket, then map
-+ * every LIVE frame again. the shard lock is held, so the LIVE set is fixed for the duration -- a
-+ * frame turns LIVE or DYING only under the lock, and a DYING frame, already unmapped by its
-+ * eviction, is never mapped again; the lock-free reclaim only moves DYING to FREE.
++/* rebuild the bucket table once tombstones pass their share of it: fill the spare table with every
++ * LIVE frame and no tombstones, then publish it in place of the current one. the shard lock is
++ * held, so the LIVE set is fixed for the duration -- a frame turns LIVE or DYING only under the
++ * lock, and a DYING frame, already unmapped by its eviction, is never mapped again; the lock-free
++ * reclaim only moves DYING to FREE.
 + *
-+ * lock-free readers keep probing meanwhile. one may miss a key that is cached, which costs it a
-+ * read from disk and nothing else. it cannot hit the wrong key: a bucket only names a frame, and a
-+ * hit is decided by the frame's key, compared again under the reader's pin together with its LIVE
++ * readers on the current table go on finding every entry it maps until the swap, so a hot block is
++ * not missed for the length of the rebuild. a reader that loaded the table before an earlier swap
++ * may still be probing the array that is now the spare, and sees it rewritten under it. that costs
++ * it a miss at worst, never a wrong hit: every word it reads is atomic and names a frame, and a hit
++ * is decided by the frame's key, compared again under the reader's pin together with its LIVE
 + * state, exactly as for a bucket that went stale any other way */
 +static void cache_maybe_rebuild(cache_shard_t *shard)
 +{
@@ -129,26 +199,42 @@ index 12eabc2..6a549f1 100644
 +        shard->num_buckets / CACHE_TOMBSTONE_REBUILD_DIVISOR)
 +        return;
 +
++    _Atomic(uint32_t) *spare =
++        cache_table_locked(shard) == shard->tables[0] ? shard->tables[1] : shard->tables[0];
 +    for (int b = 0; b < shard->num_buckets; b++)
-+        atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_EMPTY, memory_order_release);
-+    atomic_store_explicit(&shard->tombstones, 0, memory_order_relaxed);
-+
++        atomic_store_explicit(&spare[b], CACHE_BUCKET_EMPTY, memory_order_relaxed);
 +    for (int i = 0; i < shard->num_frames; i++)
 +    {
 +        const cache_entry_t *frame = &shard->frames[i];
 +        if (atomic_load_explicit(&frame->state, memory_order_relaxed) != CACHE_FRAME_LIVE) continue;
-+        cache_bucket_insert(shard,
++        cache_bucket_insert(shard, spare,
 +                            cache_hash(atomic_load_explicit(&frame->file_id, memory_order_relaxed),
 +                                       atomic_load_explicit(&frame->offset, memory_order_relaxed)),
 +                            i);
 +    }
++    /* the spare holds no tombstones, so the count starts over with it */
++    atomic_store_explicit(&shard->tombstones, 0, memory_order_relaxed);
++    atomic_store_explicit(&shard->buckets, spare, memory_order_release);
 +    atomic_fetch_add_explicit(&shard->rebuilds, 1, memory_order_relaxed);
 +}
 +
  /* evict a LIVE frame: drop its bucket mapping and its baseline reference, reclaiming the payload
   * now if no reader holds it (returning the frame to FREE) or deferring to the last reader. the
   * shard lock is held. */
-@@ -489,6 +566,7 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
+@@ -438,10 +541,11 @@ static cache_entry_t *cache_find_locked(cache_shard_t *shard, const uint64_t h,
+ {
+     const int start = cache_bucket_start(shard, h);
+     const uint32_t tag = cache_bucket_tag(h);
++    _Atomic(uint32_t) *table = cache_table_locked(shard);
+     for (int k = 0; k <= shard->bucket_mask; k++)
+     {
+         const int b = (start + k) & shard->bucket_mask;
+-        const uint32_t word = atomic_load_explicit(&shard->buckets[b], memory_order_relaxed);
++        const uint32_t word = atomic_load_explicit(&table[b], memory_order_relaxed);
+         const uint32_t fi = cache_bucket_index(word);
+         if (fi == CACHE_BUCKET_EMPTY) return NULL;
+         if (fi == CACHE_BUCKET_TOMBSTONE) continue;
+@@ -489,6 +593,7 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
      const int idx = cache_alloc_frame(shard);
      if (idx < 0)
      {
@@ -156,17 +242,19 @@ index 12eabc2..6a549f1 100644
          cache_unlock(&shard->lock);
          reclaim(payload, ctx); /* could not cache; hand the payload back for reclamation */
          return 0;
-@@ -512,6 +590,9 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
+@@ -511,7 +616,10 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
+     /* publish LIVE last so a lock-free reader that pins the frame sees every field above */
      atomic_store_explicit(&frame->state, CACHE_FRAME_LIVE, memory_order_release);
  
-     cache_bucket_insert(shard, h, idx);
+-    cache_bucket_insert(shard, h, idx);
++    cache_bucket_insert(shard, cache_table_locked(shard), h, idx);
 +    /* after the insert and after the evictions that made room, so every frame is LIVE or DYING for
 +     * good by the time the table is rebuilt from the frames */
 +    cache_maybe_rebuild(shard);
      cache_unlock(&shard->lock);
  
      if (pin) *pin = frame;
-@@ -537,7 +618,34 @@ void cache_get_stats(cache_t *cache, cache_stats_t *stats)
+@@ -537,14 +645,43 @@ void cache_get_stats(cache_t *cache, cache_stats_t *stats)
          stats->evictions += atomic_load_explicit(&shard->evictions, memory_order_relaxed);
          stats->bytes_used += atomic_load_explicit(&shard->bytes_used, memory_order_relaxed);
          stats->entries += atomic_load_explicit(&shard->entries, memory_order_relaxed);
@@ -183,11 +271,12 @@ index 12eabc2..6a549f1 100644
 +    cache_shard_t *shard = &cache->shards[h & (uint64_t)cache->shard_mask];
 +    const int start = cache_bucket_start(shard, h);
 +    const uint32_t tag = cache_bucket_tag(h);
++    _Atomic(uint32_t) *table = cache_table_read(shard);
 +    int probed = 0;
 +    for (int k = 0; k <= shard->bucket_mask; k++)
 +    {
 +        const int b = (start + k) & shard->bucket_mask;
-+        const uint32_t word = atomic_load_explicit(&shard->buckets[b], memory_order_acquire);
++        const uint32_t word = atomic_load_explicit(&table[b], memory_order_acquire);
 +        const uint32_t fi = cache_bucket_index(word);
 +        probed++;
 +        if (fi == CACHE_BUCKET_EMPTY) break;
@@ -201,7 +290,16 @@ index 12eabc2..6a549f1 100644
  }
  
  /* free a shard's arrays */
-@@ -596,6 +704,8 @@ static int cache_shard_init(cache_shard_t *shard, const int num_frames, const si
+ static void cache_shard_destroy(cache_shard_t *shard)
+ {
+     free(shard->frames);
+-    free((void *)shard->buckets);
++    free((void *)shard->tables[0]);
++    free((void *)shard->tables[1]);
+ }
+ 
+ /**
+@@ -596,13 +733,17 @@ static int cache_shard_init(cache_shard_t *shard, const int num_frames, const si
      atomic_init(&shard->misses, 0);
      atomic_init(&shard->evictions, 0);
      atomic_init(&shard->entries, 0);
@@ -209,7 +307,32 @@ index 12eabc2..6a549f1 100644
 +    atomic_init(&shard->rebuilds, 0);
  
      shard->frames = calloc((size_t)num_frames, sizeof(*shard->frames));
-     shard->buckets = calloc((size_t)shard->num_buckets, sizeof(*shard->buckets));
+-    shard->buckets = calloc((size_t)shard->num_buckets, sizeof(*shard->buckets));
+-    if (!shard->frames || !shard->buckets)
++    for (int t = 0; t < 2; t++)
++        shard->tables[t] = calloc((size_t)shard->num_buckets, sizeof(*shard->tables[t]));
++    if (!shard->frames || !shard->tables[0] || !shard->tables[1])
+     {
+         free(shard->frames);
+-        free((void *)shard->buckets);
++        free((void *)shard->tables[0]);
++        free((void *)shard->tables[1]);
+         return -1;
+     }
+ 
+@@ -612,8 +753,10 @@ static int cache_shard_init(cache_shard_t *shard, const int num_frames, const si
+         atomic_init(&shard->frames[i].state, CACHE_FRAME_FREE);
+         shard->frames[i].shard = shard;
+     }
+-    for (int i = 0; i < shard->num_buckets; i++)
+-        atomic_init(&shard->buckets[i], CACHE_BUCKET_EMPTY);
++    for (int t = 0; t < 2; t++)
++        for (int i = 0; i < shard->num_buckets; i++)
++            atomic_init(&shard->tables[t][i], CACHE_BUCKET_EMPTY);
++    atomic_init(&shard->buckets, shard->tables[0]);
+     return 0;
+ }
+ 
 diff --git a/src/cache/cache.h b/src/cache/cache.h
 index e2ceac0..9d8c400 100644
 --- a/src/cache/cache.h
@@ -249,10 +372,10 @@ index e2ceac0..9d8c400 100644
 +
  #endif /* __TIDESDB_CACHE_H__ */
 diff --git a/test/cache__tests.c b/test/cache__tests.c
-index b0549be..14aa0b1 100644
+index b0549be..b19f7d1 100644
 --- a/test/cache__tests.c
 +++ b/test/cache__tests.c
-@@ -373,6 +373,225 @@ void test_cache_stress_concurrent(void)
+@@ -373,6 +373,243 @@ void test_cache_stress_concurrent(void)
      ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
  }
  
@@ -400,8 +523,10 @@ index b0549be..14aa0b1 100644
 +    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
 +}
 +
-+/* lock-free readers racing writers that churn the table hard enough to clear and rebuild it many
-+ * times: a hit always carries the requested key's payload */
++/* lock-free readers racing writers that churn the table hard enough to rebuild it many times, each
++ * rebuild filling the spare table and swapping it in while readers probe the published one, or a
++ * stale one: a hit always carries the requested key's payload, and once the threads are done every
++ * live entry is reachable */
 +#define CHURN_STRESS_READERS  4
 +#define CHURN_STRESS_WRITERS  2
 +#define CHURN_STRESS_KEYSPACE 4096
@@ -470,6 +595,22 @@ index b0549be..14aa0b1 100644
 +           (unsigned long long)stats.rebuilds);
 +    ASSERT_TRUE(stats.rebuilds > 0); /* the readers raced table rebuilds, not just evictions */
 +    ASSERT_TRUE(atomic_load(&s_churn_hits) > 0);
++
++    /* with every thread joined no pin is left, so the live entries are exactly what the stats
++     * count, and each of them is reachable through whichever table the last rebuild published */
++    uint64_t reachable = 0;
++    for (uint64_t k = 0; k < CHURN_STRESS_KEYSPACE; k++)
++    {
++        void *got = NULL;
++        cache_entry_t *pin = NULL;
++        if (!cache_get(s_churn_cache, churn_file(k), k, &got, NULL, &pin)) continue;
++        ASSERT_EQ(*(uint64_t *)got, churn_value(churn_file(k), k));
++        cache_release(pin);
++        reachable++;
++    }
++    cache_get_stats(s_churn_cache, &stats);
++    ASSERT_TRUE(stats.entries > 0);
++    ASSERT_EQ(reachable, stats.entries);
 +    cache_destroy(s_churn_cache);
 +    s_churn_cache = NULL;
 +    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
@@ -478,7 +619,7 @@ index b0549be..14aa0b1 100644
  int main(int argc, char **argv)
  {
      INIT_TEST_FILTER(argc, argv);
-@@ -384,6 +603,10 @@ int main(int argc, char **argv)
+@@ -384,6 +621,10 @@ int main(int argc, char **argv)
      RUN_TEST(test_cache_loaded_table_returns_each_key_its_own_payload, tests_passed);
      RUN_TEST(test_cache_pin_survives_eviction, tests_passed);
      RUN_TEST(test_cache_stress_concurrent, tests_passed);

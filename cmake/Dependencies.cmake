@@ -18,14 +18,26 @@ set(TIDESDB_WITH_ZSTD ${TIDESKV_COMPRESSION} CACHE BOOL "" FORCE)
 #  4. A compaction reads each input level below L1 as one merge source instead of one per file, and the
 #     merge stops scanning every source for read failures after every entry.
 set(TIDESDB_PATCHES
-  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch
-  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch
-  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch
-  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch)
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch")
+# The patch step reruns only when its command changes, so the command carries a hash of the patches'
+# contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
+# reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.
+set(TIDESDB_PATCH_HASHES "")
+foreach(patch IN LISTS TIDESDB_PATCHES)
+  file(SHA256 "${patch}" patch_hash)
+  string(APPEND TIDESDB_PATCH_HASHES "${patch_hash}")
+endforeach()
+string(SHA256 TIDESDB_PATCH_CHAIN_SHA256 "${TIDESDB_PATCH_HASHES}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TIDESDB_PATCHES})
 FetchContent_Declare(tidesdb
   GIT_REPOSITORY https://github.com/tidesdb/tidesdb.git
   GIT_TAG 6d1fb731e6ea1bff0de1c290041bdeacbc1267e6
-  PATCH_COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/apply-patch-chain.sh ${TIDESDB_PATCHES})
+  # one argument per patch: each list element stays whole even if its path has spaces
+  PATCH_COMMAND sh "${CMAKE_CURRENT_LIST_DIR}/apply-patch-chain.sh"
+                "--chain-sha256=${TIDESDB_PATCH_CHAIN_SHA256}" ${TIDESDB_PATCHES})
 
 # --- spdlog (bundled fmt) ---
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
