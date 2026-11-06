@@ -45,7 +45,13 @@ foreach(suite planner exec)
   target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)  # fallocate, as TidesDB builds it
   target_link_libraries(tidesdb_${suite}_tests PRIVATE tidesdb)
 endforeach()
+# TidesDB's block cache suite, holding the churn cases of cmake/patches/tidesdb-cache-clear-tombstones.patch
+add_executable(tidesdb_cache_tests ${tidesdb_SOURCE_DIR}/test/cache__tests.c)
+target_include_directories(tidesdb_cache_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
+target_compile_definitions(tidesdb_cache_tests PRIVATE _GNU_SOURCE)
+target_link_libraries(tidesdb_cache_tests PRIVATE tidesdb)
 add_test(NAME TidesDbPlanner COMMAND tidesdb_planner_tests)
+add_test(NAME TidesDbCache COMMAND tidesdb_cache_tests)
 # the exec suite writes its scratch database under the working directory
 add_test(NAME TidesDbCompactionExec COMMAND tidesdb_exec_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 

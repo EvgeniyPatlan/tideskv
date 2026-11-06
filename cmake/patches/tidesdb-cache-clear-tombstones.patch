@@ -1,0 +1,491 @@
+diff --git a/src/cache/cache.c b/src/cache/cache.c
+index 12eabc2..6a549f1 100644
+--- a/src/cache/cache.c
++++ b/src/cache/cache.c
+@@ -71,6 +71,14 @@
+  * higher slice that picks the bucket probe start */
+ #define CACHE_BUCKET_TAG_SHIFT 24
+ 
++/* the share of a shard's buckets that may hold tombstones before the shard rebuilds its table. a
++ * remove leaves a tombstone unless the next bucket is empty, and an insert reuses one only on its
++ * own probe chain, so under steady eviction tombstones pile up until a miss -- which ends only at
++ * an empty bucket -- walks the whole table. a quarter keeps the table at most three quarters
++ * occupied (half live at most, by CACHE_BUCKETS_PER_FRAME), and the rebuild's cost, one pass over
++ * the buckets and frames, is spread over the num_buckets / 4 removes that triggered it */
++#define CACHE_TOMBSTONE_REBUILD_DIVISOR 4
++
+ /* frame lifecycle: FREE is reusable, LIVE is a gettable entry, DYING is evicted but still pinned by
+  * a reader whose release will reclaim the payload and return the frame to FREE */
+ #define CACHE_FRAME_FREE  0
+@@ -178,6 +186,8 @@ struct cache_entry
+  * @param misses gets that found nothing
+  * @param evictions entries evicted
+  * @param entries current live entries
++ * @param tombstones TOMBSTONE buckets in the table, written under the lock
++ * @param rebuilds times the bucket table was rebuilt to clear its tombstones
+  */
+ struct cache_shard
+ {
+@@ -195,6 +205,8 @@ struct cache_shard
+     _Atomic(uint64_t) misses;
+     _Atomic(uint64_t) evictions;
+     _Atomic(uint64_t) entries;
++    _Atomic(int) tombstones;
++    _Atomic(uint64_t) rebuilds;
+ };
+ 
+ /**
+@@ -319,22 +331,56 @@ int cache_get(cache_t *cache, uint64_t file_id, uint64_t offset, void **payload,
+     return 0;
+ }
+ 
+-/* tombstone the bucket mapping that points at frame_idx for the given key; the shard lock is held
++/* the frame index in bucket b; the shard lock is held, so the relaxed read sees every locked store
+  */
++static uint32_t cache_bucket_index_at(const cache_shard_t *shard, const int b)
++{
++    return cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
++}
++
++/* adjust the shard's tombstone count; only called under the shard lock, the atomic is for the
++ * lock-free stats read */
++static void cache_tombstones_add(cache_shard_t *shard, const int delta)
++{
++    atomic_store_explicit(&shard->tombstones,
++                          atomic_load_explicit(&shard->tombstones, memory_order_relaxed) + delta,
++                          memory_order_relaxed);
++}
++
++/* drop the bucket mapping that points at frame_idx for the given key; the shard lock is held.
++ *
++ * a probe ends at the first EMPTY, so a bucket followed by an EMPTY one lies on no other key's
++ * chain past it, and it can become EMPTY rather than a TOMBSTONE. that in turn ends the chain of
++ * every TOMBSTONE run directly before it, so those become EMPTY too. a lock-free reader racing this
++ * sees either word in each bucket; either way it only misses a key no longer, or not yet, mapped
++ * here. otherwise the bucket becomes a TOMBSTONE, which a reader skips, and the shard counts it */
+ static void cache_bucket_remove(cache_shard_t *shard, const uint64_t h, int frame_idx)
+ {
+     const int start = cache_bucket_start(shard, h);
+     for (int k = 0; k <= shard->bucket_mask; k++)
+     {
+         const int b = (start + k) & shard->bucket_mask;
+-        const uint32_t fi =
+-            cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
++        const uint32_t fi = cache_bucket_index_at(shard, b);
+         if (fi == CACHE_BUCKET_EMPTY) return;
+-        if (fi == (uint32_t)frame_idx)
++        if (fi != (uint32_t)frame_idx) continue;
++
++        if (cache_bucket_index_at(shard, (b + 1) & shard->bucket_mask) != CACHE_BUCKET_EMPTY)
+         {
+             atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_TOMBSTONE, memory_order_release);
++            cache_tombstones_add(shard, 1);
+             return;
+         }
++        atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_EMPTY, memory_order_release);
++        /* walk back over the tombstone run that now ends at an EMPTY bucket; bounded by the table,
++         * which always holds at least the EMPTY bucket just written */
++        for (int p = (b - 1) & shard->bucket_mask;
++             p != b && cache_bucket_index_at(shard, p) == CACHE_BUCKET_TOMBSTONE;
++             p = (p - 1) & shard->bucket_mask)
++        {
++            atomic_store_explicit(&shard->buckets[p], CACHE_BUCKET_EMPTY, memory_order_release);
++            cache_tombstones_add(shard, -1);
++        }
++        return;
+     }
+ }
+ 
+@@ -346,18 +392,49 @@ static void cache_bucket_insert(cache_shard_t *shard, const uint64_t h, int fram
+     for (int k = 0; k <= shard->bucket_mask; k++)
+     {
+         const int b = (start + k) & shard->bucket_mask;
+-        const uint32_t fi =
+-            cache_bucket_index(atomic_load_explicit(&shard->buckets[b], memory_order_relaxed));
++        const uint32_t fi = cache_bucket_index_at(shard, b);
+         if (fi == CACHE_BUCKET_EMPTY || fi == CACHE_BUCKET_TOMBSTONE)
+         {
+             atomic_store_explicit(&shard->buckets[b],
+                                   cache_bucket_pack(cache_bucket_tag(h), frame_idx),
+                                   memory_order_release);
++            if (fi == CACHE_BUCKET_TOMBSTONE) cache_tombstones_add(shard, -1);
+             return;
+         }
+     }
+ }
+ 
++/* rebuild the bucket table once tombstones pass their share of it: empty every bucket, then map
++ * every LIVE frame again. the shard lock is held, so the LIVE set is fixed for the duration -- a
++ * frame turns LIVE or DYING only under the lock, and a DYING frame, already unmapped by its
++ * eviction, is never mapped again; the lock-free reclaim only moves DYING to FREE.
++ *
++ * lock-free readers keep probing meanwhile. one may miss a key that is cached, which costs it a
++ * read from disk and nothing else. it cannot hit the wrong key: a bucket only names a frame, and a
++ * hit is decided by the frame's key, compared again under the reader's pin together with its LIVE
++ * state, exactly as for a bucket that went stale any other way */
++static void cache_maybe_rebuild(cache_shard_t *shard)
++{
++    if (atomic_load_explicit(&shard->tombstones, memory_order_relaxed) <=
++        shard->num_buckets / CACHE_TOMBSTONE_REBUILD_DIVISOR)
++        return;
++
++    for (int b = 0; b < shard->num_buckets; b++)
++        atomic_store_explicit(&shard->buckets[b], CACHE_BUCKET_EMPTY, memory_order_release);
++    atomic_store_explicit(&shard->tombstones, 0, memory_order_relaxed);
++
++    for (int i = 0; i < shard->num_frames; i++)
++    {
++        const cache_entry_t *frame = &shard->frames[i];
++        if (atomic_load_explicit(&frame->state, memory_order_relaxed) != CACHE_FRAME_LIVE) continue;
++        cache_bucket_insert(shard,
++                            cache_hash(atomic_load_explicit(&frame->file_id, memory_order_relaxed),
++                                       atomic_load_explicit(&frame->offset, memory_order_relaxed)),
++                            i);
++    }
++    atomic_fetch_add_explicit(&shard->rebuilds, 1, memory_order_relaxed);
++}
++
+ /* evict a LIVE frame: drop its bucket mapping and its baseline reference, reclaiming the payload
+  * now if no reader holds it (returning the frame to FREE) or deferring to the last reader. the
+  * shard lock is held. */
+@@ -489,6 +566,7 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
+     const int idx = cache_alloc_frame(shard);
+     if (idx < 0)
+     {
++        cache_maybe_rebuild(shard);
+         cache_unlock(&shard->lock);
+         reclaim(payload, ctx); /* could not cache; hand the payload back for reclamation */
+         return 0;
+@@ -512,6 +590,9 @@ int cache_put(cache_t *cache, uint64_t file_id, uint64_t offset, void *payload,
+     atomic_store_explicit(&frame->state, CACHE_FRAME_LIVE, memory_order_release);
+ 
+     cache_bucket_insert(shard, h, idx);
++    /* after the insert and after the evictions that made room, so every frame is LIVE or DYING for
++     * good by the time the table is rebuilt from the frames */
++    cache_maybe_rebuild(shard);
+     cache_unlock(&shard->lock);
+ 
+     if (pin) *pin = frame;
+@@ -537,7 +618,34 @@ void cache_get_stats(cache_t *cache, cache_stats_t *stats)
+         stats->evictions += atomic_load_explicit(&shard->evictions, memory_order_relaxed);
+         stats->bytes_used += atomic_load_explicit(&shard->bytes_used, memory_order_relaxed);
+         stats->entries += atomic_load_explicit(&shard->entries, memory_order_relaxed);
++        stats->tombstones +=
++            (uint64_t)atomic_load_explicit(&shard->tombstones, memory_order_relaxed);
++        stats->rebuilds += atomic_load_explicit(&shard->rebuilds, memory_order_relaxed);
++    }
++}
++
++int cache_probe_length(cache_t *cache, uint64_t file_id, uint64_t offset)
++{
++    if (!cache) return 0;
++    const uint64_t h = cache_hash(file_id, offset);
++    cache_shard_t *shard = &cache->shards[h & (uint64_t)cache->shard_mask];
++    const int start = cache_bucket_start(shard, h);
++    const uint32_t tag = cache_bucket_tag(h);
++    int probed = 0;
++    for (int k = 0; k <= shard->bucket_mask; k++)
++    {
++        const int b = (start + k) & shard->bucket_mask;
++        const uint32_t word = atomic_load_explicit(&shard->buckets[b], memory_order_acquire);
++        const uint32_t fi = cache_bucket_index(word);
++        probed++;
++        if (fi == CACHE_BUCKET_EMPTY) break;
++        if (fi == CACHE_BUCKET_TOMBSTONE || (word >> CACHE_BUCKET_INDEX_BITS) != tag) continue;
++        const cache_entry_t *frame = &shard->frames[fi];
++        if (atomic_load_explicit(&frame->file_id, memory_order_relaxed) == file_id &&
++            atomic_load_explicit(&frame->offset, memory_order_relaxed) == offset)
++            break;
+     }
++    return probed;
+ }
+ 
+ /* free a shard's arrays */
+@@ -596,6 +704,8 @@ static int cache_shard_init(cache_shard_t *shard, const int num_frames, const si
+     atomic_init(&shard->misses, 0);
+     atomic_init(&shard->evictions, 0);
+     atomic_init(&shard->entries, 0);
++    atomic_init(&shard->tombstones, 0);
++    atomic_init(&shard->rebuilds, 0);
+ 
+     shard->frames = calloc((size_t)num_frames, sizeof(*shard->frames));
+     shard->buckets = calloc((size_t)shard->num_buckets, sizeof(*shard->buckets));
+diff --git a/src/cache/cache.h b/src/cache/cache.h
+index e2ceac0..9d8c400 100644
+--- a/src/cache/cache.h
++++ b/src/cache/cache.h
+@@ -64,6 +64,8 @@ typedef struct
+  * @param bytes_used current live payload bytes charged against the budget
+  * @param entries current live entries
+  * @param shard_count the number of independent shards the cache is partitioned into
++ * @param tombstones bucket-table tombstones left by evictions, summed over the shards
++ * @param rebuilds bucket-table rebuilds that cleared a shard's tombstones
+  */
+ typedef struct
+ {
+@@ -73,6 +75,8 @@ typedef struct
+     uint64_t bytes_used;
+     uint64_t entries;
+     uint64_t shard_count;
++    uint64_t tombstones;
++    uint64_t rebuilds;
+ } cache_stats_t;
+ 
+ /**
+@@ -145,4 +149,15 @@ void cache_release(cache_entry_t *pin);
+  */
+ void cache_get_stats(cache_t *cache, cache_stats_t *stats);
+ 
++/**
++ * cache_probe_length
++ * a diagnostic and test hook: how many buckets a lookup of this key examines before its probe chain
++ * ends, found or not. lock-free like cache_get, pins nothing, and changes no counter
++ * @param cache the cache
++ * @param file_id owning file id of the key
++ * @param offset byte offset of the key
++ * @return the buckets examined, or 0 for a NULL cache
++ */
++int cache_probe_length(cache_t *cache, uint64_t file_id, uint64_t offset);
++
+ #endif /* __TIDESDB_CACHE_H__ */
+diff --git a/test/cache__tests.c b/test/cache__tests.c
+index b0549be..14aa0b1 100644
+--- a/test/cache__tests.c
++++ b/test/cache__tests.c
+@@ -373,6 +373,225 @@ void test_cache_stress_concurrent(void)
+     ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
+ }
+ 
++/* ===== eviction churn ===== */
++
++/* a churned shard: one shard of CHURN_SLOTS frames (twice as many buckets) and a budget of
++ * CHURN_SLOTS entries, so once it fills every insert evicts one entry and the bucket table sees a
++ * remove and an insert per put. the keys spread over CHURN_FILES file ids so both key words vary */
++#define CHURN_SLOTS     64
++#define CHURN_BUCKETS   (CHURN_SLOTS * 2)
++#define CHURN_COST      256
++#define CHURN_FILES     8
++#define CHURN_PUTS      40000
++#define CHURN_MISS_KEYS 4096
++#define CHURN_MISS_FILE 0xDEADull
++/* a miss's mean probe at the table's worst steady occupancy -- half its buckets live, a quarter
++ * tombstones -- is about eight buckets under linear probing; with nothing ever turning a tombstone
++ * back into an empty bucket, a miss walks the whole table */
++#define CHURN_MAX_MEAN_PROBE 16
++
++/* the payload a churned key carries: both key words, so a get that returns another key's payload
++ * is caught */
++static uint64_t churn_value(const uint64_t file_id, const uint64_t offset)
++{
++    return (file_id << 40) ^ offset;
++}
++
++/* the file id churned key k lives under */
++static uint64_t churn_file(const uint64_t k)
++{
++    return TEST_CACHE_FILE_ID + (k % CHURN_FILES);
++}
++
++/* put keys [first, first + n), each charged CHURN_COST */
++static void churn_puts(cache_t *cache, const uint64_t first, const uint64_t n)
++{
++    for (uint64_t k = first; k < first + n; k++)
++    {
++        uint64_t *p = make_payload(churn_value(churn_file(k), k));
++        (void)cache_put(cache, churn_file(k), k, p, sizeof(*p), CHURN_COST, reclaim_free, NULL,
++                        NULL);
++    }
++}
++
++static cache_t *churn_cache_create(void)
++{
++    cache_config_t cfg = {0};
++    cfg.capacity_bytes = CHURN_SLOTS * CHURN_COST;
++    cfg.shard_count = 1;
++    cfg.slots_per_shard = CHURN_SLOTS;
++    return cache_create(&cfg);
++}
++
++/* after long eviction churn a miss still ends its probe early: removals do not leave the bucket
++ * table full of tombstones */
++void test_cache_churn_keeps_miss_probes_short(void)
++{
++    atomic_store(&g_reclaimed, 0);
++    atomic_store(&g_allocated, 0);
++    cache_t *cache = churn_cache_create();
++    ASSERT_TRUE(cache != NULL);
++
++    churn_puts(cache, 0, CHURN_PUTS);
++
++    long total = 0;
++    int longest = 0;
++    for (uint64_t off = 0; off < CHURN_MISS_KEYS; off++)
++    {
++        const int probed = cache_probe_length(cache, CHURN_MISS_FILE, off);
++        total += probed;
++        if (probed > longest) longest = probed;
++    }
++    printf("(mean miss probe %.2f, longest %d of %d buckets) ", (double)total / CHURN_MISS_KEYS,
++           longest, CHURN_BUCKETS);
++    fflush(stdout);
++    ASSERT_TRUE(total <= (long)CHURN_MAX_MEAN_PROBE * CHURN_MISS_KEYS);
++    ASSERT_TRUE(longest < CHURN_BUCKETS); /* some bucket is EMPTY again */
++
++    /* tombstones stay under their share of the table, because the shard rebuilds past it */
++    cache_stats_t stats;
++    cache_get_stats(cache, &stats);
++    ASSERT_TRUE(stats.tombstones <= CHURN_BUCKETS / 4);
++    ASSERT_TRUE(stats.rebuilds > 0);
++
++    cache_destroy(cache);
++    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
++}
++
++/* a sparsely loaded table clears its tombstones as it goes: a removed bucket followed by an empty
++ * one becomes empty, and so does the tombstone run before it, so churn needs no rebuild at all */
++#define SPARSE_SLOTS      1024
++#define SPARSE_LIVE       4
++#define SPARSE_PUTS       20000
++#define SPARSE_TOMBSTONES 8
++void test_cache_sparse_churn_clears_tombstones_without_rebuild(void)
++{
++    atomic_store(&g_reclaimed, 0);
++    atomic_store(&g_allocated, 0);
++    cache_config_t cfg = {0};
++    cfg.capacity_bytes = SPARSE_LIVE * CHURN_COST;
++    cfg.shard_count = 1;
++    cfg.slots_per_shard = SPARSE_SLOTS;
++    cache_t *cache = cache_create(&cfg);
++    ASSERT_TRUE(cache != NULL);
++
++    churn_puts(cache, 0, SPARSE_PUTS);
++
++    cache_stats_t stats;
++    cache_get_stats(cache, &stats);
++    ASSERT_TRUE(stats.evictions >= SPARSE_PUTS - SPARSE_LIVE);
++    ASSERT_TRUE(stats.tombstones <= SPARSE_TOMBSTONES);
++    ASSERT_EQ(stats.rebuilds, 0u);
++
++    cache_destroy(cache);
++    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
++}
++
++/* after churn every key either misses or returns its own payload, never another key's, and every
++ * entry the cache holds is still reachable through the bucket table */
++void test_cache_churn_returns_own_payload_or_miss(void)
++{
++    atomic_store(&g_reclaimed, 0);
++    atomic_store(&g_allocated, 0);
++    cache_t *cache = churn_cache_create();
++    ASSERT_TRUE(cache != NULL);
++
++    churn_puts(cache, 0, CHURN_PUTS);
++
++    uint64_t hits = 0;
++    for (uint64_t k = 0; k < CHURN_PUTS; k++)
++    {
++        void *got = NULL;
++        cache_entry_t *pin = NULL;
++        if (!cache_get(cache, churn_file(k), k, &got, NULL, &pin)) continue;
++        ASSERT_EQ(*(uint64_t *)got, churn_value(churn_file(k), k));
++        cache_release(pin);
++        hits++;
++    }
++    cache_stats_t stats;
++    cache_get_stats(cache, &stats);
++    ASSERT_TRUE(stats.entries > 0);
++    ASSERT_EQ(hits, stats.entries);
++
++    cache_destroy(cache);
++    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
++}
++
++/* lock-free readers racing writers that churn the table hard enough to clear and rebuild it many
++ * times: a hit always carries the requested key's payload */
++#define CHURN_STRESS_READERS  4
++#define CHURN_STRESS_WRITERS  2
++#define CHURN_STRESS_KEYSPACE 4096
++#define CHURN_STRESS_PUTS     60000
++#define CHURN_STRESS_GETS     200000
++
++static cache_t *s_churn_cache = NULL;
++static _Atomic(int) s_churn_go = 0;
++static _Atomic(long) s_churn_hits = 0;
++
++static void *churn_stress_writer(void *arg)
++{
++    const uint64_t base = (uint64_t)(intptr_t)arg;
++    while (atomic_load(&s_churn_go) == 0) cpu_pause();
++    for (uint64_t i = 0; i < CHURN_STRESS_PUTS; i++)
++    {
++        const uint64_t k = (base + i * 7) % CHURN_STRESS_KEYSPACE;
++        uint64_t *p = make_payload(churn_value(churn_file(k), k));
++        (void)cache_put(s_churn_cache, churn_file(k), k, p, sizeof(*p), CHURN_COST, reclaim_free,
++                        NULL, NULL);
++    }
++    return NULL;
++}
++
++static void *churn_stress_reader(void *arg)
++{
++    unsigned seed = (unsigned)(intptr_t)arg * 2654435761u + 1u;
++    long hits = 0;
++    while (atomic_load(&s_churn_go) == 0) cpu_pause();
++    for (long i = 0; i < CHURN_STRESS_GETS; i++)
++    {
++        seed = seed * 1103515245u + 12345u;
++        const uint64_t k = (seed >> 8) % CHURN_STRESS_KEYSPACE;
++        void *got = NULL;
++        cache_entry_t *pin = NULL;
++        if (!cache_get(s_churn_cache, churn_file(k), k, &got, NULL, &pin)) continue;
++        ASSERT_EQ(*(uint64_t *)got, churn_value(churn_file(k), k));
++        cache_release(pin);
++        hits++;
++    }
++    atomic_fetch_add(&s_churn_hits, hits);
++    return NULL;
++}
++
++void test_cache_churn_concurrent_never_wrong_hit(void)
++{
++    atomic_store(&g_reclaimed, 0);
++    atomic_store(&g_allocated, 0);
++    atomic_store(&s_churn_go, 0);
++    atomic_store(&s_churn_hits, 0);
++    s_churn_cache = churn_cache_create();
++    ASSERT_TRUE(s_churn_cache != NULL);
++
++    pthread_t readers[CHURN_STRESS_READERS], writers[CHURN_STRESS_WRITERS];
++    for (int i = 0; i < CHURN_STRESS_READERS; i++)
++        pthread_create(&readers[i], NULL, churn_stress_reader, (void *)(intptr_t)(i + 1));
++    for (int i = 0; i < CHURN_STRESS_WRITERS; i++)
++        pthread_create(&writers[i], NULL, churn_stress_writer, (void *)(intptr_t)(i * 1031));
++    atomic_store(&s_churn_go, 1);
++    for (int i = 0; i < CHURN_STRESS_WRITERS; i++) pthread_join(writers[i], NULL);
++    for (int i = 0; i < CHURN_STRESS_READERS; i++) pthread_join(readers[i], NULL);
++
++    cache_stats_t stats;
++    cache_get_stats(s_churn_cache, &stats);
++    printf("(%ld hits, %llu rebuilds) ", atomic_load(&s_churn_hits),
++           (unsigned long long)stats.rebuilds);
++    ASSERT_TRUE(stats.rebuilds > 0); /* the readers raced table rebuilds, not just evictions */
++    ASSERT_TRUE(atomic_load(&s_churn_hits) > 0);
++    cache_destroy(s_churn_cache);
++    s_churn_cache = NULL;
++    ASSERT_EQ(atomic_load(&g_allocated), atomic_load(&g_reclaimed));
++}
++
+ int main(int argc, char **argv)
+ {
+     INIT_TEST_FILTER(argc, argv);
+@@ -384,6 +603,10 @@ int main(int argc, char **argv)
+     RUN_TEST(test_cache_loaded_table_returns_each_key_its_own_payload, tests_passed);
+     RUN_TEST(test_cache_pin_survives_eviction, tests_passed);
+     RUN_TEST(test_cache_stress_concurrent, tests_passed);
++    RUN_TEST(test_cache_churn_keeps_miss_probes_short, tests_passed);
++    RUN_TEST(test_cache_sparse_churn_clears_tombstones_without_rebuild, tests_passed);
++    RUN_TEST(test_cache_churn_returns_own_payload_or_miss, tests_passed);
++    RUN_TEST(test_cache_churn_concurrent_never_wrong_hit, tests_passed);
+     PRINT_TEST_RESULTS(tests_passed, tests_failed);
+     return tests_failed > 0 ? 1 : 0;
+ }

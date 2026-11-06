@@ -7,17 +7,22 @@ set(TIDESDB_WARN_STRICT OFF CACHE BOOL "" FORCE)
 set(TIDESDB_WITH_SNAPPY OFF CACHE BOOL "" FORCE)
 set(TIDESDB_WITH_LZ4 ${TIDESKV_COMPRESSION} CACHE BOOL "" FORCE)
 set(TIDESDB_WITH_ZSTD ${TIDESKV_COMPRESSION} CACHE BOOL "" FORCE)
-# Applied in order. The first fixes a planner loop: with only the largest level over its capacity, 10.1.1
-# merges into a smaller level that fits, leaves the largest level full, and repeats that merge forever on an
-# idle family. The second adds that level by moving the largest level's files down instead of rewriting the
-# whole family into it (6.8 GB of writes for a 60M-key strings family). The patch step skips what a re-run
-# finds applied already, so a tree that holds only the first gets the second.
-set(TIDESDB_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch)
-set(TIDESDB_PATCH2 ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch)
+# Applied in order by cmake/apply-patch-chain.sh, which skips what a re-run finds applied already, so a
+# tree that holds only the first few patches gets the rest.
+#  1. A planner loop: with only the largest level over its capacity, 10.1.1 merges into a smaller level
+#     that fits, leaves the largest level full, and repeats that merge forever on an idle family.
+#  2. That level is added by moving the largest level's files down instead of rewriting the whole family
+#     into it (6.8 GB of writes for a 60M-key strings family).
+#  3. The block cache turns eviction tombstones back into empty buckets, and rebuilds a shard's table once
+#     they pass a quarter of it. Without that, after enough churn a miss probes the whole table.
+set(TIDESDB_PATCHES
+  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch
+  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch
+  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch)
 FetchContent_Declare(tidesdb
   GIT_REPOSITORY https://github.com/tidesdb/tidesdb.git
   GIT_TAG 6d1fb731e6ea1bff0de1c290041bdeacbc1267e6
-  PATCH_COMMAND sh -c "git apply --reverse --check '${TIDESDB_PATCH2}' 2>/dev/null || (git apply --reverse --check '${TIDESDB_PATCH}' 2>/dev/null && git apply '${TIDESDB_PATCH2}') || git apply '${TIDESDB_PATCH}' '${TIDESDB_PATCH2}'")
+  PATCH_COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/apply-patch-chain.sh ${TIDESDB_PATCHES})
 
 # --- spdlog (bundled fmt) ---
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
