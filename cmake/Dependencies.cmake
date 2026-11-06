@@ -15,10 +15,13 @@ set(TIDESDB_WITH_ZSTD ${TIDESKV_COMPRESSION} CACHE BOOL "" FORCE)
 #     into it (6.8 GB of writes for a 60M-key strings family).
 #  3. The block cache turns eviction tombstones back into empty buckets, and rebuilds a shard's table once
 #     they pass a quarter of it. Without that, after enough churn a miss probes the whole table.
+#  4. A compaction reads each input level below L1 as one merge source instead of one per file, and the
+#     merge stops scanning every source for read failures after every entry.
 set(TIDESDB_PATCHES
   ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch
   ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch
-  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch)
+  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch
+  ${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch)
 FetchContent_Declare(tidesdb
   GIT_REPOSITORY https://github.com/tidesdb/tidesdb.git
   GIT_TAG 6d1fb731e6ea1bff0de1c290041bdeacbc1267e6

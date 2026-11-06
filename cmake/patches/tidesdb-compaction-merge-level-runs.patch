@@ -1,0 +1,885 @@
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+index 6e9ea7f..acea8c1 100644
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -32,11 +32,13 @@
+ #define CE_SNAPSHOT_RETRIES 8
+ 
+ /* reference the job's input sstables from the live level set, summing their on-disk sizes into
+- * read_bytes and recording each one's size in out_sizes so a rollback can put its catalogue entry
+- * back; returns 0 with the handles on success, 1 when an input was already compacted away by a
+- * raced job (skip the job), or a negative error */
++ * read_bytes, recording each one's size in out_sizes so a rollback can put its catalogue entry
++ * back, and its level in out_levels so the merge can read each level below L1 as one run; returns
++ * 0 with the handles on success, 1 when an input was already compacted away by a raced job (skip
++ * the job), or a negative error */
+ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t *job,
+-                             sstable_t **out, uint64_t *out_sizes, int *n_out, uint64_t *read_bytes)
++                             sstable_t **out, uint64_t *out_sizes, int *out_levels, int *n_out,
++                             uint64_t *read_bytes)
+ {
+     *read_bytes = 0;
+     int total = level_set_snapshot(cx->cf->levels, NULL, 0);
+@@ -71,11 +73,13 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t
+     {
+         sstable_t *found = NULL;
+         uint64_t found_size = 0;
++        int found_level = 0;
+         for (int i = 0; i < filled; i++)
+             if (all[i].sst && all[i].sst->id == job->input_ids[j])
+             {
+                 found = all[i].sst;
+                 found_size = all[i].size_bytes;
++                found_level = all[i].level;
+                 *read_bytes += all[i].size_bytes;
+                 all[i].sst = NULL;
+                 break;
+@@ -83,6 +87,7 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t
+         if (found)
+         {
+             out_sizes[n] = found_size;
++            out_levels[n] = found_level;
+             out[n++] = found;
+         }
+         else
+@@ -524,41 +529,152 @@ static int ce_write_merged(const compaction_ctx_t *cx, const compaction_job_t *j
+     return sink->cur_open ? ce_sink_seal(sink) : TDB_SUCCESS;
+ }
+ 
+-/* build the raw merge over the input sstables and drive the write of one key range */
++/* the merge's view of a job's inputs: the same tables, reordered so that each level below L1 is a
++ * run in key order, read through one merge source, and every other table is a run of one.
++ *
++ * a raw merge picks the next version by asking every source for its current entry, so its cost per
++ * entry is the source count. a job deepening a family takes whole levels -- dozens of tables each
++ * -- and given a source per table the merge spent as long scanning sources as writing. a level
++ * below L1 never overlaps itself, so a source reading the level as one keeps the same order while
++ * costing the merge one source for the level. L1 tables overlap, so each keeps its own
++ * @param ssts every input, the runs back to back, borrowed from the caller's input array
++ * @param n how many tables
++ * @param run_len how many tables each run holds, in the order the runs sit in ssts
++ * @param n_runs how many runs, which is how many sources the merge reads
++ */
++typedef struct
++{
++    sstable_t **ssts;
++    int n;
++    int *run_len;
++    int n_runs;
++} ce_runs_t;
++
++/* one input as the plan sorts it */
++typedef struct
++{
++    sstable_t *sst;
++    int level;
++    int pos;
++} ce_run_entry_t;
++
++/* whether a table names its key range; one that carries only intervals has no keys to order by */
++static int ce_has_keys(const sstable_t *t)
++{
++    return t->min_key && t->max_key && t->min_key_size > 0 && t->max_key_size > 0;
++}
++
++/* order by level, then within a level keyless tables first and the rest by smallest key, then by
++ * position so the order is total and the same on every run */
++static int ce_run_entry_cmp(const void *a, const void *b)
++{
++    const ce_run_entry_t *x = (const ce_run_entry_t *)a;
++    const ce_run_entry_t *y = (const ce_run_entry_t *)b;
++    if (x->level != y->level) return x->level < y->level ? -1 : 1;
++    const int xk = ce_has_keys(x->sst), yk = ce_has_keys(y->sst);
++    if (xk != yk) return xk < yk ? -1 : 1;
++    if (xk)
++    {
++        const int c = tdb_key_cmp(x->sst->min_key, x->sst->min_key_size, y->sst->min_key,
++                                  y->sst->min_key_size);
++        if (c != 0) return c;
++    }
++    return (x->pos > y->pos) - (x->pos < y->pos);
++}
++
++/* whether next may follow prev in one run: the same level below L1, and every key of next above
++ * every key of prev. the level says the tables should not overlap, and the keys are checked anyway,
++ * because a run that did overlap would hand the merge versions out of order, and a key's versions
++ * shared by two tables would come out oldest table first */
++static int ce_extends_run(const ce_run_entry_t *prev, const ce_run_entry_t *next)
++{
++    if (next->level <= LEVEL_SET_L1 || next->level != prev->level) return 0;
++    if (!ce_has_keys(prev->sst) || !ce_has_keys(next->sst)) return 0;
++    return tdb_key_cmp(prev->sst->max_key, prev->sst->max_key_size, next->sst->min_key,
++                       next->sst->min_key_size) < 0;
++}
++
++static void ce_runs_free(ce_runs_t *r)
++{
++    free(r->ssts);
++    free(r->run_len);
++    memset(r, 0, sizeof(*r));
++}
++
++/* plan the runs for a job's inputs; each_table makes every table a run of its own */
++static int ce_runs_build(sstable_t *const *inputs, const int *levels, int n, int each_table,
++                         ce_runs_t *out)
++{
++    memset(out, 0, sizeof(*out));
++    ce_run_entry_t *order = calloc((size_t)n, sizeof(*order));
++    out->ssts = calloc((size_t)n, sizeof(*out->ssts));
++    out->run_len = calloc((size_t)n, sizeof(*out->run_len));
++    if (!order || !out->ssts || !out->run_len)
++    {
++        free(order);
++        ce_runs_free(out);
++        return TDB_ERR_MEMORY;
++    }
++    for (int i = 0; i < n; i++) order[i] = (ce_run_entry_t){inputs[i], levels[i], i};
++    if (!each_table) qsort(order, (size_t)n, sizeof(*order), ce_run_entry_cmp);
++
++    for (int i = 0; i < n; i++)
++    {
++        out->ssts[i] = order[i].sst;
++        if (i > 0 && !each_table && ce_extends_run(&order[i - 1], &order[i]))
++            out->run_len[out->n_runs - 1]++;
++        else
++            out->run_len[out->n_runs++] = 1;
++    }
++    out->n = n;
++    free(order);
++    return TDB_SUCCESS;
++}
++
++/* build the raw merge over the input runs and drive the write of one key range. every range of a
++ * subdivided job builds its own cursors and sources over the shared plan, and a run's source seeks
++ * straight to the one table holding the range's first key */
+ static int ce_merge_inputs(const compaction_ctx_t *cx, const compaction_job_t *job,
+-                           sstable_t *const *inputs, int n_inputs, ce_sink_t *sink,
+-                           const uint8_t *begin, size_t begin_size, const uint8_t *end,
+-                           size_t end_size)
++                           const ce_runs_t *runs, ce_sink_t *sink, const uint8_t *begin,
++                           size_t begin_size, const uint8_t *end, size_t end_size)
+ {
+-    sstable_iter_t **iters = calloc((size_t)n_inputs, sizeof(*iters));
+-    merge_source_t *sources = calloc((size_t)n_inputs, sizeof(*sources));
+-    if (!iters || !sources)
++    sstable_iter_t **iters = calloc((size_t)runs->n, sizeof(*iters));
++    merge_source_t *sources = calloc((size_t)runs->n_runs, sizeof(*sources));
++    level_merge_source_t *levels = calloc((size_t)runs->n_runs, sizeof(*levels));
++    if (!iters || !sources || !levels)
+     {
+         free(iters);
+         free(sources);
++        free(levels);
+         return TDB_ERR_MEMORY;
+     }
+ 
+     int rc = TDB_SUCCESS;
+-    for (int i = 0; i < n_inputs && rc == TDB_SUCCESS; i++)
+-    {
+-        if (sstable_iter_new(inputs[i], 0, &iters[i]) != TDB_SUCCESS) /* bypass the cache */
++    for (int i = 0; i < runs->n && rc == TDB_SUCCESS; i++)
++        if (sstable_iter_new(runs->ssts[i], 0, &iters[i]) != TDB_SUCCESS) /* bypass the cache */
+             rc = TDB_ERR_IO;
++
++    for (int r = 0, at = 0; r < runs->n_runs && rc == TDB_SUCCESS; at += runs->run_len[r++])
++    {
++        if (runs->run_len[r] > 1)
++            level_merge_source(&levels[r], &runs->ssts[at], &iters[at], runs->run_len[r],
++                               &sources[r]);
+         else
+-            sstable_merge_source(iters[i], &sources[i]);
++            sstable_merge_source(iters[at], &sources[r]);
+     }
+ 
+     merge_iter_t *merge = NULL;
+     if (rc == TDB_SUCCESS &&
+-        merge_iter_new(sources, n_inputs, UINT64_MAX, MERGE_ITER_RAW, &merge) != TDB_SUCCESS)
++        merge_iter_new(sources, runs->n_runs, UINT64_MAX, MERGE_ITER_RAW, &merge) != TDB_SUCCESS)
+         rc = TDB_ERR_MEMORY;
+     if (rc == TDB_SUCCESS)
+         rc = ce_write_merged(cx, job, merge, sink, begin, begin_size, end, end_size);
+ 
+     merge_iter_free(merge);
+-    for (int i = 0; i < n_inputs; i++) sstable_iter_free(iters[i]);
++    for (int i = 0; i < runs->n; i++) sstable_iter_free(iters[i]);
+     free(iters);
+     free(sources);
++    free(levels);
+     return rc;
+ }
+ 
+@@ -568,8 +684,7 @@ typedef struct
+ {
+     const compaction_ctx_t *cx;
+     const compaction_job_t *job;
+-    sstable_t *const *inputs;
+-    int n_inputs;
++    const ce_runs_t *runs;
+     ce_sink_t sink;
+     const uint8_t *begin;
+     size_t begin_size;
+@@ -581,8 +696,8 @@ typedef struct
+ static void *ce_range_thread(void *arg)
+ {
+     ce_range_task_t *t = (ce_range_task_t *)arg;
+-    t->rc = ce_merge_inputs(t->cx, t->job, t->inputs, t->n_inputs, &t->sink, t->begin,
+-                            t->begin_size, t->end, t->end_size);
++    t->rc = ce_merge_inputs(t->cx, t->job, t->runs, &t->sink, t->begin, t->begin_size, t->end,
++                            t->end_size);
+     return NULL;
+ }
+ 
+@@ -651,14 +766,13 @@ static int ce_sink_absorb(ce_sink_t *dst, ce_sink_t *src)
+  * just as they would in one pass
+  * @param cx the compaction context
+  * @param job the job, whose boundaries divide the range
+- * @param inputs the resolved input sstables, shared by every range
+- * @param n_inputs the number of inputs
++ * @param runs the resolved inputs as the merge reads them, shared by every range
+  * @param k how many ranges to split into
+  * @param sink out -- the combined outputs of every range
+  * @return TDB_SUCCESS when every range completed, else the first failure
+  */
+ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_t *job,
+-                               sstable_t *const *inputs, int n_inputs, int k, ce_sink_t *sink)
++                               const ce_runs_t *runs, int k, ce_sink_t *sink)
+ {
+     ce_range_task_t *tasks = calloc((size_t)k, sizeof(*tasks));
+     tdb_thread_t *tids = calloc((size_t)k, sizeof(*tids));
+@@ -680,8 +794,7 @@ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_
+         const int hi = lo + base + (i < extra ? 1 : 0);
+         tasks[i].cx = cx;
+         tasks[i].job = job;
+-        tasks[i].inputs = inputs;
+-        tasks[i].n_inputs = n_inputs;
++        tasks[i].runs = runs;
+         tasks[i].sink.cx = cx;
+         tasks[i].rc = TDB_SUCCESS;
+         ce_range_bounds(&tasks[i], job, lo, hi);
+@@ -729,19 +842,23 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+     /* their catalogued sizes, kept beside them so a rollback can restate the entries a failed swap
+      * has already had removed */
+     uint64_t *in_sizes = malloc((size_t)job->n_inputs * sizeof(*in_sizes));
+-    if (!inputs || !in_sizes)
++    int *in_levels = malloc((size_t)job->n_inputs * sizeof(*in_levels));
++    if (!inputs || !in_sizes || !in_levels)
+     {
+         free(inputs);
+         free(in_sizes);
++        free(in_levels);
+         return TDB_ERR_MEMORY;
+     }
+     int n_inputs = 0;
+     uint64_t read_bytes = 0;
+-    const int resolved = ce_resolve_inputs(cx, job, inputs, in_sizes, &n_inputs, &read_bytes);
++    const int resolved =
++        ce_resolve_inputs(cx, job, inputs, in_sizes, in_levels, &n_inputs, &read_bytes);
+     if (resolved != 0)
+     {
+         free(inputs);
+         free(in_sizes);
++        free(in_levels);
+         return resolved > 0 ? TDB_SUCCESS : resolved; /* a stale job is a no-op, not a failure */
+     }
+ 
+@@ -758,6 +875,7 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+             if (sstable_unref(inputs[i])) sstable_close(inputs[i]);
+         free(inputs);
+         free(in_sizes);
++        free(in_levels);
+         return mrc;
+     }
+ 
+@@ -771,9 +889,15 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+     int rc = ce_union_intervals(cx, job, inputs, n_inputs, &carried);
+     sink.carried = carried;
+     const int k = ce_subdivisions(cx, job);
++    ce_runs_t runs;
++    memset(&runs, 0, sizeof(runs));
++    if (rc == TDB_SUCCESS)
++        rc = ce_runs_build(inputs, in_levels, n_inputs, cx->merge_each_table, &runs);
+     if (rc == TDB_SUCCESS)
+-        rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
+-                   : ce_merge_inputs(cx, job, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
++        rc = k > 1 ? ce_merge_subdivided(cx, job, &runs, k, &sink)
++                   : ce_merge_inputs(cx, job, &runs, &sink, NULL, 0, NULL, 0);
++    const int n_sources = runs.n_runs;
++    ce_runs_free(&runs);
+     if (rc == TDB_SUCCESS) rc = ce_sink_carry_alone(&sink);
+     if (rc == TDB_SUCCESS) rc = ce_commit(cx, job, inputs, in_sizes, n_inputs, &sink);
+ 
+@@ -789,9 +913,9 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+          * in, and a merge that keeps writing as much as it reads is the shape of a level that is
+          * not converging */
+         TDB_DEBUG_LOG(TDB_LOG_INFO,
+-                      "compacted cf %s to level %d, %d files in %d out over %d range%s, %llu bytes "
+-                      "read %llu written",
+-                      cx->cf->name, job->target_level, n_inputs, sink.n_outputs, k,
++                      "compacted cf %s to level %d, %d files in (%d merge sources) %d out over %d "
++                      "range%s, %llu bytes read %llu written",
++                      cx->cf->name, job->target_level, n_inputs, n_sources, sink.n_outputs, k,
+                       k == 1 ? "" : "s", (unsigned long long)read_bytes,
+                       (unsigned long long)written);
+ 
+@@ -810,5 +934,6 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+     range_tombstone_set_free(carried);
+     free(inputs);
+     free(in_sizes);
++    free(in_levels);
+     return rc;
+ }
+diff --git a/src/compaction/compaction_exec.h b/src/compaction/compaction_exec.h
+index 062eec1..43494da 100644
+--- a/src/compaction/compaction_exec.h
++++ b/src/compaction/compaction_exec.h
+@@ -38,6 +38,9 @@
+  *                        cf_config_value_threshold, which resolves the two
+  * @param max_subdivisions the most threads one job may split its key range across, or 0 or 1 to run
+  * every merge on the calling thread alone
++ * @param merge_each_table give every input table its own merge source rather than reading each
++ * level below L1 as one run; the merge is the same either way, so this exists for the tests that
++ * hold the two against each other
+  */
+ typedef struct
+ {
+@@ -49,6 +52,7 @@ typedef struct
+     int sync_mode;
+     size_t value_threshold;
+     int max_subdivisions;
++    int merge_each_table;
+ } compaction_ctx_t;
+ 
+ /**
+diff --git a/src/iter/merge_iter.c b/src/iter/merge_iter.c
+index 97aaf59..d5bccd3 100644
+--- a/src/iter/merge_iter.c
++++ b/src/iter/merge_iter.c
+@@ -51,6 +51,13 @@ struct merge_iter
+      * overlapping runs the tie set is one or two sources out of dozens */
+     int *match;
+     int n_match;
++
++    /* whether a source stopped on a read failure since the sources were last positioned. a source's
++     * failure state only changes when that source moves, so this is kept up to date by asking each
++     * source as it is moved -- the one a raw step advanced, the few a resolve walked -- and every
++     * source after a seek, rather than every source after every entry. on a merge of dozens of
++     * sources the per-entry scan cost as much as the merge itself */
++    int failed;
+ };
+ 
+ /* grow an owned buffer to at least need bytes; a zero need leaves it untouched */
+@@ -119,6 +126,19 @@ static int merge_pick_extreme(merge_iter_t *it, merge_dir_t dir)
+     return 1;
+ }
+ 
++/* note a read failure in a source that just moved */
++static void merge_note_moved(merge_iter_t *it, const merge_source_t *s)
++{
++    if (!it->failed && s->read_failed && s->read_failed(s->ctx)) it->failed = 1;
++}
++
++/* recompute the failure state from every source, after a seek or a re-seek moved them all */
++static void merge_rescan_failed(merge_iter_t *it)
++{
++    it->failed = 0;
++    for (int i = 0; i < it->n_sources && !it->failed; i++) merge_note_moved(it, &it->sources[i]);
++}
++
+ /* resolve the current key's newest version at or below the snapshot across every source, copying
+  * the winner into the iterator and advancing all sources past this key in the scan direction;
+  * returns 1 if a visible version was found, 0 if none, -1 on allocation failure */
+@@ -164,6 +184,7 @@ static int merge_resolve(merge_iter_t *it, merge_dir_t dir)
+             else
+                 (void)s->prev(s->ctx);
+         }
++        merge_note_moved(it, s);
+     }
+ 
+     /* an interval any source holds deletes this key when it is newer than the version that won.
+@@ -252,22 +273,12 @@ static int merge_advance_raw(merge_iter_t *it, merge_dir_t dir)
+         (void)s->next(s->ctx);
+     else
+         (void)s->prev(s->ctx);
++    merge_note_moved(it, s);
+     it->positioned = 1;
+     it->direction = dir;
+     return TDB_SUCCESS;
+ }
+ 
+-/* whether any source stopped on a read failure rather than on exhaustion */
+-static int merge_any_read_failed(const merge_iter_t *it)
+-{
+-    for (int i = 0; i < it->n_sources; i++)
+-    {
+-        const merge_source_t *s = &it->sources[i];
+-        if (s->read_failed && s->read_failed(s->ctx)) return 1;
+-    }
+-    return 0;
+-}
+-
+ /* find the next visible key in the scan direction, skipping keys with no version at or below the
+  * snapshot and, unless emitting tombstones, keys whose newest visible version is a tombstone */
+ static int merge_advance_inner(merge_iter_t *it, merge_dir_t dir)
+@@ -301,7 +312,7 @@ static int merge_advance_inner(merge_iter_t *it, merge_dir_t dir)
+ static int merge_advance(merge_iter_t *it, merge_dir_t dir)
+ {
+     const int rc = merge_advance_inner(it, dir);
+-    if (merge_any_read_failed(it))
++    if (it->failed)
+     {
+         it->positioned = 0;
+         return TDB_ERR_IO;
+@@ -376,6 +387,7 @@ int merge_iter_seek_first(merge_iter_t *it)
+ {
+     if (!it) return TDB_ERR_INVALID_ARGS;
+     for (int i = 0; i < it->n_sources; i++) (void)it->sources[i].first(it->sources[i].ctx);
++    merge_rescan_failed(it);
+     return merge_advance(it, MERGE_FORWARD);
+ }
+ 
+@@ -383,6 +395,7 @@ int merge_iter_seek_last(merge_iter_t *it)
+ {
+     if (!it) return TDB_ERR_INVALID_ARGS;
+     for (int i = 0; i < it->n_sources; i++) (void)it->sources[i].last(it->sources[i].ctx);
++    merge_rescan_failed(it);
+     return merge_advance(it, MERGE_BACKWARD);
+ }
+ 
+@@ -391,6 +404,7 @@ int merge_iter_seek(merge_iter_t *it, const uint8_t *key, size_t key_size)
+     if (!it || !key) return TDB_ERR_INVALID_ARGS;
+     for (int i = 0; i < it->n_sources; i++)
+         (void)it->sources[i].seek(it->sources[i].ctx, key, key_size);
++    merge_rescan_failed(it);
+     return merge_advance(it, MERGE_FORWARD);
+ }
+ 
+@@ -399,6 +413,7 @@ int merge_iter_seek_for_prev(merge_iter_t *it, const uint8_t *key, size_t key_si
+     if (!it || !key) return TDB_ERR_INVALID_ARGS;
+     for (int i = 0; i < it->n_sources; i++)
+         (void)it->sources[i].seek_for_prev(it->sources[i].ctx, key, key_size);
++    merge_rescan_failed(it);
+     return merge_advance(it, MERGE_BACKWARD);
+ }
+ 
+@@ -416,6 +431,7 @@ static int merge_turn(merge_iter_t *it, merge_dir_t dir)
+     if (it->direction == dir) return TDB_SUCCESS;
+     if (it->raw) return TDB_ERR_INVALID_ARGS;
+     merge_reseek(it, dir);
++    merge_rescan_failed(it);
+     return TDB_SUCCESS;
+ }
+ 
+diff --git a/test/compaction_exec__tests.c b/test/compaction_exec__tests.c
+index 3fa1a02..6b96a16 100644
+--- a/test/compaction_exec__tests.c
++++ b/test/compaction_exec__tests.c
+@@ -6,7 +6,11 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+  */
++#include <fcntl.h>
++#include <unistd.h>
++
+ #include "../src/base/errors.h"
++#include "../src/base/keycmp.h"
+ #include "../src/compaction/compaction_exec.h"
+ #include "../src/flush/flush.h"
+ #include "test_utils.h"
+@@ -991,6 +995,324 @@ void test_compaction_move_into_occupied_level_is_skipped(void)
+     ce_db_close(&db);
+ }
+ 
++/* ===== a merge over whole levels =====
++ *
++ * a level below L1 is one run of tables sorted by key that never overlap, and the merge reads each
++ * such run as a single source instead of giving every table its own. these build a family with two
++ * deep runs and a few overlapping L1 tables over the same keys, compact all of it, and hold the
++ * result against the merge that gives every table its own source */
++#define CE_RUN_L3_FILES 30
++#define CE_RUN_L3_KEYS  40 /* per file, every key of its slice */
++#define CE_RUN_L2_FILES 20
++#define CE_RUN_L2_KEYS  20 /* per file, every third key of its slice */
++#define CE_RUN_L2_SPAN  60
++#define CE_RUN_L1_FILES 4
++#define CE_RUN_L1_KEYS  90 /* per file, spread over the whole key space so the files overlap */
++#define CE_RUN_KEYSPACE (CE_RUN_L3_FILES * CE_RUN_L3_KEYS)
++#define CE_RUN_TARGET   4
++#define CE_RUN_MAX_IDS  (CE_RUN_L3_FILES + CE_RUN_L2_FILES + CE_RUN_L1_FILES)
++
++/* one family's entry strings, kept alive for the flush that reads them */
++typedef struct
++{
++    char keys[CE_RUN_L3_KEYS > CE_RUN_L1_KEYS ? CE_RUN_L3_KEYS : CE_RUN_L1_KEYS][12];
++    char vals[CE_RUN_L3_KEYS > CE_RUN_L1_KEYS ? CE_RUN_L3_KEYS : CE_RUN_L1_KEYS][24];
++    ce_entry_t e[CE_RUN_L3_KEYS > CE_RUN_L1_KEYS ? CE_RUN_L3_KEYS : CE_RUN_L1_KEYS];
++} ce_run_batch_t;
++
++static void ce_run_put(ce_run_batch_t *b, int i, int key, uint64_t seq, int deleted)
++{
++    snprintf(b->keys[i], sizeof(b->keys[i]), "k%05d", key);
++    snprintf(b->vals[i], sizeof(b->vals[i]), "v%05d-s%llu", key, (unsigned long long)seq);
++    b->e[i] = (ce_entry_t){b->keys[i], b->vals[i], seq, deleted};
++}
++
++/* move the given L1 tables down to level as they are, the way the planner deepens a family */
++static void ce_run_move(ce_db_t *db, const uint64_t *ids, int n, int level)
++{
++    const compaction_job_t move = {.input_ids = ids,
++                                   .n_inputs = n,
++                                   .target_level = level,
++                                   .is_largest_level = 1,
++                                   .split = COMPACTION_SPLIT_NONE,
++                                   .is_move = 1};
++    const compaction_ctx_t cx = {.cf = db->cf,
++                                 .manifest = db->manifest,
++                                 .manifest_path = db->manifest_path,
++                                 .next_sstable_id = &db->next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = db->value_threshold};
++    ASSERT_EQ(compaction_exec(&cx, &move), TDB_SUCCESS);
++    ASSERT_EQ(level_set_count(db->cf->levels, level), n);
++}
++
++/* build the layout: an L3 run of every key, oldest; an L2 run of every third key of each slice,
++ * newer, carrying tombstones and one interval; and overlapping L1 tables, newest, some versions of
++ * one key in two of them. returns the ids, the L1 tables last */
++static int ce_run_build(ce_db_t *db, uint64_t *ids)
++{
++    int n = 0;
++    uint64_t gen = 1;
++    ce_run_batch_t b;
++    for (int f = 0; f < CE_RUN_L3_FILES; f++)
++    {
++        for (int i = 0; i < CE_RUN_L3_KEYS; i++)
++        {
++            const int key = f * CE_RUN_L3_KEYS + i;
++            ce_run_put(&b, i, key, (uint64_t)(1000 + key), key % 7 == 3);
++        }
++        ids[n++] = ce_flush(db, b.e, CE_RUN_L3_KEYS, gen++);
++    }
++    ce_run_move(db, ids, CE_RUN_L3_FILES, 3);
++
++    const int l2_first = n;
++    for (int f = 0; f < CE_RUN_L2_FILES; f++)
++    {
++        for (int i = 0; i < CE_RUN_L2_KEYS; i++)
++        {
++            const int key = f * CE_RUN_L2_SPAN + i * 3;
++            ce_run_put(&b, i, key, (uint64_t)(5000 + key), key % 5 == 0);
++        }
++        if (f == CE_RUN_L2_FILES / 2)
++            ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db->l0, 0, (const uint8_t *)"k00100", 6,
++                                                       (const uint8_t *)"k00130", 6, 4999),
++                      TDB_SUCCESS);
++        ids[n++] = ce_flush(db, b.e, CE_RUN_L2_KEYS, gen++);
++    }
++    ce_run_move(db, ids + l2_first, CE_RUN_L2_FILES, 2);
++
++    for (int f = 0; f < CE_RUN_L1_FILES; f++)
++    {
++        for (int i = 0; i < CE_RUN_L1_KEYS; i++)
++        {
++            /* file f holds keys f, f + 13, f + 26 ... so the four interleave across the space */
++            const int key = (f + i * 13) % CE_RUN_KEYSPACE;
++            ce_run_put(&b, i, key, (uint64_t)(9000 + f * CE_RUN_L1_KEYS + i), i % 11 == 4);
++        }
++        /* one key every L1 table holds, so versions of it sit in all four */
++        ce_run_put(&b, CE_RUN_L1_KEYS - 1, 500, (uint64_t)(20000 + f), f == 2);
++        ids[n++] = ce_flush(db, b.e, CE_RUN_L1_KEYS, gen++);
++    }
++    ASSERT_EQ(level_set_count(db->cf->levels, LEVEL_SET_L1), CE_RUN_L1_FILES);
++    return n;
++}
++
++/* append every entry of a level, table by table in key order, as text to a growing buffer */
++static char *ce_run_dump_level(cf_t *cf, int level, size_t *len_out)
++{
++    const int total = level_set_snapshot(cf->levels, NULL, 0);
++    level_set_snapshot_entry_t *all = calloc((size_t)total + 1, sizeof(*all));
++    ASSERT_TRUE(all != NULL);
++    const int got = level_set_snapshot(cf->levels, all, total);
++    ASSERT_EQ(got, total);
++
++    /* the level's tables, sorted by their first key */
++    sstable_t **tables = calloc((size_t)total + 1, sizeof(*tables));
++    int n = 0;
++    for (int i = 0; i < total; i++)
++        if (all[i].level == level) tables[n++] = all[i].sst;
++    for (int i = 1; i < n; i++)
++        for (int j = i;
++             j > 0 && tdb_key_cmp(tables[j]->min_key, tables[j]->min_key_size,
++                                  tables[j - 1]->min_key, tables[j - 1]->min_key_size) < 0;
++             j--)
++        {
++            sstable_t *t = tables[j];
++            tables[j] = tables[j - 1];
++            tables[j - 1] = t;
++        }
++
++    size_t cap = 1 << 16, len = 0;
++    char *out = malloc(cap);
++    ASSERT_TRUE(out != NULL);
++    for (int t = 0; t < n; t++)
++    {
++        sstable_iter_t *it = NULL;
++        ASSERT_EQ(sstable_iter_new(tables[t], 0, &it), TDB_SUCCESS);
++        for (int rc = sstable_iter_seek_first(it); rc == TDB_SUCCESS && sstable_iter_valid(it);
++             rc = sstable_iter_next(it))
++        {
++            uint8_t *k = NULL, *v = NULL;
++            size_t ks = 0, vs = 0;
++            uint64_t vo = 0, sq = 0;
++            int64_t tl = 0;
++            uint8_t dl = 0;
++            ASSERT_EQ(sstable_iter_get(it, &k, &ks, &v, &vs, &vo, &sq, &tl, &dl), TDB_SUCCESS);
++            if (len + ks + vs + 64 > cap)
++            {
++                cap *= 2;
++                out = realloc(out, cap);
++                ASSERT_TRUE(out != NULL);
++            }
++            len += (size_t)snprintf(out + len, cap - len, "%.*s@%llu:%u:%lld:%.*s\n", (int)ks,
++                                    (const char *)k, (unsigned long long)sq, (unsigned)dl,
++                                    (long long)tl, v ? (int)vs : 0, v ? (const char *)v : "");
++        }
++        ASSERT_EQ(sstable_iter_read_failed(it), 0);
++        sstable_iter_free(it);
++        len += (size_t)snprintf(out + len, cap - len, "--\n"); /* the table boundary */
++    }
++    for (int i = 0; i < total; i++)
++        if (all[i].sst && sstable_unref(all[i].sst)) sstable_close(all[i].sst);
++    free(all);
++    free(tables);
++    *len_out = len;
++    return out;
++}
++
++/* lines in a dump that are entries rather than table boundaries */
++static int ce_run_count_entries(const char *dump, size_t len)
++{
++    int n = 0;
++    for (size_t i = 0; i < len; i++)
++        if (dump[i] == '\n' && !(i >= 2 && dump[i - 1] == '-' && dump[i - 2] == '-')) n++;
++    return n;
++}
++
++/* compact the whole layout into CE_RUN_TARGET once with each merge, and return both dumps */
++static void ce_run_compact_both(uint64_t gc_floor, int largest, int subdivide, char **dumps,
++                                size_t *lens)
++{
++    static const uint8_t b1[] = "k00300", b2[] = "k00600", b3[] = "k00900";
++    const uint8_t *boundaries[3] = {b1, b2, b3};
++    const size_t boundary_sizes[3] = {6, 6, 6};
++    for (int pass = 0; pass < 2; pass++)
++    {
++        ce_db_t db;
++        ce_db_open(&db);
++        uint64_t ids[CE_RUN_MAX_IDS];
++        const int n = ce_run_build(&db, ids);
++
++        compaction_job_t job = {0};
++        job.input_ids = ids;
++        job.n_inputs = n;
++        job.target_level = CE_RUN_TARGET;
++        job.is_largest_level = largest;
++        job.split = subdivide ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE;
++        job.boundaries = subdivide ? boundaries : NULL;
++        job.boundary_sizes = subdivide ? boundary_sizes : NULL;
++        job.n_boundaries = subdivide ? 3 : 0;
++        job.may_subdivide = subdivide;
++        const compaction_ctx_t cx = {.cf = db.cf,
++                                     .manifest = db.manifest,
++                                     .manifest_path = db.manifest_path,
++                                     .next_sstable_id = &db.next_id,
++                                     .gc_floor = gc_floor,
++                                     .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                     .value_threshold = db.value_threshold,
++                                     .max_subdivisions = subdivide ? 4 : 0,
++                                     /* the first pass is the reference: every table its own source
++                                      */
++                                     .merge_each_table = pass == 0};
++        ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
++        for (int lvl = 1; lvl < CE_RUN_TARGET; lvl++)
++            ASSERT_EQ(level_set_count(db.cf->levels, lvl), 0);
++        ASSERT_TRUE(level_set_count(db.cf->levels, CE_RUN_TARGET) > 0);
++        dumps[pass] = ce_run_dump_level(db.cf, CE_RUN_TARGET, &lens[pass]);
++
++        /* the interval the L2 run carried still deletes what it covered, unless the merge wrote the
++         * largest level and so finished its work, which is the same for either merge */
++        uint64_t seq = 0;
++        const int covered =
++            cf_range_tombstone_covering(db.cf, (const uint8_t *)"k00110", 6, UINT64_MAX, &seq);
++        if (!largest)
++        {
++            ASSERT_EQ(covered, 1);
++            ASSERT_EQ((int)seq, 4999);
++        }
++        ce_db_close(&db);
++    }
++}
++
++/* every version and tombstone survives a merge that keeps everything, in the same order and in the
++ * same files whichever way the inputs are read */
++void test_compaction_level_runs_match_per_table_merge(void)
++{
++    char *dumps[2];
++    size_t lens[2];
++    ce_run_compact_both(0, 0, 0, dumps, lens);
++    /* nothing is collected at floor 0, so every version written is in the output */
++    const int expected = CE_RUN_L3_FILES * CE_RUN_L3_KEYS + CE_RUN_L2_FILES * CE_RUN_L2_KEYS +
++                         CE_RUN_L1_FILES * CE_RUN_L1_KEYS;
++    ASSERT_EQ(ce_run_count_entries(dumps[0], lens[0]), expected);
++    ASSERT_EQ(lens[0], lens[1]);
++    ASSERT_TRUE(memcmp(dumps[0], dumps[1], lens[0]) == 0);
++    free(dumps[0]);
++    free(dumps[1]);
++}
++
++/* the same with retention collecting versions and tombstones at the largest level, and with the
++ * range split across threads, each seeking its runs to its own first key */
++void test_compaction_level_runs_match_per_table_merge_collected_and_subdivided(void)
++{
++    char *dumps[2];
++    size_t lens[2];
++    ce_run_compact_both(UINT64_MAX, 1, 1, dumps, lens);
++    ASSERT_TRUE(ce_run_count_entries(dumps[0], lens[0]) > 0);
++    ASSERT_EQ(lens[0], lens[1]);
++    ASSERT_TRUE(memcmp(dumps[0], dumps[1], lens[0]) == 0);
++    free(dumps[0]);
++    free(dumps[1]);
++
++    ce_run_compact_both(9000, 1, 1, dumps, lens);
++    ASSERT_EQ(lens[0], lens[1]);
++    ASSERT_TRUE(memcmp(dumps[0], dumps[1], lens[0]) == 0);
++    free(dumps[0]);
++    free(dumps[1]);
++}
++
++/* a table in the middle of a deep run that cannot be read fails the whole merge as io, whichever
++ * way the run is read, and leaves every input installed for the job to run again */
++void test_compaction_read_failure_in_level_run_is_io(void)
++{
++    for (int pass = 0; pass < 2; pass++)
++    {
++        ce_db_t db;
++        ce_db_open(&db);
++        uint64_t ids[CE_RUN_MAX_IDS];
++        const int n = ce_run_build(&db, ids);
++
++        /* overwrite the middle of one L3 table's key log, where its leaves are, so the checksum of
++         * every block there fails when the merge loads it */
++        sstable_t *victim[1];
++        const char probe[] = "k00610"; /* in L3 file 15 of 30 */
++        ASSERT_EQ(level_set_overlapping(db.cf->levels, 3, (const uint8_t *)probe, 6,
++                                        (const uint8_t *)probe, 6, victim, 1),
++                  1);
++        const int fd = open(victim[0]->klog_path, O_WRONLY);
++        ASSERT_TRUE(fd >= 0);
++        const off_t size = lseek(fd, 0, SEEK_END);
++        ASSERT_TRUE(size > 0);
++        char junk[512];
++        memset(junk, 0xA5, sizeof(junk));
++        for (off_t off = size / 8; off < size / 2; off += (off_t)sizeof(junk))
++            ASSERT_EQ(pwrite(fd, junk, sizeof(junk), off), (ssize_t)sizeof(junk));
++        ASSERT_EQ(close(fd), 0);
++        if (sstable_unref(victim[0])) sstable_close(victim[0]);
++
++        const compaction_job_t job = {.input_ids = ids,
++                                      .n_inputs = n,
++                                      .target_level = CE_RUN_TARGET,
++                                      .is_largest_level = 1,
++                                      .split = COMPACTION_SPLIT_NONE};
++        const compaction_ctx_t cx = {.cf = db.cf,
++                                     .manifest = db.manifest,
++                                     .manifest_path = db.manifest_path,
++                                     .next_sstable_id = &db.next_id,
++                                     .gc_floor = UINT64_MAX,
++                                     .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                     .value_threshold = db.value_threshold,
++                                     .merge_each_table = pass == 0};
++        ASSERT_EQ(compaction_exec(&cx, &job), TDB_ERR_IO);
++        ASSERT_EQ(level_set_count(db.cf->levels, LEVEL_SET_L1), CE_RUN_L1_FILES);
++        ASSERT_EQ(level_set_count(db.cf->levels, 2), CE_RUN_L2_FILES);
++        ASSERT_EQ(level_set_count(db.cf->levels, 3), CE_RUN_L3_FILES);
++        ASSERT_EQ(level_set_count(db.cf->levels, CE_RUN_TARGET), 0);
++        ce_db_close(&db);
++    }
++}
++
+ int main(int argc, char **argv)
+ {
+     INIT_TEST_FILTER(argc, argv);
+@@ -1014,6 +1336,10 @@ int main(int argc, char **argv)
+                              tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_compaction_move_relevels_without_rewriting, tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_compaction_move_into_occupied_level_is_skipped, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_compaction_level_runs_match_per_table_merge, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(
++        test_compaction_level_runs_match_per_table_merge_collected_and_subdivided, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_compaction_read_failure_in_level_run_is_io, tests_passed);
+     PRINT_TEST_RESULTS(tests_passed, tests_failed);
+     return tests_failed > 0 ? 1 : 0;
+ }
+diff --git a/test/merge_iter__tests.c b/test/merge_iter__tests.c
+index 148ec6b..e206456 100644
+--- a/test/merge_iter__tests.c
++++ b/test/merge_iter__tests.c
+@@ -398,6 +398,48 @@ void test_merge_raw_all_versions(void)
+     merge_iter_free(it);
+ }
+ 
++/* a raw merge reports io the moment any source fails to read, even one the merge is not currently
++ * drawing from, and keeps reporting it rather than streaming on from the sources still readable */
++void test_merge_raw_read_failure_in_any_source_is_io(void)
++{
++    static const stub_entry_t ea[] = {{"a", 1, "a1"}, {"c", 3, "c3"}, {"e", 5, "e5"}};
++    static const stub_entry_t eb[] = {{"b", 2, "b2"}, {"d", 4, "d4"}, {"f", 6, "f6"}};
++    static const stub_entry_t ec[] = {{"g", 7, "g7"}};
++    /* b is read, then the source cannot load what holds d */
++    stub_src_t sa = {.entries = ea, .n = 3}, sb = {.entries = eb, .n = 3, .fail_at = 1},
++               sc = {.entries = ec, .n = 1};
++    merge_source_t sources[3] = {stub_source(&sa), stub_source(&sb), stub_source(&sc)};
++
++    merge_iter_t *it = NULL;
++    ASSERT_EQ(merge_iter_new(sources, 3, UINT64_MAX, MERGE_ITER_RAW, &it), TDB_SUCCESS);
++    ASSERT_EQ(merge_iter_seek_first(it), TDB_SUCCESS); /* a */
++    /* b comes out of the failing source and moves it onto the entry it cannot read */
++    ASSERT_EQ(merge_iter_next(it), TDB_ERR_IO);
++    ASSERT_EQ(merge_iter_valid(it), 0);
++    merge_iter_free(it);
++}
++
++/* a source that fails on its very first read, while the merge is being positioned, makes the seek
++ * itself report io, and a later seek that repositions it past the failure clears it */
++void test_merge_read_failure_while_positioning_is_io(void)
++{
++    static const stub_entry_t ea[] = {{"a", 1, "a1"}, {"b", 2, "b2"}};
++    static const stub_entry_t eb[] = {{"c", 3, "c3"}, {"d", 4, "d4"}, {"e", 5, "e5"}};
++    stub_src_t sa = {.entries = ea, .n = 2}, sb = {.entries = eb, .n = 3, .fail_at = 2};
++    merge_source_t sources[2] = {stub_source(&sa), stub_source(&sb)};
++
++    merge_iter_t *it = NULL;
++    ASSERT_EQ(merge_iter_new(sources, 2, UINT64_MAX, MERGE_ITER_RESOLVE, &it), TDB_SUCCESS);
++    /* the seek lands sb on e, which it cannot read */
++    ASSERT_EQ(merge_iter_seek(it, (const uint8_t *)"e", 1), TDB_ERR_IO);
++    /* repositioned on readable entries the merge streams again */
++    ASSERT_EQ(merge_iter_seek_first(it), TDB_SUCCESS);
++    char got[128];
++    collect(it, 1, got, sizeof(got));
++    ASSERT_TRUE(strcmp(got, "a:a1,b:b2,c:c3,") == 0); /* and then io at d -> e, not a clean end */
++    merge_iter_free(it);
++}
++
+ int main(int argc, char **argv)
+ {
+     INIT_TEST_FILTER(argc, argv);
+@@ -410,6 +452,8 @@ int main(int argc, char **argv)
+     RUN_TEST(test_merge_direction_flip, tests_passed);
+     RUN_TEST(test_merge_seek, tests_passed);
+     RUN_TEST(test_merge_source_read_failure_is_not_end_of_scan, tests_passed);
++    RUN_TEST(test_merge_raw_read_failure_in_any_source_is_io, tests_passed);
++    RUN_TEST(test_merge_read_failure_while_positioning_is_io, tests_passed);
+     PRINT_TEST_RESULTS(tests_passed, tests_failed);
+     return tests_failed > 0 ? 1 : 0;
+ }
