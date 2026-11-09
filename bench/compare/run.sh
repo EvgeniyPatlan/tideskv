@@ -65,8 +65,9 @@ CLIENTS=${CLIENTS:-50}
 # Refuses when free disk is under 2 x (3 x logical) + 32 GiB (spec §8, raised after the quick run). DISK_FREE_OVERRIDE is a test hook.
 disk_check() {
   local need free
-  # Kvrocks measured ~8x end/logical in the quick run and its WAL retention is a fixed overhead: 3x per server, two servers, plus 32 GiB
-  need=$(( $(wl_logical_bytes) * 3 * 2 + 32 * 1024 * 1024 * 1024 ))
+  # Kvrocks measured ~8x end/logical in the quick run and its WAL retention is a fixed overhead: 3x for the one server
+  # whose data is on disk at a time (run_full empties it before the next), plus 32 GiB
+  need=$(( $(wl_logical_bytes) * 3 + 32 * 1024 * 1024 * 1024 ))
   # W7 holds one server's data at a time: 2x logical covers the load plus M32's rewrites, plus 8 GiB and fio's file
   # (80 GiB at large with its 8 GiB fio file)
   if [[ $SIZE == large* ]]; then
@@ -261,8 +262,10 @@ run_full() {
   docker pull -q "$KVROCKS_IMAGE" >/dev/null; docker pull -q "$MEMTIER_IMAGE" >/dev/null; docker pull -q "$CLI_IMAGE" >/dev/null
   write_meta
   local server
-  for server in tideskv kvrocks; do run_server "$server" || log "$server: run failed, continuing"; done
-  remove_data
+  for server in tideskv kvrocks; do
+    run_server "$server" || log "$server: run failed, continuing"
+    remove_data  # one server's data at a time; disk.json already holds its sizes
+  done
   local rc=0
   python3 "$HERE/report.py" "$OUT" || rc=$?
   log "report: $OUT/report.md"
