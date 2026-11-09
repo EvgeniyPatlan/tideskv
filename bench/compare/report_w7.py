@@ -101,15 +101,6 @@ def device_queue(samples, dev):
     return aqu, r_await
 
 
-def _busiest_in_diskstats(samples):
-    if len(samples) < 2:
-        return None
-    first, last = samples[0][1], samples[-1][1]
-    deltas = {d: {"rbytes": (last[d][3] - first[d][3]) * 512, "wbytes": (last[d][7] - first[d][7]) * 512}
-              for d in last if d in first}
-    return pick_device(deltas, {d: v[0] for d, v in last.items()})
-
-
 def parse_info_counters(text, keys=("block_cache_data_hit", "block_cache_data_miss")):
     """First value of each key in INFO output (Kvrocks lists the block-cache counters in two sections)."""
     out = {}
@@ -186,8 +177,7 @@ def _disk_fields(cell, d, phase, m):
             if synced is not None and dev is not None:
                 wbytes = io_delta(parse_io_stat(io0), parse_io_stat(synced)).get(dev, delta)["wbytes"]
             cell["write_amp"] = wbytes / float(m["set_count"] * VALUE_SIZE)
-    if dev is None:
-        dev = _busiest_in_diskstats(samples)
+    # without I/O from the server in the window, the device's queue is only the host's other traffic: left blank
     if dev is not None:
         cell["device"] = names.get(dev, dev)
         cell["aqu_sz"], cell["r_await_ms"] = device_queue(samples, dev)
@@ -365,7 +355,7 @@ def render(meta, cells, fio, disks, configs, run_dir=None):
             "written ÷ (SETs × 256 KiB), M32 only, counted after a host sync so that dirty pages written back after the "
             "window count too.",
             "- aqu-sz (Δweighted ms ÷ Δwall ms) and r_await (Δread ms ÷ Δreads) come from /proc/diskstats sampled "
-            "once a second; they are the device's, host-wide.",
+            "once a second; they are the device's, host-wide, and are left blank when the server did no I/O.",
             "- Client CPU is the timed memtier container's mean CPU as a share of its cpuset; above %d%% the run is "
             "flagged client-bound?." % CLIENT_BOUND_PCT, ""]
     if notes:

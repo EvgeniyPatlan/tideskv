@@ -625,6 +625,15 @@ class W7ReportTest(unittest.TestCase):
             self.assertAlmostEqual(c["write_amp"], 3.0)
             self.assertAlmostEqual(c["write_mbs"], 23600.82432 / 30.002)  # MB/s stays the window's
 
+    def test_no_server_io_leaves_queue_blank(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("R1",))
+            shutil.copy(os.path.join(W7, "M32.io0"), os.path.join(t, "tideskv", "large", "R1.io1"))
+            meta, _, _, _ = report.load(t)
+            c = _w7(report_w7.collect(t, meta), "tideskv", "R1")
+            self.assertEqual((c["read_mbs"], c["reads_per_get"]), (0.0, 0.0))
+            self.assertEqual((c["device"], c["aqu_sz"], c["r_await_ms"]), (None, None, None))
+
     def test_medium_run_is_not_large(self):
         with tempfile.TemporaryDirectory() as t:
             make_run(t)
