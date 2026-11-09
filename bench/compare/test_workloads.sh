@@ -272,6 +272,18 @@ check parity-tideskv-large "$(_parity_expect tideskv relaxed | head -2 | xargs)"
 check parity-blob "$(_parity_expect kvrocks-blob relaxed | tail -2 | xargs)" \
   "rocksdb.enable_blob_files yes rocksdb.min_blob_size 4096"
 check parity-kvrocks-no-blob "$(_parity_expect kvrocks relaxed | grep -c blob)" 0
+check conf-kvrocks-wal-default "$(grep -c '^rocksdb.wal_' "$(write_server_conf kvrocks relaxed)")" 0
+# --large: no WAL archive on either Kvrocks, and parity reads it back
+W7_LARGE=1
+for s in kvrocks kvrocks-blob; do
+  conf=$(write_server_conf "$s" relaxed)
+  check "conf-$s-wal-ttl" "$(grep -c '^rocksdb.wal_ttl_seconds 0$' "$conf")" 1
+  check "conf-$s-wal-size" "$(grep -c '^rocksdb.wal_size_limit_mb 0$' "$conf")" 1
+  check "parity-$s-wal" "$(_parity_expect "$s" relaxed | tail -2 | xargs)" "rocksdb.wal_ttl_seconds 0 rocksdb.wal_size_limit_mb 0"
+done
+check parity-blob-large "$(_parity_expect kvrocks-blob relaxed | grep -c blob)" 2
+check conf-tideskv-no-wal "$(grep -c wal_ "$(write_server_conf tideskv relaxed)")" 0
+W7_LARGE=0
 BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
 wl_sizes large
 W7_SWEEP=1
@@ -279,14 +291,21 @@ check w7-phases-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 R32w16 M32"
 W7_SWEEP=0
 check w7-phases-no-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 M32"
 check cpu-count "$(cpu_count 8-11) $(cpu_count 0-3,8,10-11) $(cpu_count 5)" "4 7 1"
-SIZE=large DISK_FREE_OVERRIDE=$((54 * 1024 * 1024 * 1024))
+# logical x 2 + 8 GiB + fio's file: 32 x 2 + 8 + 8 = 80 GiB at large
+SIZE=large FIO_SIZE=8g DISK_FREE_OVERRIDE=$((79 * 1024 * 1024 * 1024))
 rc=0; disk_check 2>/dev/null || rc=$?
-check disk-large-refuses-54g "$((rc != 0))" 1
-DISK_FREE_OVERRIDE=$((56 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
-check disk-large-ok-56g "$rc" 0
-wl_sizes large-smoke; SIZE=large-smoke DISK_FREE_OVERRIDE=$((8 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-refuses-79g "$((rc != 0))" 1
+DISK_FREE_OVERRIDE=$((81 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-ok-81g "$rc" 0
+FIO_SIZE=1g DISK_FREE_OVERRIDE=$((74 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-fio-size-counts "$rc" 0
+wl_sizes large-smoke; SIZE=large-smoke FIO_SIZE=1g DISK_FREE_OVERRIDE=$((10 * 1024 * 1024 * 1024)) rc=0
+disk_check || rc=$?
 check disk-large-smoke-ok "$rc" 0
-unset DISK_FREE_OVERRIDE
+unset DISK_FREE_OVERRIDE FIO_SIZE
+check size-bytes "$(size_bytes 8g) $(size_bytes 512m) $(size_bytes 4096) $(size_bytes 2K)" "8589934592 536870912 4096 2048"
+rc=0; size_bytes 8x >/dev/null 2>&1 || rc=$?
+check size-bytes-bad "$((rc != 0))" 1
 SIZE=quick; wl_sizes quick
 # the kvrocks-blob DBSIZE cache needs the same DBSIZE SCAN as kvrocks
 check load-kvrocks-glob "$(declare -f load_all | grep -c 'SERVER_NAME == kvrocks\*')" 2
@@ -294,7 +313,18 @@ check load-kvrocks-glob "$(declare -f load_all | grep -c 'SERVER_NAME == kvrocks
 # shellcheck disable=SC2016  # the literal text of run.sh
 check w7-memtier-name "$(declare -f run_w7_phase | grep -c 'mc="tideskv-bench-memtier-$TS-w7-')" 1
 check fio-pinned "$([[ $FIO_IMAGE == *@sha256:* ]] && echo yes)" yes
+# a failed page-cache drop is detected (the container's find fails with the dd) and recorded
+check evict-plus "$(grep -c "sh '{}' +" "$HERE/lib.sh")" 1
+# shellcheck disable=SC2016  # the literal text of lib.sh
+check evict-flag "$(declare -f start_server | grep -c 'evict_cache "$data" || EVICT_FAILED=1')" 1
+check w7-markers "$(declare -f run_w7_phase | grep -c "M start\|M end")" 2
+check w7-sync-before-io0 "$(declare -f run_w7_phase | grep -B6 'base.io0' | grep -c '^ *sync;\?$')" 1
+# shellcheck disable=SC2016  # the literal text of run.sh
+check w7-run-args-checked "$(declare -f run_w7_phase | grep -c 'wl_run_w7 "$phase" _run_cb || return')" 1
+check w7-io2-after-settle "$(declare -f run_w7_phase | grep -A1 'settle-after' | grep -c 'io2')" 1
 
+rc=0; bash "$HERE/run.sh" --no-w7-sweep >/dev/null 2>"$T/err" || rc=$?
+check no-sweep-needs-large "$rc $(grep -c 'needs --large' "$T/err")" "2 1"
 # M6: a missing option value is an error, and --help shows the defaults
 rc=0; bash "$HERE/run.sh" --out >/dev/null 2>"$T/err" || rc=$?
 check out-missing-value "$rc $(grep -c 'needs a value' "$T/err")" "1 1"

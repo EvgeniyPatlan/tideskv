@@ -35,6 +35,7 @@ done
 [[ $RELAXED == none || $RELAXED == interval ]] || { echo "--relaxed-mode must be none or interval" >&2; exit 2; }
 # --large --smoke is a real W7 run on a tiny dataset, not the start-and-probe smoke
 if [[ $SIZE == large ]] && ((SMOKE)); then SIZE=large-smoke SMOKE=0; fi
+if ((!W7_SWEEP)) && [[ $SIZE != large* ]]; then echo "--no-w7-sweep needs --large" >&2; exit 2; fi
 
 # Starts each server at both levels, checks parity and runs every workload's probe once (no memtier).
 run_smoke() {
@@ -66,8 +67,11 @@ disk_check() {
   local need free
   # Kvrocks measured ~8x end/logical in the quick run and its WAL retention is a fixed overhead: 3x per server, two servers, plus 32 GiB
   need=$(( $(wl_logical_bytes) * 3 * 2 + 32 * 1024 * 1024 * 1024 ))
-  # W7 holds one server's data at a time: up to 1.5x space amplification, plus room for fio's file (55 GiB at large)
-  if [[ $SIZE == large* ]]; then need=$(( $(wl_logical_bytes) * 3 / 2 + 7 * 1024 * 1024 * 1024 )); fi
+  # W7 holds one server's data at a time: 2x logical covers the load plus M32's rewrites, plus 8 GiB and fio's file
+  # (80 GiB at large with its 8 GiB fio file)
+  if [[ $SIZE == large* ]]; then
+    need=$(( $(wl_logical_bytes) * 2 + 8 * 1024 * 1024 * 1024 + $(size_bytes "${FIO_SIZE:-0}") ))
+  fi
   free=${DISK_FREE_OVERRIDE:-$(df --output=avail -B1 "$OUT" | tail -1)}
   if (( free < need )); then log "not enough disk: need $need bytes, $free free under $OUT"; return 1; fi
 }
@@ -282,24 +286,32 @@ w7_phase_list() {
 _stop_bg() { local p; for p in "$@"; do stop_sampler "$p"; done; }
 
 # One W7 phase on a freshly restarted server: settle, warm-up, then the timed run with every W7 measurement.
-# Writes <server>/large/<phase>.{json,status,settle,cpu,io0,io1,io1s,info0,info1,stats.jsonl,client.jsonl,diskstats}.
+# Writes <server>/large/<phase>.{json,status,settle,cpu,io0,io1,io1s,io2,settle-after,info0,info1,stats.jsonl,
+# client.jsonl,diskstats}. A status of "ok" can carry warning lines after it (a failed page-cache drop).
 run_w7_phase() {
-  local phase=$1 base="$CUR/large/$1" mc="tideskv-bench-memtier-$TS-w7-$CUR-$1" spid dpid cpid cpu0 cpu1
+  local phase=$1 base="$CUR/large/$1" mc="tideskv-bench-memtier-$TS-w7-$CUR-$1" spid dpid cpid cpu0 cpu1 ds
   mkdir -p "$OUT/$CUR/large"
+  ds=$OUT/$base.diskstats
   settle "$OUT/$base.settle" || { echo "could not read the server's cgroup to wait for it to settle" >"$OUT/$base.status"; return; }
-  wl_run_w7 "$phase" _run_cb
+  wl_run_w7 "$phase" _run_cb || return
   memtier "$base.warmup" --test-time="$WARMUP" "${RUN_ARGS[@]}" || true
   cli INFO >"$OUT/$base.info0" 2>&1 || true
+  # the warm-up's dirty pages are written back now, not charged to the timed window
+  sync
   stats_sampler "$SERVER_CONTAINER" >"$OUT/$base.stats.jsonl" & spid=$!
   stats_sampler "$mc" >"$OUT/$base.client.jsonl" & cpid=$!
-  diskstats_sampler >"$OUT/$base.diskstats" & dpid=$!
+  : >"$ds"
+  diskstats_sampler >>"$ds" & dpid=$!
   cg_io_snapshot >"$OUT/$base.io0"
   cpu0=$(cg_sample) || cpu0=""
+  # aqu-sz and r_await are computed between these markers only
+  printf 'M start %s\n' "$(date +%s%3N)" >>"$ds"
   if MEMTIER_CNAME=$mc memtier "$base" --test-time="$DURATION" "${RUN_ARGS[@]}"; then
     echo ok >"$OUT/$base.status"
   else
     echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
   fi
+  printf 'M end %s\n' "$(date +%s%3N)" >>"$ds"
   cpu1=$(cg_sample) || cpu1=""
   cg_io_snapshot >"$OUT/$base.io1"
   # write amp also counts the window's dirty pages, which a relaxed server writes back after it (charged to its cgroup)
@@ -308,6 +320,10 @@ run_w7_phase() {
   _stop_bg "$spid" "$cpid" "$dpid"
   if [[ -n $cpu0 && -n $cpu1 ]]; then echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"; fi
   cli INFO >"$OUT/$base.info1" 2>&1 || true
+  if ((EVICT_FAILED)); then echo "warning: the data dir could not be dropped from the page cache" >>"$OUT/$base.status"; fi
+  # and the flush and compaction debt the window left: "write amp incl. settle"
+  settle "$OUT/$base.settle-after" || true
+  cg_io_snapshot >"$OUT/$base.io2"
   if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null) != true ]]; then
     echo "server stopped during the run (OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' "$SERVER_CONTAINER"))" >"$OUT/$base.status"
     return 1
@@ -339,17 +355,20 @@ run_server_large() {
 
 run_large() {
   wl_sizes "$SIZE"
-  SERVER_MEM=${SERVER_MEM_ENV:-4g} BLOCK_CACHE_MB=1024 THREADS=$W7_THREADS CLIENTS=$W7_CLIENTS
+  SERVER_MEM=${SERVER_MEM_ENV:-4g} BLOCK_CACHE_MB=1024 THREADS=$W7_THREADS CLIENTS=$W7_CLIENTS W7_LARGE=1
   FIO_QDS=${FIO_QDS:-1 2 4 8 16 32}
   if [[ $SIZE == large ]]; then FIO_RUNTIME=${FIO_RUNTIME:-30} FIO_SIZE=${FIO_SIZE:-8g}
   else FIO_RUNTIME=${FIO_RUNTIME:-5} FIO_SIZE=${FIO_SIZE:-1g}; fi
+  size_bytes "$FIO_SIZE" >/dev/null || exit 2
   disk_check
   docker pull -q "$KVROCKS_IMAGE" >/dev/null; docker pull -q "$MEMTIER_IMAGE" >/dev/null; docker pull -q "$CLI_IMAGE" >/dev/null
   run_fio  # before any server: the disk's own 256 KiB random-read curve
   META_EXTRA=("#w7_value_size=$W7_VALUE_SIZE" "#w7_keys=$W7_KEYS" "w7_phases=$(w7_phase_list | xargs)"
               "#w7_sweep=$W7_SWEEP" "#block_cache_mb=$BLOCK_CACHE_MB" "#client_cpu_count=$(cpu_count "$CLIENT_CPUS")"
               "#client_bound_pct=$CLIENT_BOUND_PCT" "fio_image=$FIO_IMAGE" "fio_status=$FIO_STATUS"
-              "fio_qds=$FIO_QDS" "#fio_runtime_s=$FIO_RUNTIME" "fio_size=$FIO_SIZE" "w7_servers=$W7_SERVERS")
+              "fio_qds=$FIO_QDS" "#fio_runtime_s=$FIO_RUNTIME" "fio_size=$FIO_SIZE" "w7_servers=$W7_SERVERS"
+              "w7_client=--large sets memtier to $W7_THREADS threads x $W7_CLIENTS clients; THREADS and CLIENTS are ignored"
+              "w7_kvrocks_extra=${KVROCKS_LARGE_CONF[*]}")
   write_meta
   local server
   for server in $W7_SERVERS; do
