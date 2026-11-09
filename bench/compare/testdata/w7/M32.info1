@@ -1,0 +1,8 @@
+# RocksDB
+block_cache_usage:131072
+block_cache_data_hit:4000
+block_cache_data_miss:12000
+block_cache_hit:290000
+block_cache_miss:12000
+# Stats
+block_cache_data_hit:7

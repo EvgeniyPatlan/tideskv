@@ -99,6 +99,49 @@ check verify-lines "$(wl_verify_cmds | wc -l)" 5
 check verify-hlen "$(wl_verify_cmds | grep -c '^9900 HLEN h:1$')" 1
 check logical "$( (( $(wl_logical_bytes) > 400000000 )) && echo yes || echo no)" yes
 
+# W7 (--large): 256 KiB values, working set set by --key-maximum, 8 threads x 4 clients
+wl_sizes large
+check large-keys "$W7_KEYS" 131072
+check large-datasets "$DATASETS" large
+check large-logical "$(wl_logical_bytes)" $((131072 * (262144 + 8)))
+check large-verify "$(wl_verify_cmds)" "129761 DBSIZE"
+calls=(); wl_load large record
+check large-load-calls "${#calls[@]}" 1
+for a in --ratio=1:0 --data-size=262144 --random-data --key-prefix=L: --key-pattern=P:P --key-maximum=131072 \
+         --requests=allkeys; do
+  check "large-load$a" "$(has "${calls[0]}$'\x1f'" "$a"$'\x1f')" yes
+done
+check large-keys-r1 "$(wl_w7_keys R1)" 4096
+check large-keys-r4 "$(wl_w7_keys R4)" 16384
+check large-keys-r32 "$(wl_w7_keys R32)" 131072
+check large-keys-sweep "$(wl_w7_keys R32w16)" 131072
+for p in R1 R4 R32 M32 R32w16; do
+  calls=(); wl_run_w7 "$p" record
+  c="${calls[0]}"$'\x1f'
+  for a in --data-size=262144 --random-data --distinct-client-seed --randomize --threads=8 --clients=4 --pipeline=1 \
+           --key-prefix=L: --key-pattern=R:R --key-minimum=1 "--key-maximum=$(wl_w7_keys "$p")"; do
+    check "w7-$p$a" "$(has "$c" "$a"$'\x1f')" yes
+  done
+done
+calls=(); wl_run_w7 R4 record
+check w7-r4-get-only "$(has "${calls[0]}" "--ratio=0:1")" yes
+check w7-r4-keymax "$(has "${calls[0]}" "--key-maximum=16384")" yes
+calls=(); wl_run_w7 M32 record
+check w7-m32-ratio "$(has "${calls[0]}" "--ratio=1:9")" yes
+check w7-m32-keymax "$(has "${calls[0]}"$'\x1f' $'--key-maximum=131072\x1f')" yes
+rc=0; wl_run_w7 X9 record 2>/dev/null || rc=$?
+check w7-bad-phase "$((rc != 0))" 1
+rc=0; wl_w7_keys R64 2>/dev/null || rc=$?
+check w7-bad-ratio "$((rc != 0))" 1
+wl_sizes large-smoke
+check large-smoke-keys "$W7_KEYS" 512
+check large-smoke-r1 "$(wl_w7_keys R1)" 16
+check large-smoke-r32 "$(wl_w7_keys R32)" 512
+# going back to a W1-W6 size clears W7 and restores the datasets
+wl_sizes quick
+check quick-after-large "$W7_KEYS $DATASETS" "0 strings hashes zsets lists bighashes"
+check quick-verify-after-large "$(wl_verify_cmds | wc -l)" 5
+
 
 # ---- run.sh helpers, sourced without running (Docker is stubbed) ----
 # shellcheck source=run.sh
@@ -207,6 +250,92 @@ check meta-nofile "$(meta server_nofile)" 65536
 check meta-cores "$( [[ -n $(meta server_cores) ]] && echo yes)" yes
 unset -f docker sync memtier
 
+# W7 (--large): config variants, parity, phase order, disk budget
+RELAXED=none BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
+conf=$(write_server_conf tideskv relaxed)
+check conf-tideskv-default "$(diff <(sed 's/SYNC_MODE/none/' "$HERE/tideskv.conf") "$conf" && echo same)" same
+conf=$(write_server_conf kvrocks strict)
+check conf-kvrocks-default "$(diff <(sed 's/SYNC_YESNO/yes/' "$HERE/kvrocks.conf") "$conf" && echo same)" same
+check parity-default "$(_parity_expect kvrocks relaxed | head -2 | xargs)" "workers 4 rocksdb.block_cache_size 2048"
+BLOCK_CACHE_MB=1024 SERVER_WORKERS=16
+conf=$(write_server_conf tideskv relaxed)
+check conf-tideskv-large "$(grep -E '^(workers|block-cache-size) ' "$conf" | xargs)" "workers 16 block-cache-size 1gb"
+conf=$(write_server_conf kvrocks-blob relaxed)
+check conf-blob-path "$conf" "$OUT/kvrocks-blob/kvrocks-relaxed.conf"
+check conf-blob-cache "$(grep -c '^rocksdb.block_cache_size 1024$' "$conf")" 1
+check conf-blob-workers "$(grep -c '^workers 16$' "$conf")" 1
+check conf-blob-files "$(grep -c '^rocksdb.enable_blob_files yes$' "$conf")" 1
+check conf-blob-min "$(grep -c '^rocksdb.min_blob_size 4096$' "$conf")" 1
+conf=$(write_server_conf kvrocks relaxed)
+check conf-kvrocks-no-blob "$(grep -c blob "$conf")" 0
+check parity-tideskv-large "$(_parity_expect tideskv relaxed | head -2 | xargs)" "workers 16 block-cache-size 1073741824"
+check parity-blob "$(_parity_expect kvrocks-blob relaxed | tail -2 | xargs)" \
+  "rocksdb.enable_blob_files yes rocksdb.min_blob_size 4096"
+check parity-kvrocks-no-blob "$(_parity_expect kvrocks relaxed | grep -c blob)" 0
+check conf-kvrocks-wal-default "$(grep -c '^rocksdb.wal_' "$(write_server_conf kvrocks relaxed)")" 0
+# --large: no WAL archive on either Kvrocks, and parity reads it back
+W7_LARGE=1
+for s in kvrocks kvrocks-blob; do
+  conf=$(write_server_conf "$s" relaxed)
+  check "conf-$s-wal-ttl" "$(grep -c '^rocksdb.wal_ttl_seconds 0$' "$conf")" 1
+  check "conf-$s-wal-size" "$(grep -c '^rocksdb.wal_size_limit_mb 0$' "$conf")" 1
+  check "parity-$s-wal" "$(_parity_expect "$s" relaxed | tail -2 | xargs)" "rocksdb.wal_ttl_seconds 0 rocksdb.wal_size_limit_mb 0"
+done
+check parity-blob-large "$(_parity_expect kvrocks-blob relaxed | grep -c blob)" 2
+check conf-tideskv-no-wal "$(grep -c wal_ "$(write_server_conf tideskv relaxed)")" 0
+# --large: no compression on any server (memtier's random data compresses ~3x under lz4), read back by parity
+COMPRESSION=no
+check conf-tideskv-compression-off "$(grep -c '^compression no$' "$(write_server_conf tideskv relaxed)")" 1
+check parity-tideskv-compression-off "$(_parity_expect tideskv relaxed | grep -c '^compression no$')" 1
+for s in kvrocks kvrocks-blob; do
+  check "conf-$s-compression-off" "$(grep -c '^rocksdb.compression no$' "$(write_server_conf "$s" relaxed)")" 1
+  check "parity-$s-compression-off" "$(_parity_expect "$s" relaxed | grep -c '^rocksdb.compression no$')" 1
+done
+COMPRESSION=lz4
+check parity-compression-default "$(_parity_expect kvrocks relaxed | grep -c '^rocksdb.compression lz4$')" 1
+check w7-sets-compression-off "$(declare -f run_large | grep -c 'COMPRESSION=no')" 1
+W7_LARGE=0
+BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
+wl_sizes large
+W7_SWEEP=1
+check w7-phases-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 R32w16 M32"
+W7_SWEEP=0
+check w7-phases-no-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 M32"
+check cpu-count "$(cpu_count 8-11) $(cpu_count 0-3,8,10-11) $(cpu_count 5)" "4 7 1"
+# logical x 2 + 8 GiB + fio's file: 32 x 2 + 8 + 8 = 80 GiB at large
+SIZE=large FIO_SIZE=8g DISK_FREE_OVERRIDE=$((79 * 1024 * 1024 * 1024))
+rc=0; disk_check 2>/dev/null || rc=$?
+check disk-large-refuses-79g "$((rc != 0))" 1
+DISK_FREE_OVERRIDE=$((81 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-ok-81g "$rc" 0
+FIO_SIZE=1g DISK_FREE_OVERRIDE=$((74 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-fio-size-counts "$rc" 0
+wl_sizes large-smoke; SIZE=large-smoke FIO_SIZE=1g DISK_FREE_OVERRIDE=$((10 * 1024 * 1024 * 1024)) rc=0
+disk_check || rc=$?
+check disk-large-smoke-ok "$rc" 0
+unset DISK_FREE_OVERRIDE FIO_SIZE
+check size-bytes "$(size_bytes 8g) $(size_bytes 512m) $(size_bytes 4096) $(size_bytes 2K)" "8589934592 536870912 4096 2048"
+rc=0; size_bytes 8x >/dev/null 2>&1 || rc=$?
+check size-bytes-bad "$((rc != 0))" 1
+SIZE=quick; wl_sizes quick
+# the kvrocks-blob DBSIZE cache needs the same DBSIZE SCAN as kvrocks
+check load-kvrocks-glob "$(declare -f load_all | grep -c 'SERVER_NAME == kvrocks\*')" 2
+# a W7 memtier container carries $TS so bench_cleanup's name filter finds it
+# shellcheck disable=SC2016  # the literal text of run.sh
+check w7-memtier-name "$(declare -f run_w7_phase | grep -c 'mc="tideskv-bench-memtier-$TS-w7-')" 1
+check fio-pinned "$([[ $FIO_IMAGE == *@sha256:* ]] && echo yes)" yes
+# a failed page-cache drop is detected (the container's find fails with the dd) and recorded
+check evict-plus "$(grep -c "sh '{}' +" "$HERE/lib.sh")" 1
+# shellcheck disable=SC2016  # the literal text of lib.sh
+check evict-flag "$(declare -f start_server | grep -c 'evict_cache "$data" || EVICT_FAILED=1')" 1
+check w7-markers "$(declare -f run_w7_phase | grep -c "M start\|M end")" 2
+check w7-sync-before-io0 "$(declare -f run_w7_phase | grep -B6 'base.io0' | grep -c '^ *sync;\?$')" 1
+# shellcheck disable=SC2016  # the literal text of run.sh
+check w7-run-args-checked "$(declare -f run_w7_phase | grep -c 'wl_run_w7 "$phase" _run_cb || return')" 1
+check w7-io2-after-settle "$(declare -f run_w7_phase | grep -A1 'settle-after' | grep -c 'io2')" 1
+
+rc=0; bash "$HERE/run.sh" --no-w7-sweep >/dev/null 2>"$T/err" || rc=$?
+check no-sweep-needs-large "$rc $(grep -c 'needs --large' "$T/err")" "2 1"
 # M6: a missing option value is an error, and --help shows the defaults
 rc=0; bash "$HERE/run.sh" --out >/dev/null 2>"$T/err" || rc=$?
 check out-missing-value "$rc $(grep -c 'needs a value' "$T/err")" "1 1"

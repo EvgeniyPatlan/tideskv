@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turns a bench/compare run directory into report.md and summary.json (spec 2026-10-18 §7).
+"""Turns a bench/compare run directory into report.md and summary.json (spec 2026-10-18 §7; W7 in report_w7.py).
 
 Usage: report.py <run_dir>    exit 0 when every cell is ok, 1 otherwise.
 """
@@ -12,7 +12,7 @@ import sys
 SERVERS = ("tideskv", "kvrocks")
 LEVELS = ("relaxed", "strict")
 WORKLOADS = ("W1", "W2", "W3", "W4", "W5", "W6")
-NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks"}
+NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks", "kvrocks-blob": "Kvrocks+BlobDB"}
 BAD_INPUT = (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, ZeroDivisionError)
 UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40,
          "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
@@ -326,6 +326,15 @@ def main(argv):
         return 2
     run_dir = argv[0]
     meta, cells, disks, configs = load(run_dir)
+    import report_w7  # noqa: E402  (imports this module back)
+    if report_w7.is_large(meta, run_dir):
+        report_w7.load_extras(run_dir, disks, configs)
+        w7, fio = report_w7.collect(run_dir, meta), report_w7.collect_fio(run_dir)
+        with open(os.path.join(run_dir, "report.md"), "w") as f:
+            f.write(report_w7.render(meta, w7, fio, disks, configs, run_dir))
+        with open(os.path.join(run_dir, "summary.json"), "w") as f:
+            json.dump({"meta": meta, "w7_cells": w7, "fio": fio, "disks": disks}, f, indent=2)
+        return 1 if any(c["error"] is not None for c in w7) else 0
     with open(os.path.join(run_dir, "report.md"), "w") as f:
         f.write(render(meta, cells, disks, configs, run_dir))
     with open(os.path.join(run_dir, "summary.json"), "w") as f:

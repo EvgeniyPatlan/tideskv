@@ -8,12 +8,15 @@ bench/compare/run.sh --smoke   # start both servers at both durability levels, c
 bench/compare/run.sh --quick   # small dataset, 10 s warm-up, 30 s runs, about 25 min
 bench/compare/run.sh --medium  # ~8 GB dataset, full's timings, needs ~85 GB free, ~2.5 h
 bench/compare/run.sh           # full: ~24 GB dataset, 60 s warm-up, 180 s runs, ~3 h
+bench/compare/run.sh --large   # W7 only: 256 KiB values, 32 GiB per server, needs ~80 GiB free, ~1.5-2 h
+bench/compare/run.sh --large --smoke  # W7 on 512 keys (128 MiB), 10 s warm-up, 30 s runs, ~15 min
 ```
 
 Options:
 - `--relaxed-mode interval`: TidesKV's relaxed level uses `sync-mode interval` instead of `none`.
 - `--dirty`: build TidesKV from the working tree instead of HEAD.
 - `--out DIR`: write the run somewhere other than `build/bench/`. The run refuses a `DIR/data` that is not empty.
+- `--no-w7-sweep`: with `--large` (an error without it), skip the R32 pass at workers 16.
 
 Environment:
 - `SERVER_CPUS` (default `0-3`), `SERVER_MEM` (`8g`) and `CLIENT_CPUS` (`8-11`) set the limits.
@@ -60,6 +63,52 @@ Every workload runs at two durability levels:
 - The data is loaded once per server at the relaxed level. The workloads run W1..W6 at relaxed, then again after a restart at strict. W5 and W6 remove data, so the strict pass sees what the relaxed pass left. Both servers go through the same sequence.
 - Every memtier client uses its own seed (`--distinct-client-seed --randomize`) and random data, so no workload replays identical keys or values.
 - No host ports are published. All containers are named `tideskv-bench-*` and are removed on exit, including Ctrl-C.
+
+## W7: large values on a miss-heavy cache (`--large`)
+
+W7 follows the Percona post "Evaluating Kvrocks, part 2": 256 KiB values, a working set up to 32x the
+block cache, uniform reads, 10% writes. It runs instead of W1-W6 and replaces their report.
+
+- Data: 131,072 strings `L:<n>` of 262,144 random bytes (32 GiB logical), loaded once per server with SET.
+- Servers, one after another: `tideskv` (defaults; its value log already separates values over 1 KiB),
+  `kvrocks`, and `kvrocks-blob` (`rocksdb.enable_blob_files yes`, `rocksdb.min_blob_size 4096`). Each server's
+  data is deleted before the next one loads, so only one server's data is on disk at a time. Free disk must be
+  2x logical + 8 GiB + the fio file (80 GiB at full size).
+- Compression is off on all three servers in W7 only (`compression no`, `rocksdb.compression no`; parity reads it
+  back): memtier's `--random-data` compresses about 3x under lz4, which would shrink the 32x working set to about
+  10x. The report notes a server whose after-load bytes are under 80% of logical ("values compressed").
+- Both Kvrocks configs get `rocksdb.wal_ttl_seconds 0` and `rocksdb.wal_size_limit_mb 0` in W7 only (no replica
+  needs the WAL archive, whose 3 h / 16 GiB default would keep M32's rewrites on disk); parity reads them back.
+- Both servers get a 1 GiB block cache and `SERVER_MEM` defaults to `4g`, so 32x is miss-heavy even after the
+  page cache. Workers stay at 4, relaxed durability.
+- Phases, each after a restart and a page-cache drop of the data dir: R1, R4, R32 (reads only over 4,096, 16,384
+  and 131,072 keys: 1x, 4x and 32x the block cache), R32 again at workers 16 for every server (reads in flight;
+  skip with `--no-w7-sweep`), then M32 (90/10 GET/SET at 32x). The workers-16 pass runs before M32 so that it reads
+  the same data as R32.
+- memtier: 8 threads × 4 clients, pipeline 1, `--distinct-client-seed --randomize`. `THREADS`/`CLIENTS` do not
+  apply; meta.json's `w7_client` says so.
+- Before any server runs, fio (`FIO_IMAGE` in `lib.sh`, pinned by digest) reads 256 KiB blocks at random with
+  O_DIRECT at queue depths 1-32, 30 s each, from an 8 GiB file under the run directory. If the image cannot be
+  pulled, the step is skipped and `meta.json`'s `fio_status` says so. `FIO_RUNTIME`, `FIO_SIZE` and `FIO_QDS`
+  override it; `--large --smoke` uses 5 s and 1 GiB.
+
+The W7 report has, per server and phase: GET/s, SET/s, GET p50/p99/p99.9, SET p99, CPU µs/op, peak memory,
+client CPU, and, from the server cgroup's io.stat over the timed run, device read and write MB/s, disk reads per
+GET (bytes read ÷ GETs × 256 KiB), write amplification (M32: bytes written ÷ SETs × 256 KiB), plus aqu-sz and
+r_await from `/proc/diskstats` sampled once a second for the busiest device between markers around the timed run
+(host-wide counters, blank when the server did no I/O), and Kvrocks' data-block cache hit rate
+(`block_cache_data_hit`/`_miss` from INFO, before and after the run; "– (index only)" for Kvrocks+BlobDB, whose
+values bypass the block cache). A run whose memtier used over 85% of `CLIENT_CPUS` is flagged "client-bound?". The
+fio curve follows the table.
+
+- The harness syncs before the timed run, so the warm-up's dirty pages are not charged to it. Write amp counts the
+  window plus its dirty pages (io.stat after a sync); "write amp incl. settle" also counts what the server wrote
+  while it settled afterwards.
+- Every reply is checked from memtier's byte counts: each SET must answer `+OK` (5 bytes), and GETs must hit with
+  256 KiB values. Otherwise the cell is an ERR "errors: ...": memtier counts `-ERR` replies (a full disk) as done.
+- A failed page-cache drop is a warning in the phase's status and under the table. At full size, an R4/R32 cell
+  with under 0.5 × (stored ÷ logical bytes, at most 1) disk reads per GET is flagged "cache not dropped?" (about 0.75
+  and 0.97 are expected for uncompressed data).
 
 ## Reading the report
 
