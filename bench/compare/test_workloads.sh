@@ -283,6 +283,17 @@ for s in kvrocks kvrocks-blob; do
 done
 check parity-blob-large "$(_parity_expect kvrocks-blob relaxed | grep -c blob)" 2
 check conf-tideskv-no-wal "$(grep -c wal_ "$(write_server_conf tideskv relaxed)")" 0
+# --large: no compression on any server (memtier's random data compresses ~3x under lz4), read back by parity
+COMPRESSION=no
+check conf-tideskv-compression-off "$(grep -c '^compression no$' "$(write_server_conf tideskv relaxed)")" 1
+check parity-tideskv-compression-off "$(_parity_expect tideskv relaxed | grep -c '^compression no$')" 1
+for s in kvrocks kvrocks-blob; do
+  check "conf-$s-compression-off" "$(grep -c '^rocksdb.compression no$' "$(write_server_conf "$s" relaxed)")" 1
+  check "parity-$s-compression-off" "$(_parity_expect "$s" relaxed | grep -c '^rocksdb.compression no$')" 1
+done
+COMPRESSION=lz4
+check parity-compression-default "$(_parity_expect kvrocks relaxed | grep -c '^rocksdb.compression lz4$')" 1
+check w7-sets-compression-off "$(declare -f run_large | grep -c 'COMPRESSION=no')" 1
 W7_LARGE=0
 BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
 wl_sizes large

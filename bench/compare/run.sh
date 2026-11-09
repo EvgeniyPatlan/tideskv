@@ -355,7 +355,7 @@ run_server_large() {
 
 run_large() {
   wl_sizes "$SIZE"
-  SERVER_MEM=${SERVER_MEM_ENV:-4g} BLOCK_CACHE_MB=1024 THREADS=$W7_THREADS CLIENTS=$W7_CLIENTS W7_LARGE=1
+  SERVER_MEM=${SERVER_MEM_ENV:-4g} BLOCK_CACHE_MB=1024 THREADS=$W7_THREADS CLIENTS=$W7_CLIENTS W7_LARGE=1 COMPRESSION=no
   FIO_QDS=${FIO_QDS:-1 2 4 8 16 32}
   if [[ $SIZE == large ]]; then FIO_RUNTIME=${FIO_RUNTIME:-30} FIO_SIZE=${FIO_SIZE:-8g}
   else FIO_RUNTIME=${FIO_RUNTIME:-5} FIO_SIZE=${FIO_SIZE:-1g}; fi
@@ -364,7 +364,7 @@ run_large() {
   docker pull -q "$KVROCKS_IMAGE" >/dev/null; docker pull -q "$MEMTIER_IMAGE" >/dev/null; docker pull -q "$CLI_IMAGE" >/dev/null
   run_fio  # before any server: the disk's own 256 KiB random-read curve
   META_EXTRA=("#w7_value_size=$W7_VALUE_SIZE" "#w7_keys=$W7_KEYS" "w7_phases=$(w7_phase_list | xargs)"
-              "#w7_sweep=$W7_SWEEP" "#block_cache_mb=$BLOCK_CACHE_MB" "#client_cpu_count=$(cpu_count "$CLIENT_CPUS")"
+              "#w7_sweep=$W7_SWEEP" "#block_cache_mb=$BLOCK_CACHE_MB" "compression=$COMPRESSION" "#client_cpu_count=$(cpu_count "$CLIENT_CPUS")"
               "#client_bound_pct=$CLIENT_BOUND_PCT" "fio_image=$FIO_IMAGE" "fio_status=$FIO_STATUS"
               "fio_qds=$FIO_QDS" "#fio_runtime_s=$FIO_RUNTIME" "fio_size=$FIO_SIZE" "w7_servers=$W7_SERVERS"
               "w7_client=--large sets memtier to $W7_THREADS threads x $W7_CLIENTS clients; THREADS and CLIENTS are ignored"

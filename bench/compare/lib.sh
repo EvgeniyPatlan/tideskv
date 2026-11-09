@@ -15,6 +15,8 @@ SERVER_NOFILE=65536
 # Parity settings both servers get; --large lowers the block cache to 1 GiB, its sweep raises workers to 16.
 BLOCK_CACHE_MB=2048
 SERVER_WORKERS=4
+# both servers spell "off" as no; --large turns it off so stored bytes match its incompressible-data premise
+COMPRESSION=lz4
 # Quiet means under QUIESCE_CPU_PCT of one core and at most QUIESCE_WRITE_BYTES written to disk over QUIESCE_WINDOW
 # seconds; run.sh sets QUIESCE_MAX, the longest wait.
 QUIESCE_WINDOW=5
@@ -157,12 +159,14 @@ write_server_conf() {
     local cache=${BLOCK_CACHE_MB}mb
     if ((BLOCK_CACHE_MB % 1024 == 0)); then cache=$((BLOCK_CACHE_MB / 1024))gb; fi
     sed -e "s/SYNC_MODE/$mode/" -e "s/^workers .*/workers $SERVER_WORKERS/" \
-        -e "s/^block-cache-size .*/block-cache-size $cache/" "$HERE/tideskv.conf" >"$conf" || return
+        -e "s/^block-cache-size .*/block-cache-size $cache/" -e "s/^compression .*/compression $COMPRESSION/" \
+        "$HERE/tideskv.conf" >"$conf" || return
   else
     mode=$([[ $level == strict ]] && echo yes || echo no)
     conf="$OUT/$server/kvrocks-$level.conf"
     sed -e "s/SYNC_YESNO/$mode/" -e "s/^workers .*/workers $SERVER_WORKERS/" \
-        -e "s/^rocksdb.block_cache_size .*/rocksdb.block_cache_size $BLOCK_CACHE_MB/" "$HERE/kvrocks.conf" >"$conf" || return
+        -e "s/^rocksdb.block_cache_size .*/rocksdb.block_cache_size $BLOCK_CACHE_MB/" \
+        -e "s/^rocksdb.compression .*/rocksdb.compression $COMPRESSION/" "$HERE/kvrocks.conf" >"$conf" || return
     if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}" >>"$conf"; fi
     if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}" >>"$conf"; fi
   fi
@@ -224,10 +228,10 @@ _parity_expect() {
   local server=$1 level=$2
   if [[ $server == tideskv ]]; then
     echo "workers $SERVER_WORKERS"; echo "block-cache-size $((BLOCK_CACHE_MB << 20))"; echo "memtable-size 67108864"
-    echo "compression lz4"; echo "sync-mode $([[ $level == strict ]] && echo full || echo "$RELAXED")"
+    echo "compression $COMPRESSION"; echo "sync-mode $([[ $level == strict ]] && echo full || echo "$RELAXED")"
   else
     echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 64"
-    echo "rocksdb.compression lz4"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
+    echo "rocksdb.compression $COMPRESSION"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
     if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"; fi
     if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}"; fi
   fi
