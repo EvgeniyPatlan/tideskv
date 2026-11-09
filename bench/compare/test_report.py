@@ -439,7 +439,7 @@ def make_w7_run(root, servers=W7_SERVERS, phases=W7_PHASES, client_cpu="200.00%"
             f.write("# relaxed load\nworkers 4\n")
         for p in phases:
             shutil.copy(os.path.join(W7, "memtier-m32.json"), os.path.join(d, p + ".json"))
-            for ext in ("io0", "io1", "diskstats", "info0", "info1"):
+            for ext in ("io0", "io1", "io2", "diskstats", "info0", "info1"):
                 shutil.copy(os.path.join(W7, "M32." + ext), os.path.join(d, p + "." + ext))
             for name, text in ((".status", "ok\n"), (".cpu", "89997000\n"), (".settle", "5\n"),
                                (".stats.jsonl", '{"CPUPerc":"390.00%","MemUsage":"3.5GiB / 4GiB"}\n'),
@@ -543,8 +543,13 @@ class W7ReportTest(unittest.TestCase):
             self.assertIn("| TidesKV | M32 | 13498 | 1500 | ", md)
             self.assertIn("| 10.24 | 200.0 | 3.50 GiB | 50% | 5 |", md)
             self.assertIn("| Kvrocks+BlobDB | R32 (workers 16) | 13498 |", md)
-            self.assertIn("| Kvrocks | M32 | nvme0n1 | 4423.1 | 786.6 | 1.25 | 2.00 | 4.00 | 2.50 | 25.0 |", md)
-            self.assertIn("| TidesKV | R32 | nvme0n1 | 4423.1 | 786.6 | 1.25 | – | 4.00 | 2.50 | – |", md)
+            self.assertIn("| write amp | write amp incl. settle | aqu-sz | r_await ms | Kvrocks data-block hit % |", md)
+            self.assertIn("| Kvrocks | M32 | nvme0n1 | 4423.1 | 786.6 | 1.25 | 2.00 | 2.50 | 4.00 | 2.50 | 25.0 |", md)
+            self.assertIn("| TidesKV | R32 | nvme0n1 | 4423.1 | 786.6 | 1.25 | – | – | 4.00 | 2.50 | – |", md)
+            # BlobDB values bypass the block cache: no data-block hit rate for it
+            self.assertIn("| Kvrocks+BlobDB | M32 | nvme0n1 | 4423.1 | 786.6 | 1.25 | 2.00 | 2.50 | 4.00 | 2.50 "
+                          "| – (index only) |", md)
+            self.assertIn("\"– (index only)\"", md)
             self.assertIn("### Disk ceiling (fio)", md)
             self.assertIn("| 8 | 4949.9 | 18882 | 0.42 | 0.82 |", md)
             self.assertIn("| 1 | 4949.9 |", md)
@@ -633,6 +638,109 @@ class W7ReportTest(unittest.TestCase):
             c = _w7(report_w7.collect(t, meta), "tideskv", "R1")
             self.assertEqual((c["read_mbs"], c["reads_per_get"]), (0.0, 0.0))
             self.assertEqual((c["device"], c["aqu_sz"], c["r_await_ms"]), (None, None, None))
+
+    def _m32(self, t, server="tideskv"):
+        meta, _, _, _ = report.load(t)
+        return _w7(report_w7.collect(t, meta), server, "M32")
+
+    def _edit_memtier(self, t, fn, server="tideskv", phase="M32"):
+        p = os.path.join(t, server, "large", phase + ".json")
+        with open(p) as f:
+            d = json.load(f)
+        fn(d["ALL STATS"])
+        with open(p, "w") as f:
+            json.dump(d, f)
+
+    def test_valid_replies_pass(self):
+        m = report_w7.parse_memtier_w7(os.path.join(W7, "memtier-m32.json"))
+        self.assertEqual((m["set_rx"], m["get_rx"]), (5 * 45015, 262155 * 404973))
+        self.assertIsNone(report_w7.reply_errors(m))
+
+    def test_set_error_replies_are_err(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("M32",))
+            # one SET answered "-ERR ... No space left on device\r\n" instead of +OK
+            self._edit_memtier(t, lambda s: s["Sets"]["Time-Serie"]["0"].update(
+                {"Bytes RX": s["Sets"]["Time-Serie"]["0"]["Bytes RX"] + 40}))
+            c = self._m32(t)
+            self.assertTrue(c["error"].startswith("errors: SET replies are not all +OK (225115 bytes for 45015 SETs)"))
+            self.assertIsNone(c["get_ops"])  # its numbers are not reported
+            self.assertEqual(report.main([t]), 1)
+            with open(os.path.join(t, "report.md")) as f:
+                md = f.read()
+            self.assertIn("| TidesKV | M32 | ERR |", md)
+            self.assertNotIn("| TidesKV | M32 | nvme0n1", md)
+
+    def test_get_misses_and_short_replies_are_err(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("M32",))
+            self._edit_memtier(t, lambda s: s["Gets"].update({"Misses/sec": 100.0}))
+            self.assertIn("3000 GET misses", self._m32(t)["error"])
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("M32",))
+            self._edit_memtier(t, lambda s: s["Gets"]["Time-Serie"]["0"].update({"Bytes RX": 0}))
+            self.assertIn("GET replies average", self._m32(t)["error"])
+
+    def test_missing_byte_counts_are_err(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("M32",))
+            self._edit_memtier(t, lambda s: (s["Sets"].pop("Time-Serie"), s["Gets"].pop("Time-Serie")))
+            err = self._m32(t)["error"]
+            self.assertIn("no SET byte counts", err)
+            self.assertIn("no GET byte counts", err)
+
+    def test_diskstats_only_between_markers(self):
+        with open(os.path.join(W7, "M32.diskstats")) as f:
+            text = f.read()
+        # the first sample is before the timed run started: the window is 2000..31000 ms
+        samples = report_w7.parse_diskstats("M start 1500\n" + text + "M end 31500\nT 40000\n"
+                                            " 259 0 nvme0n1 99999 0 0 99999 0 0 0 0 0 0 999999 0 0 0 0 0 0\n")
+        self.assertEqual([t for t, _ in samples], [2000, 31000])
+        aqu, r_await = report_w7.device_queue(samples, "259:0")
+        self.assertAlmostEqual(aqu, (121000 - 61000) / 29000.0)
+        self.assertAlmostEqual(r_await, (25500 - 13000) / 5000.0)
+
+    def test_marker_between_a_sample_and_its_lines(self):
+        samples = report_w7.parse_diskstats("T 1000\nM start 1001\n 259 0 nvme0n1 1 0 0 1 0 0 0 0 0 0 1 0 0 0 0 0 0\n"
+                                            "T 2000\n 259 0 nvme0n1 2 0 0 3 0 0 0 0 0 0 5 0 0 0 0 0 0\n")
+        self.assertEqual([t for t, _ in samples], [2000])  # the 1000 sample precedes the marker
+
+    def test_eviction_warning_keeps_numbers_and_notes_it(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("R32",))
+            with open(os.path.join(t, "tideskv", "large", "R32.status"), "w") as f:
+                f.write("ok\nwarning: the data dir could not be dropped from the page cache\n")
+            meta, _, _, _ = report.load(t)
+            c = _w7(report_w7.collect(t, meta), "tideskv", "R32")
+            self.assertIsNone(c["error"])
+            self.assertEqual(c["warnings"], ["warning: the data dir could not be dropped from the page cache"])
+            md = report_w7.render(meta, [c], {}, {}, {})
+            self.assertIn("- TidesKV R32: warning: the data dir could not be dropped from the page cache", md)
+
+    def test_cache_not_dropped_flag_at_full_size_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("R1", "R4", "R32"))
+            for p in ("R1", "R4"):  # no reads from disk at all
+                shutil.copy(os.path.join(W7, "M32.io0"), os.path.join(t, "tideskv", "large", p + ".io1"))
+            meta, _, _, _ = report.load(t)
+            cells = report_w7.collect(t, meta)
+            self.assertEqual(_w7(cells, "tideskv", "R4")["warnings"], ["cache not dropped? 0.00 disk reads per GET"])
+            self.assertEqual(_w7(cells, "tideskv", "R1")["warnings"], [])  # R1 is expected to be cached
+            self.assertEqual(_w7(cells, "tideskv", "R32")["warnings"], [])  # 1.25 reads per GET
+            _set_meta(t, size="large-smoke")  # 128 MiB fits in memory: no flag
+            meta, _, _, _ = report.load(t)
+            self.assertEqual(_w7(report_w7.collect(t, meta), "tideskv", "R4")["warnings"], [])
+
+    def test_fio_queue_depths_come_from_the_files(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("R1",))
+            shutil.copy(os.path.join(W7, "fio-qd8.json"), os.path.join(t, "fio", "qd64.json"))
+            with open(os.path.join(t, "fio", "qd3.json"), "w") as f:
+                f.write("{broken")
+            self.assertEqual(sorted(report_w7.collect_fio(t)), [1, 3, 8, 64])
+            md = report_w7.render({}, [], report_w7.collect_fio(t), {}, {})
+            self.assertIn("| 64 | 4949.9 |", md)
+            self.assertIn("| 3 | unreadable |", md)
 
     def test_medium_run_is_not_large(self):
         with tempfile.TemporaryDirectory() as t:

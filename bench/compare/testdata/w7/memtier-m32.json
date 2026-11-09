@@ -75,6 +75,132 @@
    "KB/sec RX/TX": 384166.12,
    "KB/sec RX": 7.33,
    "KB/sec TX": 384158.8,
+   "Time-Serie": {
+    "0": {
+     "Bytes RX": 7085,
+     "Count": 1417
+    },
+    "1": {
+     "Bytes RX": 7180,
+     "Count": 1436
+    },
+    "2": {
+     "Bytes RX": 7300,
+     "Count": 1460
+    },
+    "3": {
+     "Bytes RX": 7630,
+     "Count": 1526
+    },
+    "4": {
+     "Bytes RX": 7395,
+     "Count": 1479
+    },
+    "5": {
+     "Bytes RX": 7545,
+     "Count": 1509
+    },
+    "6": {
+     "Bytes RX": 7345,
+     "Count": 1469
+    },
+    "7": {
+     "Bytes RX": 7350,
+     "Count": 1470
+    },
+    "8": {
+     "Bytes RX": 7855,
+     "Count": 1571
+    },
+    "9": {
+     "Bytes RX": 7470,
+     "Count": 1494
+    },
+    "10": {
+     "Bytes RX": 7575,
+     "Count": 1515
+    },
+    "11": {
+     "Bytes RX": 6100,
+     "Count": 1220
+    },
+    "12": {
+     "Bytes RX": 6835,
+     "Count": 1367
+    },
+    "13": {
+     "Bytes RX": 7470,
+     "Count": 1494
+    },
+    "14": {
+     "Bytes RX": 7850,
+     "Count": 1570
+    },
+    "15": {
+     "Bytes RX": 7735,
+     "Count": 1547
+    },
+    "16": {
+     "Bytes RX": 7385,
+     "Count": 1477
+    },
+    "17": {
+     "Bytes RX": 7885,
+     "Count": 1577
+    },
+    "18": {
+     "Bytes RX": 7745,
+     "Count": 1549
+    },
+    "19": {
+     "Bytes RX": 7895,
+     "Count": 1579
+    },
+    "20": {
+     "Bytes RX": 7710,
+     "Count": 1542
+    },
+    "21": {
+     "Bytes RX": 7755,
+     "Count": 1551
+    },
+    "22": {
+     "Bytes RX": 7525,
+     "Count": 1505
+    },
+    "23": {
+     "Bytes RX": 7915,
+     "Count": 1583
+    },
+    "24": {
+     "Bytes RX": 7875,
+     "Count": 1575
+    },
+    "25": {
+     "Bytes RX": 6955,
+     "Count": 1391
+    },
+    "26": {
+     "Bytes RX": 7795,
+     "Count": 1559
+    },
+    "27": {
+     "Bytes RX": 7810,
+     "Count": 1562
+    },
+    "28": {
+     "Bytes RX": 7590,
+     "Count": 1518
+    },
+    "29": {
+     "Bytes RX": 7465,
+     "Count": 1493
+    },
+    "30": {
+     "Bytes RX": 50,
+     "Count": 10
+    }
+   },
    "Percentile Latencies": {
     "p50.00": 5.055,
     "p99.00": 10.239,
@@ -95,6 +221,132 @@
    "KB/sec RX/TX": 3456046.65,
    "KB/sec RX": 3455733.07,
    "KB/sec TX": 313.58,
+   "Time-Serie": {
+    "0": {
+     "Bytes RX": 3315474285,
+     "Count": 12647
+    },
+    "1": {
+     "Bytes RX": 3380488725,
+     "Count": 12895
+    },
+    "2": {
+     "Bytes RX": 3448649025,
+     "Count": 13155
+    },
+    "3": {
+     "Bytes RX": 3594407205,
+     "Count": 13711
+    },
+    "4": {
+     "Bytes RX": 3494526150,
+     "Count": 13330
+    },
+    "5": {
+     "Bytes RX": 3561113520,
+     "Count": 13584
+    },
+    "6": {
+     "Bytes RX": 3466737720,
+     "Count": 13224
+    },
+    "7": {
+     "Bytes RX": 3468048495,
+     "Count": 13229
+    },
+    "8": {
+     "Bytes RX": 3702939375,
+     "Count": 14125
+    },
+    "9": {
+     "Bytes RX": 3532276470,
+     "Count": 13474
+    },
+    "10": {
+     "Bytes RX": 3568453860,
+     "Count": 13612
+    },
+    "11": {
+     "Bytes RX": 2875578195,
+     "Count": 10969
+    },
+    "12": {
+     "Bytes RX": 3231584685,
+     "Count": 12327
+    },
+    "13": {
+     "Bytes RX": 3521790270,
+     "Count": 13434
+    },
+    "14": {
+     "Bytes RX": 3706347390,
+     "Count": 14138
+    },
+    "15": {
+     "Bytes RX": 3650508375,
+     "Count": 13925
+    },
+    "16": {
+     "Bytes RX": 3488496585,
+     "Count": 13307
+    },
+    "17": {
+     "Bytes RX": 3720503760,
+     "Count": 14192
+    },
+    "18": {
+     "Bytes RX": 3654178545,
+     "Count": 13939
+    },
+    "19": {
+     "Bytes RX": 3720765915,
+     "Count": 14193
+    },
+    "20": {
+     "Bytes RX": 3637924935,
+     "Count": 13877
+    },
+    "21": {
+     "Bytes RX": 3657324405,
+     "Count": 13951
+    },
+    "22": {
+     "Bytes RX": 3550627320,
+     "Count": 13544
+    },
+    "23": {
+     "Bytes RX": 3733873665,
+     "Count": 14243
+    },
+    "24": {
+     "Bytes RX": 3722601000,
+     "Count": 14200
+    },
+    "25": {
+     "Bytes RX": 3281131980,
+     "Count": 12516
+    },
+    "26": {
+     "Bytes RX": 3671742930,
+     "Count": 14006
+    },
+    "27": {
+     "Bytes RX": 3690880245,
+     "Count": 14079
+    },
+    "28": {
+     "Bytes RX": 3578940060,
+     "Count": 13652
+    },
+    "29": {
+     "Bytes RX": 3532014315,
+     "Count": 13473
+    },
+    "30": {
+     "Bytes RX": 5767410,
+     "Count": 22
+    }
+   },
    "Percentile Latencies": {
     "p50.00": 1.655,
     "p99.00": 4.767,
@@ -115,6 +367,132 @@
    "KB/sec RX/TX": 0.0,
    "KB/sec RX": 0.0,
    "KB/sec TX": 0.0,
+   "Time-Serie": {
+    "0": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "1": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "2": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "3": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "4": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "5": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "6": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "7": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "8": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "9": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "10": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "11": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "12": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "13": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "14": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "15": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "16": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "17": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "18": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "19": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "20": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "21": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "22": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "23": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "24": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "25": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "26": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "27": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "28": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "29": {
+     "Bytes RX": 0,
+     "Count": 0
+    },
+    "30": {
+     "Bytes RX": 0,
+     "Count": 0
+    }
+   },
    "Percentile Latencies": {
     "p50.00": 0.007,
     "p99.00": 0.007,
@@ -135,6 +513,132 @@
    "KB/sec RX/TX": 3840212.77,
    "KB/sec RX": 3455740.39,
    "KB/sec TX": 384472.38,
+   "Time-Serie": {
+    "0": {
+     "Bytes RX": 3315481370,
+     "Count": 14064
+    },
+    "1": {
+     "Bytes RX": 3380495905,
+     "Count": 14331
+    },
+    "2": {
+     "Bytes RX": 3448656325,
+     "Count": 14615
+    },
+    "3": {
+     "Bytes RX": 3594414835,
+     "Count": 15237
+    },
+    "4": {
+     "Bytes RX": 3494533545,
+     "Count": 14809
+    },
+    "5": {
+     "Bytes RX": 3561121065,
+     "Count": 15093
+    },
+    "6": {
+     "Bytes RX": 3466745065,
+     "Count": 14693
+    },
+    "7": {
+     "Bytes RX": 3468055845,
+     "Count": 14699
+    },
+    "8": {
+     "Bytes RX": 3702947230,
+     "Count": 15696
+    },
+    "9": {
+     "Bytes RX": 3532283940,
+     "Count": 14968
+    },
+    "10": {
+     "Bytes RX": 3568461435,
+     "Count": 15127
+    },
+    "11": {
+     "Bytes RX": 2875584295,
+     "Count": 12189
+    },
+    "12": {
+     "Bytes RX": 3231591520,
+     "Count": 13694
+    },
+    "13": {
+     "Bytes RX": 3521797740,
+     "Count": 14928
+    },
+    "14": {
+     "Bytes RX": 3706355240,
+     "Count": 15708
+    },
+    "15": {
+     "Bytes RX": 3650516110,
+     "Count": 15472
+    },
+    "16": {
+     "Bytes RX": 3488503970,
+     "Count": 14784
+    },
+    "17": {
+     "Bytes RX": 3720511645,
+     "Count": 15769
+    },
+    "18": {
+     "Bytes RX": 3654186290,
+     "Count": 15488
+    },
+    "19": {
+     "Bytes RX": 3720773810,
+     "Count": 15772
+    },
+    "20": {
+     "Bytes RX": 3637932645,
+     "Count": 15419
+    },
+    "21": {
+     "Bytes RX": 3657332160,
+     "Count": 15502
+    },
+    "22": {
+     "Bytes RX": 3550634845,
+     "Count": 15049
+    },
+    "23": {
+     "Bytes RX": 3733881580,
+     "Count": 15826
+    },
+    "24": {
+     "Bytes RX": 3722608875,
+     "Count": 15775
+    },
+    "25": {
+     "Bytes RX": 3281138935,
+     "Count": 13907
+    },
+    "26": {
+     "Bytes RX": 3671750725,
+     "Count": 15565
+    },
+    "27": {
+     "Bytes RX": 3690888055,
+     "Count": 15641
+    },
+    "28": {
+     "Bytes RX": 3578947650,
+     "Count": 15170
+    },
+    "29": {
+     "Bytes RX": 3532021780,
+     "Count": 14966
+    },
+    "30": {
+     "Bytes RX": 5767460,
+     "Count": 32
+    }
+   },
    "Percentile Latencies": {
     "p50.00": 1.727,
     "p99.00": 6.687,

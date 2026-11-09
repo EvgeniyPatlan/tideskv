@@ -10,8 +10,13 @@ import report as base
 SERVERS = ("tideskv", "kvrocks", "kvrocks-blob")
 PHASES = ("R1", "R4", "R32", "R32w16", "M32")
 VALUE_SIZE = 262144
-FIO_QDS = (1, 2, 4, 8, 16, 32)
 CLIENT_BOUND_PCT = 85.0
+# RESP replies: "+OK\r\n" to a SET, "$262144\r\n<value>\r\n" to a GET hit
+SET_REPLY_BYTES = 5
+GET_REPLY_BYTES = len("$%d\r\n" % VALUE_SIZE) + VALUE_SIZE + 2
+# below this many disk reads per GET, R4/R32 at full size cannot have started from a dropped page cache
+# (expected about 0.75 and 0.97)
+CACHE_DROPPED_MIN_READS = 0.5
 # devices whose byte counts are this close to the busiest are a stack (dm-crypt, LVM, the NVMe below them):
 # the physical device is the one whose queue and latency matter
 _STACK_TOLERANCE = 0.10
@@ -31,11 +36,36 @@ def parse_memtier_w7(path):
         sec = stats.get(key) or {}
         out[name + "_count"] = base._num(sec.get("Count", 0))
         out[name + "_ops"] = base._num(sec.get("Ops/sec", 0.0))
+        # memtier totals bytes received only per second of the run
+        series = sec.get("Time-Serie")
+        out[name + "_rx"] = (sum(base._num(v.get("Bytes RX", 0)) for v in series.values())
+                             if isinstance(series, dict) else None)
+        out[name + "_misses"] = base._num(sec.get("Misses/sec", 0.0)) * out["duration_s"]
         pct = sec.get("Percentile Latencies") or {}
         for src, dst in (("p50.00", "p50"), ("p99.00", "p99"), ("p99.90", "p999")):
             v = pct.get(src)
             out["%s_%s" % (name, dst)] = base._num(v) if v is not None and out[name + "_count"] else None
     return out
+
+
+def reply_errors(m):
+    """Why the replies were not what a valid run gets (every SET +OK, every GET a 256 KiB hit), or None.
+    A full disk answers SETs with -ERR, which memtier still counts as completed requests."""
+    bad = []
+    if m["set_count"]:
+        if m["set_rx"] is None:
+            bad.append("no SET byte counts to check the replies")
+        elif m["set_rx"] != SET_REPLY_BYTES * m["set_count"]:
+            bad.append("SET replies are not all +OK (%d bytes for %d SETs)" % (m["set_rx"], m["set_count"]))
+    if m["get_count"]:
+        if m["get_misses"] > 0.001 * m["get_count"]:
+            bad.append("%d GET misses" % round(m["get_misses"]))
+        if m["get_rx"] is None:
+            bad.append("no GET byte counts to check the replies")
+        elif abs(m["get_rx"] / float(m["get_count"]) - GET_REPLY_BYTES) > 0.01 * GET_REPLY_BYTES:
+            bad.append("GET replies average %.0f bytes, not %d" % (m["get_rx"] / float(m["get_count"]),
+                                                                    GET_REPLY_BYTES))
+    return "errors: " + "; ".join(bad) if bad else None
 
 
 def parse_io_stat(text):
@@ -64,16 +94,20 @@ def io_delta(before, after):
 
 
 def parse_diskstats(text):
-    """[(epoch_ms, {'maj:min': (name, fields...)})] from diskstats_sampler output."""
-    samples, cur = [], None
+    """[(epoch_ms, {'maj:min': (name, fields...)})] from diskstats_sampler output. With "M start|end <ms>" markers
+    (run_w7_phase writes them around the timed run), only the samples between them."""
+    samples, cur, marks = [], None, {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0] == "T" and parts[1].isdigit():
+        if len(parts) == 3 and parts[0] == "M" and parts[1] in ("start", "end") and parts[2].isdigit():
+            marks[parts[1]] = int(parts[2])
+        elif len(parts) == 2 and parts[0] == "T" and parts[1].isdigit():
             cur = (int(parts[1]), {})
             samples.append(cur)
         elif cur is not None and len(parts) >= 14 and all(p.isdigit() for p in parts[3:14]):
             cur[1]["%s:%s" % (parts[0], parts[1])] = (parts[2],) + tuple(int(p) for p in parts[3:14])
-    return [s for s in samples if s[1]]
+    lo, hi = marks.get("start", float("-inf")), marks.get("end", float("inf"))
+    return [s for s in samples if s[1] and lo <= s[0] <= hi]
 
 
 def pick_device(deltas, names):
@@ -141,10 +175,10 @@ def _client_pct(path, ncpu):
 def _empty(server, phase):
     keys = ("get_ops", "set_ops", "get_p50", "get_p99", "get_p999", "set_p99", "read_mbs", "write_mbs",
             "reads_per_get", "write_amp", "device", "aqu_sz", "r_await_ms", "cpu_us_per_op", "mem_peak_bytes",
-            "data_hit_pct", "client_cpu_pct")
+            "data_hit_pct", "client_cpu_pct", "write_amp_settle")
     cell = {k: None for k in keys}
     cell.update({"server": server, "phase": phase, "client_bound": False, "settle_s": None,
-                 "settle_capped": False, "error": None})
+                 "settle_capped": False, "error": None, "warnings": []})
     return cell
 
 
@@ -177,6 +211,11 @@ def _disk_fields(cell, d, phase, m):
             if synced is not None and dev is not None:
                 wbytes = io_delta(parse_io_stat(io0), parse_io_stat(synced)).get(dev, delta)["wbytes"]
             cell["write_amp"] = wbytes / float(m["set_count"] * VALUE_SIZE)
+            # io2 follows the settle after the run: the flush and compaction debt the window left
+            settled = _read_opt(os.path.join(d, phase + ".io2"))
+            if settled is not None and dev is not None:
+                w2 = io_delta(parse_io_stat(io0), parse_io_stat(settled)).get(dev, delta)["wbytes"]
+                cell["write_amp_settle"] = w2 / float(m["set_count"] * VALUE_SIZE)
     # without I/O from the server in the window, the device's queue is only the host's other traffic: left blank
     if dev is not None:
         cell["device"] = names.get(dev, dev)
@@ -191,10 +230,11 @@ def _w7_cell(run_dir, server, phase, ncpu):
         cell["error"] = "not run: " + reason if reason else "not run"
         return cell
     cell["settle_s"], cell["settle_capped"] = base.read_settle(os.path.join(d, phase + ".settle"))
-    status = _read_opt(os.path.join(d, phase + ".status"))
-    if status != "ok":
-        cell["error"] = status or "no status"
+    status = (_read_opt(os.path.join(d, phase + ".status")) or "").splitlines()
+    if not status or status[0] != "ok":
+        cell["error"] = "; ".join(status) or "no status"
         return cell
+    cell["warnings"] = [w for w in status[1:] if w.strip()]
     try:
         m = parse_memtier_w7(os.path.join(d, phase + ".json"))
     except base.BAD_INPUT as e:
@@ -202,6 +242,9 @@ def _w7_cell(run_dir, server, phase, ncpu):
         return cell
     if m["count"] == 0:
         cell["error"] = "memtier recorded no requests"
+        return cell
+    cell["error"] = reply_errors(m)
+    if cell["error"] is not None:  # its numbers would count error replies as work
         return cell
     cell.update({"get_ops": m["get_ops"], "set_ops": m["set_ops"], "get_p50": m["get_p50"],
                  "get_p99": m["get_p99"], "get_p999": m["get_p999"], "set_p99": m["set_p99"]})
@@ -218,13 +261,25 @@ def _w7_cell(run_dir, server, phase, ncpu):
             cell["mem_peak_bytes"] = base.parse_stats(stats)["mem_peak_bytes"]
         except base.BAD_INPUT:
             pass
-    if server.startswith("kvrocks"):
+    # BlobDB values bypass the block cache: its data-block counters cover index and key blocks only
+    if server == "kvrocks":
         i0, i1 = _read_opt(os.path.join(d, phase + ".info0")), _read_opt(os.path.join(d, phase + ".info1"))
         if i0 and i1:
             cell["data_hit_pct"] = _hit_pct(parse_info_counters(i0), parse_info_counters(i1))
     cell["client_cpu_pct"] = _client_pct(os.path.join(d, phase + ".client.jsonl"), ncpu)
     cell["client_bound"] = cell["client_cpu_pct"] is not None and cell["client_cpu_pct"] > CLIENT_BOUND_PCT
     return cell
+
+
+def flag_cache(cells, meta):
+    """At full size, R4/R32 reads with under CACHE_DROPPED_MIN_READS disk reads per GET did not start cold."""
+    if meta.get("size") != "large":
+        return cells
+    for c in cells:
+        if c["error"] is None and c["phase"] in ("R4", "R32", "R32w16") and c["reads_per_get"] is not None \
+                and c["reads_per_get"] < CACHE_DROPPED_MIN_READS:
+            c["warnings"] = c["warnings"] + ["cache not dropped? %.2f disk reads per GET" % c["reads_per_get"]]
+    return cells
 
 
 def phases_of(meta):
@@ -235,7 +290,7 @@ def phases_of(meta):
 def collect(run_dir, meta):
     ncpu = meta.get("client_cpu_count")
     ncpu = ncpu if isinstance(ncpu, int) and ncpu > 0 else None
-    return [_w7_cell(run_dir, s, p, ncpu) for s in SERVERS for p in phases_of(meta)]
+    return flag_cache([_w7_cell(run_dir, s, p, ncpu) for s in SERVERS for p in phases_of(meta)], meta)
 
 
 def parse_fio(path):
@@ -249,9 +304,11 @@ def parse_fio(path):
 
 
 def collect_fio(run_dir):
-    out = {}
-    for qd in FIO_QDS:
-        p = os.path.join(run_dir, "fio", "qd%d.json" % qd)
+    """{queue depth: result or None} for every fio/qd<N>.json the run wrote."""
+    out, d = {}, os.path.join(run_dir, "fio")
+    names = os.listdir(d) if os.path.isdir(d) else []
+    for qd in sorted(int(n[2:-5]) for n in names if n.startswith("qd") and n.endswith(".json") and n[2:-5].isdigit()):
+        p = os.path.join(d, "qd%d.json" % qd)
         if os.path.exists(p):
             try:
                 out[qd] = parse_fio(p)
@@ -287,6 +344,12 @@ def _header(meta):
                 m("warmup_s"), m("duration_s")), ""]
 
 
+def _hit(c):
+    if c["server"] == "kvrocks-blob":
+        return "– (index only)"
+    return _f(c["data_hit_pct"], "%.1f")
+
+
 def _tables(cells):
     out = ["| Server | Phase | GET/s | SET/s | GET p50 / p99 / p99.9 ms | SET p99 ms | CPU µs/op | peak mem "
            "| client CPU | settle s |",
@@ -299,21 +362,22 @@ def _tables(cells):
                 name, _phase_label(c["phase"]), base._fmt_settle(c["settle_s"], c["settle_capped"])))
             notes.append("- %s %s: %s" % (name, c["phase"], c["error"]))
             continue
+        notes += ["- %s %s: %s" % (name, c["phase"], w) for w in c["warnings"]]
         lat = "%s / %s / %s" % (_f(c["get_p50"], "%.2f"), _f(c["get_p99"], "%.2f"), _f(c["get_p999"], "%.2f"))
         out.append("| %s | %s | %d | %d | %s | %s | %s | %s | %s | %s |" % (
             name, _phase_label(c["phase"]), round(c["get_ops"]), round(c["set_ops"]), lat, _f(c["set_p99"], "%.2f"),
             _f(c["cpu_us_per_op"], "%.1f"), "–" if c["mem_peak_bytes"] is None else base._gib(c["mem_peak_bytes"]),
             _client(c), base._fmt_settle(c["settle_s"], c["settle_capped"])))
-    out += ["", "| Server | Phase | device | read MB/s | write MB/s | disk reads / GET | write amp | aqu-sz "
-            "| r_await ms | Kvrocks data-block hit % |",
-            "|---|---|---|---|---|---|---|---|---|---|"]
+    out += ["", "| Server | Phase | device | read MB/s | write MB/s | disk reads / GET | write amp "
+            "| write amp incl. settle | aqu-sz | r_await ms | Kvrocks data-block hit % |",
+            "|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in cells:
         if c["error"] is not None:
             continue
-        out.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        out.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             base.NAMES[c["server"]], _phase_label(c["phase"]), c["device"] or "–", _f(c["read_mbs"], "%.1f"),
             _f(c["write_mbs"], "%.1f"), _f(c["reads_per_get"], "%.2f"), _f(c["write_amp"], "%.2f"),
-            _f(c["aqu_sz"], "%.2f"), _f(c["r_await_ms"], "%.2f"), _f(c["data_hit_pct"], "%.1f")))
+            _f(c["write_amp_settle"], "%.2f"), _f(c["aqu_sz"], "%.2f"), _f(c["r_await_ms"], "%.2f"), _hit(c)))
     return out, notes
 
 
@@ -329,9 +393,7 @@ def _fio_lines(meta, fio):
     out += ["256 KiB random reads, O_DIRECT, libaio, %s s per queue depth, on the bench filesystem (`%s`, file %s)." % (
         meta.get("fio_runtime_s", "?"), meta.get("fio_image", "?"), meta.get("fio_size", "?")), "",
             "| QD | MB/s | IOPS | mean lat ms | p99 lat ms |", "|---|---|---|---|---|"]
-    for qd in FIO_QDS:
-        if qd not in fio:
-            continue
+    for qd in sorted(fio):
         r = fio[qd]
         if r is None:
             out.append("| %d | unreadable | – | – | – |" % qd)
@@ -353,9 +415,16 @@ def render(meta, cells, fio, disks, configs, run_dir=None):
     out += ["- Device numbers are the server cgroup's io.stat deltas over the timed run, on its busiest device "
             "(the physical one of a dm stack). Disk reads / GET = bytes read ÷ (GETs × 256 KiB); write amp = bytes "
             "written ÷ (SETs × 256 KiB), M32 only, counted after a host sync so that dirty pages written back after the "
-            "window count too.",
+            "window count too; write amp incl. settle also counts what the server wrote while it settled after the "
+            "run (the flush and compaction debt the window left).",
             "- aqu-sz (Δweighted ms ÷ Δwall ms) and r_await (Δread ms ÷ Δreads) come from /proc/diskstats sampled "
-            "once a second; they are the device's, host-wide, and are left blank when the server did no I/O.",
+            "once a second between markers around the timed run; they are the device's, host-wide, and are left blank "
+            "when the server did no I/O.",
+            "- Kvrocks data-block hit % is block_cache_data_hit ÷ (hit + miss) from INFO over the timed run. "
+            "Kvrocks+BlobDB shows \"– (index only)\": its values are in blob files, which bypass the block cache, so "
+            "its data-block counters only see key blocks.",
+            "- A cell whose replies were not all valid (a SET that did not answer +OK, a GET miss or a short GET reply, "
+            "e.g. on a full disk) is an ERR: memtier counts error replies as completed requests.",
             "- Client CPU is the timed memtier container's mean CPU as a share of its cpuset; above %d%% the run is "
             "flagged client-bound?." % CLIENT_BOUND_PCT, ""]
     if notes:
