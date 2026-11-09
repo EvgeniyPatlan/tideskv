@@ -4,17 +4,23 @@
 KVROCKS_IMAGE=apache/kvrocks:2.17.0
 MEMTIER_IMAGE=redislabs/memtier_benchmark:2.1.4
 CLI_IMAGE=redis:7.2.5
+# W7's disk ceiling (fio 3.13). Pinned by digest; run_fio skips and says so in meta.json when it cannot be pulled.
+FIO_IMAGE=xridge/fio@sha256:c58227616c9d2ef4c7d9c762a382d5921608ee3cf4b6aef7d99c4f964089d9c3
 SERVER_CPUS=${SERVER_CPUS:-0-3}
 CLIENT_CPUS=${CLIENT_CPUS:-8-11}
 SERVER_MEM=${SERVER_MEM:-8g}
 # Docker's default is soft 1024 / hard 524288: Kvrocks raises its soft limit itself, TidesKV does not and clamps its
 # SST cache, so both get the same explicit limit.
 SERVER_NOFILE=65536
+# Parity settings both servers get; --large lowers the block cache to 1 GiB, its sweep raises workers to 16.
+BLOCK_CACHE_MB=2048
+SERVER_WORKERS=4
 # Quiet means under QUIESCE_CPU_PCT of one core and at most QUIESCE_WRITE_BYTES written to disk over QUIESCE_WINDOW
 # seconds; run.sh sets QUIESCE_MAX, the longest wait.
 QUIESCE_WINDOW=5
 QUIESCE_CPU_PCT=5
 QUIESCE_WRITE_BYTES=$((1 << 20))
+KVROCKS_BLOB_CONF=("rocksdb.enable_blob_files yes" "rocksdb.min_blob_size 4096")
 CONTAINERS=()
 NET_CREATED=0
 
@@ -132,8 +138,30 @@ quiesce() {
   done
 }
 
+# Writes the server's config for a level into $OUT/<server>/ and prints its path. SERVER_WORKERS and BLOCK_CACHE_MB
+# replace the parity values; kvrocks-blob is the Kvrocks config plus BlobDB (the Percona post's W7 setup).
+write_server_conf() {
+  local server=$1 level=$2 conf mode
+  mkdir -p "$OUT/$server"
+  if [[ $server == tideskv ]]; then
+    mode=$([[ $level == strict ]] && echo full || echo "$RELAXED")
+    conf="$OUT/$server/tideskv-$level.conf"
+    local cache=${BLOCK_CACHE_MB}mb
+    if ((BLOCK_CACHE_MB % 1024 == 0)); then cache=$((BLOCK_CACHE_MB / 1024))gb; fi
+    sed -e "s/SYNC_MODE/$mode/" -e "s/^workers .*/workers $SERVER_WORKERS/" \
+        -e "s/^block-cache-size .*/block-cache-size $cache/" "$HERE/tideskv.conf" >"$conf" || return
+  else
+    mode=$([[ $level == strict ]] && echo yes || echo no)
+    conf="$OUT/$server/kvrocks-$level.conf"
+    sed -e "s/SYNC_YESNO/$mode/" -e "s/^workers .*/workers $SERVER_WORKERS/" \
+        -e "s/^rocksdb.block_cache_size .*/rocksdb.block_cache_size $BLOCK_CACHE_MB/" "$HERE/kvrocks.conf" >"$conf" || return
+    if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}" >>"$conf"; fi
+  fi
+  echo "$conf"
+}
+
 start_server() {
-  local server=$1 level=$2 data=$3 conf mode
+  local server=$1 level=$2 data=$3 conf
   mkdir -p "$data" "$OUT/$server"
   evict_cache "$data"
   chmod 0777 "$data"  # Kvrocks runs as uid 999 in its image (plan ruling 4)
@@ -142,16 +170,11 @@ start_server() {
   _track "$SERVER_CONTAINER"
   local common=(--detach --name "$SERVER_CONTAINER" --network "$NET" --cpuset-cpus "$SERVER_CPUS"
                 --memory "$SERVER_MEM" --memory-swap "$SERVER_MEM" --ulimit "nofile=$SERVER_NOFILE:$SERVER_NOFILE")
+  conf=$(write_server_conf "$server" "$level") || return 1
   if [[ $server == tideskv ]]; then
-    mode=$([[ $level == strict ]] && echo full || echo "$RELAXED")
-    conf="$OUT/$server/tideskv-$level.conf"
-    sed "s/SYNC_MODE/$mode/" "$HERE/tideskv.conf" >"$conf"
     SERVER_PORT=6379
     docker run "${common[@]}" -v "$data:/data" -v "$conf:/etc/tideskv.conf:ro" "$TIDESKV_IMAGE" /etc/tideskv.conf >/dev/null
   else
-    mode=$([[ $level == strict ]] && echo yes || echo no)
-    conf="$OUT/$server/kvrocks-$level.conf"
-    sed "s/SYNC_YESNO/$mode/" "$HERE/kvrocks.conf" >"$conf"
     SERVER_PORT=6666
     docker run "${common[@]}" -v "$data:/var/lib/kvrocks/data" -v "$conf:/etc/kvrocks.conf:ro" \
       --entrypoint kvrocks "$KVROCKS_IMAGE" -c /etc/kvrocks.conf >/dev/null
@@ -190,17 +213,18 @@ cli() {
 _parity_expect() {
   local server=$1 level=$2
   if [[ $server == tideskv ]]; then
-    echo "workers 4"; echo "block-cache-size 2147483648"; echo "memtable-size 67108864"
+    echo "workers $SERVER_WORKERS"; echo "block-cache-size $((BLOCK_CACHE_MB << 20))"; echo "memtable-size 67108864"
     echo "compression lz4"; echo "sync-mode $([[ $level == strict ]] && echo full || echo "$RELAXED")"
   else
-    echo "workers 4"; echo "rocksdb.block_cache_size 2048"; echo "rocksdb.write_buffer_size 64"
+    echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 64"
     echo "rocksdb.compression lz4"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
+    if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"; fi
   fi
 }
 
 parity_check() {
   local server=$1 level=$2 key want got bad=0
-  echo "# $level" >>"$OUT/$server/config.txt"
+  echo "# $level${3:+ $3}" >>"$OUT/$server/config.txt"
   while read -r key want; do
     got=$(cli CONFIG GET "$key" | sed -n 2p)
     echo "$key $got" >>"$OUT/$server/config.txt"
@@ -214,10 +238,66 @@ memtier() {
   local dir; dir=$(dirname "$OUT/$name")
   mkdir -p "$dir"
   chmod 0777 "$dir"  # memtier writes its JSON as root inside the container
-  local c=tideskv-bench-memtier-$TS-$RANDOM
+  # MEMTIER_CNAME names the container so a sampler can find it (W7's client CPU); it must carry $TS for bench_cleanup
+  local c=${MEMTIER_CNAME:-tideskv-bench-memtier-$TS-$RANDOM}
   _track "$c"
   docker run --rm --name "$c" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" -v "$dir:/out" "$MEMTIER_IMAGE" \
     -s "$SERVER_CONTAINER" -p "$SERVER_PORT" --protocol=redis --hide-histogram \
     --print-percentiles=50,99,99.9 --json-out-file="/out/$(basename "$name").json" "$@" \
     >"$OUT/$name.log" 2>&1
+}
+
+# ---- W7 (--large) measurements ----
+
+# Number of CPUs in a cpuset list such as 0-3,8.
+cpu_count() {
+  local part n=0 parts
+  IFS=, read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then n=$((n + ${part#*-} - ${part%-*} + 1)); else n=$((n + 1)); fi
+  done
+  echo "$n"
+}
+
+# The server cgroup's io.stat as it stands; report.py takes the busiest device's delta between two snapshots.
+cg_io_snapshot() { cat "$SERVER_CGROUP/io.stat" 2>/dev/null || true; }
+
+# Once a second: "T <epoch ms>" then /proc/diskstats for the block devices (no loop/ram/zram). report.py computes
+# aqu-sz (Δweighted ms / Δwall ms) and r_await (Δread ms / Δreads) for the device io.stat names busiest.
+# The counters are the device's, host-wide: they include any other I/O on the host.
+diskstats_sampler() {
+  while kill -0 $$ 2>/dev/null; do
+    printf 'T %s\n' "$(date +%s%3N)"
+    awk '$3 !~ /^(loop|ram|zram)/' /proc/diskstats
+    sleep 1
+  done
+}
+
+# docker stats of one container every 2 s, one JSON line per sample (peak memory, the client's CPU).
+stats_sampler() {
+  while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$1" 2>/dev/null; sleep 2; done
+}
+
+# fio 256 KiB random reads at each queue depth in FIO_QDS, FIO_RUNTIME s each, O_DIRECT on a FIO_SIZE file under
+# $OUT/fio (the bench filesystem). Writes $OUT/fio/qd<N>.json and sets FIO_STATUS (ok, skipped: ..., failed ...).
+run_fio() {
+  local dir=$OUT/fio qd c rc=0
+  if ! docker image inspect "$FIO_IMAGE" >/dev/null 2>&1 && ! docker pull -q "$FIO_IMAGE" >/dev/null 2>&1; then
+    log "fio: cannot pull $FIO_IMAGE; skipping the disk ceiling"
+    FIO_STATUS="skipped: cannot pull $FIO_IMAGE"; return 0
+  fi
+  mkdir -p "$dir"; chmod 0777 "$dir"
+  for qd in $FIO_QDS; do
+    c=tideskv-bench-fio-$TS-qd$qd
+    _track "$c"
+    log "fio QD $qd"
+    docker run --rm --name "$c" --network none --cpuset-cpus "$CLIENT_CPUS" -v "$dir:/f" --entrypoint fio "$FIO_IMAGE" \
+      --name="qd$qd" --filename=/f/fio.dat --size="$FIO_SIZE" --rw=randread --bs=256k --direct=1 --ioengine=libaio \
+      --iodepth="$qd" --numjobs=1 --runtime="$FIO_RUNTIME" --time_based --output-format=json --output="/f/qd$qd.json" \
+      >"$dir/qd$qd.log" 2>&1 || { rc=$?; log "fio QD $qd failed ($rc); see fio/qd$qd.log"; break; }
+  done
+  # the file is root's; delete it from a container
+  docker run --rm --name "tideskv-bench-clean-fio-$TS" --network none -v "$dir:/f" --entrypoint rm "$CLI_IMAGE" \
+    -f /f/fio.dat >/dev/null 2>&1 || log "could not delete $dir/fio.dat"
+  if ((rc)); then FIO_STATUS="failed at QD $qd (exit $rc)"; else FIO_STATUS=ok; fi
 }

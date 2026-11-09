@@ -250,6 +250,51 @@ check meta-nofile "$(meta server_nofile)" 65536
 check meta-cores "$( [[ -n $(meta server_cores) ]] && echo yes)" yes
 unset -f docker sync memtier
 
+# W7 (--large): config variants, parity, phase order, disk budget
+RELAXED=none BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
+conf=$(write_server_conf tideskv relaxed)
+check conf-tideskv-default "$(diff <(sed 's/SYNC_MODE/none/' "$HERE/tideskv.conf") "$conf" && echo same)" same
+conf=$(write_server_conf kvrocks strict)
+check conf-kvrocks-default "$(diff <(sed 's/SYNC_YESNO/yes/' "$HERE/kvrocks.conf") "$conf" && echo same)" same
+check parity-default "$(_parity_expect kvrocks relaxed | head -2 | xargs)" "workers 4 rocksdb.block_cache_size 2048"
+BLOCK_CACHE_MB=1024 SERVER_WORKERS=16
+conf=$(write_server_conf tideskv relaxed)
+check conf-tideskv-large "$(grep -E '^(workers|block-cache-size) ' "$conf" | xargs)" "workers 16 block-cache-size 1gb"
+conf=$(write_server_conf kvrocks-blob relaxed)
+check conf-blob-path "$conf" "$OUT/kvrocks-blob/kvrocks-relaxed.conf"
+check conf-blob-cache "$(grep -c '^rocksdb.block_cache_size 1024$' "$conf")" 1
+check conf-blob-workers "$(grep -c '^workers 16$' "$conf")" 1
+check conf-blob-files "$(grep -c '^rocksdb.enable_blob_files yes$' "$conf")" 1
+check conf-blob-min "$(grep -c '^rocksdb.min_blob_size 4096$' "$conf")" 1
+conf=$(write_server_conf kvrocks relaxed)
+check conf-kvrocks-no-blob "$(grep -c blob "$conf")" 0
+check parity-tideskv-large "$(_parity_expect tideskv relaxed | head -2 | xargs)" "workers 16 block-cache-size 1073741824"
+check parity-blob "$(_parity_expect kvrocks-blob relaxed | tail -2 | xargs)" \
+  "rocksdb.enable_blob_files yes rocksdb.min_blob_size 4096"
+check parity-kvrocks-no-blob "$(_parity_expect kvrocks relaxed | grep -c blob)" 0
+BLOCK_CACHE_MB=2048 SERVER_WORKERS=4
+wl_sizes large
+W7_SWEEP=1
+check w7-phases-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 R32w16 M32"
+W7_SWEEP=0
+check w7-phases-no-sweep "$(w7_phase_list | xargs)" "R1 R4 R32 M32"
+check cpu-count "$(cpu_count 8-11) $(cpu_count 0-3,8,10-11) $(cpu_count 5)" "4 7 1"
+SIZE=large DISK_FREE_OVERRIDE=$((54 * 1024 * 1024 * 1024))
+rc=0; disk_check 2>/dev/null || rc=$?
+check disk-large-refuses-54g "$((rc != 0))" 1
+DISK_FREE_OVERRIDE=$((56 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-ok-56g "$rc" 0
+wl_sizes large-smoke; SIZE=large-smoke DISK_FREE_OVERRIDE=$((8 * 1024 * 1024 * 1024)) rc=0; disk_check || rc=$?
+check disk-large-smoke-ok "$rc" 0
+unset DISK_FREE_OVERRIDE
+SIZE=quick; wl_sizes quick
+# the kvrocks-blob DBSIZE cache needs the same DBSIZE SCAN as kvrocks
+check load-kvrocks-glob "$(declare -f load_all | grep -c 'SERVER_NAME == kvrocks\*')" 2
+# a W7 memtier container carries $TS so bench_cleanup's name filter finds it
+# shellcheck disable=SC2016  # the literal text of run.sh
+check w7-memtier-name "$(declare -f run_w7_phase | grep -c 'mc="tideskv-bench-memtier-$TS-w7-')" 1
+check fio-pinned "$([[ $FIO_IMAGE == *@sha256:* ]] && echo yes)" yes
+
 # M6: a missing option value is an error, and --help shows the defaults
 rc=0; bash "$HERE/run.sh" --out >/dev/null 2>"$T/err" || rc=$?
 check out-missing-value "$rc $(grep -c 'needs a value' "$T/err")" "1 1"
