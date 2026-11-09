@@ -611,6 +611,20 @@ class W7ReportTest(unittest.TestCase):
             self.assertIsNone(c["client_cpu_pct"])
             self.assertEqual(report.main([t]), 1)  # the other servers did not run
 
+    def test_write_amp_counts_writeback_after_the_window(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv",), phases=("M32",))
+            d = os.path.join(t, "tideskv", "large")
+            with open(os.path.join(W7, "M32.io1")) as f:
+                text = f.read()
+            # another 45015 x 256 KiB written back once the host synced
+            with open(os.path.join(d, "M32.io1s"), "w") as f:
+                f.write(text.replace("wbytes=24100824320", "wbytes=35901236480"))
+            meta, _, _, _ = report.load(t)
+            c = _w7(report_w7.collect(t, meta), "tideskv", "M32")
+            self.assertAlmostEqual(c["write_amp"], 3.0)
+            self.assertAlmostEqual(c["write_mbs"], 23600.82432 / 30.002)  # MB/s stays the window's
+
     def test_medium_run_is_not_large(self):
         with tempfile.TemporaryDirectory() as t:
             make_run(t)

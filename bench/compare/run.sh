@@ -282,7 +282,7 @@ w7_phase_list() {
 _stop_bg() { local p; for p in "$@"; do stop_sampler "$p"; done; }
 
 # One W7 phase on a freshly restarted server: settle, warm-up, then the timed run with every W7 measurement.
-# Writes <server>/large/<phase>.{json,status,settle,cpu,io0,io1,info0,info1,stats.jsonl,client.jsonl,diskstats}.
+# Writes <server>/large/<phase>.{json,status,settle,cpu,io0,io1,io1s,info0,info1,stats.jsonl,client.jsonl,diskstats}.
 run_w7_phase() {
   local phase=$1 base="$CUR/large/$1" mc="tideskv-bench-memtier-$TS-w7-$CUR-$1" spid dpid cpid cpu0 cpu1
   mkdir -p "$OUT/$CUR/large"
@@ -302,6 +302,9 @@ run_w7_phase() {
   fi
   cpu1=$(cg_sample) || cpu1=""
   cg_io_snapshot >"$OUT/$base.io1"
+  # write amp also counts the window's dirty pages, which a relaxed server writes back after it (charged to its cgroup)
+  sync
+  cg_io_snapshot >"$OUT/$base.io1s"
   _stop_bg "$spid" "$cpid" "$dpid"
   if [[ -n $cpu0 && -n $cpu1 ]]; then echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"; fi
   cli INFO >"$OUT/$base.info1" 2>&1 || true

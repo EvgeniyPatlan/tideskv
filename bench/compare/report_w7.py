@@ -179,7 +179,13 @@ def _disk_fields(cell, d, phase, m):
         if m["get_count"]:
             cell["reads_per_get"] = delta["rbytes"] / float(m["get_count"] * VALUE_SIZE)
         if phase.startswith("M") and m["set_count"]:
-            cell["write_amp"] = delta["wbytes"] / float(m["set_count"] * VALUE_SIZE)
+            # io1s is io.stat after a host sync: a buffered writer's dirty pages from the window, written back
+            # after it ends, still count against its SETs
+            synced = _read_opt(os.path.join(d, phase + ".io1s"))
+            wbytes = delta["wbytes"]
+            if synced is not None and dev is not None:
+                wbytes = io_delta(parse_io_stat(io0), parse_io_stat(synced)).get(dev, delta)["wbytes"]
+            cell["write_amp"] = wbytes / float(m["set_count"] * VALUE_SIZE)
     if dev is None:
         dev = _busiest_in_diskstats(samples)
     if dev is not None:
@@ -284,7 +290,8 @@ def _header(meta):
             "%s keys of %s B (`L:<n>`, random data), loaded once per server. Block cache %s MiB on both servers, "
             "server memory `%s`, workers 4 (R32 (workers 16) is the reads-in-flight sweep). Each phase restarts the "
             "server and drops its data from the page cache first. Reads are uniform over the working set: R1/R4/R32 "
-            "read 1x/4x/32x the block cache's worth of keys, M32 is 90/10 GET/SET at 32x. memtier %s threads × %s "
+            "read 1/32, 4/32 and all of the keys (at the full 131072 keys: 1x, 4x and 32x the block cache), M32 is "
+            "90/10 GET/SET over all of them. memtier %s threads × %s "
             "clients, pipeline 1; warm-up %ss, timed %ss; relaxed durability." % (
                 m("w7_keys"), m("w7_value_size"), m("block_cache_mb"), m("server_mem"), m("threads"), m("clients"),
                 m("warmup_s"), m("duration_s")), ""]
@@ -355,7 +362,8 @@ def render(meta, cells, fio, disks, configs, run_dir=None):
     out += tables + [""]
     out += ["- Device numbers are the server cgroup's io.stat deltas over the timed run, on its busiest device "
             "(the physical one of a dm stack). Disk reads / GET = bytes read ÷ (GETs × 256 KiB); write amp = bytes "
-            "written ÷ (SETs × 256 KiB), M32 only.",
+            "written ÷ (SETs × 256 KiB), M32 only, counted after a host sync so that dirty pages written back after the "
+            "window count too.",
             "- aqu-sz (Δweighted ms ÷ Δwall ms) and r_await (Δread ms ÷ Δreads) come from /proc/diskstats sampled "
             "once a second; they are the device's, host-wide.",
             "- Client CPU is the timed memtier container's mean CPU as a share of its cpuset; above %d%% the run is "
