@@ -724,12 +724,50 @@ class W7ReportTest(unittest.TestCase):
                 shutil.copy(os.path.join(W7, "M32.io0"), os.path.join(t, "tideskv", "large", p + ".io1"))
             meta, _, _, _ = report.load(t)
             cells = report_w7.collect(t, meta)
-            self.assertEqual(_w7(cells, "tideskv", "R4")["warnings"], ["cache not dropped? 0.00 disk reads per GET"])
+            self.assertEqual(_w7(cells, "tideskv", "R4")["warnings"],
+                             ["cache not dropped? 0.00 disk reads per GET, expected about 0.75"])
             self.assertEqual(_w7(cells, "tideskv", "R1")["warnings"], [])  # R1 is expected to be cached
             self.assertEqual(_w7(cells, "tideskv", "R32")["warnings"], [])  # 1.25 reads per GET
             _set_meta(t, size="large-smoke")  # 128 MiB fits in memory: no flag
             meta, _, _, _ = report.load(t)
             self.assertEqual(_w7(report_w7.collect(t, meta), "tideskv", "R4")["warnings"], [])
+
+    def _disk(self, t, server, after, logical=32 << 30):
+        with open(os.path.join(t, server, "disk.json"), "w") as f:
+            json.dump({"after_load_bytes": after, "end_bytes": after, "load_seconds": 120, "logical_bytes": logical}, f)
+
+    def test_compressed_values_are_noted(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, phases=("R1",))
+            self._disk(t, "tideskv", 12 << 30)  # 32 GiB loaded as 12 GiB: lz4 on memtier's random data
+            self._disk(t, "kvrocks", int(0.81 * (32 << 30)))  # above 0.8: no note
+            self.assertAlmostEqual(report_w7.stored_ratio(t, "tideskv"), 0.375)
+            self.assertIsNone(report_w7.stored_ratio(t, "nonexistent"))
+            self.assertEqual(report.main([t]), 0)  # a note, not an ERR
+            with open(os.path.join(t, "report.md")) as f:
+                md = f.read()
+            self.assertIn("Errors:\n- TidesKV: values compressed (2.7×): working-set ratios are understated", md)
+            self.assertNotIn("Kvrocks: values compressed", md)
+
+    def test_cache_check_scales_with_compression(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_w7_run(t, servers=("tideskv", "kvrocks"), phases=("R4", "R32"))
+            # 0.30 disk reads per GET in R4 on both
+            for s in ("tideskv", "kvrocks"):
+                with open(os.path.join(t, s, "large", "R4.io1"), "w") as f:
+                    f.write("259:0 rbytes=%d wbytes=500000000\n" % (1000000000 + int(0.3 * 404973 * 262144)))
+            self._disk(t, "tideskv", 12 << 30)  # stored 0.375 of logical: 0.30 is what a cold start gives
+            meta, _, _, _ = report.load(t)
+            cells = report_w7.collect(t, meta)
+            self.assertAlmostEqual(_w7(cells, "tideskv", "R4")["reads_per_get"], 0.3, places=3)
+            self.assertEqual(_w7(cells, "tideskv", "R4")["warnings"], [])
+            self.assertEqual(_w7(cells, "kvrocks", "R4")["warnings"],  # stored 1.06x: 0.30 is too few
+                             ["cache not dropped? 0.30 disk reads per GET, expected about 0.75"])
+            self._disk(t, "tideskv", 4 << 30)  # stored 0.125: threshold 0.0625, still not flagged
+            self.assertEqual(_w7(report_w7.collect(t, meta), "tideskv", "R4")["warnings"], [])
+            self._disk(t, "tideskv", 30 << 30)  # stored 0.94: threshold 0.47, 0.30 is flagged
+            self.assertEqual(_w7(report_w7.collect(t, meta), "tideskv", "R4")["warnings"],
+                             ["cache not dropped? 0.30 disk reads per GET, expected about 0.70"])
 
     def test_fio_queue_depths_come_from_the_files(self):
         with tempfile.TemporaryDirectory() as t:

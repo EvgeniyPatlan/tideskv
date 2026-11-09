@@ -14,9 +14,14 @@ CLIENT_BOUND_PCT = 85.0
 # RESP replies: "+OK\r\n" to a SET, "$262144\r\n<value>\r\n" to a GET hit
 SET_REPLY_BYTES = 5
 GET_REPLY_BYTES = len("$%d\r\n" % VALUE_SIZE) + VALUE_SIZE + 2
-# below this many disk reads per GET, R4/R32 at full size cannot have started from a dropped page cache
-# (expected about 0.75 and 0.97)
+# Expected disk reads per GET from a dropped page cache at full size, when stored bytes match logical bytes:
+# the share of the working set that is not in the 1 GiB block cache
+EXPECTED_MISS = {"R4": 0.75, "R32": 0.97, "R32w16": 0.97}
+# below this many disk reads per GET (scaled by stored ÷ logical bytes), the phase did not start cold
 CACHE_DROPPED_MIN_READS = 0.5
+# after-load bytes under this share of logical bytes: the values were compressed, so the working set was smaller
+# than its ratio says
+COMPRESSED_BELOW = 0.8
 # devices whose byte counts are this close to the busiest are a stack (dm-crypt, LVM, the NVMe below them):
 # the physical device is the one whose queue and latency matter
 _STACK_TOLERANCE = 0.10
@@ -271,15 +276,36 @@ def _w7_cell(run_dir, server, phase, ncpu):
     return cell
 
 
-def flag_cache(cells, meta):
-    """At full size, R4/R32 reads with under CACHE_DROPPED_MIN_READS disk reads per GET did not start cold."""
+def stored_ratio(run_dir, server):
+    """after_load_bytes ÷ logical_bytes from <server>/disk.json, or None."""
+    try:
+        with open(os.path.join(run_dir, server, "disk.json")) as f:
+            d = json.load(f)
+        after, logical = base._num(d["after_load_bytes"]), base._num(d["logical_bytes"])
+    except (base.BAD_INPUT + (IndexError,)):
+        return None
+    return after / float(logical) if logical > 0 else None
+
+
+def flag_cache(cells, meta, ratios):
+    """At full size, R4/R32 cells reading under CACHE_DROPPED_MIN_READS x (stored ÷ logical, at most 1) disk reads
+    per GET did not start from a dropped page cache. Compressed values need fewer reads per GET for the same misses."""
     if meta.get("size") != "large":
         return cells
     for c in cells:
-        if c["error"] is None and c["phase"] in ("R4", "R32", "R32w16") and c["reads_per_get"] is not None \
-                and c["reads_per_get"] < CACHE_DROPPED_MIN_READS:
-            c["warnings"] = c["warnings"] + ["cache not dropped? %.2f disk reads per GET" % c["reads_per_get"]]
+        if c["error"] is not None or c["phase"] not in EXPECTED_MISS or c["reads_per_get"] is None:
+            continue
+        scale = min(1.0, ratios.get(c["server"]) or 1.0)
+        if c["reads_per_get"] < CACHE_DROPPED_MIN_READS * scale:
+            c["warnings"] = c["warnings"] + ["cache not dropped? %.2f disk reads per GET, expected about %.2f" % (
+                c["reads_per_get"], EXPECTED_MISS[c["phase"]] * scale)]
     return cells
+
+
+def compression_notes(ratios):
+    """One line per server whose stored bytes after the load were under COMPRESSED_BELOW of logical."""
+    return ["- %s: values compressed (%.1f×): working-set ratios are understated" % (base.NAMES[s], 1.0 / r)
+            for s in SERVERS for r in [ratios.get(s)] if r is not None and 0 < r < COMPRESSED_BELOW]
 
 
 def phases_of(meta):
@@ -290,7 +316,8 @@ def phases_of(meta):
 def collect(run_dir, meta):
     ncpu = meta.get("client_cpu_count")
     ncpu = ncpu if isinstance(ncpu, int) and ncpu > 0 else None
-    return flag_cache([_w7_cell(run_dir, s, p, ncpu) for s in SERVERS for p in phases_of(meta)], meta)
+    ratios = {s: stored_ratio(run_dir, s) for s in SERVERS}
+    return flag_cache([_w7_cell(run_dir, s, p, ncpu) for s in SERVERS for p in phases_of(meta)], meta, ratios)
 
 
 def parse_fio(path):
@@ -411,6 +438,8 @@ def render(meta, cells, fio, disks, configs, run_dir=None):
                m("server_mem"), m("client_cpus"), m("host"), m("started_utc")), ""]
     out += _header(meta)
     tables, notes = _tables(cells)
+    if run_dir:
+        notes = compression_notes({s: stored_ratio(run_dir, s) for s in SERVERS}) + notes
     out += tables + [""]
     out += ["- Device numbers are the server cgroup's io.stat deltas over the timed run, on its busiest device "
             "(the physical one of a dm stack). Disk reads / GET = bytes read ÷ (GETs × 256 KiB); write amp = bytes "
@@ -425,6 +454,10 @@ def render(meta, cells, fio, disks, configs, run_dir=None):
             "its data-block counters only see key blocks.",
             "- A cell whose replies were not all valid (a SET that did not answer +OK, a GET miss or a short GET reply, "
             "e.g. on a full disk) is an ERR: memtier counts error replies as completed requests.",
+            "- W7 turns compression off on all three servers. A server that stored under %d%% of the logical bytes "
+            "after the load gets a \"values compressed\" line: its working set was smaller than the ratios say. "
+            "The \"cache not dropped?\" check (full size only) scales its expectation by stored ÷ logical bytes."
+            % round(COMPRESSED_BELOW * 100),
             "- Client CPU is the timed memtier container's mean CPU as a share of its cpuset; above %d%% the run is "
             "flagged client-bound?." % CLIENT_BOUND_PCT, ""]
     if notes:

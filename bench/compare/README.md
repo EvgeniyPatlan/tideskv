@@ -74,6 +74,9 @@ block cache, uniform reads, 10% writes. It runs instead of W1-W6 and replaces th
   `kvrocks`, and `kvrocks-blob` (`rocksdb.enable_blob_files yes`, `rocksdb.min_blob_size 4096`). Each server's
   data is deleted before the next one loads, so only one server's data is on disk at a time. Free disk must be
   2x logical + 8 GiB + the fio file (80 GiB at full size).
+- Compression is off on all three servers in W7 only (`compression no`, `rocksdb.compression no`; parity reads it
+  back): memtier's `--random-data` compresses about 3x under lz4, which would shrink the 32x working set to about
+  10x. The report notes a server whose after-load bytes are under 80% of logical ("values compressed").
 - Both Kvrocks configs get `rocksdb.wal_ttl_seconds 0` and `rocksdb.wal_size_limit_mb 0` in W7 only (no replica
   needs the WAL archive, whose 3 h / 16 GiB default would keep M32's rewrites on disk); parity reads them back.
 - Both servers get a 1 GiB block cache and `SERVER_MEM` defaults to `4g`, so 32x is miss-heavy even after the
@@ -104,7 +107,8 @@ fio curve follows the table.
 - Every reply is checked from memtier's byte counts: each SET must answer `+OK` (5 bytes), and GETs must hit with
   256 KiB values. Otherwise the cell is an ERR "errors: ...": memtier counts `-ERR` replies (a full disk) as done.
 - A failed page-cache drop is a warning in the phase's status and under the table. At full size, an R4/R32 cell
-  with under 0.5 disk reads per GET is flagged "cache not dropped?" (about 0.75 and 0.97 are expected).
+  with under 0.5 × (stored ÷ logical bytes, at most 1) disk reads per GET is flagged "cache not dropped?" (about 0.75
+  and 0.97 are expected for uncompressed data).
 
 ## Reading the report
 
