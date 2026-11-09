@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# memtier arguments for the comparison workloads W1-W6 (spec 2026-10-18 §6, plan rulings 1-2).
+# memtier arguments for the comparison workloads W1-W6 (spec 2026-10-18 §6, plan rulings 1-2) and W7 (--large).
 # Sourced by run.sh; callbacks receive memtier arguments as separate words.
 # wl_load owns --threads/--clients (strings: 4x8; collection loads: 1x1, because in --command mode
 # --requests=allkeys is NOT split across clients, every client would walk the whole range).
@@ -14,6 +14,13 @@ MEMTIER_RUN_FLAGS=(--distinct-client-seed --randomize)
 # memtier rate-limits per connection, so the W6 DEL rate is spread over W6_DEL_RATE / W6_DEL_PER_CONN connections:
 # at 1 DEL/s each, a connection keeps up as long as a DEL answers within 1 s.
 W6_DEL_PER_CONN=1
+# W7 (--large, notes design 2026-11-09): 256 KiB values on a miss-heavy cache, one strings dataset L:<n>.
+W7_VALUE_SIZE=262144
+W7_PHASES="R1 R4 R32 M32"
+# 8 threads x 4 clients = 32 connections, so the client is not the limit at 256 KiB per request
+W7_THREADS=8
+W7_CLIENTS=4
+W7_KEYS=0
 
 wl_sizes() {
   case $1 in
@@ -24,8 +31,14 @@ wl_sizes() {
             L_COUNT=20 L_ELEMS=100000 BH_COUNT=10000 BH_FIELDS=1000 W6_DEL_RATE=50 ;;
     quick) S_KEYS=4000000 H_COUNT=5 H_FIELDS=10000 Z_COUNT=5 Z_MEMBERS=10000
            L_COUNT=5 L_ELEMS=10000 BH_COUNT=1000 BH_FIELDS=1000 W6_DEL_RATE=20 ;;
+    # large: W7 only, 131072 x 256 KiB = 32 GiB logical; large-smoke: 512 keys (128 MiB), runs in minutes
+    large|large-smoke)
+          S_KEYS=0 H_COUNT=0 H_FIELDS=0 Z_COUNT=0 Z_MEMBERS=0 L_COUNT=0 L_ELEMS=0 BH_COUNT=0 BH_FIELDS=0 W6_DEL_RATE=0
+          W7_KEYS=$([[ $1 == large ]] && echo 131072 || echo 512)
+          DATASETS=large ;;
     *) echo "wl_sizes: unknown size $1" >&2; return 2 ;;
   esac
+  if [[ $1 != large* ]]; then W7_KEYS=0 DATASETS="strings hashes zsets lists bighashes"; fi
   W6_DEL_CLIENTS=$((W6_DEL_RATE / W6_DEL_PER_CONN))
 }
 
@@ -65,6 +78,11 @@ wl_load() {
       # shellcheck disable=SC2046
       "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=$VALUE_SIZE" "--random-data" \
         "--key-prefix=bh:" $(_cseq "$BH_COUNT") || return ;;
+    large)
+      # pipeline 4, not 32: 32 connections x 32 x 256 KiB would put 256 MiB in flight against a 4 GiB server
+      "$cb" "--ratio=1:0" "--data-size=$W7_VALUE_SIZE" "--random-data" "--key-prefix=L:" "--key-pattern=P:P" \
+        "--key-minimum=1" "--key-maximum=$W7_KEYS" "--requests=allkeys" "--pipeline=4" "--threads=4" "--clients=8" \
+        || return ;;
     *) echo "wl_load: unknown dataset $ds" >&2; return 2 ;;
   esac
 }
@@ -103,6 +121,29 @@ wl_run() {
   esac
 }
 
+# Keys a W7 phase touches: the ratio is working set / block cache, and 32x is the whole dataset.
+wl_w7_keys() {
+  local r=${1#[RM]}
+  r=${r%%w*}
+  if ! [[ $r =~ ^[0-9]+$ ]] || ((r < 1 || r > 32)); then echo "wl_w7_keys: bad phase $1" >&2; return 2; fi
+  echo $((W7_KEYS * r / 32))
+}
+
+# One W7 phase: R<n> reads only, M<n> 90/10 GET/SET (memtier --ratio is SET:GET), uniform over wl_w7_keys keys.
+# A trailing w<N> (R32w16, the workers sweep) changes the server, not the traffic.
+wl_run_w7() {
+  local phase=$1 cb=$2 ratio keys
+  case $phase in
+    R*) ratio=0:1 ;;
+    M*) ratio=1:9 ;;
+    *) echo "wl_run_w7: unknown phase $phase" >&2; return 2 ;;
+  esac
+  keys=$(wl_w7_keys "$phase") || return
+  "$cb" "--ratio=$ratio" "--data-size=$W7_VALUE_SIZE" "--random-data" "--key-prefix=L:" "--key-pattern=R:R" \
+    "--key-minimum=1" "--key-maximum=$keys" "--threads=$W7_THREADS" "--clients=$W7_CLIENTS" "--pipeline=1" \
+    "${MEMTIER_RUN_FLAGS[@]}"
+}
+
 wl_run_w6_del() {
   # shellcheck disable=SC2046
   "$1" "--command=DEL __key__" "--command-key-pattern=R" "--key-prefix=bh:" $(_random "$BH_COUNT") \
@@ -124,6 +165,7 @@ wl_probe() {
 
 wl_verify_cmds() {
   # 99% of the planned count: memtier skips edge ids
+  if ((W7_KEYS)); then echo "$(( W7_KEYS * 99 / 100 )) DBSIZE"; return; fi
   echo "$(( (S_KEYS + H_COUNT + Z_COUNT + L_COUNT + BH_COUNT) * 99 / 100 )) DBSIZE"
   echo "$(( H_FIELDS * 99 / 100 )) HLEN h:1"
   echo "$(( Z_MEMBERS * 99 / 100 )) ZCARD z:1"
@@ -134,5 +176,5 @@ wl_verify_cmds() {
 wl_logical_bytes() {
   local v=$VALUE_SIZE
   echo $(( S_KEYS * (v + 12) + H_COUNT * H_FIELDS * (v + 10) + Z_COUNT * Z_MEMBERS * 20 \
-         + L_COUNT * L_ELEMS * v + BH_COUNT * BH_FIELDS * (v + 6) ))
+         + L_COUNT * L_ELEMS * v + BH_COUNT * BH_FIELDS * (v + 6) + W7_KEYS * (W7_VALUE_SIZE + 8) ))
 }

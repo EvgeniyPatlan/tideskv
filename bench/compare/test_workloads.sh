@@ -99,6 +99,49 @@ check verify-lines "$(wl_verify_cmds | wc -l)" 5
 check verify-hlen "$(wl_verify_cmds | grep -c '^9900 HLEN h:1$')" 1
 check logical "$( (( $(wl_logical_bytes) > 400000000 )) && echo yes || echo no)" yes
 
+# W7 (--large): 256 KiB values, working set set by --key-maximum, 8 threads x 4 clients
+wl_sizes large
+check large-keys "$W7_KEYS" 131072
+check large-datasets "$DATASETS" large
+check large-logical "$(wl_logical_bytes)" $((131072 * (262144 + 8)))
+check large-verify "$(wl_verify_cmds)" "129761 DBSIZE"
+calls=(); wl_load large record
+check large-load-calls "${#calls[@]}" 1
+for a in --ratio=1:0 --data-size=262144 --random-data --key-prefix=L: --key-pattern=P:P --key-maximum=131072 \
+         --requests=allkeys; do
+  check "large-load$a" "$(has "${calls[0]}$'\x1f'" "$a"$'\x1f')" yes
+done
+check large-keys-r1 "$(wl_w7_keys R1)" 4096
+check large-keys-r4 "$(wl_w7_keys R4)" 16384
+check large-keys-r32 "$(wl_w7_keys R32)" 131072
+check large-keys-sweep "$(wl_w7_keys R32w16)" 131072
+for p in R1 R4 R32 M32 R32w16; do
+  calls=(); wl_run_w7 "$p" record
+  c="${calls[0]}"$'\x1f'
+  for a in --data-size=262144 --random-data --distinct-client-seed --randomize --threads=8 --clients=4 --pipeline=1 \
+           --key-prefix=L: --key-pattern=R:R --key-minimum=1 "--key-maximum=$(wl_w7_keys "$p")"; do
+    check "w7-$p$a" "$(has "$c" "$a"$'\x1f')" yes
+  done
+done
+calls=(); wl_run_w7 R4 record
+check w7-r4-get-only "$(has "${calls[0]}" "--ratio=0:1")" yes
+check w7-r4-keymax "$(has "${calls[0]}" "--key-maximum=16384")" yes
+calls=(); wl_run_w7 M32 record
+check w7-m32-ratio "$(has "${calls[0]}" "--ratio=1:9")" yes
+check w7-m32-keymax "$(has "${calls[0]}"$'\x1f' $'--key-maximum=131072\x1f')" yes
+rc=0; wl_run_w7 X9 record 2>/dev/null || rc=$?
+check w7-bad-phase "$((rc != 0))" 1
+rc=0; wl_w7_keys R64 2>/dev/null || rc=$?
+check w7-bad-ratio "$((rc != 0))" 1
+wl_sizes large-smoke
+check large-smoke-keys "$W7_KEYS" 512
+check large-smoke-r1 "$(wl_w7_keys R1)" 16
+check large-smoke-r32 "$(wl_w7_keys R32)" 512
+# going back to a W1-W6 size clears W7 and restores the datasets
+wl_sizes quick
+check quick-after-large "$W7_KEYS $DATASETS" "0 strings hashes zsets lists bighashes"
+check quick-verify-after-large "$(wl_verify_cmds | wc -l)" 5
+
 
 # ---- run.sh helpers, sourced without running (Docker is stubbed) ----
 # shellcheck source=run.sh
