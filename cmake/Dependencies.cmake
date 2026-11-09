@@ -17,11 +17,18 @@ set(TIDESDB_WITH_ZSTD ${TIDESKV_COMPRESSION} CACHE BOOL "" FORCE)
 #     they pass a quarter of it. Without that, after enough churn a miss probes the whole table.
 #  4. A compaction reads each input level below L1 as one merge source instead of one per file, and the
 #     merge stops scanning every source for read failures after every entry.
+#  5. Point reads fetch only what they ask for: every file is opened with readahead off
+#     (POSIX_FADV_RANDOM, RocksDB's advise_random_on_open), and the scans that read in order --
+#     recovery, compaction, iteration -- prefetch the ranges ahead of them instead of switching the
+#     shared descriptor to sequential. A value-log read also asks for the value's stored length rather
+#     than its decoded one. A cold 256 KiB GET read ~450 KiB from disk and now reads ~245 KiB; one
+#     stored lz4 in ~110 KiB read ~380 KiB and now reads ~107 KiB.
 set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-when-largest-level-full.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-deepen-by-moving-the-largest-level.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-cache-clear-tombstones.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-random-read-hint.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

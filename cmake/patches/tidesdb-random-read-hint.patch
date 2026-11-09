@@ -1,0 +1,785 @@
+diff --git a/src/io/block_manager.h b/src/io/block_manager.h
+index 0569092..c626561 100644
+--- a/src/io/block_manager.h
++++ b/src/io/block_manager.h
+@@ -168,6 +168,40 @@ typedef struct
+     uint8_t inline_data;
+ } block_manager_block_t;
+ 
++/**
++ * block_manager_readahead_t
++ * the readahead state of one scan over one file. every file is opened with readahead off, since
++ * nearly every read of it is a point read, so a scan reading in order asks for its own: once two
++ * reads in a row move forward through the file, it prefetches a window past the latest one, and
++ * doubles the window each time it refills it, from BLOCK_MANAGER_READAHEAD_MIN up to
++ * BLOCK_MANAGER_READAHEAD_MAX. a read that ends before the last one did, or starts more than
++ * BLOCK_MANAGER_READAHEAD_GAP past its end, starts over. zeroed is the initial state
++ * @param next_offset where the previous read ended, the offset a read continuing it starts at
++ * @param end where the prefetched range ends
++ * @param window bytes the next refill prefetches, 0 before the scan has proven sequential
++ * @param run forward reads in a row so far
++ */
++typedef struct
++{
++    uint64_t next_offset;
++    uint64_t end;
++    uint64_t window;
++    uint32_t run;
++} block_manager_readahead_t;
++
++/* the first readahead window a sequential scan prefetches, and the largest it grows to. the cap
++ * matches RocksDB's compaction_readahead_size default */
++#define BLOCK_MANAGER_READAHEAD_MIN (64u * 1024u)
++#define BLOCK_MANAGER_READAHEAD_MAX (2u * 1024u * 1024u)
++
++/* the most one prefetch request asks for, the kernel's default readahead size, past which linux
++ * silently truncates a WILLNEED */
++#define BLOCK_MANAGER_READAHEAD_CHUNK (128u * 1024u)
++
++/* how far past the end of the previous read a read may start and still count as continuing it, so a
++ * scan skipping the btree's internal nodes between two leaves stays sequential */
++#define BLOCK_MANAGER_READAHEAD_GAP BLOCK_MANAGER_READAHEAD_MAX
++
+ /**
+  * block_manager_cursor_t
+  * block cursor struct
+@@ -176,6 +210,7 @@ typedef struct
+  * @param current_pos the current position of the cursor
+  * @param current_block_size the size of the current block
+  * @param block_size_valid 1 if current_block_size is cached and valid, 0 otherwise
++ * @param ra the readahead state of the cursor's reads
+  */
+ typedef struct
+ {
+@@ -183,8 +218,22 @@ typedef struct
+     uint64_t current_pos;
+     uint64_t current_block_size;
+     int block_size_valid;
++    block_manager_readahead_t ra;
+ } block_manager_cursor_t;
+ 
++/**
++ * block_manager_readahead_note
++ * record a read of [offset, offset + len) by a scan, and prefetch past it when the scan is reading
++ * the file in order (see block_manager_readahead_t). the prefetch starts the reads and does not
++ * wait for them
++ * @param bm the block manager the scan reads
++ * @param ra the scan's readahead state
++ * @param offset the first byte of the read
++ * @param len the bytes read, or the caller's estimate of them
++ */
++void block_manager_readahead_note(block_manager_t *bm, block_manager_readahead_t *ra,
++                                  uint64_t offset, uint64_t len);
++
+ /**
+  * block_manager_set_io_stat
+  * route this handle's write accounting to a caller-owned counter, so bytes and time can be
+diff --git a/src/io/block_manager_core.c b/src/io/block_manager_core.c
+index 56206ac..a55780c 100644
+--- a/src/io/block_manager_core.c
++++ b/src/io/block_manager_core.c
+@@ -189,6 +189,8 @@ int reopen_fd(block_manager_t *bm)
+ 
+     bm->fd = bm_open_file(bm->file_path, flags, BLOCK_MANAGER_FILE_MODE);
+     if (bm->fd == -1) return -1;
++    /* see block_manager_open_internal: point reads fetch only what they ask for */
++    (void)set_file_random_hint(bm->fd);
+ 
+     bm->opened_with_odsync = bm_fd_uses_odsync(bm->fd);
+     return 0;
+@@ -354,6 +356,14 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
+ 
+     new_bm->opened_with_odsync = bm_fd_uses_odsync(new_bm->fd);
+ 
++    /* nearly every read of a block manager's file is a point read -- a value from a value log
++     * segment, a node from a klog -- at an offset unrelated to the last one, and the kernel's
++     * readahead pads each with bytes nothing asked for, doubling a cold large-value read. this is
++     * RocksDB's advise_random_on_open. the advice is the open file's, shared by every reader of the
++     * handle, so the scans that do read in order -- recovery, compaction, iteration -- prefetch the
++     * ranges they are about to read instead (block_manager_readahead_note) */
++    (void)set_file_random_hint(new_bm->fd);
++
+     strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
+     new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
+ 
+@@ -513,6 +523,59 @@ uint64_t block_manager_framed_size(const uint32_t payload_size)
+     return BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)payload_size + BLOCK_MANAGER_FOOTER_SIZE;
+ }
+ 
++void block_manager_readahead_note(block_manager_t *bm, block_manager_readahead_t *ra,
++                                  const uint64_t offset, const uint64_t len)
++{
++    if (!bm || !ra) return;
++
++    /* a read continues the scan when it ends past where the last one ended and starts no further
++     * than the gap beyond it -- overlapping the last read's tail, as a scan re-reading a block that
++     * straddled its buffer does, still moves forward */
++    const int continues = ra->run > 0 && offset + len > ra->next_offset &&
++                          offset <= ra->next_offset + BLOCK_MANAGER_READAHEAD_GAP;
++    if (continues)
++    {
++        ra->run++;
++    }
++    else
++    {
++        ra->run = 1;
++        ra->end = 0;
++        ra->window = 0;
++    }
++    ra->next_offset = offset + len;
++
++    /* one read says nothing about the next, and a lone point read through a scan's API -- a footer,
++     * a seek that stays in its leaf -- should cost no more than it reads */
++    if (ra->run < 2) return;
++
++    /* refill once the scan is half way through what is prefetched, so the next window is on its way
++     * before the scan reaches it */
++    const uint64_t read_end = offset + len;
++    if (ra->window && read_end + ra->window / 2 <= ra->end) return;
++
++    if (ra->window == 0)
++        ra->window = BLOCK_MANAGER_READAHEAD_MIN;
++    else if (ra->window < BLOCK_MANAGER_READAHEAD_MAX)
++        ra->window *= 2;
++
++    const uint64_t from = ra->end > read_end ? ra->end : read_end;
++    uint64_t to = read_end + ra->window;
++    /* nothing past the data is worth fetching -- a file's tail is preallocated zeroes */
++    const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_relaxed);
++    if (to > extent) to = extent;
++    /* linux reads at most the device's readahead size (max of read_ahead_kb and max_sectors_kb,
++     * 128 KiB by default) per WILLNEED and drops the rest of the range, so a window goes out in
++     * pieces no larger than that */
++    for (uint64_t at = from; at < to; at += BLOCK_MANAGER_READAHEAD_CHUNK)
++    {
++        const uint64_t n =
++            to - at < BLOCK_MANAGER_READAHEAD_CHUNK ? to - at : BLOCK_MANAGER_READAHEAD_CHUNK;
++        (void)set_file_readahead(bm->fd, at, n);
++    }
++    ra->end = to;
++}
++
+ int block_manager_buffered_lag(block_manager_t *bm, uint64_t *out_lag, uint64_t *out_capacity)
+ {
+     if (!bm || !out_lag || !out_capacity) return -1;
+diff --git a/src/io/block_manager_cursor.c b/src/io/block_manager_cursor.c
+index cac3fef..5447ff1 100644
+--- a/src/io/block_manager_cursor.c
++++ b/src/io/block_manager_cursor.c
+@@ -36,6 +36,7 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
+     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+     cursor->current_block_size = 0;
+     cursor->block_size_valid = 0;
++    memset(&cursor->ra, 0, sizeof(cursor->ra));
+ 
+     /* position at first block so cursor_read works immediately. an empty file has none to go to,
+      * and the cursor is left where a read reports that rather than being an error to hand back */
+@@ -51,14 +52,9 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
+     (*cursor) = malloc(sizeof(block_manager_cursor_t));
+     if (!(*cursor)) return -1;
+ 
+-    const int rc = block_manager_cursor_init_stack(*cursor, bm);
+-    if (rc == 0)
+-    {
+-        /* heap-allocated cursors are used for sequential iteration
+-         * hint the OS for read-ahead optimization */
+-        set_file_sequential_hint(bm->fd);
+-    }
+-    return rc;
++    /* no file-wide sequential hint here: the advice is shared with every point reader of the
++     * file, and the cursor's reads prefetch for themselves (block_manager_readahead_note) */
++    return block_manager_cursor_init_stack(*cursor, bm);
+ }
+ 
+ int block_manager_cursor_next(block_manager_cursor_t *cursor)
+@@ -359,6 +355,8 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
+         block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+     if (block)
+     {
++        block_manager_readahead_note(cursor->bm, &cursor->ra, cursor->current_pos,
++                                     block_manager_framed_size((uint32_t)block->size));
+         /* cache block size so cursor_next skips the pread for size header */
+         cursor->current_block_size = block->size;
+         cursor->block_size_valid = 1;
+@@ -373,6 +371,8 @@ block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_curso
+     block_manager_block_t *block =
+         block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+     if (!block) return NULL;
++    block_manager_readahead_note(cursor->bm, &cursor->ra, cursor->current_pos,
++                                 block_manager_framed_size((uint32_t)block->size));
+ 
+     /* advance cursor using the block size just read, avoiding redundant pread */
+     cursor->current_pos +=
+diff --git a/src/io/block_manager_recover.c b/src/io/block_manager_recover.c
+index 9aaa8fd..b9fd7b1 100644
+--- a/src/io/block_manager_recover.c
++++ b/src/io/block_manager_recover.c
+@@ -68,8 +68,6 @@ int block_manager_count_blocks(block_manager_t *bm)
+     const uint64_t file_size = atomic_load(&bm->current_file_size);
+     if (file_size <= BLOCK_MANAGER_HEADER_SIZE) return 0;
+ 
+-    set_file_sequential_hint(bm->fd);
+-
+     /** buffered scan reading 64KB chunks so thousands of block headers are parsed per
+      * syscall. only the first 4 bytes of each block (size field) are needed to compute the skip
+      * distance. */
+@@ -90,12 +88,14 @@ int block_manager_count_blocks(block_manager_t *bm)
+ 
+     int count = 0;
+     uint64_t pos = BLOCK_MANAGER_HEADER_SIZE;
++    block_manager_readahead_t ra = {0};
+ 
+     while (pos < file_size)
+     {
+         size_t want = COUNT_BUF;
+         if (pos + want > file_size) want = (size_t)(file_size - pos);
+ 
++        block_manager_readahead_note(bm, &ra, pos, want);
+         const ssize_t got = pread(bm->fd, buf, want, (off_t)pos);
+         if (got < (ssize_t)BLOCK_MANAGER_SIZE_FIELD_SIZE) break;
+ 
+diff --git a/src/platform/platform_fs_sys.h b/src/platform/platform_fs_sys.h
+index a1413b1..caf7cde 100644
+--- a/src/platform/platform_fs_sys.h
++++ b/src/platform/platform_fs_sys.h
+@@ -98,23 +98,53 @@ static inline int tdb_preallocate_extent(int fd, off_t offset, off_t len)
+ }
+ 
+ /*
+- * set_file_sequential_hint
+- * hints to the OS that file access will be sequential for read-ahead optimization
++ * set_file_random_hint
++ * tells the OS that reads of this descriptor land at unrelated offsets, so a read fetches what it
++ * asks for and nothing after it. the advice belongs to the open file, which every reader of a block
++ * manager shares, and almost every read is a point read -- a value from a value log segment, a node
++ * from a klog -- that kernel readahead would pad with the bytes that follow. a 256 KiB value read
++ * cold cost twice its size in disk reads without it. a sequential scan asks for its readahead
++ * explicitly, per range, with set_file_readahead, which this advice does not disable
+  * @param fd the file descriptor
+- * @return 0 on success, -1 on failure (non-critical, can be ignored)
++ * @return 0 on success, -1 or an error number on failure (non-critical, can be ignored)
+  */
+-static inline int set_file_sequential_hint(int fd)
++static inline int set_file_random_hint(int fd)
+ {
+ #ifdef __linux__
+-    return posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
++    return posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+ #elif defined(__APPLE__)
+-    return fcntl(fd, F_RDAHEAD, 1);
+-#elif defined(_WIN32)
+-    /* _O_SEQUENTIAL flag set at open time via compat.h wrapper */
+-    (void)fd; /* unused on Windows */
++    return fcntl(fd, F_RDAHEAD, 0);
++#else
++    /* windows opens every file with _O_SEQUENTIAL (compat.h); other platforms keep their default */
++    (void)fd;
+     return 0;
++#endif
++}
++
++/*
++ * set_file_readahead
++ * starts reading [offset, offset + len) into the page cache without waiting for it, for a scan
++ * about to read that range in order. unlike a file-wide sequential hint this leaves the other
++ * readers of the descriptor alone, so a compaction or a recovery scan does not turn on readahead for
++ * the point reads sharing its file
++ * @param fd the file descriptor
++ * @param offset the first byte to fetch
++ * @param len how many bytes to fetch
++ * @return 0 on success, -1 or an error number on failure (non-critical, can be ignored)
++ */
++static inline int set_file_readahead(int fd, uint64_t offset, uint64_t len)
++{
++#ifdef __linux__
++    return posix_fadvise(fd, (off_t)offset, (off_t)len, POSIX_FADV_WILLNEED);
++#elif defined(__APPLE__)
++    struct radvisory ra;
++    ra.ra_offset = (off_t)offset;
++    ra.ra_count = len > 0x7fffffffu ? 0x7fffffff : (int)len;
++    return fcntl(fd, F_RDADVISE, &ra);
+ #else
+-    (void)fd; /* unused on other platforms */
++    (void)fd;
++    (void)offset;
++    (void)len;
+     return 0;
+ #endif
+ }
+diff --git a/src/sstable/btree/btree.h b/src/sstable/btree/btree.h
+index eb95c54..0a1899d 100644
+--- a/src/sstable/btree/btree.h
++++ b/src/sstable/btree/btree.h
+@@ -195,6 +195,7 @@ typedef struct
+  * @param read_error set when a node load failed (vs a genuine end of tree) so callers can tell a
+  *                   truncated traversal apart from a complete one and not treat lost entries as
+  * gone
++ * @param ra readahead state of the cursor's walk from leaf to leaf
+  */
+ struct btree_cursor_t
+ {
+@@ -206,6 +207,7 @@ struct btree_cursor_t
+     int at_begin;
+     cache_entry_t *current_pin;
+     int read_error;
++    block_manager_readahead_t ra;
+ };
+ 
+ /**
+diff --git a/src/sstable/btree/btree_cursor.c b/src/sstable/btree/btree_cursor.c
+index a910d63..7e3ae9b 100644
+--- a/src/sstable/btree/btree_cursor.c
++++ b/src/sstable/btree/btree_cursor.c
+@@ -128,6 +128,12 @@ int btree_cursor_next(btree_cursor_t *cursor)
+         btree_node_done(cursor->current_node, cursor->current_pin);
+         cursor->current_node = NULL;
+ 
++        /* the klog is opened with readahead off for the point lookups sharing it, so a cursor
++         * walking the leaves in order -- a compaction merge, an iterator -- prefetches the ones
++         * ahead itself. a scan that crosses into one more leaf and stops costs nothing extra */
++        block_manager_readahead_note(cursor->tree->bm, &cursor->ra, (uint64_t)next_leaf_offset,
++                                     (uint64_t)cursor->tree->config.target_node_size);
++
+         cursor->current_leaf_offset = next_leaf_offset;
+         if (btree_node_read_cached(cursor->tree, cursor->current_leaf_offset, &cursor->current_node,
+                                    &cursor->current_pin) != 0)
+diff --git a/src/sstable/vlog.c b/src/sstable/vlog.c
+index 552ce83..01fde48 100644
+--- a/src/sstable/vlog.c
++++ b/src/sstable/vlog.c
+@@ -543,13 +543,14 @@ int vlog_read(vlog_t *v, vlog_id_t id, uint8_t **out_value, size_t *out_len)
+     pthread_rwlock_rdlock(&v->index_rw);
+     size_t bucket;
+     const size_t found = vlog_index_locate(v, id, &bucket);
+-    uint64_t offset = 0, value_len = 0;
++    uint64_t offset = 0, value_len = 0, disk_len = 0;
+     uint32_t slot = 0;
+     if (found != SIZE_MAX)
+     {
+         slot = v->buckets[found].segment;
+         offset = v->buckets[found].offset;
+         value_len = v->buckets[found].value_len;
++        disk_len = v->buckets[found].disk_len;
+     }
+     pthread_rwlock_unlock(&v->index_rw);
+ 
+@@ -559,7 +560,13 @@ int vlog_read(vlog_t *v, vlog_id_t id, uint8_t **out_value, size_t *out_len)
+      * concurrently waits for this to drop before it unlinks anything */
+     if (!vlog_segment_acquire(v, slot)) return VLOG_ERR_NOT_FOUND;
+ 
+-    const uint32_t hint = (uint32_t)(VLOG_BLK_HDR_SIZE + value_len);
++    /* the first pread asks for the block's payload as stored. value_len is the decoded length, so
++     * for a compressed value it overshot by what compression saved and read that much of the next
++     * value too -- a 256 KiB value stored in 85 KiB read 256 KiB. the framed size the index records
++     * is exact; the decoded length remains the fallback for an entry that somehow lacks it */
++    const uint64_t framing = block_manager_framed_size(0);
++    const uint32_t hint = (uint32_t)(disk_len > framing ? disk_len - framing
++                                                        : VLOG_BLK_HDR_SIZE + value_len);
+     uint32_t payload_len = 0;
+     const uint8_t *payload = block_manager_borrow_block_data_at_offset(
+         vlog_segment_ensure_open(v, slot), offset, hint, &payload_len);
+diff --git a/test/random_read__tests.c b/test/random_read__tests.c
+new file mode 100644
+index 0000000..44ce5a2
+--- /dev/null
++++ b/test/random_read__tests.c
+@@ -0,0 +1,399 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* what a cold point read costs in disk reads, and that the scans which read a file in order still
++ * prefetch. a file's residency in the page cache is observable with mincore and resettable with
++ * POSIX_FADV_DONTNEED, so a test drops a file's pages, does one read, and counts what came in. the
++ * residency checks are linux only; elsewhere those tests pass without checking anything */
++
++#include <dirent.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../src/base/encoding/encoding.h"
++#include "../src/base/errors.h"
++#include "../src/io/block_manager.h"
++#include "../src/sstable/vlog.h"
++#include "test_utils.h"
++
++#ifdef __linux__
++#include <sys/mman.h>
++#define RR_RESIDENCY 1
++#else
++#define RR_RESIDENCY 0
++#endif
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define RR_DIR      "." PATH_SEPARATOR "test_random_read_db"
++#define RR_DIR_MODE 0755
++#define RR_FILE     RR_DIR PATH_SEPARATOR "blocks"
++#define RR_PAGE     4096u
++
++/* a large value, as a separated value or a merge source's run of blocks would be, and enough of them
++ * that a read in the middle has neighbours on both sides for readahead to pull in */
++#define RR_BLOCK_BYTES (256u * 1024u)
++#define RR_BLOCKS      16
++#define RR_MIDDLE      7
++
++/* how long a test waits for a prefetch it issued to land, polling */
++#define RR_PREFETCH_WAIT_US  (5 * 1000 * 1000)
++#define RR_PREFETCH_POLL_US  1000
++
++/* the user codec the value log test stores through, with an id past the built-ins */
++#define RR_CODEC_ID   TDB_ENCODING_ID_USER_MIN
++#define RR_CODEC_NAME "rr-halves"
++
++static void fresh_dir(void)
++{
++    (void)remove_directory(RR_DIR);
++    (void)mkdir(RR_DIR, RR_DIR_MODE);
++}
++
++static void fill(uint8_t *b, size_t n, unsigned seed)
++{
++    uint32_t s = seed * 2654435761u + 1;
++    for (size_t i = 0; i < n; i++)
++    {
++        s ^= s << 13;
++        s ^= s >> 17;
++        s ^= s << 5;
++        b[i] = (uint8_t)(s >> 24);
++    }
++}
++
++static uint64_t pages_spanned(uint64_t offset, uint64_t len)
++{
++    return (offset + len + RR_PAGE - 1) / RR_PAGE - offset / RR_PAGE;
++}
++
++#if RR_RESIDENCY
++/* pages of [from, to) the page cache holds; to == 0 means the whole file */
++static uint64_t resident_pages(const char *path, uint64_t from, uint64_t to)
++{
++    const int fd = open(path, O_RDONLY);
++    ASSERT_TRUE(fd >= 0);
++    struct stat st;
++    ASSERT_TRUE(fstat(fd, &st) == 0);
++    const uint64_t size = (uint64_t)st.st_size;
++    if (to == 0 || to > size) to = size;
++    uint64_t count = 0;
++    if (size > 0 && from < to)
++    {
++        void *map = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fd, 0);
++        ASSERT_TRUE(map != MAP_FAILED);
++        const size_t pages = (size_t)((size + RR_PAGE - 1) / RR_PAGE);
++        unsigned char *vec = malloc(pages);
++        ASSERT_TRUE(vec != NULL);
++        ASSERT_TRUE(mincore(map, (size_t)size, vec) == 0);
++        for (uint64_t p = from / RR_PAGE; p < (to + RR_PAGE - 1) / RR_PAGE; p++) count += vec[p] & 1;
++        free(vec);
++        munmap(map, (size_t)size);
++    }
++    close(fd);
++    return count;
++}
++
++/* drop the file's pages from the page cache; 0 when it could, so a filesystem that keeps them (a
++ * tmpfs) skips the residency checks rather than failing them */
++static int evict(const char *path)
++{
++    const int fd = open(path, O_RDONLY);
++    ASSERT_TRUE(fd >= 0);
++    (void)fdatasync(fd);
++    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
++    close(fd);
++    if (resident_pages(path, 0, 0) == 0) return 0;
++    printf("(page cache kept %s, residency not checked) ", path);
++    return -1;
++}
++#endif
++
++/* write RR_BLOCKS blocks of RR_BLOCK_BYTES, recording each block's offset */
++static block_manager_t *write_blocks(int64_t *offsets)
++{
++    fresh_dir();
++    block_manager_t *bm = NULL;
++    ASSERT_TRUE(block_manager_open(&bm, RR_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
++    uint8_t *data = malloc(RR_BLOCK_BYTES);
++    ASSERT_TRUE(data != NULL);
++    for (int i = 0; i < RR_BLOCKS; i++)
++    {
++        fill(data, RR_BLOCK_BYTES, (unsigned)i + 1);
++        block_manager_block_t *b = block_manager_block_create(RR_BLOCK_BYTES, data);
++        ASSERT_TRUE(b != NULL);
++        offsets[i] = block_manager_block_write(bm, b);
++        ASSERT_TRUE(offsets[i] >= 0);
++        block_manager_block_free(b);
++    }
++    free(data);
++    return bm;
++}
++
++#if RR_RESIDENCY
++/* a cold point read of the middle block brings in that block's pages and nothing past them */
++static void assert_point_read_is_exact(block_manager_t *bm, const int64_t *offsets)
++{
++    if (evict(RR_FILE) != 0) return;
++    uint32_t got = 0;
++    ASSERT_TRUE(block_manager_borrow_block_data_at_offset(bm, (uint64_t)offsets[RR_MIDDLE],
++                                                          RR_BLOCK_BYTES, &got) != NULL);
++    ASSERT_EQ(got, RR_BLOCK_BYTES);
++    const uint64_t frame = block_manager_framed_size(RR_BLOCK_BYTES);
++    ASSERT_TRUE(resident_pages(RR_FILE, 0, 0) <= pages_spanned((uint64_t)offsets[RR_MIDDLE], frame));
++}
++#endif
++
++void test_point_read_fetches_only_its_block(void)
++{
++    int64_t offsets[RR_BLOCKS];
++    block_manager_t *bm = write_blocks(offsets);
++#if RR_RESIDENCY
++    assert_point_read_is_exact(bm, offsets);
++#endif
++    ASSERT_TRUE(block_manager_close(bm) == 0);
++    (void)remove_directory(RR_DIR);
++}
++
++/* the scans that used to switch the shared descriptor to sequential readahead -- a heap cursor, as
++ * the manifest replay uses, and a count over the file -- and a reopen, which revalidates the file,
++ * leave the next point read as cheap as the first */
++void test_point_read_stays_exact_after_scans_and_reopen(void)
++{
++    int64_t offsets[RR_BLOCKS];
++    block_manager_t *bm = write_blocks(offsets);
++
++    block_manager_cursor_t *c = NULL;
++    ASSERT_TRUE(block_manager_cursor_init(&c, bm) == 0);
++    int seen = 0;
++    block_manager_block_t *b;
++    while ((b = block_manager_cursor_read_and_advance(c)) != NULL)
++    {
++        block_manager_block_free(b);
++        seen++;
++    }
++    block_manager_cursor_free(c);
++    ASSERT_EQ(seen, RR_BLOCKS);
++    ASSERT_EQ(block_manager_count_blocks(bm), RR_BLOCKS);
++#if RR_RESIDENCY
++    assert_point_read_is_exact(bm, offsets);
++#endif
++
++    ASSERT_TRUE(block_manager_close(bm) == 0);
++    ASSERT_TRUE(block_manager_open(&bm, RR_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
++#if RR_RESIDENCY
++    assert_point_read_is_exact(bm, offsets);
++#endif
++    ASSERT_TRUE(block_manager_close(bm) == 0);
++    (void)remove_directory(RR_DIR);
++}
++
++/* a cursor reading the file in order prefetches past what it has read, with readahead off on the
++ * descriptor: two reads in, the bytes after the second block arrive without anyone reading them */
++void test_cursor_scan_prefetches_ahead(void)
++{
++    int64_t offsets[RR_BLOCKS];
++    block_manager_t *bm = write_blocks(offsets);
++#if RR_RESIDENCY
++    if (evict(RR_FILE) == 0)
++    {
++        block_manager_cursor_t c;
++        ASSERT_TRUE(block_manager_cursor_init_stack(&c, bm) == 0);
++        for (int i = 0; i < 2; i++)
++        {
++            block_manager_block_t *b = block_manager_cursor_read_and_advance(&c);
++            ASSERT_TRUE(b != NULL);
++            block_manager_block_free(b);
++        }
++        /* the prefetch is asynchronous; wait for its first window, entirely past the bytes read */
++        const uint64_t from = ((uint64_t)offsets[2] / RR_PAGE + 1) * RR_PAGE;
++        const uint64_t to = from + BLOCK_MANAGER_READAHEAD_MIN / 2;
++        const uint64_t want = (to - from) / RR_PAGE;
++        int waited = 0;
++        while (resident_pages(RR_FILE, from, to) < want && waited < RR_PREFETCH_WAIT_US)
++        {
++            usleep(RR_PREFETCH_POLL_US);
++            waited += RR_PREFETCH_POLL_US;
++        }
++        ASSERT_EQ(resident_pages(RR_FILE, from, to), want);
++    }
++#endif
++    ASSERT_TRUE(block_manager_close(bm) == 0);
++    (void)remove_directory(RR_DIR);
++}
++
++/* the window logic on its own, against a handle whose prefetches go nowhere that matters: a lone
++ * read prefetches nothing, a second read continuing it opens the minimum window, refills double
++ * it up to the cap, and a read going backwards or jumping far ahead starts over */
++void test_readahead_window_grows_and_resets(void)
++{
++    int64_t offsets[RR_BLOCKS];
++    block_manager_t *bm = write_blocks(offsets);
++    block_manager_readahead_t ra = {0};
++    const uint64_t len = 4096;
++
++    block_manager_readahead_note(bm, &ra, 0, len);
++    ASSERT_EQ(ra.run, 1u);
++    ASSERT_EQ(ra.window, 0u);
++    ASSERT_EQ(ra.end, 0u);
++
++    block_manager_readahead_note(bm, &ra, len, len);
++    ASSERT_EQ(ra.run, 2u);
++    ASSERT_EQ(ra.window, (uint64_t)BLOCK_MANAGER_READAHEAD_MIN);
++    ASSERT_EQ(ra.end, 2 * len + BLOCK_MANAGER_READAHEAD_MIN);
++
++    /* well inside the window: no refill */
++    block_manager_readahead_note(bm, &ra, 2 * len, len);
++    ASSERT_EQ(ra.window, (uint64_t)BLOCK_MANAGER_READAHEAD_MIN);
++
++    /* a scan with gaps between its reads (internal nodes between leaves) and re-reads overlapping
++     * the last read's tail both still count as continuing, and the window keeps doubling */
++    uint64_t at = 3 * len;
++    for (int i = 0; i < 512; i++)
++    {
++        block_manager_readahead_note(bm, &ra, at, len);
++        at += (i % 2) ? 2 * len : len / 2;
++    }
++    ASSERT_EQ(ra.window, (uint64_t)BLOCK_MANAGER_READAHEAD_MAX);
++    ASSERT_TRUE(ra.end > at);
++    ASSERT_TRUE(ra.run > 500u);
++
++    /* backwards: the read ends before the last one did */
++    block_manager_readahead_note(bm, &ra, 0, len);
++    ASSERT_EQ(ra.run, 1u);
++    ASSERT_EQ(ra.window, 0u);
++
++    /* far ahead: past the gap */
++    block_manager_readahead_note(bm, &ra, len, len);
++    ASSERT_EQ(ra.run, 2u);
++    block_manager_readahead_note(bm, &ra, 2 * len + BLOCK_MANAGER_READAHEAD_GAP + 1, len);
++    ASSERT_EQ(ra.run, 1u);
++    ASSERT_EQ(ra.window, 0u);
++
++    ASSERT_TRUE(block_manager_close(bm) == 0);
++    (void)remove_directory(RR_DIR);
++}
++
++/* a codec storing a value made of two equal halves as one half: compressible by exactly two without
++ * depending on which compression libraries the build has */
++static int halves_encode(void *ctx, const uint8_t *src, size_t n, uint8_t **dst, size_t *dst_n)
++{
++    (void)ctx;
++    if (n % 2 || memcmp(src, src + n / 2, n / 2) != 0) return TDB_ERR_INVALID_ARGS;
++    *dst = malloc(n / 2);
++    if (!*dst) return TDB_ERR_MEMORY;
++    memcpy(*dst, src, n / 2);
++    *dst_n = n / 2;
++    return TDB_SUCCESS;
++}
++
++static int halves_decode(void *ctx, const uint8_t *src, size_t n, uint8_t **dst, size_t *dst_n)
++{
++    (void)ctx;
++    *dst = malloc(2 * n);
++    if (!*dst) return TDB_ERR_MEMORY;
++    memcpy(*dst, src, n);
++    memcpy(*dst + n, src, n);
++    *dst_n = 2 * n;
++    return TDB_SUCCESS;
++}
++
++#if RR_RESIDENCY
++/* the one segment file the store wrote */
++static void segment_path(char *out, size_t cap)
++{
++    DIR *d = opendir(RR_DIR);
++    ASSERT_TRUE(d != NULL);
++    struct dirent *e;
++    int found = 0;
++    while ((e = readdir(d)) != NULL)
++    {
++        const size_t n = strlen(e->d_name);
++        if (n > 5 && strcmp(e->d_name + n - 5, ".vlog") == 0)
++        {
++            snprintf(out, cap, "%s%s%s", RR_DIR, PATH_SEPARATOR, e->d_name);
++            found++;
++        }
++    }
++    closedir(d);
++    ASSERT_EQ(found, 1);
++}
++#endif
++
++/* a compressed value read cold costs what it occupies on disk, not its decoded length: the read
++ * used to ask for the decoded length and pulled in that much of the values stored after it */
++void test_compressed_value_read_fetches_its_stored_bytes(void)
++{
++    fresh_dir();
++    tidesdb_encoding_registry_t reg;
++    ASSERT_TRUE(tidesdb_encoding_registry_init(&reg) == TDB_SUCCESS);
++    ASSERT_TRUE(tidesdb_encoding_register(&reg, RR_CODEC_NAME, RR_CODEC_ID, halves_encode,
++                                          halves_decode, NULL) == TDB_SUCCESS);
++    const vlog_config_t cfg = {
++        .encodings = &reg, .sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
++    vlog_t *v = NULL;
++    ASSERT_TRUE(vlog_open(RR_DIR, &cfg, &v) == VLOG_OK);
++
++    const uint8_t ids[1] = {RR_CODEC_ID};
++    uint8_t *val = malloc(RR_BLOCK_BYTES);
++    ASSERT_TRUE(val != NULL);
++    vlog_id_t vid[RR_BLOCKS];
++    uint64_t disk[RR_BLOCKS];
++    for (int i = 0; i < RR_BLOCKS; i++)
++    {
++        fill(val, RR_BLOCK_BYTES / 2, (unsigned)i + 1);
++        memcpy(val + RR_BLOCK_BYTES / 2, val, RR_BLOCK_BYTES / 2);
++        ASSERT_TRUE(vlog_write(v, val, RR_BLOCK_BYTES, ids, 1, &vid[i], &disk[i]) == VLOG_OK);
++        ASSERT_TRUE(disk[i] < RR_BLOCK_BYTES / 2 + RR_PAGE); /* it really was stored halved */
++    }
++
++#if RR_RESIDENCY
++    char path[1024];
++    segment_path(path, sizeof(path));
++    if (evict(path) == 0)
++    {
++        uint8_t *got = NULL;
++        size_t got_n = 0;
++        ASSERT_TRUE(vlog_read(v, vid[RR_MIDDLE], &got, &got_n) == VLOG_OK);
++        ASSERT_EQ(got_n, RR_BLOCK_BYTES);
++        free(got);
++        /* one extra page for the frame straddling a page boundary at either end */
++        ASSERT_TRUE(resident_pages(path, 0, 0) <= disk[RR_MIDDLE] / RR_PAGE + 2);
++    }
++#endif
++
++    /* and every value still decodes to itself */
++    for (int i = 0; i < RR_BLOCKS; i++)
++    {
++        fill(val, RR_BLOCK_BYTES / 2, (unsigned)i + 1);
++        memcpy(val + RR_BLOCK_BYTES / 2, val, RR_BLOCK_BYTES / 2);
++        uint8_t *got = NULL;
++        size_t got_n = 0;
++        ASSERT_TRUE(vlog_read(v, vid[i], &got, &got_n) == VLOG_OK);
++        ASSERT_EQ(got_n, RR_BLOCK_BYTES);
++        ASSERT_EQ(memcmp(got, val, RR_BLOCK_BYTES), 0);
++        free(got);
++    }
++    free(val);
++    vlog_close(v);
++    (void)remove_directory(RR_DIR);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_point_read_fetches_only_its_block, tests_passed);
++    RUN_TEST(test_point_read_stays_exact_after_scans_and_reopen, tests_passed);
++    RUN_TEST(test_cursor_scan_prefetches_ahead, tests_passed);
++    RUN_TEST(test_readahead_window_grows_and_resets, tests_passed);
++    RUN_TEST(test_compressed_value_read_fetches_its_stored_bytes, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
