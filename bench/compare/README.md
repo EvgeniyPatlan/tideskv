@@ -118,6 +118,34 @@ fio curve follows the table.
 - `ERR` cells name their cause under the table.
 - The W6 line shows the achieved DEL rate against the target. A server below 90% of the target gets a note, because its reads ran against fewer deletes.
 
+## Profiling
+
+`profile.sh` runs TidesKV alone under perf while a workload's timed run is going:
+
+```bash
+bench/compare/profile.sh [--quick|--medium] [--strict] [--seconds N] --out DIR W1 [W3 ...]
+```
+
+- It builds two images from the committed tree (it refuses uncommitted changes under the image paths), tagged by content so reruns reuse them: `tideskv-prof:<hash>` is the server built with `-fno-omit-frame-pointer`, and `tideskv-perf:<hash>` is built `FROM` it with `linux-tools-generic`. perf must run in the second image so that it sees the same binaries at the same paths and can name TidesKV and TidesDB frames.
+- It loads the data set once, profiles each named workload (W1..W6) at the relaxed level, and with `--strict` restarts the server in strict mode and profiles them again. The size defaults to `--medium`. `WARMUP` and `DURATION` default to 40 and 60 s here and can be overridden by env.
+- perf samples for `--seconds` (default 30) starting 15 s into the timed run, at 499 Hz with frame-pointer call graphs. Keep `--seconds` at or below `DURATION - 15`.
+- The data dir is removed at the end, as in `run.sh`.
+
+Per workload and level (`<level>` is `relaxed` or `strict`), under `DIR`:
+
+- `perf/<level>-<W>.data`: the raw perf data, kept for offline reading.
+- `perf/<level>-<W>.flat.txt`: self time by library and symbol. `perf/<level>-<W>.tree.txt`: inclusive time with callers and callees. `perf/<level>-<W>.threads.txt`: self time by thread name (for example `compaction.` threads).
+- `info-<level>-<W>-{before,after}.txt`: `INFO all` around the run. The usual memtier results are under `DIR/tideskv/<level>/`.
+
+To read a `.data` file again, run `perf report` in the perf image, for example:
+
+```bash
+docker run --rm -v "$PWD/DIR/perf:/out" -w /out tideskv-perf:<hash> \
+  perf report -i relaxed-W1.data --no-children --stdio --percent-limit 0.7 -g none --sort dso,sym
+```
+
+The perf sidecar shares the server's pid namespace and has profiling capabilities only (`PERFMON`, `SYS_PTRACE`, and `IPC_LOCK` for perf's locked buffers). It is pinned to CPUs 4-7 and is removed when perf finishes. The frame-pointer build is not the build `run.sh` measures, so do not compare throughput between the two.
+
 ## After Ctrl-C
 
 An interrupted run leaves `build/bench/<ts>/data` holding files owned by root and uid 999. Delete them from a container:
