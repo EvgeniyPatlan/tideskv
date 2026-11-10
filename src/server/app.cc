@@ -431,6 +431,17 @@ void App::FillStorageStats(ServerStats& s) const {
       s.storage_keys += st->cf[CfIndex(cf)].total_keys;
       s.storage_tombstones += st->cf[CfIndex(cf)].total_tombstones;
     }
+    for (ColumnFamily cf : kAllColumnFamilies) {
+      const CfStats& c = st->cf[CfIndex(cf)];
+      ServerStats::CfIo io{std::string(ColumnFamilyName(cf)), c.flush_bytes_written, c.compaction_bytes_read,
+                           c.compaction_bytes_written, c.user_bytes_written, {}};
+      for (size_t l = 0; l < c.levels.size(); ++l) {
+        if (l > 0) io.levels += ',';
+        io.levels += "L" + std::to_string(l + 1) + "=" + std::to_string(c.levels[l].first) + "/" +
+                     std::to_string(c.levels[l].second);
+      }
+      s.storage_cf_io.push_back(std::move(io));
+    }
     s.storage_flushes = st->flush_count;
     s.storage_compactions = st->compaction_count;
   }

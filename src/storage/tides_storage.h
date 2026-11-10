@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "storage/compactor.h"
 #include "storage/storage.h"
@@ -22,6 +24,11 @@ struct CfStats {
   uint64_t compaction_count = 0;
   int l1_file_count_trigger = 0;  // as configured on the family
   int dividing_level_offset = 0;  // as configured on the family
+  uint64_t flush_bytes_written = 0;       // on-disk bytes flushes wrote to L1
+  uint64_t compaction_bytes_read = 0;     // on-disk input bytes of compactions
+  uint64_t compaction_bytes_written = 0;  // on-disk output bytes of compactions
+  uint64_t user_bytes_written = 0;        // logical key+value bytes committed
+  std::vector<std::pair<int, uint64_t>> levels;  // (sstables, bytes) for L1..Ln, existing levels only
 };
 
 struct StorageStats {

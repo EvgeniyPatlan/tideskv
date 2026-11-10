@@ -84,6 +84,16 @@ struct ServerStats {
   uint64_t storage_tombstones = 0;
   uint64_t storage_flushes = 0;
   uint64_t storage_compactions = 0;
+  // Per-column-family flush/compaction byte counters and level layout, in ColumnFamily order.
+  struct CfIo {
+    std::string name;
+    uint64_t flush_bytes_written = 0;
+    uint64_t compaction_bytes_read = 0;
+    uint64_t compaction_bytes_written = 0;
+    uint64_t user_bytes_written = 0;
+    std::string levels;  // "L1=<tables>/<bytes>,L2=..." for the levels that exist
+  };
+  std::vector<CfIo> storage_cf_io;
   uint64_t background_compactions = 0;          // CompactionScheduler jobs completed
   uint64_t background_compaction_failures = 0;  // jobs given up after retries
   uint64_t expired_keys = 0;                    // removed by the active-expiry reaper

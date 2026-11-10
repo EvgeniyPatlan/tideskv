@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -108,6 +109,44 @@ TEST(CompactionIT, FlushDbPhysicallyReclaimsThatDbsKeys) {
   EXPECT_EQ(c->Command({"SELECT", "0"}).str, "OK");
   EXPECT_EQ(c->Command({"GET", "live0"}).str, "v");
   EXPECT_EQ(Info(*c, "background_compaction_failures"), 0);
+}
+
+std::string InfoStr(RespClient& c, const std::string& field) {
+  const std::string info = c.Command({"INFO", "persistence"}).str;
+  const size_t at = info.find(field + ":");
+  if (at == std::string::npos) return "";
+  const size_t end = info.find("\r\n", at);
+  return info.substr(at + field.size() + 1, end - at - field.size() - 1);
+}
+
+TEST(CompactionIT, InfoReportsCompactionBytes) {
+  TestServer s(TIDESKV_SERVER_BIN,
+               {.extra_args = {"--memtable-size", "1mb", "--compaction-collection-deletes", "3"}});
+  auto c = s.Connect();
+  ASSERT_NE(c, nullptr);
+  constexpr int kFields = 3000;
+  std::vector<std::string> hset = {"HSET", "keep"};
+  for (int i = 0; i < kFields; ++i) {
+    hset.push_back("f" + std::to_string(i));
+    hset.push_back(std::string(100, 'v'));
+  }
+  EXPECT_EQ(c->Command(hset).integer, kFields);
+  for (const char* k : {"h1", "h2", "h3"}) {
+    hset[1] = k;
+    EXPECT_EQ(c->Command(hset).integer, kFields);
+    EXPECT_EQ(c->Command({"DEL", k}).integer, 1);
+  }
+  EXPECT_GE(WaitAtLeast(*c, "background_compactions", 2), 2);
+  EXPECT_EQ(c->Command({"SELECT", "9"}).str, "OK");
+  EXPECT_EQ(c->Command({"FLUSHDB"}).str, "OK");  // checkpoint flush of every memtable
+  EXPECT_GT(WaitAtLeast(*c, "cf_subkey_flush_bytes_written", 1), 0);
+  EXPECT_GT(Info(*c, "cf_subkey_compaction_bytes_written"), 0);
+  EXPECT_GT(Info(*c, "cf_subkey_compaction_bytes_read"), 0);
+  EXPECT_GT(Info(*c, "cf_subkey_user_bytes_written"), 0);
+  for (const char* name : {"meta", "zscore", "expire", "replog", "sys"})
+    EXPECT_GE(Info(*c, std::string("cf_") + name + "_flush_bytes_written"), 0) << name;
+  EXPECT_TRUE(std::regex_match(InfoStr(*c, "cf_subkey_levels"), std::regex(R"(L1=\d+/\d+(,L\d+=\d+/\d+)*)")))
+      << InfoStr(*c, "cf_subkey_levels");
 }
 
 }  // namespace

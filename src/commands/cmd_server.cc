@@ -43,6 +43,14 @@ Fields PersistenceFields(const ServerStats& s) {
               {"compactions", std::to_string(s.storage_compactions)},
               {"background_compactions", std::to_string(s.background_compactions)},
               {"background_compaction_failures", std::to_string(s.background_compaction_failures)}};
+  for (const auto& io : s.storage_cf_io) {
+    const std::string p = "cf_" + io.name + "_";
+    f.insert(f.end(), {{p + "flush_bytes_written", std::to_string(io.flush_bytes_written)},
+                       {p + "compaction_bytes_read", std::to_string(io.compaction_bytes_read)},
+                       {p + "compaction_bytes_written", std::to_string(io.compaction_bytes_written)},
+                       {p + "user_bytes_written", std::to_string(io.user_bytes_written)},
+                       {p + "levels", io.levels}});
+  }
   if (!s.loading) return f;
   f.insert(f.end(), {{"loading_start_time", std::to_string(s.loading_start_time)},
                      {"loading_total_bytes", "0"},

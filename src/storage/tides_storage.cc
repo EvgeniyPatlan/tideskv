@@ -510,7 +510,12 @@ Result<StorageStats> TidesStorage::Stats() {
       return FromTdb(rc, "get_cf_stats");
     }
     out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count,
-                           st.config.l1_file_count_trigger, st.config.dividing_level_offset};
+                           st.config.l1_file_count_trigger, st.config.dividing_level_offset,
+                           st.flush_bytes_written, st.compaction_bytes_read, st.compaction_bytes_written,
+                           st.user_bytes_written, {}};
+    for (int l = 0; l < st.num_levels && l < TDB_MAX_LEVELS; ++l) {
+      out.cf[CfIndex(cf)].levels.emplace_back(st.level_num_sstables[l], st.level_sizes[l]);
+    }
   }
   return out;
 }
