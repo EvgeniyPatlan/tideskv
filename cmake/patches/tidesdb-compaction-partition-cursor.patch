@@ -1,0 +1,311 @@
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+index acea8c1..f3ea537 100644
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -222,10 +222,14 @@ static int ce_sink_seal(ce_sink_t *s)
+     return TDB_SUCCESS;
+ }
+ 
+-/* the boundary partition a key falls in -- the count of boundaries at or below it */
+-static int ce_partition_of(const compaction_job_t *job, const uint8_t *key, size_t key_size)
+-{
+-    int p = 0;
++/* the boundary partition a key falls in -- the count of boundaries at or below it. keys of one merge
++ * arrive in ascending order, so the search starts at the partition of the key before (from) rather
++ * than at the first boundary; it is the same answer for any key at or past the one that gave from,
++ * and from = 0 is always valid */
++int ce_partition_of_from(const compaction_job_t *job, const uint8_t *key, size_t key_size,
++                         int from)
++{
++    int p = from;
+     while (p < job->n_boundaries &&
+            tdb_key_cmp(key, key_size, job->boundaries[p], job->boundary_sizes[p]) >= 0)
+         p++;
+@@ -236,14 +240,17 @@ static int ce_partition_of(const compaction_job_t *job, const uint8_t *key, size
+ static int ce_sink_maybe_roll(ce_sink_t *s, const compaction_job_t *job, const uint8_t *key,
+                               size_t key_size)
+ {
+-    const int part = ce_partition_of(job, key, key_size);
++    /* only a boundary roll reads the partition, so a merge that does not split at boundaries skips
++     * the lookup */
++    const int by_boundary = job->split == COMPACTION_SPLIT_BOUNDARIES;
++    const int part =
++        by_boundary ? ce_partition_of_from(job, key, key_size, s->cur_partition) : 0;
+     if (s->cur_open)
+     {
+         /* the two reasons are independent: a partitioned merge still caps each partition's output,
+          * and a cap alone splits an unaligned merge. the caller rolls only on a new distinct key,
+          * so neither ever divides a key's version chain */
+-        const int at_boundary =
+-            job->split == COMPACTION_SPLIT_BOUNDARIES && part > s->cur_partition;
++        const int at_boundary = by_boundary && part > s->cur_partition;
+         const int at_cap =
+             job->file_max > 0 && sstable_builder_klog_bytes(s->cur_builder) >= job->file_max;
+         if ((at_boundary || at_cap) && ce_sink_seal(s) != TDB_SUCCESS) return TDB_ERR_IO;
+diff --git a/src/compaction/compaction_internal.h b/src/compaction/compaction_internal.h
+index 4a1c269..dff37a2 100644
+--- a/src/compaction/compaction_internal.h
++++ b/src/compaction/compaction_internal.h
+@@ -40,6 +40,19 @@ typedef struct
+     const range_tombstone_set_t *carried;
+ } ce_sink_t;
+ 
++/**
++ * ce_partition_of_from
++ * the boundary partition a key falls in, searching forward from a partition already known to be at
++ * or below it. exposed for the partition suite
++ * @param job the job, whose boundaries are sorted ascending
++ * @param key the key
++ * @param key_size the key's length
++ * @param from the partition of an earlier key of the same merge, or 0
++ * @return the count of boundaries at or below the key
++ */
++int ce_partition_of_from(const compaction_job_t *job, const uint8_t *key, size_t key_size,
++                         int from);
++
+ /**
+  * ce_commit
+  * record the outputs and the removed inputs in one manifest batch, then swap the level set, rolling
+diff --git a/test/compaction_partition__tests.c b/test/compaction_partition__tests.c
+new file mode 100644
+index 0000000..e9553cd
+--- /dev/null
++++ b/test/compaction_partition__tests.c
+@@ -0,0 +1,237 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the boundary partition a merge looks up for each key it enters. keys arrive in ascending order,
++ * so the lookup starts from the partition of the key before and must agree with a scan from the
++ * first boundary; and a merge that does not split at boundaries must not let them change its
++ * outputs. the exec suite's helpers are reused by including the suite with its main renamed */
++
++#define main ce_exec_suite_main
++#include "compaction_exec__tests.c"
++#undef main
++
++#include "../src/compaction/compaction_internal.h"
++
++#define CP_KEY_LEN 8
++
++typedef struct
++{
++    uint8_t (*keys)[CP_KEY_LEN];
++    const uint8_t **ptrs;
++    size_t *sizes;
++    int n;
++} cp_keys_t;
++
++static uint64_t cp_rng_state = 0x9e3779b97f4a7c15ull;
++
++static uint64_t cp_rng(void)
++{
++    cp_rng_state ^= cp_rng_state << 13;
++    cp_rng_state ^= cp_rng_state >> 7;
++    cp_rng_state ^= cp_rng_state << 17;
++    return cp_rng_state;
++}
++
++static void cp_key_set(uint8_t *dst, uint64_t v)
++{
++    snprintf((char *)dst, CP_KEY_LEN, "k%06llu", (unsigned long long)v);
++}
++
++static void cp_keys_alloc(cp_keys_t *k, int n)
++{
++    k->n = n;
++    k->keys = calloc((size_t)(n > 0 ? n : 1), sizeof(*k->keys));
++    k->ptrs = calloc((size_t)(n > 0 ? n : 1), sizeof(*k->ptrs));
++    k->sizes = calloc((size_t)(n > 0 ? n : 1), sizeof(*k->sizes));
++    ASSERT_TRUE(k->keys && k->ptrs && k->sizes);
++}
++
++static void cp_keys_free(cp_keys_t *k)
++{
++    free(k->keys);
++    free(k->ptrs);
++    free(k->sizes);
++}
++
++/* the partition by the definition: the count of boundaries at or below the key */
++static int cp_linear(const compaction_job_t *job, const uint8_t *key, size_t size)
++{
++    int c = 0;
++    for (int i = 0; i < job->n_boundaries; i++)
++        if (tdb_key_cmp(key, size, job->boundaries[i], job->boundary_sizes[i]) >= 0) c++;
++    return c;
++}
++
++/* a stream of 10000 ascending keys, with n_boundaries boundaries drawn from its middle so some keys
++ * sit below the first and some above the last, and every boundary key is itself in the stream */
++static void cp_check_stream(int n_boundaries)
++{
++    enum { STREAM = 10000 };
++    uint8_t(*stream)[CP_KEY_LEN] = calloc(STREAM, sizeof(*stream));
++    ASSERT_TRUE(stream != NULL);
++    uint64_t v = 100;
++    for (int i = 0; i < STREAM; i++)
++    {
++        v += 1 + cp_rng() % 3;
++        cp_key_set(stream[i], v);
++    }
++
++    cp_keys_t b;
++    cp_keys_alloc(&b, n_boundaries);
++    int at = STREAM / 10;
++    for (int i = 0; i < n_boundaries; i++)
++    {
++        const int room = (STREAM - 2 * (STREAM / 10)) / (n_boundaries > 0 ? n_boundaries : 1);
++        at += 1 + (int)(cp_rng() % (uint64_t)(room > 1 ? room : 1));
++        if (at >= STREAM - STREAM / 10) at = STREAM - STREAM / 10 - 1;
++        memcpy(b.keys[i], stream[at], CP_KEY_LEN);
++        b.ptrs[i] = b.keys[i];
++        b.sizes[i] = strlen((const char *)b.keys[i]);
++    }
++    /* clamping can repeat a boundary; the planner never emits duplicates, so drop them */
++    int w = 0;
++    for (int i = 0; i < n_boundaries; i++)
++        if (w == 0 || tdb_key_cmp(b.ptrs[i], b.sizes[i], b.ptrs[w - 1], b.sizes[w - 1]) > 0)
++        {
++            b.ptrs[w] = b.ptrs[i];
++            b.sizes[w] = b.sizes[i];
++            w++;
++        }
++
++    compaction_job_t job = {0};
++    job.split = COMPACTION_SPLIT_BOUNDARIES;
++    job.boundaries = b.ptrs;
++    job.boundary_sizes = b.sizes;
++    job.n_boundaries = w;
++
++    int cursor = 0;
++    for (int i = 0; i < STREAM; i++)
++    {
++        const size_t size = strlen((const char *)stream[i]);
++        const int expect = cp_linear(&job, stream[i], size);
++        cursor = ce_partition_of_from(&job, stream[i], size, cursor);
++        ASSERT_EQ(cursor, expect);
++    }
++    ASSERT_EQ(cursor, w);
++
++    cp_keys_free(&b);
++    free(stream);
++}
++
++void test_partition_of_matches_linear_scan(void)
++{
++    cp_check_stream(0);
++    cp_check_stream(1);
++    cp_check_stream(2);
++    cp_check_stream(110);
++}
++
++/* a lookup that starts partway returns what a scan from the start would, for any key at or past
++ * the one that gave the start */
++void test_partition_of_from_any_earlier_partition(void)
++{
++    const uint8_t *bp[3] = {(const uint8_t *)"b", (const uint8_t *)"d", (const uint8_t *)"f"};
++    const size_t bz[3] = {1, 1, 1};
++    compaction_job_t job = {0};
++    job.split = COMPACTION_SPLIT_BOUNDARIES;
++    job.boundaries = bp;
++    job.boundary_sizes = bz;
++    job.n_boundaries = 3;
++    const char *keys[] = {"a", "b", "bb", "c", "d", "e", "f", "g"};
++    const int expect[] = {0, 1, 1, 1, 2, 2, 3, 3};
++    for (int k = 0; k < 8; k++)
++        for (int from = 0; from <= expect[k]; from++)
++            ASSERT_EQ(ce_partition_of_from(&job, (const uint8_t *)keys[k], strlen(keys[k]), from),
++                      expect[k]);
++}
++
++static int cp_outputs_at(ce_db_t *db, int level, sstable_t **out, int cap)
++{
++    return level_set_overlapping(db->cf->levels, level, (const uint8_t *)"a", 1,
++                                 (const uint8_t *)"z", 1, out, cap);
++}
++
++/* a merge that does not split at boundaries writes the files the size cap alone calls for, whether
++ * or not the job carries boundaries */
++static int cp_run_split_none(int with_boundaries, uint64_t file_max)
++{
++    ce_db_t db;
++    ce_db_open(&db);
++    ce_entry_t e[12];
++    char keys[12][8], vals[12][64];
++    for (int i = 0; i < 12; i++)
++    {
++        snprintf(keys[i], sizeof(keys[i]), "k%02d", i);
++        snprintf(vals[i], sizeof(vals[i]), "value-%02d-%0*d", i, 40, i);
++        e[i] = (ce_entry_t){keys[i], vals[i], (uint64_t)i + 1, 0};
++    }
++    const uint64_t id0 = ce_flush(&db, e, 12, 1);
++
++    static const uint8_t b0[] = "k03", b1[] = "k07";
++    const uint8_t *bp[2] = {b0, b1};
++    const size_t bz[2] = {3, 3};
++    const uint64_t inputs[1] = {id0};
++    compaction_job_t job = {0};
++    job.input_ids = inputs;
++    job.n_inputs = 1;
++    job.target_level = 2;
++    job.is_largest_level = 1;
++    job.split = COMPACTION_SPLIT_NONE;
++    job.file_max = file_max;
++    if (with_boundaries)
++    {
++        job.boundaries = bp;
++        job.boundary_sizes = bz;
++        job.n_boundaries = 2;
++    }
++    const compaction_ctx_t cx = {.cf = db.cf,
++                                 .manifest = db.manifest,
++                                 .manifest_path = db.manifest_path,
++                                 .next_sstable_id = &db.next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = db.value_threshold};
++    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
++
++    sstable_t *out[16];
++    const int n = cp_outputs_at(&db, 2, out, 16);
++    /* the outputs, key range of each, folded into one number the two runs compare */
++    int sig = n;
++    for (int i = 0; i < n; i++)
++    {
++        sig = sig * 31 + (int)out[i]->min_key[2] * 7 + (int)out[i]->min_key[1];
++        sig = sig * 31 + (int)out[i]->max_key[2] * 7 + (int)out[i]->max_key[1];
++        if (sstable_unref(out[i])) sstable_close(out[i]);
++    }
++    ce_assert_read(db.cf, 2, "k00", vals[0]);
++    ce_assert_read(db.cf, 2, "k11", vals[11]);
++    ce_db_close(&db);
++    return sig;
++}
++
++void test_split_none_ignores_boundaries(void)
++{
++    /* no cap: one output however many boundaries the job carries */
++    const int bare = cp_run_split_none(0, 0);
++    ASSERT_EQ(cp_run_split_none(1, 0), bare);
++    ASSERT_TRUE(bare != 0);
++    /* a cap that forces several outputs: the same files with and without boundaries */
++    const int capped = cp_run_split_none(0, 200);
++    ASSERT_TRUE(capped != bare);
++    ASSERT_EQ(cp_run_split_none(1, 200), capped);
++}
++
++int main(void)
++{
++    RUN_TEST_HANDLE_BALANCED(test_partition_of_matches_linear_scan, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_partition_of_from_any_earlier_partition, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_split_none_ignores_boundaries, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

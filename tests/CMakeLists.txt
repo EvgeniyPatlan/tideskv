@@ -47,8 +47,9 @@ foreach(suite planner exec)
 endforeach()
 # TidesDB's block cache and merge iterator suites, holding the cases of cmake/patches/tidesdb-cache-* and
 # tidesdb-compaction-merge-level-runs.patch, the random read suite tidesdb-random-read-hint.patch adds,
-# and the range covering suite tidesdb-range-covering-index.patch adds
-foreach(suite cache merge_iter random_read range_covering)
+# the range covering suite tidesdb-range-covering-index.patch adds, and the partition suite
+# tidesdb-compaction-partition-cursor.patch adds
+foreach(suite cache merge_iter random_read range_covering compaction_partition)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)
@@ -64,6 +65,9 @@ add_test(NAME TidesDbRandomRead COMMAND tidesdb_random_read_tests WORKING_DIRECT
 add_test(NAME TidesDbRangeCovering COMMAND tidesdb_range_covering_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the exec suite writes its scratch database under the working directory
 add_test(NAME TidesDbCompactionExec COMMAND tidesdb_exec_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the partition suite runs the exec suite's helpers, so the two share one scratch database and must not overlap
+add_test(NAME TidesDbCompactionPartition COMMAND tidesdb_compaction_partition_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(TidesDbCompactionExec TidesDbCompactionPartition PROPERTIES RESOURCE_LOCK compaction_scratch_db)
 
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)
