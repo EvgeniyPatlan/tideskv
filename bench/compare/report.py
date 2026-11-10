@@ -117,7 +117,7 @@ def parse_cf_counter(text, suffix="compaction_bytes_written"):
 def compaction_bytes_per_op(info0, info1, count):
     """Sum over column families of the compaction bytes written between two INFO snapshots, per op; None if unknown."""
     a, b = parse_cf_counter(info0), parse_cf_counter(info1)
-    if not count or not b:
+    if not count or not a or not b:
         return None
     delta = sum(max(0, v - a.get(cf, 0)) for cf, v in b.items())
     return delta / float(count)

@@ -364,6 +364,15 @@ class DiskBytesTest(unittest.TestCase):
             k = _cellof(report.collect(t), "kvrocks", "relaxed", "W1")
             self.assertIsNone(k["compaction_bytes_per_op"])
 
+    def test_empty_info0_is_none_not_the_cumulative_value(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.json", open(SETGET).read().replace("416298", "18000"))
+            _write(t, "tideskv/relaxed/W1.info0", "")
+            shutil.copy(PERSIST1, os.path.join(t, "tideskv/relaxed/W1.info1"))
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertIsNone(c["compaction_bytes_per_op"])
+
     def test_old_run_without_io_files_renders(self):
         with tempfile.TemporaryDirectory() as t:
             make_run(t)
