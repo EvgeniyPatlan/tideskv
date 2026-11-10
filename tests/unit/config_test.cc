@@ -140,7 +140,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 45u);
+  EXPECT_EQ(c.Get("*").size(), 46u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -281,6 +281,19 @@ TEST(Config, CompactionCollectionDeletes) {
 std::string GetOne(const Config& c, std::string_view name) {
   const auto got = c.Get(name);
   return got.size() == 1 ? got[0].second : "<missing>";
+}
+
+TEST(Config, CompactionCollectionDeadRatio) {
+  Config c;
+  EXPECT_EQ(c.Snapshot().compaction_collection_dead_ratio, 0.2);
+  EXPECT_TRUE(c.Set("compaction-collection-dead-ratio", "0.5", true).ok());  // runtime-mutable
+  EXPECT_EQ(c.Snapshot().compaction_collection_dead_ratio, 0.5);
+  EXPECT_EQ(GetOne(c, "compaction-collection-dead-ratio"), "0.5");
+  EXPECT_TRUE(c.Set("compaction-collection-dead-ratio", "0", true).ok());  // 0 = off
+  EXPECT_FALSE(c.Set("compaction-collection-dead-ratio", "-0.1", true).ok());
+  EXPECT_FALSE(c.Set("compaction-collection-dead-ratio", "1.5", true).ok());
+  EXPECT_FALSE(c.Set("compaction-collection-dead-ratio", "abc", true).ok());
+  EXPECT_EQ(c.Snapshot().compaction_collection_dead_ratio, 0.0);
 }
 
 TEST(ConfigRepl, Defaults) {

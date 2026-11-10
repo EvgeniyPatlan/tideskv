@@ -31,6 +31,9 @@ class RecordingTxn final : public WriteTxn {
   Status Commit() override { return inner_.Commit(); }
   Status Rollback() override;
   void NoteRewrite(ColumnFamily cf, std::string_view key) override { Wrote(cf, key); }  // not captured
+  void HintRangeElements(uint64_t n) override {
+    if (!deletes_.empty()) deletes_.back().elements = n;
+  }
 
   const std::vector<RangeDelete>& deletes() const { return deletes_; }
   // Successful mutations (Put, Delete, DeletePrefix, DeleteRange, NoteRewrite), minus those rolled back.

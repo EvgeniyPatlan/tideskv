@@ -11,6 +11,7 @@ namespace tideskv {
 
 void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
   const uint64_t threshold = options_.collection_delete_threshold();  // outside mu_: reads config
+  const double ratio = options_.dead_ratio_source ? options_.dead_ratio_source() : options_.dead_ratio;
   std::lock_guard lock(mu_);
   const size_t before = queue_.size();
   for (const RangeDelete& d : deletes) {
@@ -18,14 +19,25 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
       EnqueueLocked({d.cf});
     } else if (d.cf == ColumnFamily::kSubkey && d.lo.size() == encoding::ObjectPrefixSize()) {
       ++collection_deletes_;
+      deleted_elements_ += d.elements;
     }
   }
-  if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_) {
+  if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_ &&
+      EnoughIsDead(ratio)) {
     collection_deletes_ = 0;
+    deleted_elements_ = 0;
     EnqueueLocked({ColumnFamily::kSubkey});
     EnqueueLocked({ColumnFamily::kZScore});
   }
   if (queue_.size() != before) cv_.notify_one();
+}
+
+// Only asked once the count and spacing allow a compaction, so reading the stats stays rare.
+bool CompactionScheduler::EnoughIsDead(double ratio) const {
+  if (ratio <= 0 || !options_.subkey_keys) return true;
+  const uint64_t keys = options_.subkey_keys();
+  if (keys == 0) return true;  // nothing in sstables to measure against
+  return static_cast<double>(deleted_elements_) >= ratio * static_cast<double>(keys);
 }
 
 void CompactionScheduler::EnqueueLocked(Job job) {

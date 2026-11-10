@@ -87,6 +87,9 @@ class WriteTxn : public ReadView {
   // Reports that key would have been rewritten with the bytes it already holds: nothing reaches
   // storage, but a transaction that tracks its writes (RecordingTxn, for WATCH) counts it as one.
   virtual void NoteRewrite(ColumnFamily /*cf*/, std::string_view /*key*/) {}
+  // Tells a transaction that tracks its range deletes (RecordingTxn) how many elements the one issued
+  // just before deletes. Storage itself ignores it.
+  virtual void HintRangeElements(uint64_t /*n*/) {}
 };
 
 // ReadViews and WriteTxns must be destroyed before the Storage that created them.

@@ -1,6 +1,8 @@
 #include "server/config.h"
 
 #include <fcntl.h>
+#include <cerrno>
+#include <cstdlib>
 #include <unistd.h>
 
 #include <sys/stat.h>
@@ -25,6 +27,24 @@ Status Bounded(std::string_view v, int64_t lo, int64_t hi, int64_t* out) {
     return Status::InvalidArgument("argument must be between " + std::to_string(lo) + " and " +
                                    std::to_string(hi));
   }
+  return Status::Ok();
+}
+
+std::string FormatDouble(double d) {
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%g", d);
+  return buf;
+}
+
+Status Fraction(std::string_view v, double* out) {
+  const std::string s(v);
+  char* end = nullptr;
+  errno = 0;
+  const double d = std::strtod(s.c_str(), &end);
+  if (s.empty() || end != s.c_str() + s.size() || errno != 0 || !(d >= 0.0 && d <= 1.0)) {
+    return Status::InvalidArgument("argument must be a number between 0 and 1");
+  }
+  *out = d;
   return Status::Ok();
 }
 
@@ -124,6 +144,9 @@ std::vector<Option> BaseOptions() {
          return SetInt(v, 0, 1'000'000'000, &c.compaction_collection_deletes);
        },
        [](const ConfigValues& c) { return std::to_string(c.compaction_collection_deletes); }},
+      {"compaction-collection-dead-ratio", true,
+       [](ConfigValues& c, std::string_view v) { return Fraction(v, &c.compaction_collection_dead_ratio); },
+       [](const ConfigValues& c) { return FormatDouble(c.compaction_collection_dead_ratio); }},
       {"busy-reply-threshold", true,
        [](ConfigValues& c, std::string_view v) {
          return SetInt(v, 0, std::numeric_limits<int64_t>::max(), &c.busy_reply_threshold_ms);

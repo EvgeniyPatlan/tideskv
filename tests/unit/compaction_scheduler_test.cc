@@ -101,6 +101,55 @@ TEST(CompactionScheduler, SlotlessCollectionDeletesAreCounted) {  // their prefi
   EXPECT_EQ(s.pending(), 2u);
 }
 
+RangeDelete Elements(ColumnFamily cf, std::string p, uint64_t n) {
+  RangeDelete d = Prefix(cf, std::move(p));
+  d.elements = n;
+  return d;
+}
+
+CompactionScheduler::Options DeadOpts(uint64_t threshold, uint64_t keys, double ratio) {
+  CompactionScheduler::Options o = Opts(threshold);
+  o.dead_ratio = ratio;
+  o.subkey_keys = [keys] { return keys; };
+  return o;
+}
+
+TEST(CompactionScheduler, DeadRatioHoldsCompactionUntilEnoughIsDead) {
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 1000, 0.2));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
+  EXPECT_EQ(s.pending(), 0u);
+  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
+  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
+  EXPECT_EQ(s.pending(), 2u);  // 250 >= 200
+}
+
+TEST(CompactionScheduler, ZeroKeysFallsBackToCount) {  // everything still in memtables: no division, no hold
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 0, 0.2));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 2; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 5)});
+  EXPECT_EQ(s.pending(), 0u);
+  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 5)});
+  EXPECT_EQ(s.pending(), 2u);
+}
+
+TEST(CompactionScheduler, DeadRatioZeroIsTheOldBehaviour) {
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 1000, 0.0));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
+  EXPECT_EQ(s.pending(), 2u);
+}
+
+TEST(CompactionScheduler, FlushDbIgnoresDeadRatio) {
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 1000, 0.2));
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::DbPrefix(3))});
+  EXPECT_EQ(s.pending(), 1u);
+}
+
 TEST(CompactionScheduler, ThresholdZeroNeverCompactsForCollections) {
   FakeCompactor c;
   CompactionScheduler s(c, Opts(0));

@@ -24,6 +24,9 @@ struct ConfigValues {
   // Until that compaction runs, iterating in a slot right after a very large collection was
   // deleted can be slow (dead subkeys are skipped one by one); with 0 that cost stays.
   uint64_t compaction_collection_deletes = 1000;
+  // ...and only once the deleted elements are at least this fraction of the subkey CF's sstable keys
+  // (0 = count alone). Stops a few big-CF rewrites for a CF that is mostly live.
+  double compaction_collection_dead_ratio = 0.2;
   uint64_t sync_interval_us = 1'000'000;
   uint64_t block_cache_size = 4ULL << 30;
   uint64_t memtable_size = 64ULL << 20;

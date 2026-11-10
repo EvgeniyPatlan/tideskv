@@ -81,8 +81,14 @@ Status DeleteObject(WriteTxn& txn, uint8_t db, std::string_view key, const Metad
       !st.ok()) {
     return st;
   }
+  txn.HintRangeElements(meta.size);  // the scheduler weighs the dead share of the subkey CF
   if (meta.type != ValueType::kZSet) return Status::Ok();
-  return txn.DeletePrefix(ColumnFamily::kZScore, encoding::ZScorePrefix(db, slot, meta.oid));
+  if (Status st = txn.DeletePrefix(ColumnFamily::kZScore, encoding::ZScorePrefix(db, slot, meta.oid));
+      !st.ok()) {
+    return st;
+  }
+  txn.HintRangeElements(meta.size);
+  return Status::Ok();
 }
 
 Status PutObjectMeta(WriteTxn& txn, uint8_t db, std::string_view key, const Metadata& meta) {

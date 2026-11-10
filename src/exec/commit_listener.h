@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@ struct RangeDelete {
   std::string lo;
   std::string hi;  // DeleteRange only; empty = to the end
   bool is_prefix = true;
+  uint64_t elements = 0;  // elements the range is known to delete (a collection delete); 0 = unknown
 };
 
 // Told about the range deletes of each committed write (Engine, M3 plan E6). Called on the

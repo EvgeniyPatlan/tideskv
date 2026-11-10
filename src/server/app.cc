@@ -114,6 +114,11 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
       [this](const std::vector<encoding::ReplOp>& ops) { return repl_log_->CommitStandalone(ops); });
   CompactionScheduler::Options co;
   co.collection_delete_threshold = [this] { return config_->Snapshot().compaction_collection_deletes; };
+  co.dead_ratio_source = [this] { return config_->Snapshot().compaction_collection_dead_ratio; };
+  co.subkey_keys = [this]() -> uint64_t {
+    const auto st = storage_->Stats();
+    return st.ok() ? st->cf[CfIndex(ColumnFamily::kSubkey)].total_keys : 0;
+  };
   scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
   engine_ =
       std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_, repl_log_.get());
