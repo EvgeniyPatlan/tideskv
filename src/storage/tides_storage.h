@@ -22,13 +22,15 @@ struct CfStats {
   uint64_t total_keys = 0;        // in sstables (not the memtable)
   uint64_t total_tombstones = 0;  // point + range tombstones in sstables
   uint64_t compaction_count = 0;
-  int l1_file_count_trigger = 0;  // as configured on the family
-  int dividing_level_offset = 0;  // as configured on the family
-  uint64_t flush_bytes_written = 0;       // on-disk bytes flushes wrote to L1
-  uint64_t compaction_bytes_read = 0;     // on-disk input bytes of compactions
-  uint64_t compaction_bytes_written = 0;  // on-disk output bytes of compactions
-  uint64_t user_bytes_written = 0;        // logical key+value bytes committed
+  int l1_file_count_trigger = 0;                 // as configured on the family
+  int dividing_level_offset = 0;                 // as configured on the family
+  uint64_t flush_bytes_written = 0;              // on-disk bytes flushes wrote to L1
+  uint64_t compaction_bytes_read = 0;            // on-disk input bytes of compactions
+  uint64_t compaction_bytes_written = 0;         // on-disk output bytes of compactions
+  uint64_t user_bytes_written = 0;               // logical key+value bytes committed
   std::vector<std::pair<int, uint64_t>> levels;  // (sstables, bytes) for L1..Ln, existing levels only
+  size_t btree_block_size = 0;                   // as configured on the family
+  int compression_start_level = 0;               // as configured on the family
 };
 
 struct StorageStats {
@@ -36,6 +38,7 @@ struct StorageStats {
   uint64_t flush_count = 0;
   uint64_t compaction_count = 0;
   int immutable_memtables = 0;
+  uint64_t family_config_updates = 0;  // config updates Open issued to existing families
 };
 
 struct StorageOptions {
@@ -51,6 +54,10 @@ struct StorageOptions {
   // TidesDB's defaults (4, 16) throttle every writer while a merge rewrites a large level. 0 = default.
   int l1_file_count_trigger = 0;
   int l0_stall_threshold = 0;
+  // Size of a btree node in bytes (0 = engine default, 4096) and the first level whose tables are
+  // compressed (0 = every level, the flush tier being level 1). Applied to every family at open.
+  size_t btree_block_size = 0;
+  int compression_start_level = 0;
   Compression compression = Compression::kLz4;
 };
 

@@ -50,11 +50,12 @@ endforeach()
 # the range covering suite tidesdb-range-covering-index.patch adds, the partition suite
 # tidesdb-compaction-partition-cursor.patch adds, the single-pass leaf suite
 # tidesdb-btree-single-pass-leaves.patch adds, the leaf arena suite tidesdb-btree-builder-arena.patch
-# adds, the syscall suite tidesdb-io-trim-syscalls.patch adds, and the upstream sstable suite that guards the builder it
+# adds, the syscall suite tidesdb-io-trim-syscalls.patch adds, the start level suite
+# tidesdb-compression-start-level.patch adds, and the upstream sstable suite that guards the builder it
 # changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
-foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim sstable)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level sstable)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   # the btree internals include xxhash.h, which TidesDB keeps under external/
@@ -90,6 +91,8 @@ add_test(NAME TidesDbBtreeSinglePass COMMAND tidesdb_btree_single_pass_tests WOR
 add_test(NAME TidesDbBtreeArena COMMAND tidesdb_btree_arena_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the syscall suite writes its scratch database under the working directory
 add_test(NAME TidesDbIoTrim COMMAND tidesdb_io_trim_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the start level suite writes its scratch database under the working directory
+add_test(NAME TidesDbCompressionStartLevel COMMAND tidesdb_compression_start_level_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the upstream sstable suite writes its scratch files under the working directory
 add_test(NAME TidesDbSstable COMMAND tidesdb_sstable_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 

@@ -58,6 +58,16 @@ Status Memory(std::string_view v, uint64_t min, uint64_t* out) {
   return Status::Ok();
 }
 
+Status MemoryRange(std::string_view v, uint64_t lo, uint64_t hi, uint64_t* out) {
+  uint64_t parsed = 0;
+  if (!ParseMemory(v, &parsed) || parsed < lo || parsed > hi) {
+    return Status::InvalidArgument("argument must be a memory value between " + std::to_string(lo) + " and " +
+                                   std::to_string(hi) + " bytes");
+  }
+  *out = parsed;
+  return Status::Ok();
+}
+
 Status Choice(std::string_view v, std::initializer_list<std::string_view> allowed, std::string* out) {
   const std::string lower = ToLower(v);
   std::string list;
@@ -107,6 +117,9 @@ std::vector<Option> BaseOptions() {
       {"block-cache-size", false,
        [](ConfigValues& c, std::string_view v) { return Memory(v, 0, &c.block_cache_size); },
        [](const ConfigValues& c) { return std::to_string(c.block_cache_size); }},
+      {"btree-block-size", false,
+       [](ConfigValues& c, std::string_view v) { return MemoryRange(v, 4096, 65536, &c.btree_block_size); },
+       [](const ConfigValues& c) { return std::to_string(c.btree_block_size); }},
       {"client-query-buffer-limit", true,
        [](ConfigValues& c, std::string_view v) {
          return Memory(v, 1ULL << 20, &c.client_query_buffer_limit);
@@ -115,6 +128,9 @@ std::vector<Option> BaseOptions() {
       {"compression", false,
        [](ConfigValues& c, std::string_view v) { return Choice(v, {"no", "lz4", "zstd"}, &c.compression); },
        [](const ConfigValues& c) { return c.compression; }},
+      {"compression-start-level", false,
+       [](ConfigValues& c, std::string_view v) { return SetInt(v, 0, 7, &c.compression_start_level); },
+       [](const ConfigValues& c) { return std::to_string(c.compression_start_level); }},
       {"dir", false,
        [](ConfigValues& c, std::string_view v) {
          if (Status st = ValidateNoControlChars(v); !st.ok()) return st;

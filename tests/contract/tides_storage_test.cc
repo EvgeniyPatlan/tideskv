@@ -229,6 +229,62 @@ TEST(TidesStorageMaint, L1FileCountTriggerAppliesToNewAndExistingFamilies) {
   for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 4);
 }
 
+// The block size and the compression start level reach every family, on creation and on reopen, and a
+// reopen with the settings the families already carry issues no config update.
+TEST(TidesStorageMaint, BlockSizeAndCompressionStartLevelApplyAndSkipUnchangedUpdates) {
+  TempDir dir;
+  StorageOptions o = OptionsFor(dir);
+  o.btree_block_size = 16384;
+  o.compression_start_level = 2;
+  {
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    for (const CfStats& cf : st->cf) {
+      EXPECT_EQ(cf.btree_block_size, 16384u);
+      EXPECT_EQ(cf.compression_start_level, 2);
+    }
+  }
+  {  // the same values: nothing to update
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    EXPECT_EQ(st->family_config_updates, 0u);
+    for (const CfStats& cf : st->cf) EXPECT_EQ(cf.btree_block_size, 16384u);
+  }
+  o.btree_block_size = 32768;
+  {  // a changed value reaches the existing families
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    EXPECT_EQ(st->family_config_updates, static_cast<uint64_t>(kColumnFamilyCount));
+    for (const CfStats& cf : st->cf) {
+      EXPECT_EQ(cf.btree_block_size, 32768u);
+      EXPECT_EQ(cf.compression_start_level, 2);
+    }
+  }
+  o.compression_start_level = 0;
+  {
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    for (const CfStats& cf : st->cf) EXPECT_EQ(cf.compression_start_level, 0);
+  }
+  TempDir fresh;  // the defaults are today's behaviour
+  auto s = MustOpen(OptionsFor(fresh));
+  ASSERT_NE(s, nullptr);
+  auto st = s->Stats();
+  ASSERT_TRUE(st.ok());
+  for (const CfStats& cf : st->cf) {
+    EXPECT_EQ(cf.btree_block_size, 4096u);
+    EXPECT_EQ(cf.compression_start_level, 0);
+  }
+}
+
 TEST(TidesStorageMaint, StatsCountKeysAndTombstonesAfterFlush) {
   TempDir dir;
   auto s = MustOpen(OptionsWith(dir, Compression::kNone));

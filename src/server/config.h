@@ -36,6 +36,11 @@ struct ConfigValues {
   // flush tier to reach 16 tables. The cost is a higher ceiling on queued memtables (64 x memtable-size).
   int l1_file_count_trigger = 8;
   int l0_stall_threshold = 64;
+  // Size of a TidesDB btree node (4kb-64kb; the default is TidesDB's own, so nothing changes unless set) and
+  // the first level whose tables are compressed (0 = every level; the flush tier is level 1). Both are
+  // applied to every column family at open.
+  uint64_t btree_block_size = 4096;
+  int compression_start_level = 0;
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   int64_t busy_reply_threshold_ms = 5000;  // busy-reply-threshold / lua-time-limit (M5b)

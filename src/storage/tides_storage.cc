@@ -341,6 +341,8 @@ void SetPipeline(tidesdb_column_family_config_t* cfg, Compression c) {
 struct FamilySettings {
   Compression compression = Compression::kNone;
   int l1_file_count_trigger = 0;  // 0 = keep (default at creation)
+  size_t btree_block_size = 0;    // 0 = keep (default at creation)
+  int compression_start_level = 0;
 };
 
 // TidesDB 10.1.1's default (1) puts the dividing level on the flush tier of a 3-level family, and then
@@ -351,13 +353,16 @@ constexpr int kDividingLevelOffset = 0;
 void ApplySettings(tidesdb_column_family_config_t* cfg, const FamilySettings& f) {
   SetPipeline(cfg, f.compression);
   if (f.l1_file_count_trigger > 0) cfg->l1_file_count_trigger = f.l1_file_count_trigger;
+  if (f.btree_block_size > 0) cfg->btree_klog_block_size = f.btree_block_size;
+  cfg->compression_start_level = f.compression_start_level;
   cfg->dividing_level_offset = kDividingLevelOffset;
 }
 
 // Existing families keep the config persisted in the manifest unless we change it.
 // The update contends with background compaction (TDB_ERR_LOCKED); if it never wins, Open must
 // not fail, so we keep the persisted config (new data is still readable either way).
-Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const FamilySettings& f) {
+Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const FamilySettings& f,
+                           uint64_t* updates) {
   tidesdb_cf_stats_t st{};
   if (int rc = tidesdb_get_cf_stats(cf, &st); rc != TDB_SUCCESS) return FromTdb(rc, "get_cf_stats");
   tidesdb_column_family_config_t cfg = st.config;
@@ -365,8 +370,11 @@ Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const Fam
   const bool same = cfg.encoding_count == st.config.encoding_count &&
                     (cfg.encoding_count == 0 || cfg.encoding_pipeline[0] == st.config.encoding_pipeline[0]) &&
                     cfg.l1_file_count_trigger == st.config.l1_file_count_trigger &&
-                    cfg.dividing_level_offset == st.config.dividing_level_offset;
+                    cfg.dividing_level_offset == st.config.dividing_level_offset &&
+                    cfg.btree_klog_block_size == st.config.btree_klog_block_size &&
+                    cfg.compression_start_level == st.config.compression_start_level;
   if (same) return Status::Ok();
+  ++*updates;
   constexpr int kAttempts = 10;
   int rc = TDB_ERR_LOCKED;
   for (int i = 0; i < kAttempts && rc == TDB_ERR_LOCKED; ++i) {
@@ -380,11 +388,11 @@ Status ApplyFamilySettings(tidesdb_t* db, tidesdb_column_family_t* cf, const Fam
   return FromTdb(rc, "cf_update_runtime_config");
 }
 
-Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, const FamilySettings& f,
+Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, const FamilySettings& f, uint64_t* updates,
                           tidesdb_column_family_t** out) {
   const std::string name(ColumnFamilyName(cf));
   *out = tidesdb_get_column_family(db, name.c_str());
-  if (*out != nullptr) return ApplyFamilySettings(db, *out, f);
+  if (*out != nullptr) return ApplyFamilySettings(db, *out, f, updates);
   tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
   ApplySettings(&cfg, f);
   const int rc = tidesdb_create_column_family(db, name.c_str(), &cfg);
@@ -399,6 +407,7 @@ struct TidesStorage::Impl {
   tidesdb_t* db = nullptr;
   CfHandles cfs{};
   Compression compression = Compression::kNone;
+  uint64_t family_config_updates = 0;  // issued by Open to families that already existed
   // D1 (M6a): TidesDB 10.1.1 can tear or lose concurrently committed txns across a memtable
   // rotation on kill -9 (notes/m6-research/tidesdb-replication.md §5.2). Every commit and
   // checkpoint (a forced rotation) runs under this mutex until upstream fixes the split-apply race.
@@ -431,9 +440,12 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
   }
   if (rc != TDB_SUCCESS) return FromTdb(rc, "open " + o.path);
   const Compression comp = Effective(o.compression);
-  const FamilySettings settings{comp, o.l1_file_count_trigger};
+  const FamilySettings settings{comp, o.l1_file_count_trigger, o.btree_block_size, o.compression_start_level};
   for (ColumnFamily cf : kAllColumnFamilies) {
-    if (Status st = EnsureColumnFamily(impl->db, cf, settings, &impl->cfs[CfIndex(cf)]); !st.ok()) return st;
+    if (Status st =
+            EnsureColumnFamily(impl->db, cf, settings, &impl->family_config_updates, &impl->cfs[CfIndex(cf)]);
+        !st.ok())
+      return st;
   }
   impl->compression = comp;
   return std::unique_ptr<TidesStorage>(new TidesStorage(std::move(impl)));
@@ -504,15 +516,24 @@ Result<StorageStats> TidesStorage::Stats() {
   out.flush_count = db.flush_count;
   out.compaction_count = db.compaction_count;
   out.immutable_memtables = db.immutable_memtable_count;
+  out.family_config_updates = impl_->family_config_updates;
   for (ColumnFamily cf : kAllColumnFamilies) {
     tidesdb_cf_stats_t st{};
     if (int rc = tidesdb_get_cf_stats(impl_->cfs[CfIndex(cf)], &st); rc != TDB_SUCCESS) {
       return FromTdb(rc, "get_cf_stats");
     }
-    out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count,
-                           st.config.l1_file_count_trigger, st.config.dividing_level_offset,
-                           st.flush_bytes_written, st.compaction_bytes_read, st.compaction_bytes_written,
-                           st.user_bytes_written, {}};
+    out.cf[CfIndex(cf)] = {st.total_keys,
+                           st.total_tombstones,
+                           st.compaction_count,
+                           st.config.l1_file_count_trigger,
+                           st.config.dividing_level_offset,
+                           st.flush_bytes_written,
+                           st.compaction_bytes_read,
+                           st.compaction_bytes_written,
+                           st.user_bytes_written,
+                           {}};
+    out.cf[CfIndex(cf)].btree_block_size = st.config.btree_klog_block_size;
+    out.cf[CfIndex(cf)].compression_start_level = st.config.compression_start_level;
     for (int l = 0; l < st.num_levels && l < TDB_MAX_LEVELS; ++l) {
       out.cf[CfIndex(cf)].levels.emplace_back(st.level_num_sstables[l], st.level_sizes[l]);
     }

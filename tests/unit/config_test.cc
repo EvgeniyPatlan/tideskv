@@ -35,6 +35,8 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_TRUE(v.requirepass.empty());
   EXPECT_EQ(v.l1_file_count_trigger, 8);
   EXPECT_EQ(v.l0_stall_threshold, 64);
+  EXPECT_EQ(v.btree_block_size, 4096u);
+  EXPECT_EQ(v.compression_start_level, 0);
 }
 
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
@@ -110,7 +112,12 @@ TEST(Config, ValidatesValues) {
                                                         {"l1-file-count-trigger", "0"},
                                                         {"l1-file-count-trigger", "1025"},
                                                         {"l0-stall-threshold", "1"},
-                                                        {"l0-stall-threshold", "1025"}}) {
+                                                        {"l0-stall-threshold", "1025"},
+                                                        {"btree-block-size", "2kb"},
+                                                        {"btree-block-size", "128kb"},
+                                                        {"btree-block-size", "big"},
+                                                        {"compression-start-level", "-1"},
+                                                        {"compression-start-level", "8"}}) {
     EXPECT_FALSE(c.Set(name, value, false).ok()) << name << "=" << value;
   }
 }
@@ -140,7 +147,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 46u);
+  EXPECT_EQ(c.Get("*").size(), 48u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {
@@ -581,6 +588,22 @@ TEST(ConfigMigrate, TheMigrateKnobsAreRuntimeAndTheDeprecatedOnesStartupOnly) { 
   ASSERT_TRUE(c.LoadFile(WriteFile(dir, "migrate-speed 4096\nmigrate-pipeline-size 16\n")).ok());
   EXPECT_EQ(c.Set("migrate-type", "redis-command", true).message(), "unknown option 'migrate-type'");
   EXPECT_TRUE(c.Get("migrate-type").empty());
+}
+
+// Block size and the level compression starts at: startup only, with the ends of their ranges accepted.
+TEST(Config, BtreeBlockSizeAndCompressionStartLevelAreParsedAndStartupOnly) {
+  Config c;
+  ASSERT_TRUE(c.Set("btree-block-size", "16kb", false).ok());
+  ASSERT_TRUE(c.Set("compression-start-level", "2", false).ok());
+  EXPECT_EQ(c.Snapshot().btree_block_size, 16384u);
+  EXPECT_EQ(c.Snapshot().compression_start_level, 2);
+  ASSERT_TRUE(c.Set("btree-block-size", "4kb", false).ok());
+  ASSERT_TRUE(c.Set("btree-block-size", "64kb", false).ok());
+  EXPECT_EQ(c.Snapshot().btree_block_size, 65536u);
+  ASSERT_TRUE(c.Set("compression-start-level", "7", false).ok());
+  ASSERT_TRUE(c.Set("compression-start-level", "0", false).ok());
+  EXPECT_FALSE(c.Set("btree-block-size", "8kb", true).ok());
+  EXPECT_FALSE(c.Set("compression-start-level", "1", true).ok());
 }
 
 }  // namespace

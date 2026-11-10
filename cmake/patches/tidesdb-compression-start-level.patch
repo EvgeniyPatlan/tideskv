@@ -1,0 +1,508 @@
+diff --git a/include/db.h b/include/db.h
+--- a/include/db.h
++++ b/include/db.h
+@@ -270,6 +270,12 @@
+  * this build lacks is accepted so a database written elsewhere still opens, and fails when such a
+  * node is read
+  * @param encoding_count number of entries in the pipeline, at most TDB_ENCODING_PIPELINE_MAX
++ * @param compression_start_level the first level, counting the flush tier as level 1, whose klog
++ * nodes are encoded with the pipeline. tables written to a level below it carry no pipeline at
++ * all, which saves the codec's cpu on data that the next merge rewrites anyway; a reader decodes
++ * each table by the pipeline in its own footer, so tables of either kind stay readable. 0 and 1
++ * both encode every level, the behaviour before this field existed, and the range is 0 to
++ * TDB_MAX_LEVELS
+  * @param enable_bloom_filter build a partition-range filter for point-get pruning
+  * @param bloom_fpr target bloom false-positive rate when the filter is enabled
+  * @param default_isolation_level isolation applied to a transaction opened without an explicit
+@@ -293,6 +299,7 @@
+     size_t btree_klog_block_size;
+     uint8_t encoding_pipeline[TDB_ENCODING_PIPELINE_MAX];
+     uint8_t encoding_count;
++    int compression_start_level;
+     int enable_bloom_filter;
+     double bloom_fpr;
+     tidesdb_isolation_level_t default_isolation_level;
+diff --git a/src/column_family/cf_config.c b/src/column_family/cf_config.c
+--- a/src/column_family/cf_config.c
++++ b/src/column_family/cf_config.c
+@@ -66,6 +66,13 @@
+         cfg->name, db_threshold, cfg->btree_klog_block_size, CF_CONFIG_MIN_ENTRIES_PER_BLOCK);
+ }
+ 
++uint8_t cf_config_encoding_count_for_level(const tidesdb_column_family_config_t *cfg,
++                                           const int level)
++{
++    if (!cfg) return 0;
++    return level < cfg->compression_start_level ? 0 : cfg->encoding_count;
++}
++
+ int cf_config_validate(const tidesdb_column_family_config_t *cfg,
+                        const tidesdb_encoding_registry_t *reg)
+ {
+@@ -88,6 +95,11 @@
+             if (tidesdb_encoding_find_by_id(reg, cfg->encoding_pipeline[i]) == NULL) return -1;
+     }
+ 
++    /* the start level indexes the level a table is written to, so a negative one or one past the
++     * deepest level has no meaning */
++    if (cfg->compression_start_level < 0 || cfg->compression_start_level > TDB_MAX_LEVELS)
++        return -1;
++
+     /* a bloom filter needs a false-positive rate strictly inside (0, 1) */
+     if (cfg->enable_bloom_filter && (cfg->bloom_fpr <= 0.0 || cfg->bloom_fpr >= 1.0)) return -1;
+ 
+@@ -114,7 +126,8 @@
+     if (!cfg || !out || !out_len) return -1;
+     if (cfg->encoding_count > TDB_ENCODING_PIPELINE_MAX) return -1;
+ 
+-    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count;
++    const size_t tail = cfg->compression_start_level != 0 ? CF_CONFIG_BLOB_START_LEVEL_SIZE : 0;
++    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count + tail;
+     uint8_t *buf = malloc(len);
+     if (!buf) return -1;
+ 
+@@ -142,6 +155,8 @@
+     off += 8;
+     buf[off++] = cfg->encoding_count;
+     memcpy(buf + off, cfg->encoding_pipeline, cfg->encoding_count);
++    off += cfg->encoding_count;
++    if (tail) tdb_encode_be32((uint32_t)cfg->compression_start_level, buf + off);
+ 
+     *out = buf;
+     *out_len = len;
+@@ -181,6 +196,12 @@
+     if (len < (size_t)CF_CONFIG_BLOB_FIXED_SIZE + encoding_count) return -1;
+     out->encoding_count = encoding_count;
+     memcpy(out->encoding_pipeline, data + off, encoding_count);
++    off += encoding_count;
++
++    /* a blob written before the field existed, or with it at 0, ends at the pipeline */
++    out->compression_start_level = 0;
++    if (len >= off + CF_CONFIG_BLOB_START_LEVEL_SIZE)
++        out->compression_start_level = (int)tdb_decode_be32(data + off);
+ 
+     /* every field above came off disk, where a torn write or a hostile blob can leave any bit
+      * pattern that still passes the version and length checks. the decoded config then reaches the
+diff --git a/src/column_family/cf_config.h b/src/column_family/cf_config.h
+--- a/src/column_family/cf_config.h
++++ b/src/column_family/cf_config.h
+@@ -19,13 +19,18 @@
+  * is runtime-mutable and there is no immutable subset. */
+ 
+ /* on-disk version leading a serialized blob; a hard break (v10), so a blob whose version is not the
+- * current one is refused rather than misread */
++ * current one is refused rather than misread. compression_start_level follows the pipeline array as
++ * four bytes, and only when it is not 0, so a default config serializes exactly as before and a
++ * blob with the tail still reads under code that ignores it (it never reads past the pipeline) */
+ #define CF_CONFIG_BLOB_VERSION 10
+ 
+ /* the fixed portion of a serialized blob (version byte through the encoding-count byte); the
+  * variable encoding-id array of encoding_count bytes follows */
+ #define CF_CONFIG_BLOB_FIXED_SIZE 60
+ 
++/* the optional tail after the pipeline array: compression_start_level as a big-endian u32 */
++#define CF_CONFIG_BLOB_START_LEVEL_SIZE 4
++
+ /* the highest encoding id a pipeline entry may carry, named from the enum it is cast to rather than
+  * written as a number so adding an algorithm cannot leave this behind */
+ #define CF_CONFIG_MAX_ENCODING_ID TDB_COMPRESS_LZ4_FAST
+@@ -47,6 +52,16 @@
+ size_t cf_config_value_threshold(const tidesdb_column_family_config_t *cfg, size_t db_threshold);
+ 
+ /**
++ * cf_config_encoding_count_for_level
++ * how many entries of the family's encoding pipeline a table written to a level carries: all of
++ * them from compression_start_level on, none below it
++ * @param cfg the family config
++ * @param level the 1-based level the table is written to, the flush tier being level 1
++ * @return the pipeline length to build the table with
++ */
++uint8_t cf_config_encoding_count_for_level(const tidesdb_column_family_config_t *cfg, int level);
++
++/**
+  * cf_config_validate
+  * check a column family config is well-formed -- name length, encoding pipeline bounds, that every
+  * encoding id names a real algorithm and (when a registry is given) that it is registered, and a
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -109,8 +109,9 @@
+ }
+ 
+ /* fill a builder config from the cf's persisted config and the compaction's shared services */
+-static void ce_builder_config(const compaction_ctx_t *cx, uint64_t id, const char *klog_path,
+-                              tidesdb_column_family_config_t *cc, sstable_builder_config_t *config)
++static void ce_builder_config(const compaction_ctx_t *cx, int level, uint64_t id,
++                              const char *klog_path, tidesdb_column_family_config_t *cc,
++                              sstable_builder_config_t *config)
+ {
+     /* the caller owns the snapshot because the builder config points into its pipeline array, and
+      * that pointer is followed after this returns */
+@@ -128,7 +129,7 @@
+     config->klog_path = klog_path;
+     config->encoding_pipeline = cc->encoding_pipeline;
+     config->encodings = cx->cf->encodings;
+-    config->encoding_count = cc->encoding_count;
++    config->encoding_count = cf_config_encoding_count_for_level(cc, level);
+     config->node_cache = cx->cf->cache;
+     config->arena_pool = cx->cf->arena_pool;
+     config->now = cx->cf->now;
+@@ -173,7 +174,7 @@
+ 
+     sstable_builder_config_t config;
+     tidesdb_column_family_config_t cc;
+-    ce_builder_config(s->cx, id, klog_path, &cc, &config);
++    ce_builder_config(s->cx, s->level, id, klog_path, &cc, &config);
+     config.range_tombstones = s->carried;
+     if (sstable_builder_new(&s->cur_builder, s->cur_bm, s->cx->cf->vlog, &config) != TDB_SUCCESS)
+     {
+@@ -815,6 +816,7 @@
+         tasks[i].job = job;
+         tasks[i].runs = runs;
+         tasks[i].sink.cx = cx;
++        tasks[i].sink.level = job->target_level;
+         tasks[i].sink.prealloc = job->file_max;
+         tasks[i].rc = TDB_SUCCESS;
+         ce_range_bounds(&tasks[i], job, lo, hi);
+@@ -902,6 +904,7 @@
+     ce_sink_t sink;
+     memset(&sink, 0, sizeof(sink));
+     sink.cx = cx;
++    sink.level = job->target_level;
+     sink.prealloc = job->file_max;
+     /* borrowed by the sink for the length of the merge; every output clones what it is given */
+     range_tombstone_set_t *carried = NULL;
+diff --git a/src/compaction/compaction_internal.h b/src/compaction/compaction_internal.h
+--- a/src/compaction/compaction_internal.h
++++ b/src/compaction/compaction_internal.h
+@@ -28,6 +28,8 @@
+ typedef struct
+ {
+     const compaction_ctx_t *cx;
++    /* the 1-based level the outputs land at, which decides whether they carry the encoding pipeline */
++    int level;
+     sstable_t **outputs;
+     uint64_t *sizes;
+     int n_outputs;
+diff --git a/src/flush/flush.c b/src/flush/flush.c
+--- a/src/flush/flush.c
++++ b/src/flush/flush.c
+@@ -97,7 +97,8 @@
+     config->klog_path = klog_path;
+     config->encoding_pipeline = cc->encoding_pipeline;
+     config->encodings = cf->encodings;
+-    config->encoding_count = cc->encoding_count;
++    /* a flush writes the flush tier, level 1 */
++    config->encoding_count = cf_config_encoding_count_for_level(cc, 1);
+     config->node_cache = cf->cache;
+     config->arena_pool = cf->arena_pool;
+     config->now = cf->now;
+diff --git a/test/compression_start_level__tests.c b/test/compression_start_level__tests.c
+new file mode 100644
+--- /dev/null
++++ b/test/compression_start_level__tests.c
+@@ -0,0 +1,304 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* compression_start_level: the first level whose tables carry the family's encoding pipeline. the
++ * flush tier is level 1, so a start level of 2 writes flushes verbatim and encodes what a merge
++ * writes below them. each table records the pipeline it was written with in its own footer, which is
++ * what the reader decodes by, so tables of both kinds sit in one family and stay readable */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../src/base/errors.h"
++#include "../src/column_family/cf_config.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define CSL_DIR    "." PATH_SEPARATOR "test_compression_start_level_db"
++#define CSL_BATCH  64
++#define CSL_BATCHES 4
++
++static int lz4_available(void)
++{
++    return tidesdb_compression_available(TDB_COMPRESS_LZ4) != 0;
++}
++
++static tidesdb_t *csl_open(void)
++{
++    static char path[] = CSL_DIR;
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = path;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    return db;
++}
++
++static tidesdb_column_family_t *csl_create_cf(tidesdb_t *db, int start_level)
++{
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    cc.encoding_pipeline[0] = TDB_COMPRESS_LZ4;
++    cc.encoding_count = 1;
++    cc.compression_start_level = start_level;
++    cc.l1_file_count_trigger = 100; /* no background merge until the test asks for one */
++    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
++    ASSERT_TRUE(cf != NULL);
++    return cf;
++}
++
++static void csl_key(char *buf, size_t cap, int batch, int i)
++{
++    snprintf(buf, cap, "key-%d-%05d", batch, i);
++}
++
++/* writes one batch of compressible values and flushes it to its own level-1 table */
++static void csl_write_batch(tidesdb_t *db, tidesdb_column_family_t *cf, int batch)
++{
++    char value[200];
++    memset(value, 'v', sizeof(value));
++    for (int i = 0; i < CSL_BATCH; i++)
++    {
++        char key[32];
++        csl_key(key, sizeof(key), batch, i);
++        tidesdb_txn_t *t = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_put(t, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)value,
++                                  sizeof(value), -1),
++                  TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
++        tidesdb_txn_free(t);
++    }
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++}
++
++static void csl_check_all_readable(tidesdb_t *db, tidesdb_column_family_t *cf, int batches)
++{
++    for (int b = 0; b < batches; b++)
++    {
++        for (int i = 0; i < CSL_BATCH; i++)
++        {
++            char key[32];
++            csl_key(key, sizeof(key), b, i);
++            tidesdb_txn_t *t = NULL;
++            ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++            uint8_t *got = NULL;
++            size_t got_size = 0;
++            ASSERT_EQ(tidesdb_txn_get(t, cf, (const uint8_t *)key, strlen(key), &got, &got_size),
++                      TDB_SUCCESS);
++            ASSERT_EQ((int)got_size, 200);
++            ASSERT_EQ((int)got[0], 'v');
++            tidesdb_free(got);
++            tidesdb_txn_free(t);
++        }
++    }
++}
++
++typedef struct
++{
++    tidesdb_encoding_stats_t chains[TDB_MAX_ENCODING_CHAINS];
++    size_t n;
++} csl_chains_t;
++
++static void csl_chains(tidesdb_t *db, csl_chains_t *out)
++{
++    out->n = 0;
++    ASSERT_EQ(tidesdb_get_klog_encoding_stats(db, out->chains, TDB_MAX_ENCODING_CHAINS, &out->n),
++              TDB_SUCCESS);
++}
++
++/* the number of tables, across every chain, written with the given pipeline length */
++static uint64_t csl_tables_with(const csl_chains_t *c, int id_count, int id)
++{
++    uint64_t n = 0;
++    for (size_t i = 0; i < c->n; i++)
++    {
++        if (c->chains[i].id_count != id_count) continue;
++        if (id_count > 0 && c->chains[i].ids[0] != id) continue;
++        n += c->chains[i].item_count;
++    }
++    return n;
++}
++
++static uint64_t csl_tables(const csl_chains_t *c)
++{
++    uint64_t n = 0;
++    for (size_t i = 0; i < c->n; i++) n += c->chains[i].item_count;
++    return n;
++}
++
++/* start level 2: the level-1 flush outputs have no codec in their footer pipeline, what a merge
++ * writes below them has LZ4, and every key reads back at each step */
++void test_start_level_skips_upper_levels(void)
++{
++    if (!lz4_available())
++    {
++        printf("(skipped: no lz4) ");
++        return;
++    }
++    (void)remove_directory(CSL_DIR);
++    tidesdb_t *db = csl_open();
++    tidesdb_column_family_t *cf = csl_create_cf(db, 2);
++    for (int b = 0; b < CSL_BATCHES; b++) csl_write_batch(db, cf, b);
++
++    csl_chains_t c;
++    csl_chains(db, &c);
++    ASSERT_TRUE(csl_tables(&c) >= 1);
++    ASSERT_EQ(csl_tables_with(&c, 0, 0), csl_tables(&c)); /* every flush output is verbatim */
++    csl_check_all_readable(db, cf, CSL_BATCHES);
++
++    ASSERT_EQ(tidesdb_compact(db, cf), TDB_SUCCESS);
++    csl_chains(db, &c);
++    ASSERT_TRUE(csl_tables(&c) >= 1);
++    ASSERT_EQ(csl_tables_with(&c, 1, TDB_COMPRESS_LZ4), csl_tables(&c)); /* merge outputs are lz4 */
++    csl_check_all_readable(db, cf, CSL_BATCHES);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CSL_DIR);
++}
++
++/* the default, 0, encodes every level including the flush tier, which is what the field's
++ * absence did before, so the case above is not passing because flushes are never compressed */
++void test_start_level_zero_encodes_every_level(void)
++{
++    if (!lz4_available())
++    {
++        printf("(skipped: no lz4) ");
++        return;
++    }
++    (void)remove_directory(CSL_DIR);
++    tidesdb_t *db = csl_open();
++    tidesdb_column_family_t *cf = csl_create_cf(db, 0);
++    for (int b = 0; b < CSL_BATCHES; b++) csl_write_batch(db, cf, b);
++
++    csl_chains_t c;
++    csl_chains(db, &c);
++    ASSERT_TRUE(csl_tables(&c) >= 1);
++    ASSERT_EQ(csl_tables_with(&c, 1, TDB_COMPRESS_LZ4), csl_tables(&c));
++    csl_check_all_readable(db, cf, CSL_BATCHES);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CSL_DIR);
++}
++
++/* the setting is stored with the family, so a reopen keeps it, a runtime update changes it and
++ * persists, and a family opened over tables of both kinds reads them all */
++void test_start_level_persists(void)
++{
++    if (!lz4_available())
++    {
++        printf("(skipped: no lz4) ");
++        return;
++    }
++    (void)remove_directory(CSL_DIR);
++    tidesdb_t *db = csl_open();
++    tidesdb_column_family_t *cf = csl_create_cf(db, 2);
++    csl_write_batch(db, cf, 0);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++
++    db = csl_open();
++    cf = tidesdb_get_column_family(db, "kv");
++    ASSERT_TRUE(cf != NULL);
++    tidesdb_cf_stats_t st;
++    memset(&st, 0, sizeof(st));
++    ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
++    ASSERT_EQ(st.config.compression_start_level, 2);
++
++    /* change it and write a table under the new setting beside the old one */
++    tidesdb_column_family_config_t cc = st.config;
++    cc.compression_start_level = 0;
++    ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 1), TDB_SUCCESS);
++    csl_write_batch(db, cf, 1);
++    csl_chains_t c;
++    csl_chains(db, &c);
++    ASSERT_EQ(csl_tables_with(&c, 0, 0), 1u);
++    ASSERT_EQ(csl_tables_with(&c, 1, TDB_COMPRESS_LZ4), 1u);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++
++    db = csl_open();
++    cf = tidesdb_get_column_family(db, "kv");
++    ASSERT_TRUE(cf != NULL);
++    memset(&st, 0, sizeof(st));
++    ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
++    ASSERT_EQ(st.config.compression_start_level, 0);
++    csl_check_all_readable(db, cf, 2);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CSL_DIR);
++}
++
++/* a level the tree cannot have is refused, on create and on a runtime update alike */
++void test_start_level_rejects_out_of_range(void)
++{
++    (void)remove_directory(CSL_DIR);
++    tidesdb_t *db = csl_open();
++    tidesdb_column_family_t *cf = csl_create_cf(db, 0);
++    tidesdb_cf_stats_t st;
++    memset(&st, 0, sizeof(st));
++    ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = st.config;
++    cc.compression_start_level = -1;
++    ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 0), TDB_ERR_INVALID_ARGS);
++    cc.compression_start_level = TDB_MAX_LEVELS + 1;
++    ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 0), TDB_ERR_INVALID_ARGS);
++    cc.compression_start_level = TDB_MAX_LEVELS;
++    ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 0), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CSL_DIR);
++}
++
++/* the manifest blob of a default config is byte for byte what it was before the field existed, and
++ * one that carries a start level adds only a tail after the pipeline, which a decoder that stops at
++ * the pipeline never reads. a blob without the tail decodes as 0 */
++void test_start_level_blob_is_compatible(void)
++{
++    tidesdb_column_family_config_t in = tidesdb_default_column_family_config();
++    snprintf(in.name, sizeof(in.name), "%s", "kv");
++    in.encoding_pipeline[0] = TDB_COMPRESS_LZ4;
++    in.encoding_count = 1;
++
++    uint8_t *plain = NULL;
++    size_t plain_len = 0;
++    ASSERT_EQ(cf_config_serialize(&in, &plain, &plain_len), 0);
++    ASSERT_EQ((int)plain_len, CF_CONFIG_BLOB_FIXED_SIZE + 1);
++
++    tidesdb_column_family_config_t out;
++    memset(&out, 0, sizeof(out));
++    out.compression_start_level = 5; /* decode must overwrite it, not leave it */
++    ASSERT_EQ(cf_config_deserialize(plain, plain_len, &out), 0);
++    ASSERT_EQ(out.compression_start_level, 0);
++
++    in.compression_start_level = 3;
++    uint8_t *tailed = NULL;
++    size_t tailed_len = 0;
++    ASSERT_EQ(cf_config_serialize(&in, &tailed, &tailed_len), 0);
++    ASSERT_EQ((int)tailed_len, (int)plain_len + CF_CONFIG_BLOB_START_LEVEL_SIZE);
++    ASSERT_EQ(memcmp(plain, tailed, plain_len), 0); /* the shared prefix is unchanged */
++    memset(&out, 0, sizeof(out));
++    ASSERT_EQ(cf_config_deserialize(tailed, tailed_len, &out), 0);
++    ASSERT_EQ(out.compression_start_level, 3);
++    ASSERT_EQ(cf_config_deserialize(tailed, plain_len, &out), 0); /* old reader's view of it */
++    ASSERT_EQ(out.compression_start_level, 0);
++
++    free(plain);
++    free(tailed);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST_HANDLE_BALANCED(test_start_level_skips_upper_levels, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_start_level_zero_encodes_every_level, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_start_level_persists, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_start_level_rejects_out_of_range, tests_passed);
++    RUN_TEST(test_start_level_blob_is_compatible, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
