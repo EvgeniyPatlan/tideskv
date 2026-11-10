@@ -1,27 +1,5 @@
-diff --git a/src/sstable/btree/btree.h b/src/sstable/btree/btree.h
-index 0a1899d..38e3447 100644
---- a/src/sstable/btree/btree.h
-+++ b/src/sstable/btree/btree.h
-@@ -250,6 +250,17 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, size_t key_s
-  */
- int btree_builder_finish(btree_builder_t *builder, btree_t **tree);
- 
-+/**
-+ * btree_builder_last_key
-+ * the key most recently added to the builder, which sits in the leaf being built until the add
-+ * that follows it
-+ * @param builder the builder
-+ * @param key receives the key, valid until the next add
-+ * @param key_size receives its length
-+ * @return 0 on success, -1 when nothing has been added yet
-+ */
-+int btree_builder_last_key(const btree_builder_t *builder, const uint8_t **key, size_t *key_size);
-+
- /**
-  * btree_builder_free
-  * frees builder resources (call after finish or on error)
 diff --git a/src/sstable/btree/btree_builder.c b/src/sstable/btree/btree_builder.c
-index 7ef91d3..d77fc41 100644
+index 7ef91d3..728348c 100644
 --- a/src/sstable/btree/btree_builder.c
 +++ b/src/sstable/btree/btree_builder.c
 @@ -22,14 +22,12 @@ static btree_pending_leaf_t *btree_pending_leaf_create(void)
@@ -165,7 +143,7 @@ index 7ef91d3..d77fc41 100644
 -    if (vlog_offset == 0 && value && value_size > 0)
 +    btree_pending_slot_t *slot = &leaf->slots[idx];
 +    slot->key_off = leaf->arena_size;
-+    memcpy(leaf->arena + leaf->arena_size, key, key_size);
++    if (key_size) memcpy(leaf->arena + leaf->arena_size, key, key_size);
 +    leaf->arena_size += key_size;
 +    slot->val_off = BTREE_PENDING_NO_VALUE;
 +    if (inline_value)
@@ -414,7 +392,7 @@ index 7ef91d3..d77fc41 100644
      const int64_t next =
          has_next ? (int64_t)(at + block_manager_framed_size((uint32_t)builder->held_leaf_size))
                   : BTREE_LEAF_LINK_NONE;
-@@ -334,9 +366,8 @@ static int btree_builder_write_held_leaf(btree_builder_t *builder, int has_next)
+@@ -334,9 +366,15 @@ static int btree_builder_write_held_leaf(btree_builder_t *builder, int has_next)
          return -1;
      }
  
@@ -422,10 +400,17 @@ index 7ef91d3..d77fc41 100644
 -    builder->held_leaf = NULL;
      builder->held_leaf_size = 0;
 +    builder->expected_next = next;
++    /* one oversized leaf must not pin its buffer for the rest of the build */
++    if (builder->held_leaf_cap > BTREE_PENDING_ARENA_RETAIN_MAX)
++    {
++        free(builder->held_leaf);
++        builder->held_leaf = NULL;
++        builder->held_leaf_cap = 0;
++    }
  
      if (builder->first_leaf_offset < 0) builder->first_leaf_offset = offset;
      builder->last_leaf_offset = offset;
-@@ -350,7 +381,8 @@ static int btree_builder_write_held_leaf(btree_builder_t *builder, int has_next)
+@@ -350,7 +388,8 @@ static int btree_builder_write_held_leaf(btree_builder_t *builder, int has_next)
  /**
   * btree_builder_flush_leaf
   * close the current pending leaf: write the leaf held before it, now known to have a successor,
@@ -435,7 +420,7 @@ index 7ef91d3..d77fc41 100644
   * @param builder the builder instance
   * @return 0 on success, -1 on failure
   */
-@@ -374,32 +406,32 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
+@@ -374,32 +413,38 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
          builder->level_entries_capacity = new_cap;
      }
  
@@ -482,11 +467,17 @@ index 7ef91d3..d77fc41 100644
 +    const int rc = btree_builder_set_max_key(builder, btree_pending_key(leaf, last),
 +                                             leaf->entries[last].key_size);
 +    btree_pending_leaf_reset(leaf);
++    if (builder->scratch.buf_cap > BTREE_PENDING_ARENA_RETAIN_MAX)
++    {
++        free(builder->scratch.buf);
++        builder->scratch.buf = NULL;
++        builder->scratch.buf_cap = 0;
++    }
 +    return rc;
  }
  
  int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t key_size,
-@@ -424,8 +456,9 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
+@@ -424,8 +469,9 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
          builder->current_leaf->num_entries >= BTREE_MIN_ENTRIES_PER_LEAF)
      {
          const btree_pending_leaf_t *cur = builder->current_leaf;
@@ -498,7 +489,7 @@ index 7ef91d3..d77fc41 100644
          if (!same_key_as_last && btree_builder_flush_leaf(builder) != 0)
          {
              return -1;
-@@ -438,10 +471,11 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
+@@ -438,10 +484,11 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
          return -1;
      }
  
@@ -513,7 +504,7 @@ index 7ef91d3..d77fc41 100644
      if (builder->min_key == NULL)
      {
          builder->min_key = malloc(key_size);
-@@ -450,16 +484,6 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
+@@ -450,16 +497,6 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
          builder->min_key_size = key_size;
      }
  
@@ -530,7 +521,7 @@ index 7ef91d3..d77fc41 100644
      if (seq > builder->max_seq)
      {
          builder->max_seq = seq;
-@@ -701,6 +725,7 @@ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
+@@ -701,6 +738,7 @@ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
          t->max_key = builder->max_key;
          t->max_key_size = builder->max_key_size;
          builder->max_key = NULL;
@@ -538,7 +529,7 @@ index 7ef91d3..d77fc41 100644
      }
  
      *tree = t;
-@@ -713,6 +738,9 @@ void btree_builder_free(btree_builder_t *builder)
+@@ -713,6 +751,9 @@ void btree_builder_free(btree_builder_t *builder)
  
      btree_pending_leaf_free(builder->current_leaf);
      free(builder->held_leaf);
@@ -549,7 +540,7 @@ index 7ef91d3..d77fc41 100644
      if (builder->level_entries)
      {
 diff --git a/src/sstable/btree/btree_internal.h b/src/sstable/btree/btree_internal.h
-index 533777c..d385bd2 100644
+index 533777c..fd665c6 100644
 --- a/src/sstable/btree/btree_internal.h
 +++ b/src/sstable/btree/btree_internal.h
 @@ -22,6 +22,11 @@
@@ -706,8 +697,21 @@ index 533777c..d385bd2 100644
  };
  
  /**
-@@ -271,7 +333,8 @@ static inline void btree_node_done(btree_node_t *node, cache_entry_t *pin)
+@@ -269,9 +331,21 @@ static inline void btree_node_done(btree_node_t *node, cache_entry_t *pin)
+         btree_node_free(node);
+ }
  
++/**
++ * btree_builder_last_key
++ * the key most recently added to the builder, which sits in the leaf being built until the add
++ * that follows it
++ * @param builder the builder
++ * @param key receives the key, valid until the next add
++ * @param key_size receives its length
++ * @return 0 on success, -1 when nothing has been added yet
++ */
++int btree_builder_last_key(const btree_builder_t *builder, const uint8_t **key, size_t *key_size);
++
  /* helpers shared across the btree translation units; not part of the public api */
  int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t prev_offset,
 -                         const int64_t next_offset, uint8_t **out, size_t *out_size);
@@ -874,10 +878,18 @@ index 44417b2..97d8abb 100644
      return 0;
  }
 diff --git a/src/sstable/sstable_builder.c b/src/sstable/sstable_builder.c
-index d992e9a..2b2cff8 100644
+index d992e9a..b3ce580 100644
 --- a/src/sstable/sstable_builder.c
 +++ b/src/sstable/sstable_builder.c
-@@ -58,11 +58,6 @@ struct sstable_builder
+@@ -13,6 +13,7 @@
+ #include "base/errors.h"    /* TDB_SUCCESS and the TDB_ERR_* result codes */
+ #include "internal/types.h" /* TDB_KV_FLAG_* entry flags carried in from the memtable */
+ #include "sstable.h"
++#include "sstable/btree/btree_internal.h" /* btree_builder_last_key */
+ #include "sstable_internal.h"
+ 
+ /* the in-progress build state; opaque to callers */
+@@ -58,11 +59,6 @@ struct sstable_builder
      uint64_t
          klog_bytes; /* running estimate of the klog's encoded size, for output split decisions */
  
@@ -889,7 +901,7 @@ index d992e9a..2b2cff8 100644
      /* which value-log segments this table's separated values landed in, kept sorted by segment
       * number so the running insert is a binary search rather than a walk. summed across the live
       * tables this is what tells the store how much of a segment is still referenced, which is the
-@@ -238,19 +233,24 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key,
+@@ -238,19 +234,24 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key,
      if (flags & TDB_KV_FLAG_TOMBSTONE) entry_flags |= BTREE_ENTRY_FLAG_TOMBSTONE;
      if (flags & TDB_KV_FLAG_SINGLE_DELETE) entry_flags |= BTREE_ENTRY_FLAG_SINGLE_DELETE;
  
@@ -923,7 +935,7 @@ index d992e9a..2b2cff8 100644
      if (is_new_distinct)
      {
          if (builder->bloom_builder &&
-@@ -261,17 +261,6 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key,
+@@ -261,17 +262,6 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key,
          if (!(flags & TDB_KV_FLAG_TOMBSTONE)) builder->total_value_bytes += value_size;
      }
  
@@ -941,7 +953,7 @@ index d992e9a..2b2cff8 100644
      builder->num_entries++;
      if (flags & TDB_KV_FLAG_TOMBSTONE) builder->tombstone_count++;
  
-@@ -664,7 +653,6 @@ void sstable_builder_free(sstable_builder_t *builder)
+@@ -664,7 +654,6 @@ void sstable_builder_free(sstable_builder_t *builder)
      /* NULL once a finish moved it onto the produced sstable */
      range_tombstone_set_free(builder->range_tombstones);
      free(builder->klog_path);
@@ -951,10 +963,10 @@ index d992e9a..2b2cff8 100644
  }
 diff --git a/test/btree_arena__tests.c b/test/btree_arena__tests.c
 new file mode 100644
-index 0000000..4bc25ac
+index 0000000..a5bf3a8
 --- /dev/null
 +++ b/test/btree_arena__tests.c
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,386 @@
 +/**
 + *
 + * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
@@ -996,7 +1008,11 @@ index 0000000..4bc25ac
 +#define AR_VALUE_MAX 9000
 +
 +/* allocation counting: the test binary's own malloc family forwards to glibc and counts while
-+ * enabled, so the builder's calls (and anything it calls) are included */
++ * enabled, so the builder's calls (and anything it calls) are included. a sanitizer supplies its
++ * own allocator, which memory from strdup or stdio reaches through the real free, so the override
++ * and the case that needs it are built only when ARENA_COUNT_ALLOCS is defined, which the build
++ * does when no sanitizer is on */
++#ifdef ARENA_COUNT_ALLOCS
 +extern void *__libc_malloc(size_t);
 +extern void *__libc_calloc(size_t, size_t);
 +extern void *__libc_realloc(void *, size_t);
@@ -1027,6 +1043,7 @@ index 0000000..4bc25ac
 +{
 +    __libc_free(p);
 +}
++#endif
 +
 +static tidesdb_encoding_registry_t g_reg;
 +static tidesdb_encoding_stage_t g_lz4[1];
@@ -1039,14 +1056,18 @@ index 0000000..4bc25ac
 +} ar_mode_t;
 +
 +static ar_mode_t g_modes[2];
++static int g_mode_count = 0;
 +
++/* the codec modes this build can run: lz4 when it was built with compression, and always none */
 +static int ar_init_codecs(void)
 +{
 +    if (tidesdb_encoding_registry_init(&g_reg) != TDB_SUCCESS) return 0;
 +    const uint8_t lz4[1] = {TDB_COMPRESS_LZ4};
-+    if (tidesdb_encoding_resolve(&g_reg, lz4, 1, g_lz4, 1) != 1) return 0;
-+    g_modes[0] = (ar_mode_t){"lz4", g_lz4, 1};
-+    g_modes[1] = (ar_mode_t){"none", NULL, 0};
++    if (tidesdb_encoding_resolve(&g_reg, lz4, 1, g_lz4, 1) == 1)
++        g_modes[g_mode_count++] = (ar_mode_t){"lz4", g_lz4, 1};
++    else
++        printf("lz4 unavailable in this build, running without a codec only\n");
++    g_modes[g_mode_count++] = (ar_mode_t){"none", NULL, 0};
 +    return 1;
 +}
 +
@@ -1125,7 +1146,7 @@ index 0000000..4bc25ac
 +
 +static void test_arena_many_leaves_round_trip(void)
 +{
-+    for (int mi = 0; mi < 2; mi++)
++    for (int mi = 0; mi < g_mode_count; mi++)
 +    {
 +        const ar_mode_t *m = &g_modes[mi];
 +        ar_fresh_dir();
@@ -1175,7 +1196,7 @@ index 0000000..4bc25ac
 +{
 +    /* node sizes that give a few leaves and many, and one table of a single entry */
 +    const size_t sizes[] = {32768, 4096, 512};
-+    for (int mi = 0; mi < 2; mi++)
++    for (int mi = 0; mi < g_mode_count; mi++)
 +    {
 +        for (size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++)
 +        {
@@ -1227,6 +1248,7 @@ index 0000000..4bc25ac
 +    (void)remove_directory(AR_DIR);
 +}
 +
++#ifdef ARENA_COUNT_ALLOCS
 +#define AR_ALLOC_ENTRIES 10000
 +
 +/* the builder used to allocate a key, a value, a last-key copy and a max-key copy for each entry;
@@ -1234,7 +1256,7 @@ index 0000000..4bc25ac
 + * well under one allocation in sixteen entries */
 +static void test_alloc_count_per_entry(void)
 +{
-+    for (int mi = 0; mi < 2; mi++)
++    for (int mi = 0; mi < g_mode_count; mi++)
 +    {
 +        const ar_mode_t *m = &g_modes[mi];
 +        ar_fresh_dir();
@@ -1272,13 +1294,14 @@ index 0000000..4bc25ac
 +    }
 +    (void)remove_directory(AR_DIR);
 +}
++#endif
 +
 +/* a block appended to the klog between two leaves breaks the back-to-back layout the next links
 + * were computed from. the leaf written after it must fail the build rather than publish a chain
 + * whose links point at the stray block's neighbour */
 +static void test_stray_block_between_leaves_fails_build(void)
 +{
-+    for (int mi = 0; mi < 2; mi++)
++    for (int mi = 0; mi < g_mode_count; mi++)
 +    {
 +        const ar_mode_t *m = &g_modes[mi];
 +        ar_fresh_dir();
@@ -1319,7 +1342,11 @@ index 0000000..4bc25ac
 +{
 +    ASSERT_TRUE(ar_init_codecs());
 +    INIT_TEST_FILTER(argc, argv);
++#ifdef ARENA_COUNT_ALLOCS
 +    RUN_TEST(test_alloc_count_per_entry, tests_passed);
++#else
++    printf("skipped: test_alloc_count_per_entry (a sanitizer owns the allocator)\n");
++#endif
 +    RUN_TEST(test_min_max_key_match, tests_passed);
 +    RUN_TEST(test_arena_many_leaves_round_trip, tests_passed);
 +    RUN_TEST(test_stray_block_between_leaves_fails_build, tests_passed);

@@ -49,7 +49,8 @@ endforeach()
 # tidesdb-compaction-merge-level-runs.patch, the random read suite tidesdb-random-read-hint.patch adds,
 # the range covering suite tidesdb-range-covering-index.patch adds, the partition suite
 # tidesdb-compaction-partition-cursor.patch adds, the single-pass leaf suite
-# tidesdb-btree-single-pass-leaves.patch adds, and the upstream sstable suite that guards the builder it
+# tidesdb-btree-single-pass-leaves.patch adds, the leaf arena suite tidesdb-btree-builder-arena.patch
+# adds, and the upstream sstable suite that guards the builder it
 # changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
@@ -61,6 +62,10 @@ foreach(suite cache merge_iter random_read range_covering compaction_partition b
   target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)
   target_link_libraries(tidesdb_${suite}_tests PRIVATE tidesdb)
 endforeach()
+# the arena suite counts allocations by overriding malloc, which a sanitizer's allocator cannot share
+if(NOT TIDESKV_SANITIZE)
+  target_compile_definitions(tidesdb_btree_arena_tests PRIVATE ARENA_COUNT_ALLOCS)
+endif()
 add_test(NAME TidesDbPlanner COMMAND tidesdb_planner_tests)
 add_test(NAME TidesDbCache COMMAND tidesdb_cache_tests)
 add_test(NAME TidesDbMergeIter COMMAND tidesdb_merge_iter_tests)
