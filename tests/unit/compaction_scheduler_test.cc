@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -109,7 +111,7 @@ RangeDelete Elements(ColumnFamily cf, std::string p, uint64_t n) {
 
 CompactionScheduler::Options DeadOpts(uint64_t threshold, uint64_t keys, double ratio) {
   CompactionScheduler::Options o = Opts(threshold);
-  o.dead_ratio = ratio;
+  o.dead_ratio = [ratio] { return ratio; };
   o.subkey_keys = [keys] { return keys; };
   return o;
 }
@@ -119,9 +121,10 @@ TEST(CompactionScheduler, DeadRatioHoldsCompactionUntilEnoughIsDead) {
   CompactionScheduler s(c, DeadOpts(3, 1000, 0.2));
   const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
   for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
-  EXPECT_EQ(s.pending(), 0u);
-  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
-  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 0u);  // 150 < 200
+  for (int i = 0; i < 2; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 50)});
+  s.EvaluateCollectionTrigger();
   EXPECT_EQ(s.pending(), 2u);  // 250 >= 200
 }
 
@@ -130,8 +133,10 @@ TEST(CompactionScheduler, ZeroKeysFallsBackToCount) {  // everything still in me
   CompactionScheduler s(c, DeadOpts(3, 0, 0.2));
   const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
   for (int i = 0; i < 2; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 5)});
+  s.EvaluateCollectionTrigger();
   EXPECT_EQ(s.pending(), 0u);
   s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 5)});
+  s.EvaluateCollectionTrigger();
   EXPECT_EQ(s.pending(), 2u);
 }
 
@@ -140,7 +145,43 @@ TEST(CompactionScheduler, DeadRatioZeroIsTheOldBehaviour) {
   CompactionScheduler s(c, DeadOpts(3, 1000, 0.0));
   const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
   for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
-  EXPECT_EQ(s.pending(), 2u);
+  EXPECT_EQ(s.pending(), 2u);  // at once, no evaluation step
+}
+
+// The commit path must not read storage stats: subkey_keys runs only in EvaluateCollectionTrigger.
+TEST(CompactionScheduler, CommitsNeverReadTheKeyCount) {
+  FakeCompactor c;
+  std::atomic<int> reads{0};
+  CompactionScheduler::Options o = DeadOpts(3, 1000, 0.2);
+  o.subkey_keys = [&reads] {
+    ++reads;
+    return uint64_t{1000};
+  };
+  CompactionScheduler s(c, std::move(o));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 50; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
+  EXPECT_EQ(reads.load(), 0);
+  EXPECT_EQ(s.pending(), 0u);
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(reads.load(), 1);
+  s.EvaluateCollectionTrigger();  // nothing new to decide
+  EXPECT_EQ(reads.load(), 1);
+}
+
+TEST(CompactionScheduler, ChangedDeadRatioTakesEffectOnTheNextCheck) {
+  FakeCompactor c;
+  std::atomic<double> ratio{0.5};
+  CompactionScheduler::Options o = DeadOpts(3, 1000, 0.5);
+  o.dead_ratio = [&ratio] { return ratio.load(); };
+  CompactionScheduler s(c, std::move(o));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 100)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 0u);  // 300 < 500
+  ratio = 0.2;
+  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 100)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 2u);  // 400 >= 200
 }
 
 TEST(CompactionScheduler, FlushDbIgnoresDeadRatio) {

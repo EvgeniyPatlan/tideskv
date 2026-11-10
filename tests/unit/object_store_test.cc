@@ -5,6 +5,7 @@
 #include "common/crc16.h"
 #include "encoding/key_codec.h"
 #include "encoding/object_codec.h"
+#include "exec/recording_txn.h"
 #include "storage/memory_storage.h"
 
 namespace tideskv {
@@ -165,6 +166,25 @@ TEST_F(ObjectStoreTest, DeleteCollectionDropsOnlyItsOwnData) {
   EXPECT_EQ(Load(1, "h").state, ObjectState::kMissing);
   EXPECT_TRUE(Load(1, "other").live());
   EXPECT_EQ(Cf(ColumnFamily::kSubkey).size(), 2u);  // only oid 43's two fields remain
+}
+
+TEST_F(ObjectStoreTest, DeleteObjectHintsTheElementCountOfEachRangeDelete) {
+  Write([&](WriteTxn& t) {
+    SeedCollection(t, 0, "z", ValueType::kZSet, 7);
+    return Status::Ok();
+  });
+  auto inner = storage.BeginWrite();
+  ASSERT_TRUE(inner.ok());
+  RecordingTxn txn(**inner);
+  auto obj = LoadForWrite(txn, 0, "z", kNow);
+  Metadata meta = obj->meta;
+  meta.size = 5;
+  ASSERT_TRUE(DeleteObject(txn, 0, "z", meta).ok());
+  ASSERT_EQ(txn.deletes().size(), 2u);
+  EXPECT_EQ(txn.deletes()[0].cf, ColumnFamily::kSubkey);
+  EXPECT_EQ(txn.deletes()[0].elements, 5u);
+  EXPECT_EQ(txn.deletes()[1].cf, ColumnFamily::kZScore);
+  EXPECT_EQ(txn.deletes()[1].elements, 5u);
 }
 
 TEST_F(ObjectStoreTest, DeleteZSetAlsoDropsScores) {

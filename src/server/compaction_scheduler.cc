@@ -11,7 +11,7 @@ namespace tideskv {
 
 void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
   const uint64_t threshold = options_.collection_delete_threshold();  // outside mu_: reads config
-  const double ratio = options_.dead_ratio_source ? options_.dead_ratio_source() : options_.dead_ratio;
+  const double ratio = options_.dead_ratio();
   std::lock_guard lock(mu_);
   const size_t before = queue_.size();
   for (const RangeDelete& d : deletes) {
@@ -22,22 +22,41 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
       deleted_elements_ += d.elements;
     }
   }
-  if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_ &&
-      EnoughIsDead(ratio)) {
-    collection_deletes_ = 0;
-    deleted_elements_ = 0;
-    EnqueueLocked({ColumnFamily::kSubkey});
-    EnqueueLocked({ColumnFamily::kZScore});
+  if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_) {
+    if (ratio <= 0 || !options_.subkey_keys) {
+      EnqueueCollectionsLocked();
+    } else {
+      eval_pending_ = true;  // the worker reads the key count: storage stats never run on the commit path
+    }
   }
   if (queue_.size() != before) cv_.notify_one();
 }
 
-// Only asked once the count and spacing allow a compaction, so reading the stats stays rare.
-bool CompactionScheduler::EnoughIsDead(double ratio) const {
-  if (ratio <= 0 || !options_.subkey_keys) return true;
-  const uint64_t keys = options_.subkey_keys();
-  if (keys == 0) return true;  // nothing in sstables to measure against
-  return static_cast<double>(deleted_elements_) >= ratio * static_cast<double>(keys);
+void CompactionScheduler::EnqueueCollectionsLocked() {
+  collection_deletes_ = 0;
+  deleted_elements_ = 0;
+  eval_pending_ = false;
+  EnqueueLocked({ColumnFamily::kSubkey});
+  EnqueueLocked({ColumnFamily::kZScore});
+}
+
+void CompactionScheduler::EvaluateCollectionTrigger() {
+  {
+    std::lock_guard lock(mu_);
+    if (!eval_pending_) return;
+    eval_pending_ = false;
+  }
+  const uint64_t threshold = options_.collection_delete_threshold();
+  const double ratio = options_.dead_ratio();
+  const uint64_t keys = options_.subkey_keys ? options_.subkey_keys() : 0;  // storage stats, outside mu_
+  std::lock_guard lock(mu_);
+  if (threshold == 0 || collection_deletes_ < threshold || options_.now() < collection_not_before_) return;
+  // keys == 0: nothing in sstables to measure against, so the count decides
+  if (ratio > 0 && keys > 0 && static_cast<double>(deleted_elements_) < ratio * static_cast<double>(keys)) {
+    return;
+  }
+  EnqueueCollectionsLocked();
+  cv_.notify_one();
 }
 
 void CompactionScheduler::EnqueueLocked(Job job) {
@@ -130,7 +149,11 @@ void CompactionScheduler::Loop() {
   std::unique_lock lock(mu_);
   while (!stop_) {
     cv_.wait_for(lock, options_.tick, [this] { return stop_ || !queue_.empty(); });
-    if (stop_ || queue_.empty()) continue;
+    if (stop_) continue;
+    lock.unlock();
+    EvaluateCollectionTrigger();
+    lock.lock();
+    if (queue_.empty()) continue;
     lock.unlock();
     RunPending();
     lock.lock();

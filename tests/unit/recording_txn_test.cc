@@ -51,6 +51,23 @@ TEST(RecordingTxn, NoteRewriteCountsAsAWriteWithoutWritingOrCapturing) {
   EXPECT_EQ((*view)->Get(ColumnFamily::kMeta, key).status().code(), StatusCode::kNotFound);
 }
 
+TEST(RecordingTxn, HintRangeElementsAttachesToTheLastDelete) {
+  InMemoryStorage s;
+  auto inner = s.BeginWrite();
+  RecordingTxn txn(**inner);
+  txn.HintRangeElements(9);  // no delete yet: ignored
+  EXPECT_TRUE(txn.deletes().empty());
+  ASSERT_TRUE(txn.DeletePrefix(ColumnFamily::kSubkey, "one").ok());
+  ASSERT_TRUE(txn.DeletePrefix(ColumnFamily::kSubkey, "two").ok());
+  txn.HintRangeElements(7);
+  ASSERT_EQ(txn.deletes().size(), 2u);
+  EXPECT_EQ(txn.deletes()[0].elements, 0u);
+  EXPECT_EQ(txn.deletes()[1].elements, 7u);
+  ASSERT_TRUE(txn.Rollback().ok());
+  txn.HintRangeElements(5);  // after rollback: nothing to attach to
+  EXPECT_TRUE(txn.deletes().empty());
+}
+
 TEST(RecordingTxn, SavepointRollbackForgetsLaterDeletes) {
   InMemoryStorage s;
   auto inner = s.BeginWrite();

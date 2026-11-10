@@ -19,7 +19,7 @@ namespace tideskv {
 //    (a range compaction cannot reclaim a FLUSHDB: see TidesStorage::Compact);
 //  - a subkey prefix of encoding::ObjectPrefixSize() bytes (a collection deleted: 11 slotted, 9
 //    slotless) -> counted; at the threshold the whole subkey and zscore CFs are compacted and the count
-//    restarts, provided enough of the CF is dead (Options::dead_ratio). The next collection-triggered compaction waits collection_compaction_spacing times the
+//    restarts, provided enough of the CF is dead (Options::dead_ratio, checked by the worker). The next collection-triggered compaction waits collection_compaction_spacing times the
 //    last subkey compaction's length after it ended (it rewrites the whole CF), so a steady stream of
 //    big-collection DELs cannot keep one running for good; FLUSHDB/FLUSHALL jobs are never held back.
 // A job is checkpointed once before its first attempt (range tombstones still in the memtable are not
@@ -36,12 +36,12 @@ class CompactionScheduler final : public CommitListener {
     int max_attempts = 5;
     std::function<uint64_t()> collection_delete_threshold = [] { return uint64_t{1000}; };  // 0 = never
     std::chrono::milliseconds busy_retry{2000};
-    // A collection-triggered compaction also waits until the deleted elements reach dead_ratio of the
-    // subkey CF's sstable keys (subkey_keys). 0 = count and spacing only; subkey_keys() == 0 (all data
-    // still in memtables) also falls back to the count.
-    double dead_ratio = 0.2;
-    std::function<double()> dead_ratio_source;  // when set, read at each check instead of dead_ratio (CONFIG SET)
-    std::function<uint64_t()> subkey_keys = [] { return uint64_t{0}; };
+    // A collection-triggered compaction also waits until the deleted elements reach dead_ratio() of the
+    // subkey CF's sstable keys. 0 = count and spacing only. subkey_keys is read only on the worker thread
+    // (never on the commit path); unset, or returning 0 (all data still in memtables), it falls back to
+    // the count.
+    std::function<double()> dead_ratio = [] { return 0.2; };
+    std::function<uint64_t()> subkey_keys;
     uint64_t collection_compaction_spacing = 4;  // 0 = compact at every threshold
     std::function<std::chrono::steady_clock::time_point()> now = [] { return std::chrono::steady_clock::now(); };
   };
@@ -55,6 +55,10 @@ class CompactionScheduler final : public CommitListener {
   void OnCommitted(const std::vector<RangeDelete>& deletes) override;  // only enqueues
   // Runs the queued jobs on the calling thread; returns how many finished (done or given up).
   size_t RunPending();
+  // If a commit reached the count threshold with a dead-ratio condition to check, reads the subkey
+  // key count (storage stats, so off the commit path) and enqueues the collection compactions when
+  // enough is dead. The worker calls it every tick.
+  void EvaluateCollectionTrigger();
   // Start/Stop are not concurrent with each other. Stop drops queued and not-yet-started jobs;
   // a Compact already running is not interrupted.
   void Start();
@@ -70,7 +74,7 @@ class CompactionScheduler final : public CommitListener {
     int attempts = 0;
     bool checkpointed = false;  // its tombstones are in sstables: a retry needs no new checkpoint
   };
-  bool EnoughIsDead(double ratio) const;  // requires mu_
+  void EnqueueCollectionsLocked();  // requires mu_
   void EnqueueLocked(Job job);  // requires mu_
   Status RunJob(Job& job);
   void Loop();
@@ -81,6 +85,7 @@ class CompactionScheduler final : public CommitListener {
   std::condition_variable cv_;
   std::deque<Job> queue_;
   uint64_t collection_deletes_ = 0;  // since the last collection-triggered compaction
+  bool eval_pending_ = false;        // count and spacing allow a compaction; the dead ratio is still unchecked
   uint64_t deleted_elements_ = 0;    // elements of those collections (RangeDelete::elements)
   std::chrono::steady_clock::time_point collection_not_before_{};  // spacing after the last subkey compaction
   bool last_round_busy_ = false;  // the worker's next wait is busy_retry, not tick
