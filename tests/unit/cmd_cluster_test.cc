@@ -139,7 +139,7 @@ TEST(ClusterCmd, InfoShowsTheMigrationBlocksOfThePublishedStates) {  // D15
   c.Push(kThreeNodes, 1);
   auto s = std::make_shared<cluster::SlotStates>();
   s->job = cluster::SourceJob{{3300, 3300}, kNodeB, "127.0.0.1", 7001, cluster::MigrateState::kStart};
-  c.manager->PublishStates(s);
+  c.PublishStates(s);
   const std::string info = h.Run({"CLUSTER", "INFO"});
   EXPECT_NE(info.find("cluster_my_epoch:1\r\nmigrating_slot(s): 3300\r\ndestination_node: " + kNodeB +
                       "\r\nmigrating_state: start\r\n"),
