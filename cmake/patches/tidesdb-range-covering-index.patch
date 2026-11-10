@@ -1,0 +1,1207 @@
+diff --git a/src/column_family/column_family.c b/src/column_family/column_family.c
+index eb67409..3e55f2d 100644
+--- a/src/column_family/column_family.c
++++ b/src/column_family/column_family.c
+@@ -276,52 +276,21 @@ void cf_free(cf_t *cf)
+     free(cf);
+ }
+ 
+-/* tables one interval lookup reads before it gives up rather than answer from a partial view */
+-#define CF_INTERVAL_SCAN_MAX 512
+-
+ int cf_range_tombstone_covering(cf_t *cf, const uint8_t *key, const size_t key_size,
+                                 const uint64_t snapshot, uint64_t *out_seq)
+ {
+     if (!cf || !key || !out_seq) return 0;
+ 
+     /* every point read and every conflict probe comes through here, so a family that has never
+-     * deleted a range must not pay for the walk below. the set republishes the count with each
++     * deleted a range must not pay for anything more. the set republishes the count with each
+      * layout, which makes that one load */
+     if (level_set_interval_tables(cf->levels) == 0) return 0;
+ 
+-    /* asked of the tables, since a table carries the intervals it was built with and there is no
+-     * store of the family's own to ask instead. every table is consulted rather than only those
+-     * whose key range holds the key, because an interval covers a range the table it rode in on
+-     * need not have a single key of */
+-    sstable_t *tables[CF_INTERVAL_SCAN_MAX];
+-    const int n = level_set_collect_all(cf->levels, tables, CF_INTERVAL_SCAN_MAX);
+-    if (n <= 0) return 0;
+-    if (n > CF_INTERVAL_SCAN_MAX)
+-    {
+-        /* a partial view could miss the interval that covers this key and report it live, so the
+-         * read is answered as covered by nothing only when the whole family was seen */
+-        for (int i = 0; i < CF_INTERVAL_SCAN_MAX; i++)
+-            if (sstable_unref(tables[i])) sstable_close(tables[i]);
+-        return 0;
+-    }
+-
+-    int covered = 0;
+-    uint64_t newest = 0;
+-    for (int i = 0; i < n; i++)
+-    {
+-        uint64_t seq = 0;
+-        if (tables[i]->range_tombstones &&
+-            range_tombstone_max_covering(tables[i]->range_tombstones, key, key_size, snapshot,
+-                                         &seq) == 1 &&
+-            (!covered || seq > newest))
+-        {
+-            covered = 1;
+-            newest = seq;
+-        }
+-        if (sstable_unref(tables[i])) sstable_close(tables[i]);
+-    }
+-    if (covered) *out_seq = newest;
+-    return covered;
++    /* an interval covers a range the table it rode in on need not have a single key of, so every
++     * table's intervals count, however many tables there are. the layout merged them all into one
++     * index when it was published, and asking it is one binary search under the reader epoch, with
++     * no table referenced */
++    return level_set_range_covering(cf->levels, key, key_size, snapshot, out_seq);
+ }
+ 
+ /* free a configuration displaced by a reconfigure, once the epoch says no reader holds it */
+diff --git a/src/column_family/level/level_set.c b/src/column_family/level/level_set.c
+index 6302b16..0de9958 100644
+--- a/src/column_family/level/level_set.c
++++ b/src/column_family/level/level_set.c
+@@ -13,6 +13,7 @@
+ 
+ #include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
+ #include "base/lockfree.h"
++#include "range_tombstone/range_tombstone.h" /* range_tombstone_set_merge, the covering index */
+ 
+ /* a layout that is neither published nor on the retire list holds sstable references nothing will
+  * ever give back, which surfaces only as a leaked handle long afterwards. counting the layouts
+@@ -24,6 +25,15 @@ int64_t level_live_layouts(void)
+     return atomic_load_explicit(&level_live_layouts_count, memory_order_relaxed);
+ }
+ 
++/* the covering indexes allocated and not yet freed, the same balance for the one thing a layout
++ * owns besides its arrays */
++static _Atomic(int64_t) level_live_covering_count;
++
++int64_t level_live_covering_indexes(void)
++{
++    return atomic_load_explicit(&level_live_covering_count, memory_order_relaxed);
++}
++
+ /**
+  * level_entry_t
+  * one sstable's slot within a level -- the open handle plus the on-disk size that feeds size
+@@ -44,11 +54,18 @@ typedef struct
+  * listed sstable.
+  * @param levels per-level arrays of entries, index level-1; L1 unordered, L2+ sorted by min_key
+  * @param counts number of entries at each level
++ * @param carrying how many listed sstables carry range tombstones
++ * @param covering every listed sstable's intervals merged into one set, built at publish when any
++ * table carries one and freed with the layout, so what covers a key is one binary search under the
++ * reader epoch rather than a walk of every table. NULL with carrying non-zero only when the build
++ * ran out of memory, and a reader then walks the tables instead
+  */
+ typedef struct
+ {
+     level_entry_t *levels[LEVEL_SET_MAX_LEVELS];
+     int counts[LEVEL_SET_MAX_LEVELS];
++    uint32_t carrying;
++    range_tombstone_set_t *covering;
+ } level_layout_t;
+ 
+ /**
+@@ -177,6 +194,11 @@ static void level_layout_reclaim(void *item, void *ctx)
+         }
+         free(lay->levels[i]);
+     }
++    if (lay->covering)
++    {
++        range_tombstone_set_free(lay->covering);
++        atomic_fetch_sub_explicit(&level_live_covering_count, 1, memory_order_relaxed);
++    }
+     atomic_fetch_sub_explicit(&level_live_layouts_count, 1, memory_order_relaxed);
+     free(lay);
+ }
+@@ -248,6 +270,41 @@ static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const i
+     return 0;
+ }
+ 
++/**
++ * level_layout_build_covering
++ * merge the intervals of every sstable a layout lists into the layout's covering index. called on
++ * a layout that is not yet published, so nothing reads it while it is built; the inputs are the
++ * tables' own sets, immutable once a table is open and kept live by the layout's references. the
++ * cost is a sort of the tables' total fragment count and a copy of each, paid under the write lock
++ * only publishers take -- reads never wait on it, and it runs before the generation turns odd
++ * so a point read does not spin on it either. on allocation failure the layout carries no index and
++ * a covering query walks its tables instead, so a publish never fails for want of one
++ * @param lay the unpublished layout, its carrying count already set
++ */
++static void level_layout_build_covering(level_layout_t *lay)
++{
++    lay->covering = NULL;
++    if (lay->carrying == 0) return;
++
++    const range_tombstone_set_t **sets = malloc((size_t)lay->carrying * sizeof(*sets));
++    if (!sets) return;
++    size_t n = 0;
++    for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
++        for (int j = 0; j < lay->counts[i]; j++)
++        {
++            const range_tombstone_set_t *rt = lay->levels[i][j].sst->range_tombstones;
++            if (range_tombstone_set_count(rt) > 0 && n < lay->carrying) sets[n++] = rt;
++        }
++
++    range_tombstone_set_t *merged = NULL;
++    if (range_tombstone_set_merge(sets, n, &merged) == TDB_SUCCESS)
++    {
++        lay->covering = merged;
++        atomic_fetch_add_explicit(&level_live_covering_count, 1, memory_order_relaxed);
++    }
++    free(sets);
++}
++
+ /**
+  * level_publish
+  * install a freshly built layout as current and retire the old one for epoch-guarded reclamation
+@@ -265,6 +322,8 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
+             if (range_tombstone_set_count(fresh->levels[i][j].sst->range_tombstones) > 0)
+                 carrying++;
+     }
++    fresh->carrying = carrying;
++    level_layout_build_covering(fresh);
+ 
+     /* the layout, the mask and the interval count are three words a reader loads one at a time, and
+      * a publish changes all three. a reader that mixes them -- the old mask with the new layout, or
+@@ -547,3 +606,63 @@ int level_set_snapshot(level_set_t *ls, level_set_snapshot_entry_t *out, const i
+     tdb_epoch_exit(&ls->epoch);
+     return total;
+ }
++
++size_t level_set_covering_fragments(level_set_t *ls)
++{
++    if (!ls) return 0;
++    tdb_epoch_enter(&ls->epoch);
++    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
++    const size_t n = range_tombstone_set_count(lay->covering);
++    tdb_epoch_exit(&ls->epoch);
++    return n;
++}
++
++/**
++ * level_layout_walk_covering
++ * the fallback for a layout whose index could not be built: ask every listed table. the epoch the
++ * caller holds keeps the layout and so every table it lists live, so nothing is referenced
++ * @param lay the layout
++ * @param key the key to test
++ * @param key_size length of key
++ * @param snapshot the inclusive sequence ceiling
++ * @param out_seq receives the newest covering sequence when the call returns 1
++ * @return 1 when covered, 0 otherwise
++ */
++static int level_layout_walk_covering(const level_layout_t *lay, const uint8_t *key,
++                                      const size_t key_size, const uint64_t snapshot,
++                                      uint64_t *out_seq)
++{
++    int covered = 0;
++    uint64_t newest = 0;
++    for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
++        for (int j = 0; j < lay->counts[i]; j++)
++        {
++            const range_tombstone_set_t *rt = lay->levels[i][j].sst->range_tombstones;
++            uint64_t seq = 0;
++            if (rt && range_tombstone_max_covering(rt, key, key_size, snapshot, &seq) == 1 &&
++                (!covered || seq > newest))
++            {
++                covered = 1;
++                newest = seq;
++            }
++        }
++    if (covered) *out_seq = newest;
++    return covered;
++}
++
++int level_set_range_covering(level_set_t *ls, const uint8_t *key, const size_t key_size,
++                             const uint64_t snapshot, uint64_t *out_seq)
++{
++    if (!ls || !key || !out_seq) return 0;
++
++    tdb_epoch_enter(&ls->epoch);
++    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
++    int covered = 0;
++    if (lay->covering)
++        covered =
++            range_tombstone_max_covering(lay->covering, key, key_size, snapshot, out_seq) == 1;
++    else if (lay->carrying > 0)
++        covered = level_layout_walk_covering(lay, key, key_size, snapshot, out_seq);
++    tdb_epoch_exit(&ls->epoch);
++    return covered;
++}
+diff --git a/src/column_family/level/level_set.h b/src/column_family/level/level_set.h
+index ea8abce..47f5699 100644
+--- a/src/column_family/level/level_set.h
++++ b/src/column_family/level/level_set.h
+@@ -229,4 +229,35 @@ uint32_t level_set_occupancy(const level_set_t *ls);
+  */
+ uint32_t level_set_interval_tables(const level_set_t *ls);
+ 
++/**
++ * level_live_covering_indexes
++ * how many layout covering indexes are allocated and not yet freed, for a teardown balance check
++ * and for asserting a family without range deletes built none
++ * @return the live index count
++ */
++int64_t level_live_covering_indexes(void);
++
++/**
++ * level_set_covering_fragments
++ * the fragment count of the current layout's covering index, 0 when the layout carries none
++ * @param ls the level set, may be NULL
++ * @return the count
++ */
++size_t level_set_covering_fragments(level_set_t *ls);
++
++/**
++ * level_set_range_covering
++ * the newest range tombstone sequence at or below snapshot covering key, across every sstable of
++ * the current layout, answered from the layout's merged covering index under one reader epoch --
++ * no sstable is referenced and no table is walked
++ * @param ls the level set
++ * @param key the key to test
++ * @param key_size length of key
++ * @param snapshot the inclusive sequence ceiling
++ * @param out_seq receives the covering sequence when the call returns 1
++ * @return 1 when covered, 0 when not or on a bad argument
++ */
++int level_set_range_covering(level_set_t *ls, const uint8_t *key, size_t key_size,
++                             uint64_t snapshot, uint64_t *out_seq);
++
+ #endif /* __TIDESDB_LEVEL_SET_H__ */
+diff --git a/src/range_tombstone/range_tombstone.c b/src/range_tombstone/range_tombstone.c
+index 8762870..4385746 100644
+--- a/src/range_tombstone/range_tombstone.c
++++ b/src/range_tombstone/range_tombstone.c
+@@ -695,3 +695,296 @@ int range_tombstone_prefix_successor(const uint8_t *prefix, const size_t prefix_
+     *out_hi_size = n;
+     return TDB_SUCCESS;
+ }
++
++/**
++ * rt_seq_desc
++ * order two sequences descending, for qsort
++ * @param a the first sequence
++ * @param b the second sequence
++ * @return negative when a is the larger, positive when b is, 0 when equal
++ */
++static int rt_seq_desc(const void *a, const void *b)
++{
++    const uint64_t x = *(const uint64_t *)a;
++    const uint64_t y = *(const uint64_t *)b;
++    return x > y ? -1 : (x < y ? 1 : 0);
++}
++
++/**
++ * rt_frag_lo_cmp
++ * order two borrowed fragments by lower bound, for qsort
++ * @param a pointer to the first fragment pointer
++ * @param b pointer to the second fragment pointer
++ * @return negative, zero, or positive as a's lower bound orders before, with or after b's
++ */
++static int rt_frag_lo_cmp(const void *a, const void *b)
++{
++    const rt_fragment_t *x = *(const rt_fragment_t *const *)a;
++    const rt_fragment_t *y = *(const rt_fragment_t *const *)b;
++    return tdb_key_cmp(x->lo, x->lo_size, y->lo, y->lo_size);
++}
++
++/**
++ * rt_merge_state_t
++ * the sweep a merge runs over every input fragment at once
++ * @param order every input fragment, borrowed, sorted by lower bound
++ * @param total how many there are
++ * @param next the first fragment of order not yet reached by the sweep
++ * @param active the fragments covering the sweep position, a min-heap on upper bound
++ * @param n_active how many fragments active holds
++ * @param seqs scratch the covering sequences of one piece are gathered into
++ * @param seq_cap capacity of seqs
++ */
++typedef struct
++{
++    const rt_fragment_t **order;
++    size_t total;
++    size_t next;
++    const rt_fragment_t **active;
++    size_t n_active;
++    uint64_t *seqs;
++    size_t seq_cap;
++} rt_merge_state_t;
++
++/**
++ * rt_heap_less
++ * whether fragment a ends before fragment b, the heap order of the active fragments
++ * @param a the first fragment
++ * @param b the second fragment
++ * @return 1 when a's upper bound orders before b's
++ */
++static int rt_heap_less(const rt_fragment_t *a, const rt_fragment_t *b)
++{
++    return rt_hi_cmp_hi(a->hi, a->hi_size, b->hi, b->hi_size) < 0;
++}
++
++/**
++ * rt_heap_push
++ * add a fragment to the active heap, which is sized to hold every input fragment
++ * @param st the sweep
++ * @param f the fragment
++ */
++static void rt_heap_push(rt_merge_state_t *st, const rt_fragment_t *f)
++{
++    size_t i = st->n_active++;
++    while (i > 0)
++    {
++        const size_t parent = (i - 1) / 2;
++        if (!rt_heap_less(f, st->active[parent])) break;
++        st->active[i] = st->active[parent];
++        i = parent;
++    }
++    st->active[i] = f;
++}
++
++/**
++ * rt_heap_pop
++ * remove the active fragment that ends first
++ * @param st the sweep, holding at least one active fragment
++ */
++static void rt_heap_pop(rt_merge_state_t *st)
++{
++    const rt_fragment_t *last = st->active[--st->n_active];
++    size_t i = 0;
++    for (;;)
++    {
++        size_t child = 2 * i + 1;
++        if (child >= st->n_active) break;
++        if (child + 1 < st->n_active && rt_heap_less(st->active[child + 1], st->active[child]))
++            child++;
++        if (!rt_heap_less(st->active[child], last)) break;
++        st->active[i] = st->active[child];
++        i = child;
++    }
++    if (st->n_active > 0) st->active[i] = last;
++}
++
++/**
++ * rt_merge_gather
++ * collect, sorted descending without repeats, every sequence of the active fragments -- the ones
++ * covering the piece the sweep is at
++ * @param st the sweep, with at least one active fragment
++ * @param out_count receives how many sequences were gathered
++ * @return TDB_SUCCESS or TDB_ERR_MEMORY
++ */
++static int rt_merge_gather(rt_merge_state_t *st, size_t *out_count)
++{
++    size_t count = 0;
++    for (size_t i = 0; i < st->n_active; i++) count += st->active[i]->seq_count;
++    if (count > st->seq_cap)
++    {
++        size_t grown = st->seq_cap ? st->seq_cap : RT_APPEND_INITIAL_CAPACITY;
++        while (grown < count) grown *= 2;
++        uint64_t *seqs = realloc(st->seqs, grown * sizeof(uint64_t));
++        if (!seqs) return TDB_ERR_MEMORY;
++        st->seqs = seqs;
++        st->seq_cap = grown;
++    }
++    size_t at = 0;
++    for (size_t i = 0; i < st->n_active; i++)
++    {
++        memcpy(st->seqs + at, st->active[i]->seqs, st->active[i]->seq_count * sizeof(uint64_t));
++        at += st->active[i]->seq_count;
++    }
++    /* one fragment's sequences already descend without repeats, which is the common case of
++     * intervals that do not overlap across tables */
++    if (st->n_active > 1)
++    {
++        qsort(st->seqs, count, sizeof(uint64_t), rt_seq_desc);
++        size_t kept = 1;
++        for (size_t i = 1; i < count; i++)
++            if (st->seqs[i] != st->seqs[kept - 1]) st->seqs[kept++] = st->seqs[i];
++        count = kept;
++    }
++    *out_count = count;
++    return TDB_SUCCESS;
++}
++
++/**
++ * rt_merge_emit
++ * append the piece [lo, hi) covered by seqs, or widen the last fragment over it when that one ends
++ * where the piece starts and is covered by exactly the same sequences
++ * @param out the set being built
++ * @param lo inclusive lower bound
++ * @param lo_size length of lo
++ * @param hi exclusive upper bound, NULL when unbounded above
++ * @param hi_size length of hi, RT_UNBOUNDED_ABOVE when unbounded above
++ * @param seqs the covering sequences, strictly descending
++ * @param seq_count how many, never zero
++ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_INVALID_ARGS on a piece out of order
++ */
++static int rt_merge_emit(range_tombstone_set_t *out, const uint8_t *lo, const size_t lo_size,
++                         const uint8_t *hi, const size_t hi_size, const uint64_t *seqs,
++                         const size_t seq_count)
++{
++    if (out->count > 0)
++    {
++        rt_fragment_t *last = &out->frags[out->count - 1];
++        if (last->hi_size != RT_UNBOUNDED_ABOVE &&
++            tdb_key_cmp(last->hi, last->hi_size, lo, lo_size) == 0 &&
++            last->seq_count == seq_count &&
++            memcmp(last->seqs, seqs, seq_count * sizeof(uint64_t)) == 0)
++        {
++            uint8_t *widened = NULL;
++            if (hi_size > RT_UNBOUNDED_ABOVE)
++            {
++                widened = malloc(hi_size);
++                if (!widened) return TDB_ERR_MEMORY;
++                memcpy(widened, hi, hi_size);
++            }
++            free(last->hi);
++            last->hi = widened;
++            last->hi_size = hi_size;
++            return TDB_SUCCESS;
++        }
++    }
++    return range_tombstone_set_append_fragment(out, lo, lo_size, hi, hi_size, seqs, seq_count);
++}
++
++/**
++ * rt_merge_sweep
++ * walk every boundary of every input in key order, emitting each piece something covers. at each
++ * position the fragments starting there join the active heap and the ones ending there leave it;
++ * the next position is the nearer of the next fragment's start and the first active end. each
++ * fragment joins and leaves once, so the sweep costs the sort plus a heap step a fragment, plus
++ * the active fragments' sequences at every piece -- one fragment's worth where intervals do not
++ * overlap across tables
++ * @param st the sweep, order sorted, nothing active
++ * @param out the empty set to build into
++ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_INVALID_ARGS on an input that is not fragmented
++ */
++static int rt_merge_sweep(rt_merge_state_t *st, range_tombstone_set_t *out)
++{
++    if (st->total == 0) return TDB_SUCCESS;
++    const uint8_t *pos = st->order[0]->lo;
++    size_t pos_size = st->order[0]->lo_size;
++    for (;;)
++    {
++        while (st->next < st->total &&
++               tdb_key_cmp(st->order[st->next]->lo, st->order[st->next]->lo_size, pos, pos_size) <=
++                   0)
++            rt_heap_push(st, st->order[st->next++]);
++        while (st->n_active > 0 &&
++               rt_hi_cmp_key(st->active[0]->hi, st->active[0]->hi_size, pos, pos_size) <= 0)
++            rt_heap_pop(st);
++
++        if (st->n_active == 0)
++        {
++            /* a gap no input covers; the sweep resumes at the next fragment to start */
++            if (st->next == st->total) return TDB_SUCCESS;
++            pos = st->order[st->next]->lo;
++            pos_size = st->order[st->next]->lo_size;
++            continue;
++        }
++
++        const rt_fragment_t *ends = st->active[0];
++        const uint8_t *next = ends->hi;
++        size_t next_size = ends->hi_size;
++        if (st->next < st->total && rt_hi_cmp_key(next, next_size, st->order[st->next]->lo,
++                                                  st->order[st->next]->lo_size) > 0)
++        {
++            next = st->order[st->next]->lo;
++            next_size = st->order[st->next]->lo_size;
++        }
++        else if (next_size == RT_UNBOUNDED_ABOVE)
++            next = NULL;
++
++        size_t seq_count = 0;
++        const int rc = rt_merge_gather(st, &seq_count);
++        if (rc != TDB_SUCCESS) return rc;
++        const int erc = rt_merge_emit(out, pos, pos_size, next, next_size, st->seqs, seq_count);
++        if (erc != TDB_SUCCESS) return erc;
++
++        /* a piece running to the end of the order is the last one there can be */
++        if (next_size == RT_UNBOUNDED_ABOVE) return TDB_SUCCESS;
++        pos = next;
++        pos_size = next_size;
++    }
++}
++
++int range_tombstone_set_merge(const range_tombstone_set_t *const *sets, const size_t n,
++                              range_tombstone_set_t **out)
++{
++    if (!out) return TDB_ERR_INVALID_ARGS;
++    *out = NULL;
++    if (!sets && n > 0) return TDB_ERR_INVALID_ARGS;
++
++    range_tombstone_set_t *merged = range_tombstone_set_new();
++    if (!merged) return TDB_ERR_MEMORY;
++
++    size_t total = 0;
++    for (size_t i = 0; i < n; i++) total += range_tombstone_set_count(sets[i]);
++    if (total == 0)
++    {
++        *out = merged;
++        return TDB_SUCCESS;
++    }
++
++    rt_merge_state_t st = {.order = malloc(total * sizeof(rt_fragment_t *)),
++                           .total = total,
++                           .next = 0,
++                           .active = malloc(total * sizeof(rt_fragment_t *)),
++                           .n_active = 0,
++                           .seqs = NULL,
++                           .seq_cap = 0};
++    int rc = TDB_ERR_MEMORY;
++    if (st.order && st.active)
++    {
++        size_t k = 0;
++        for (size_t i = 0; i < n; i++)
++            for (size_t j = 0; j < range_tombstone_set_count(sets[i]); j++)
++                st.order[k++] = &sets[i]->frags[j];
++        qsort(st.order, total, sizeof(rt_fragment_t *), rt_frag_lo_cmp);
++        rc = rt_merge_sweep(&st, merged);
++    }
++    free(st.order);
++    free(st.active);
++    free(st.seqs);
++    if (rc != TDB_SUCCESS)
++    {
++        range_tombstone_set_free(merged);
++        return rc;
++    }
++    *out = merged;
++    return TDB_SUCCESS;
++}
+diff --git a/src/range_tombstone/range_tombstone.h b/src/range_tombstone/range_tombstone.h
+index 8034aae..d310339 100644
+--- a/src/range_tombstone/range_tombstone.h
++++ b/src/range_tombstone/range_tombstone.h
+@@ -127,6 +127,24 @@ int range_tombstone_set_append_fragment(range_tombstone_set_t *set, const uint8_
+                                         size_t lo_size, const uint8_t *hi, size_t hi_size,
+                                         const uint64_t *seqs, size_t seq_count);
+ 
++/**
++ * range_tombstone_set_merge
++ * build one set answering for several at once -- every key covered by any input is covered in the
++ * result by the union of the sequences the inputs cover it with, so a query of the result gives the
++ * newest sequence at or below a snapshot across all of them. the inputs are only read, and the
++ * result shares no storage with them. the inputs' fragments are sorted together and swept once with
++ * a heap of the ones covering the sweep position, so the work is the sort of the total fragment
++ * count plus, at every piece, the sequences of the fragments overlapping there. adjacent pieces
++ * covered alike are folded into one fragment
++ * @param sets the sets to merge, any of which may be NULL or empty
++ * @param n how many sets
++ * @param out receives the merged set, owned by the caller, empty when no input covers anything
++ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS when out is NULL or sets is NULL with n non-zero, or
++ *         TDB_ERR_MEMORY, in which case *out is left NULL
++ */
++int range_tombstone_set_merge(const range_tombstone_set_t *const *sets, size_t n,
++                              range_tombstone_set_t **out);
++
+ /**
+  * range_tombstone_max_covering
+  * the newest sequence at or below snapshot_seq whose tombstone covers key -- what a read compares
+diff --git a/test/range_covering__tests.c b/test/range_covering__tests.c
+new file mode 100644
+index 0000000..de8b783
+--- /dev/null
++++ b/test/range_covering__tests.c
+@@ -0,0 +1,594 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* what covers a key across a family's tables. an interval covers a range the table carrying it need
++ * not hold a single key of, so a family answers from one index merged out of every table's
++ * intervals, built when a layout is published and freed with it. these cases hold that index to the
++ * answer a scan of every table would give -- past any table count, at any snapshot, and while
++ * layouts change under readers */
++
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../src/base/errors.h"
++#include "../src/base/keycmp.h"
++#include "../src/compaction/compaction_exec.h"
++#include "../src/flush/flush.h"
++#include "../src/range_tombstone/range_tombstone.h"
++#include "../src/txn/cf_source.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define RC_DB_DIR    "." PATH_SEPARATOR "test_range_covering_db"
++#define RC_MAX_LEVEL 12
++#define RC_PROB      0.25f
++
++typedef struct
++{
++    vlog_t *vlog;
++    cache_t *cache;
++    fd_manager_t fdm;
++    tidesdb_manifest_t *manifest;
++    char manifest_path[256];
++    tidesdb_l0_t *l0;
++    cf_t *cf;
++    _Atomic(uint64_t) next_id;
++    uint64_t generation;
++} rc_db_t;
++
++static void rc_db_open(rc_db_t *db)
++{
++    (void)remove_directory(RC_DB_DIR);
++    ASSERT_EQ(mkdir(RC_DB_DIR, 0755), 0);
++    const vlog_config_t vc = {.sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
++    ASSERT_EQ(vlog_open(RC_DB_DIR, &vc, &db->vlog), VLOG_OK);
++    db->cache = cache_create(NULL);
++    ASSERT_EQ(fd_manager_init(&db->fdm, 0), 0);
++    snprintf(db->manifest_path, sizeof(db->manifest_path), "%s%sMANIFEST", RC_DB_DIR,
++             PATH_SEPARATOR);
++    db->manifest = tidesdb_manifest_open(db->manifest_path);
++    ASSERT_TRUE(db->manifest != NULL);
++
++    tidesdb_column_family_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    snprintf(cfg.name, sizeof(cfg.name), "%s", "cf0");
++    cfg.level_size_ratio = 10;
++    cfg.min_levels = 3;
++    cfg.btree_klog_block_size = 4096;
++    ASSERT_EQ(
++        cf_create(RC_DB_DIR, 0, &cfg, NULL, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf), 0);
++    ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
++
++    db->l0 = tidesdb_l0_create(64 * 1024, 8, RC_MAX_LEVEL, RC_PROB, NULL, NULL);
++    tidesdb_l0_set_active(db->l0,
++                          tidesdb_memtable_create(NULL, 0, 0, RC_MAX_LEVEL, RC_PROB, NULL, NULL));
++    atomic_init(&db->next_id, 100);
++    db->generation = 1;
++}
++
++static void rc_db_close(rc_db_t *db)
++{
++    tidesdb_l0_destroy(db->l0);
++    cf_free(db->cf);
++    tidesdb_manifest_close(db->manifest);
++    fd_manager_destroy(&db->fdm);
++    cache_destroy(db->cache);
++    vlog_close(db->vlog);
++    (void)remove_directory(RC_DB_DIR);
++}
++
++/* write one live version into the active memtable */
++static void rc_put(rc_db_t *db, const char *key, uint64_t seq)
++{
++    ASSERT_EQ(tidesdb_l0_apply(db->l0, 0, (const uint8_t *)key, strlen(key), (const uint8_t *)"v",
++                               1, -1, seq, 0),
++              TDB_SUCCESS);
++}
++
++/* lay [lo, hi) at seq into the active memtable, hi NULL for unbounded above */
++static void rc_range(rc_db_t *db, const char *lo, const char *hi, uint64_t seq)
++{
++    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db->l0, 0, (const uint8_t *)lo, strlen(lo),
++                                               (const uint8_t *)hi, hi ? strlen(hi) : 0, seq),
++              TDB_SUCCESS);
++}
++
++/* rotate the active memtable and flush it into one L1 table */
++static void rc_flush(rc_db_t *db)
++{
++    db->generation++;
++    ASSERT_EQ(
++        tidesdb_l0_rotate(db->l0, tidesdb_memtable_create(NULL, db->generation, db->generation,
++                                                          RC_MAX_LEVEL, RC_PROB, NULL, NULL)),
++        TDB_SUCCESS);
++    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(db->l0);
++    cf_t *cfs[1] = {db->cf};
++    flush_ctx_t fx = {.l0 = db->l0,
++                      .cfs = cfs,
++                      .n_cfs = 1,
++                      .manifest = db->manifest,
++                      .manifest_path = db->manifest_path,
++                      .next_sstable_id = &db->next_id,
++                      .fdm = &db->fdm,
++                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                      .value_threshold = 1u << 20};
++    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
++}
++
++/* merge every table of the family into one run at level 2, keeping every interval */
++static void rc_compact_all(rc_db_t *db)
++{
++    const int total = level_set_snapshot(db->cf->levels, NULL, 0);
++    if (total == 0) return;
++    level_set_snapshot_entry_t *all = calloc((size_t)total, sizeof(*all));
++    ASSERT_TRUE(all != NULL);
++    ASSERT_EQ(level_set_snapshot(db->cf->levels, all, total), total);
++    uint64_t *ids = malloc((size_t)total * sizeof(uint64_t));
++    ASSERT_TRUE(ids != NULL);
++    for (int i = 0; i < total; i++) ids[i] = all[i].sst->id;
++    for (int i = 0; i < total; i++)
++        if (sstable_unref(all[i].sst)) sstable_close(all[i].sst);
++    free(all);
++
++    const compaction_job_t job = {.input_ids = ids,
++                                  .n_inputs = total,
++                                  .target_level = 2,
++                                  .is_largest_level = 0,
++                                  .split = COMPACTION_SPLIT_NONE,
++                                  .file_max = 0};
++    const compaction_ctx_t cx = {.cf = db->cf,
++                                 .manifest = db->manifest,
++                                 .manifest_path = db->manifest_path,
++                                 .next_sstable_id = &db->next_id,
++                                 .gc_floor = 0,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = 1u << 20};
++    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
++    free(ids);
++}
++
++/* the answer a scan of every table in the family gives -- the reference the index is held to */
++static int rc_brute_cf(cf_t *cf, const uint8_t *key, size_t key_size, uint64_t snapshot,
++                       uint64_t *out_seq)
++{
++    const int total = level_set_collect_all(cf->levels, NULL, 0);
++    sstable_t **tables = calloc((size_t)total + 1, sizeof(*tables));
++    ASSERT_TRUE(tables != NULL);
++    ASSERT_EQ(level_set_collect_all(cf->levels, tables, total), total);
++    int covered = 0;
++    uint64_t newest = 0;
++    for (int i = 0; i < total; i++)
++    {
++        uint64_t seq = 0;
++        if (tables[i]->range_tombstones &&
++            range_tombstone_max_covering(tables[i]->range_tombstones, key, key_size, snapshot,
++                                         &seq) == 1 &&
++            (!covered || seq > newest))
++        {
++            covered = 1;
++            newest = seq;
++        }
++        if (sstable_unref(tables[i])) sstable_close(tables[i]);
++    }
++    free(tables);
++    if (covered) *out_seq = newest;
++    return covered;
++}
++
++/* a point read of key through the family's sstable source; 1 when it reads a live version */
++static int rc_point_live(cf_t *cf, const char *key, uint64_t snapshot)
++{
++    tidesdb_source_t src;
++    cf_source(cf, &src);
++    for (;;)
++    {
++        tidesdb_source_version_t v;
++        memset(&v, 0, sizeof(v));
++        const tidesdb_source_result_t r =
++            src.get(src.ctx, 0, (const uint8_t *)key, strlen(key), snapshot, &v);
++        if (r == TDB_SOURCE_BUSY) continue;
++        if (r != TDB_SOURCE_FOUND) return 0;
++        free(v.value);
++        return v.deleted ? 0 : 1;
++    }
++}
++
++/* more tables than the old 512-table scan would look at, the interval in the oldest of them. a
++ * family past that count answered "covered by nothing" and the deleted key came back */
++#define RC_MANY_TABLES 600
++
++void test_covering_sees_past_table_512(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++
++    rc_put(&db, "k00015", 1);
++    rc_range(&db, "k0001", "k0002", 2);
++    rc_flush(&db);
++    for (int i = 1; i < RC_MANY_TABLES; i++)
++    {
++        char key[16];
++        snprintf(key, sizeof(key), "z%05d", i);
++        rc_put(&db, key, (uint64_t)(2 + i));
++        rc_flush(&db);
++    }
++    ASSERT_EQ(level_set_count(db.cf->levels, LEVEL_SET_L1), RC_MANY_TABLES);
++
++    uint64_t seq = 0;
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"k00015", 6, UINT64_MAX, &seq),
++              1);
++    ASSERT_EQ(seq, 2);
++    ASSERT_EQ(rc_point_live(db.cf, "k00015", UINT64_MAX), 0);
++    /* outside the interval, the keys still read */
++    ASSERT_EQ(rc_point_live(db.cf, "z00007", UINT64_MAX), 1);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"k0002", 5, UINT64_MAX, &seq), 0);
++
++    rc_db_close(&db);
++}
++
++/* ===== the merge against a scan of every set ===== */
++
++#define RC_CASES        2000
++#define RC_MAX_SETS     40
++#define RC_MAX_TOMBS    6
++#define RC_KEY_MAX      3
++#define RC_ALPHABET     3
++#define RC_SEQ_MAX      100
++#define RC_UNBOUNDED_1N 10 /* one in this many intervals runs to the end of the order */
++
++static uint32_t rc_rand(uint32_t *s)
++{
++    *s ^= *s << 13;
++    *s ^= *s >> 17;
++    *s ^= *s << 5;
++    return *s;
++}
++
++/* a random key of 0..RC_KEY_MAX bytes over a small alphabet, so intervals share endpoints often */
++static size_t rc_rand_key(uint32_t *s, uint8_t *out)
++{
++    const size_t n = rc_rand(s) % (RC_KEY_MAX + 1);
++    for (size_t i = 0; i < n; i++) out[i] = (uint8_t)('a' + rc_rand(s) % RC_ALPHABET);
++    return n;
++}
++
++static void rc_fill_set(uint32_t *s, range_tombstone_set_t *set)
++{
++    const int tombs = (int)(rc_rand(s) % (RC_MAX_TOMBS + 1));
++    for (int t = 0; t < tombs; t++)
++    {
++        uint8_t lo[RC_KEY_MAX], hi[RC_KEY_MAX];
++        const size_t lo_size = rc_rand_key(s, lo);
++        const int unbounded = rc_rand(s) % RC_UNBOUNDED_1N == 0;
++        const size_t hi_size = unbounded ? RT_UNBOUNDED_ABOVE : rc_rand_key(s, hi);
++        if (!range_tombstone_interval_valid(lo, lo_size, unbounded ? NULL : hi, hi_size)) continue;
++        const uint64_t seq = 1 + rc_rand(s) % RC_SEQ_MAX;
++        ASSERT_EQ(range_tombstone_set_add(set, lo, lo_size, unbounded ? NULL : hi, hi_size, seq),
++                  TDB_SUCCESS);
++    }
++}
++
++static int rc_brute_sets(range_tombstone_set_t *const *sets, int n, const uint8_t *key,
++                         size_t key_size, uint64_t snapshot, uint64_t *out_seq)
++{
++    int covered = 0;
++    uint64_t newest = 0;
++    for (int i = 0; i < n; i++)
++    {
++        uint64_t seq = 0;
++        if (range_tombstone_max_covering(sets[i], key, key_size, snapshot, &seq) == 1 &&
++            (!covered || seq > newest))
++        {
++            covered = 1;
++            newest = seq;
++        }
++    }
++    if (covered) *out_seq = newest;
++    return covered;
++}
++
++/* every key of 0..RC_KEY_MAX bytes over the alphabet, which includes every interval endpoint */
++static void rc_probe_all(range_tombstone_set_t *const *sets, int n,
++                         const range_tombstone_set_t *merged, uint32_t *s)
++{
++    uint8_t key[RC_KEY_MAX];
++    int digits[RC_KEY_MAX];
++    for (size_t len = 0; len <= RC_KEY_MAX; len++)
++    {
++        for (size_t i = 0; i < len; i++) digits[i] = 0;
++        for (;;)
++        {
++            for (size_t i = 0; i < len; i++) key[i] = (uint8_t)('a' + digits[i]);
++            const uint64_t snaps[3] = {UINT64_MAX, rc_rand(s) % (RC_SEQ_MAX + 2),
++                                       rc_rand(s) % (RC_SEQ_MAX + 2)};
++            for (int k = 0; k < 3; k++)
++            {
++                uint64_t want = 0, got = 0;
++                const int w = rc_brute_sets(sets, n, key, len, snaps[k], &want);
++                const int g = range_tombstone_max_covering(merged, key, len, snaps[k], &got);
++                ASSERT_EQ(g, w);
++                if (w) ASSERT_EQ(got, want);
++            }
++            size_t d = 0;
++            while (d < len && ++digits[d] == RC_ALPHABET) digits[d++] = 0;
++            if (d == len) break;
++        }
++    }
++}
++
++/* the merged fragments ascend without overlap and adjacent equal runs are folded together, so the
++ * index is no larger than the boundaries it has to tell apart */
++static void rc_assert_well_formed(const range_tombstone_set_t *merged)
++{
++    const size_t n = range_tombstone_set_count(merged);
++    for (size_t i = 0; i < n; i++)
++    {
++        const rt_fragment_t *f = NULL;
++        ASSERT_EQ(range_tombstone_set_fragment_at(merged, i, &f), TDB_SUCCESS);
++        ASSERT_TRUE(f->seq_count > 0);
++        for (size_t j = 1; j < f->seq_count; j++) ASSERT_TRUE(f->seqs[j] < f->seqs[j - 1]);
++        if (i == 0) continue;
++        const rt_fragment_t *p = NULL;
++        ASSERT_EQ(range_tombstone_set_fragment_at(merged, i - 1, &p), TDB_SUCCESS);
++        ASSERT_TRUE(p->hi_size != RT_UNBOUNDED_ABOVE);
++        ASSERT_TRUE(tdb_key_cmp(p->hi, p->hi_size, f->lo, f->lo_size) <= 0);
++        const int touching = tdb_key_cmp(p->hi, p->hi_size, f->lo, f->lo_size) == 0;
++        const int same = p->seq_count == f->seq_count &&
++                         memcmp(p->seqs, f->seqs, f->seq_count * sizeof(uint64_t)) == 0;
++        ASSERT_FALSE(touching && same);
++    }
++}
++
++/* cases also run through a real family, the layout's own index against a scan of its tables */
++#define RC_CF_CASES      6
++#define RC_CF_MAX_TABLES 12
++
++static void rc_cf_case(uint32_t *s)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    const int tables = 1 + (int)(rc_rand(s) % RC_CF_MAX_TABLES);
++    uint64_t seq = 1;
++    for (int t = 0; t < tables; t++)
++    {
++        const int tombs = (int)(rc_rand(s) % (RC_MAX_TOMBS + 1));
++        for (int k = 0; k < tombs; k++)
++        {
++            uint8_t lo[RC_KEY_MAX + 1], hi[RC_KEY_MAX + 1];
++            /* the memtable refuses an empty lower bound, so these start at one byte */
++            size_t lo_size = rc_rand_key(s, lo);
++            if (lo_size == 0) lo[lo_size++] = 'a';
++            const int unbounded = rc_rand(s) % RC_UNBOUNDED_1N == 0;
++            const size_t hi_size = unbounded ? 0 : rc_rand_key(s, hi);
++            if (!unbounded && !range_tombstone_interval_valid(lo, lo_size, hi, hi_size)) continue;
++            ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, lo, lo_size, unbounded ? NULL : hi,
++                                                       hi_size, seq++),
++                      TDB_SUCCESS);
++        }
++        rc_put(&db, "zz", seq++);
++        rc_flush(&db);
++    }
++
++    uint8_t key[RC_KEY_MAX];
++    for (int p = 0; p < 200; p++)
++    {
++        const size_t len = rc_rand_key(s, key);
++        if (len == 0) continue;
++        const uint64_t snap = rc_rand(s) % 3 == 0 ? UINT64_MAX : rc_rand(s) % (seq + 1);
++        uint64_t want = 0, got = 0;
++        const int w = rc_brute_cf(db.cf, key, len, snap, &want);
++        const int g = cf_range_tombstone_covering(db.cf, key, len, snap, &got);
++        ASSERT_EQ(g, w);
++        if (w) ASSERT_EQ(got, want);
++    }
++    rc_db_close(&db);
++}
++
++void test_covering_matches_brute_force(void)
++{
++    uint32_t s = 0x9e3779b9u;
++    for (int c = 0; c < RC_CASES; c++)
++    {
++        const int n = 1 + (int)(rc_rand(&s) % RC_MAX_SETS);
++        range_tombstone_set_t *sets[RC_MAX_SETS];
++        for (int i = 0; i < n; i++)
++        {
++            sets[i] = range_tombstone_set_new();
++            ASSERT_TRUE(sets[i] != NULL);
++            rc_fill_set(&s, sets[i]);
++        }
++
++        range_tombstone_set_t *merged = NULL;
++        ASSERT_EQ(range_tombstone_set_merge((const range_tombstone_set_t *const *)sets, (size_t)n,
++                                            &merged),
++                  TDB_SUCCESS);
++        ASSERT_TRUE(merged != NULL);
++        rc_assert_well_formed(merged);
++        rc_probe_all(sets, n, merged, &s);
++
++        range_tombstone_set_free(merged);
++        for (int i = 0; i < n; i++) range_tombstone_set_free(sets[i]);
++    }
++
++    /* an empty input merges into an empty set */
++    range_tombstone_set_t *merged = NULL;
++    ASSERT_EQ(range_tombstone_set_merge(NULL, 0, &merged), TDB_SUCCESS);
++    ASSERT_EQ(range_tombstone_set_count(merged), 0);
++    range_tombstone_set_free(merged);
++
++    for (int c = 0; c < RC_CF_CASES; c++) rc_cf_case(&s);
++}
++
++/* a tombstone newer than the reader's snapshot does not hide the key from it, and with several the
++ * newest at or below the snapshot is the one returned */
++void test_covering_respects_snapshot(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    rc_put(&db, "b", 10);
++    rc_flush(&db);
++    rc_range(&db, "a", "c", 50);
++    rc_put(&db, "q", 51);
++    rc_flush(&db);
++
++    uint64_t seq = 0;
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 40, &seq), 0);
++    ASSERT_EQ(rc_point_live(db.cf, "b", 40), 1);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 60, &seq), 1);
++    ASSERT_EQ(seq, 50);
++    ASSERT_EQ(rc_point_live(db.cf, "b", 60), 0);
++
++    /* a newer one in another table, over part of the first */
++    rc_range(&db, "b", "bb", 70);
++    rc_put(&db, "q", 71);
++    rc_flush(&db);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 40, &seq), 0);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 60, &seq), 1);
++    ASSERT_EQ(seq, 50);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 80, &seq), 1);
++    ASSERT_EQ(seq, 70);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"bb", 2, 80, &seq), 1);
++    ASSERT_EQ(seq, 50);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"c", 1, 80, &seq), 0);
++
++    rc_db_close(&db);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++}
++
++/* a family that never deleted a range carries no index and answers from the count alone */
++void test_no_intervals_no_index(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    for (int i = 0; i < 5; i++)
++    {
++        char key[16];
++        snprintf(key, sizeof(key), "k%03d", i);
++        rc_put(&db, key, (uint64_t)(i + 1));
++        rc_flush(&db);
++    }
++    rc_compact_all(&db);
++    rc_put(&db, "k999", 99);
++    rc_flush(&db);
++
++    ASSERT_EQ(level_set_interval_tables(db.cf->levels), 0);
++    ASSERT_EQ(level_set_covering_fragments(db.cf->levels), 0);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++    uint64_t seq = 0;
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"k001", 4, UINT64_MAX, &seq), 0);
++
++    /* the first range delete brings an index with it */
++    rc_range(&db, "k0", "k1", 100);
++    rc_flush(&db);
++    ASSERT_TRUE(level_set_covering_fragments(db.cf->levels) > 0);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"k001", 4, UINT64_MAX, &seq), 1);
++    ASSERT_EQ(seq, 100);
++
++    rc_db_close(&db);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++}
++
++/* ===== readers against layouts changing under them ===== */
++
++#define RC_READERS 4
++#define RC_CYCLES  50
++#define RC_TOMB    1000000u /* the seq of the interval every reader checks for, above any other */
++
++typedef struct
++{
++    cf_t *cf;
++    _Atomic(int) *stop;
++    uint64_t reads;
++    int wrong;
++} rc_reader_t;
++
++static void *rc_reader(void *arg)
++{
++    rc_reader_t *r = (rc_reader_t *)arg;
++    while (!atomic_load_explicit(r->stop, memory_order_acquire))
++    {
++        uint64_t seq = 0;
++        if (cf_range_tombstone_covering(r->cf, (const uint8_t *)"k00015", 6, UINT64_MAX, &seq) !=
++                1 ||
++            seq != RC_TOMB)
++            r->wrong++;
++        if (cf_range_tombstone_covering(r->cf, (const uint8_t *)"k00015", 6, RC_TOMB - 1, &seq) !=
++            0)
++            r->wrong++;
++        if (cf_range_tombstone_covering(r->cf, (const uint8_t *)"m", 1, UINT64_MAX, &seq) != 0)
++            r->wrong++;
++        r->reads++;
++    }
++    return NULL;
++}
++
++void test_index_survives_layout_change_under_readers(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    rc_put(&db, "k00015", 1);
++    rc_range(&db, "k0001", "k0002", RC_TOMB);
++    rc_flush(&db);
++
++    _Atomic(int) stop;
++    atomic_init(&stop, 0);
++    pthread_t threads[RC_READERS];
++    rc_reader_t readers[RC_READERS];
++    for (int i = 0; i < RC_READERS; i++)
++    {
++        readers[i] = (rc_reader_t){.cf = db.cf, .stop = &stop, .reads = 0, .wrong = 0};
++        ASSERT_EQ(pthread_create(&threads[i], NULL, rc_reader, &readers[i]), 0);
++    }
++
++    uint64_t seq = 2;
++    for (int c = 0; c < RC_CYCLES; c++)
++    {
++        /* new tables with keys and intervals of their own, away from the one readers check */
++        char key[16], lo[16], hi[16];
++        snprintf(key, sizeof(key), "x%05d", c);
++        snprintf(lo, sizeof(lo), "p%03d", c);
++        snprintf(hi, sizeof(hi), "p%03d~", c);
++        rc_put(&db, key, seq++);
++        rc_range(&db, lo, hi, seq++);
++        rc_flush(&db);
++        rc_put(&db, "y", seq++);
++        rc_flush(&db);
++        rc_compact_all(&db);
++        level_set_reclaim_deferred(db.cf->levels);
++    }
++
++    atomic_store_explicit(&stop, 1, memory_order_release);
++    uint64_t reads = 0;
++    for (int i = 0; i < RC_READERS; i++)
++    {
++        ASSERT_EQ(pthread_join(threads[i], NULL), 0);
++        ASSERT_EQ(readers[i].wrong, 0);
++        reads += readers[i].reads;
++    }
++    ASSERT_TRUE(reads > 0);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"p007", 4, UINT64_MAX, &seq), 1);
++
++    rc_db_close(&db);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST_HANDLE_BALANCED(test_covering_sees_past_table_512, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_covering_matches_brute_force, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_covering_respects_snapshot, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_no_intervals_no_index, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_index_survives_layout_change_under_readers, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

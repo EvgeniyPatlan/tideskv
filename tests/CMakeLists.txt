@@ -46,8 +46,9 @@ foreach(suite planner exec)
   target_link_libraries(tidesdb_${suite}_tests PRIVATE tidesdb)
 endforeach()
 # TidesDB's block cache and merge iterator suites, holding the cases of cmake/patches/tidesdb-cache-* and
-# tidesdb-compaction-merge-level-runs.patch, and the random read suite tidesdb-random-read-hint.patch adds
-foreach(suite cache merge_iter random_read)
+# tidesdb-compaction-merge-level-runs.patch, the random read suite tidesdb-random-read-hint.patch adds,
+# and the range covering suite tidesdb-range-covering-index.patch adds
+foreach(suite cache merge_iter random_read range_covering)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)
@@ -59,6 +60,8 @@ add_test(NAME TidesDbMergeIter COMMAND tidesdb_merge_iter_tests)
 # the random read suite writes its scratch files, whose page cache residency it checks, under the working
 # directory
 add_test(NAME TidesDbRandomRead COMMAND tidesdb_random_read_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the range covering suite writes its scratch database under the working directory
+add_test(NAME TidesDbRangeCovering COMMAND tidesdb_range_covering_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the exec suite writes its scratch database under the working directory
 add_test(NAME TidesDbCompactionExec COMMAND tidesdb_exec_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
