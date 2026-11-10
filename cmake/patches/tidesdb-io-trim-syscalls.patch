@@ -1,0 +1,514 @@
+diff --git a/src/base/bg_pool.c b/src/base/bg_pool.c
+--- a/src/base/bg_pool.c
++++ b/src/base/bg_pool.c
+@@ -57,6 +57,8 @@ typedef struct
+ } bg_pool_thread_arg;
+ 
+ #ifndef _WIN32
++THREAD_LOCAL int tdb_timer_signals_blocked = 0;
++
+ /* block the process timer signals on the calling thread so a blocking dequeue or syscall is not
+  * restarted by an interval or profiling timer */
+ static void bg_pool_block_timer_signals(void)
+@@ -67,6 +69,8 @@ static void bg_pool_block_timer_signals(void)
+     sigaddset(&timer_signals, SIGVTALRM);
+     sigaddset(&timer_signals, SIGPROF);
+     pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
++    /* the mask stays for the thread's life, so the write path can skip masking per write */
++    tdb_timer_signals_blocked = 1;
+ }
+ #endif
+ 
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -135,6 +135,15 @@ static void ce_builder_config(const compaction_ctx_t *cx, uint64_t id, const cha
+     config->fdm = cx->cf->fdm;
+ }
+ 
++/* the preallocation chunk for an output expected to reach expected bytes: that, rounded up to a
++ * whole MB and held to the default chunk, so a capped output reserves its own size rather than 64
++ * MB it will never fill; the block manager still extends if the output outgrows it. no expectation
++ * (no cap) keeps the default */
++static uint64_t ce_prealloc_chunk(uint64_t expected)
++{
++    return block_manager_prealloc_round(expected);
++}
++
+ /* open a fresh klog and builder as the sink's current output under a newly allocated id */
+ static int ce_sink_open(ce_sink_t *s)
+ {
+@@ -154,9 +163,12 @@ static int ce_sink_open(ce_sink_t *s)
+      * until it installs, and the builder's closing fsync covers the whole file, so a barrier per
+      * block would only slow the merge down. the builder config below still carries the real sync
+      * mode, which is what drives that closing barrier */
+-    if (s->cx->cf->fdm ? fd_manager_bm_open(s->cx->cf->fdm, &s->cur_bm, klog_path,
+-                                            BLOCK_MANAGER_SYNC_NONE, FD_LABEL_SSTABLE_KLOG)
+-                       : block_manager_open(&s->cur_bm, klog_path, BLOCK_MANAGER_SYNC_NONE))
++    const uint64_t chunk = ce_prealloc_chunk(s->prealloc);
++    if (s->cx->cf->fdm ? fd_manager_bm_open_pre(s->cx->cf->fdm, &s->cur_bm, klog_path,
++                                                BLOCK_MANAGER_SYNC_NONE, chunk,
++                                                FD_LABEL_SSTABLE_KLOG)
++                       : block_manager_open_pre(&s->cur_bm, klog_path, BLOCK_MANAGER_SYNC_NONE,
++                                                chunk))
+         return TDB_ERR_IO;
+ 
+     sstable_builder_config_t config;
+@@ -803,6 +815,7 @@ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_
+         tasks[i].job = job;
+         tasks[i].runs = runs;
+         tasks[i].sink.cx = cx;
++        tasks[i].sink.prealloc = job->file_max;
+         tasks[i].rc = TDB_SUCCESS;
+         ce_range_bounds(&tasks[i], job, lo, hi);
+         lo = hi;
+@@ -889,6 +902,7 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
+     ce_sink_t sink;
+     memset(&sink, 0, sizeof(sink));
+     sink.cx = cx;
++    sink.prealloc = job->file_max;
+     /* borrowed by the sink for the length of the merge; every output clones what it is given */
+     range_tombstone_set_t *carried = NULL;
+     /* built before anything is written, so a failure to gather what the inputs carry stops the
+diff --git a/src/compaction/compaction_internal.h b/src/compaction/compaction_internal.h
+--- a/src/compaction/compaction_internal.h
++++ b/src/compaction/compaction_internal.h
+@@ -37,6 +37,9 @@ typedef struct
+     sstable_builder_t *cur_builder;
+     int cur_open;
+     int cur_partition;
++    /* the klog bytes an output is expected to reach (the job's per-output cap), which sizes its
++     * preallocation; 0 keeps the block manager's default chunk */
++    uint64_t prealloc;
+     const range_tombstone_set_t *carried;
+ } ce_sink_t;
+ 
+diff --git a/src/flush/flush.c b/src/flush/flush.c
+--- a/src/flush/flush.c
++++ b/src/flush/flush.c
+@@ -623,9 +623,8 @@ int flush_build(const flush_ctx_t *fx, tidesdb_memtable_t *immutable, flush_job_
+      * extends if a run outgrows the estimate. the whole immutable size bounds any single family's
+      * klog, and the cap keeps a large immutable at the default */
+     const uint64_t data = skip_list_get_data_bytes(immutable->skip_list);
+-    uint64_t prealloc = data + (data >> FLUSH_KLOG_PREALLOC_SLACK_SHIFT);
+-    if (prealloc == 0 || prealloc > BLOCK_MANAGER_PREALLOC_CHUNK)
+-        prealloc = BLOCK_MANAGER_PREALLOC_CHUNK;
++    const uint64_t prealloc =
++        block_manager_prealloc_round(data + (data >> FLUSH_KLOG_PREALLOC_SLACK_SHIFT));
+ 
+     const int cap = fx->n_cfs > 0 ? fx->n_cfs : 1;
+     flush_output_t *outputs = malloc((size_t)cap * sizeof(*outputs));
+diff --git a/src/io/block_manager.h b/src/io/block_manager.h
+--- a/src/io/block_manager.h
++++ b/src/io/block_manager.h
+@@ -60,6 +60,25 @@
+  * extending writes serialize on the per-inode lock (e.g., ext4 i_rwsem) regardless
+  * of disjoint offsets, so preallocation happens in chunks and pwrites land in-place. */
+ #define BLOCK_MANAGER_PREALLOC_CHUNK (64ull * 1024 * 1024) /* extend by 64 MB at a time */
++/* the unit a sized preallocation rounds up to */
++#define BLOCK_MANAGER_PREALLOC_UNIT (1024ull * 1024)
++
++/**
++ * block_manager_prealloc_round
++ * the preallocation chunk for a file expected to reach expected bytes: that rounded up to a whole
++ * BLOCK_MANAGER_PREALLOC_UNIT and held to BLOCK_MANAGER_PREALLOC_CHUNK, so an output reserves about
++ * what it will write rather than the full default extent. 0 gives the default chunk
++ * @param expected the bytes the file is expected to reach
++ * @return the chunk to pass to block_manager_open_pre
++ */
++static inline uint64_t block_manager_prealloc_round(const uint64_t expected)
++{
++    if (expected == 0 || expected > BLOCK_MANAGER_PREALLOC_CHUNK)
++        return BLOCK_MANAGER_PREALLOC_CHUNK;
++    return (expected + BLOCK_MANAGER_PREALLOC_UNIT - 1) / BLOCK_MANAGER_PREALLOC_UNIT *
++           BLOCK_MANAGER_PREALLOC_UNIT;
++}
++
+ /* the per-instance lowwater derives from the chunk by this shift (chunk >> 4 = chunk / 16), which
+  * reproduces the default 64 MB chunk / 4 MB lowwater ratio for any chunk size */
+ #define BLOCK_MANAGER_PREALLOC_LOWWATER_SHIFT 4
+diff --git a/src/platform/platform_runtime.h b/src/platform/platform_runtime.h
+--- a/src/platform/platform_runtime.h
++++ b/src/platform/platform_runtime.h
+@@ -123,10 +123,17 @@ static inline ssize_t tdb_pwritev(int fd, const struct iovec *iov, int iovcnt, o
+ #define pwritev tdb_pwritev
+ #endif
+ 
++#ifndef _WIN32
++/* set by a thread that blocks SIGALRM/SIGVTALRM/SIGPROF for its whole life (the bg_pool workers), so
++ * tdb_pwritev_safe need not mask them around every write. defined in base/bg_pool.c */
++extern THREAD_LOCAL int tdb_timer_signals_blocked;
++#endif
++
+ /**
+  * tdb_pwritev_safe
+  * wrapper around pwritev that blocks SIGALRM/SIGVTALRM/SIGPROF for the duration
+- * of the syscall. prevents EINTR from leaving a zero-filled hole in the file when
++ * of the syscall, unless the calling thread already blocks them for good
++ * (tdb_timer_signals_blocked). prevents EINTR from leaving a zero-filled hole in the file when
+  * the atomic offset reservation has already been committed.
+  * @param fd the file descriptor
+  * @param iov array of iovec buffers
+@@ -141,6 +148,7 @@ static ssize_t
+ tdb_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+ {
+ #ifndef _WIN32
++    if (tdb_timer_signals_blocked) return pwritev(fd, iov, iovcnt, offset);
+     sigset_t block_set, old_set;
+     sigemptyset(&block_set);
+     sigaddset(&block_set, SIGALRM);
+diff --git a/test/io_trim__tests.c b/test/io_trim__tests.c
+new file mode 100644
+--- /dev/null
++++ b/test/io_trim__tests.c
+@@ -0,0 +1,350 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the syscalls a block manager write path makes per output file. a flush or compaction output
++ * preallocates what it expects to write rather than the default 64 MB chunk, and a pool worker,
++ * which blocks the timer signals for life, writes without masking them again around every pwritev.
++ * both are observed by interposing libc in this binary (ftruncate, to read how much of the file was
++ * allocated before the builder trimmed it, and pthread_sigmask, to count calls), so the cases run
++ * only on Linux without a sanitizer, whose runtime owns those symbols; elsewhere they pass without
++ * checking, saying so */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <fcntl.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "../src/base/errors.h"
++#include "../src/column_family/cf_config.h"
++#include "../src/compaction/compaction_exec.h"
++#include "../src/datastructures/queue.h"
++#include "../src/base/bg_pool.h"
++#include "../src/flush/flush.h"
++#include "../src/io/block_manager.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define IT_DIR       "." PATH_SEPARATOR "test_io_trim_db"
++#define IT_MAX_LEVEL 12
++#define IT_PROB      0.25f
++#define IT_MB        (1024ull * 1024ull)
++
++#if defined(__linux__) && defined(IO_TRIM_INTERPOSE)
++#include <sys/syscall.h>
++
++static volatile int g_watch_trunc = 0;
++static volatile uint64_t g_klog_alloc_max = 0; /* the most bytes any klog held when trimmed */
++static __thread int t_count_masks = 0;
++static __thread uint64_t t_mask_calls = 0;
++
++int ftruncate(int fd, off_t len)
++{
++    if (g_watch_trunc)
++    {
++        char link[64], target[512];
++        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++        const ssize_t n = readlink(link, target, sizeof(target) - 1);
++        struct stat st;
++        if (n > 5 && (target[n] = '\0', strstr(target, ".klog")) && fstat(fd, &st) == 0)
++        {
++            const uint64_t held = (uint64_t)st.st_blocks * 512u;
++            if (held > g_klog_alloc_max) g_klog_alloc_max = held;
++        }
++    }
++    return (int)syscall(SYS_ftruncate, fd, len);
++}
++
++int pthread_sigmask(int how, const sigset_t *set, sigset_t *old)
++{
++    if (t_count_masks) t_mask_calls++;
++    return syscall(SYS_rt_sigprocmask, how, set, old, 8) == 0 ? 0 : -1;
++}
++#define IT_OBSERVABLE 1
++#else
++#define IT_OBSERVABLE 0
++#endif
++
++/* whether the scratch filesystem backs fallocate with real blocks; a filesystem that does not
++ * (or one that does not report st_blocks) leaves the allocation checks meaningless */
++static int fs_preallocates(void)
++{
++    (void)remove_directory(IT_DIR);
++    if (mkdir(IT_DIR, 0755) != 0) return 0;
++    const int fd = open(IT_DIR PATH_SEPARATOR "probe", O_CREAT | O_RDWR, 0644);
++    if (fd < 0) return 0;
++    int ok = 0;
++    struct stat st;
++    if (fallocate(fd, 0, 0, (off_t)(4 * IT_MB)) == 0 && fstat(fd, &st) == 0)
++        ok = (uint64_t)st.st_blocks * 512u >= 4 * IT_MB;
++    close(fd);
++    (void)remove_directory(IT_DIR);
++    return ok;
++}
++
++typedef struct
++{
++    vlog_t *vlog;
++    cache_t *cache;
++    fd_manager_t fdm;
++    tidesdb_manifest_t *manifest;
++    char manifest_path[256];
++    tidesdb_l0_t *l0;
++    cf_t *cf;
++    _Atomic(uint64_t) next_id;
++    uint64_t generation;
++} it_db_t;
++
++static void it_db_open(it_db_t *db)
++{
++    (void)remove_directory(IT_DIR);
++    ASSERT_EQ(mkdir(IT_DIR, 0755), 0);
++    const vlog_config_t vc = {.sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
++    ASSERT_EQ(vlog_open(IT_DIR, &vc, &db->vlog), VLOG_OK);
++    db->cache = cache_create(NULL);
++    ASSERT_EQ(fd_manager_init(&db->fdm, 0), 0);
++    snprintf(db->manifest_path, sizeof(db->manifest_path), "%s%sMANIFEST", IT_DIR, PATH_SEPARATOR);
++    db->manifest = tidesdb_manifest_open(db->manifest_path);
++    ASSERT_TRUE(db->manifest != NULL);
++
++    tidesdb_column_family_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    snprintf(cfg.name, sizeof(cfg.name), "%s", "cf0");
++    cfg.level_size_ratio = 10;
++    cfg.min_levels = 3;
++    cfg.btree_klog_block_size = 4096;
++    ASSERT_EQ(
++        cf_create(IT_DIR, 0, &cfg, NULL, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf), 0);
++    ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
++
++    db->l0 = tidesdb_l0_create(64 * 1024, 8, IT_MAX_LEVEL, IT_PROB, NULL, NULL);
++    tidesdb_l0_set_active(db->l0,
++                          tidesdb_memtable_create(NULL, 0, 0, IT_MAX_LEVEL, IT_PROB, NULL, NULL));
++    atomic_init(&db->next_id, 100);
++    db->generation = 1;
++}
++
++static void it_db_close(it_db_t *db)
++{
++    tidesdb_l0_destroy(db->l0);
++    cf_free(db->cf);
++    tidesdb_manifest_close(db->manifest);
++    fd_manager_destroy(&db->fdm);
++    cache_destroy(db->cache);
++    vlog_close(db->vlog);
++    (void)remove_directory(IT_DIR);
++}
++
++/* about one MB of live data: 1024 keys of 1000 byte values, inline */
++static void it_fill_one_mb(it_db_t *db, int round)
++{
++    uint8_t value[1000];
++    memset(value, 'v', sizeof(value));
++    for (int i = 0; i < 1024; i++)
++    {
++        char key[32];
++        snprintf(key, sizeof(key), "k%d-%06d", round, i);
++        ASSERT_EQ(tidesdb_l0_apply(db->l0, 0, (const uint8_t *)key, strlen(key), value,
++                                   sizeof(value), -1, (uint64_t)(round * 2000 + i + 1), 0),
++                  TDB_SUCCESS);
++    }
++}
++
++static void it_flush(it_db_t *db)
++{
++    db->generation++;
++    ASSERT_EQ(
++        tidesdb_l0_rotate(db->l0, tidesdb_memtable_create(NULL, db->generation, db->generation,
++                                                          IT_MAX_LEVEL, IT_PROB, NULL, NULL)),
++        TDB_SUCCESS);
++    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(db->l0);
++    cf_t *cfs[1] = {db->cf};
++    flush_ctx_t fx = {.l0 = db->l0,
++                      .cfs = cfs,
++                      .n_cfs = 1,
++                      .manifest = db->manifest,
++                      .manifest_path = db->manifest_path,
++                      .next_sstable_id = &db->next_id,
++                      .fdm = &db->fdm,
++                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                      .value_threshold = 1u << 20};
++    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
++}
++
++static void it_compact_all(it_db_t *db, uint64_t file_max)
++{
++    const int total = level_set_snapshot(db->cf->levels, NULL, 0);
++    level_set_snapshot_entry_t *all = calloc((size_t)total, sizeof(*all));
++    uint64_t *ids = malloc((size_t)total * sizeof(uint64_t));
++    ASSERT_TRUE(all && ids);
++    ASSERT_EQ(level_set_snapshot(db->cf->levels, all, total), total);
++    for (int i = 0; i < total; i++) ids[i] = all[i].sst->id;
++    for (int i = 0; i < total; i++)
++        if (sstable_unref(all[i].sst)) sstable_close(all[i].sst);
++    free(all);
++
++    const compaction_job_t job = {.input_ids = ids,
++                                  .n_inputs = total,
++                                  .target_level = 2,
++                                  .is_largest_level = 0,
++                                  .split = COMPACTION_SPLIT_NONE,
++                                  .file_max = file_max};
++    const compaction_ctx_t cx = {.cf = db->cf,
++                                 .manifest = db->manifest,
++                                 .manifest_path = db->manifest_path,
++                                 .next_sstable_id = &db->next_id,
++                                 .gc_floor = 0,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = 1u << 20};
++    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
++    free(ids);
++}
++
++static void test_output_prealloc_is_sized(void)
++{
++#if IT_OBSERVABLE
++    if (!fs_preallocates())
++    {
++        printf("(skipped: the scratch filesystem does not preallocate) ");
++        return;
++    }
++    it_db_t db;
++    it_db_open(&db);
++
++    /* a flush of about 1 MB holds its klog to about that, not the default 64 MB chunk */
++    it_fill_one_mb(&db, 1);
++    g_klog_alloc_max = 0;
++    g_watch_trunc = 1;
++    it_flush(&db);
++    g_watch_trunc = 0;
++    ASSERT_TRUE(g_klog_alloc_max > 0);
++    ASSERT_TRUE(g_klog_alloc_max <= 2 * IT_MB);
++
++    /* a compaction output is sized by the job's per-output cap */
++    it_fill_one_mb(&db, 2);
++    it_flush(&db);
++    g_klog_alloc_max = 0;
++    g_watch_trunc = 1;
++    it_compact_all(&db, 2 * IT_MB);
++    g_watch_trunc = 0;
++    ASSERT_TRUE(g_klog_alloc_max > 0);
++    ASSERT_TRUE(g_klog_alloc_max <= 4 * IT_MB);
++
++    it_db_close(&db);
++#else
++    printf("(skipped: needs Linux and no sanitizer) ");
++#endif
++}
++
++#if IT_OBSERVABLE
++#define IT_WRITES 100
++
++typedef struct
++{
++    const char *path;
++    uint64_t mask_calls;
++    int rc;
++    pthread_mutex_t mu;
++    pthread_cond_t cv;
++    int done;
++} it_job_t;
++
++/* open a file and write IT_WRITES blocks from the calling thread, counting the sigmask calls the
++ * writes make */
++static void it_write_blocks(it_job_t *job)
++{
++    block_manager_t *bm = NULL;
++    job->rc = -1;
++    if (block_manager_open(&bm, job->path, BLOCK_MANAGER_SYNC_NONE) != 0) return;
++    uint8_t payload[256];
++    memset(payload, 'p', sizeof(payload));
++    t_mask_calls = 0;
++    t_count_masks = 1;
++    int ok = 1;
++    for (int i = 0; i < IT_WRITES; i++)
++    {
++        block_manager_block_t *b = block_manager_block_create(sizeof(payload), payload);
++        if (!b || block_manager_block_write(bm, b) < 0) ok = 0;
++        if (b) block_manager_block_free(b);
++    }
++    t_count_masks = 0;
++    job->mask_calls = t_mask_calls;
++    (void)block_manager_close(bm);
++    job->rc = ok ? 0 : -1;
++}
++
++static void *it_plain_thread(void *arg)
++{
++    it_write_blocks((it_job_t *)arg);
++    return NULL;
++}
++
++static void it_pool_worker(void *item, void *ctx)
++{
++    (void)ctx;
++    it_job_t *job = (it_job_t *)item;
++    it_write_blocks(job);
++    pthread_mutex_lock(&job->mu);
++    job->done = 1;
++    pthread_cond_signal(&job->cv);
++    pthread_mutex_unlock(&job->mu);
++}
++#endif
++
++static void test_pool_thread_skips_sigmask(void)
++{
++#if IT_OBSERVABLE
++    (void)remove_directory(IT_DIR);
++    ASSERT_EQ(mkdir(IT_DIR, 0755), 0);
++
++    it_job_t plain = {.path = IT_DIR PATH_SEPARATOR "plain.blk"};
++    pthread_t t;
++    ASSERT_EQ(pthread_create(&t, NULL, it_plain_thread, &plain), 0);
++    ASSERT_EQ(pthread_join(t, NULL), 0);
++    ASSERT_EQ(plain.rc, 0);
++    /* two masks per write, set and restore */
++    ASSERT_EQ(plain.mask_calls, 2u * IT_WRITES);
++
++    it_job_t pooled = {.path = IT_DIR PATH_SEPARATOR "pooled.blk",
++                       .mu = PTHREAD_MUTEX_INITIALIZER,
++                       .cv = PTHREAD_COND_INITIALIZER};
++    queue_t *q = queue_new();
++    ASSERT_TRUE(q != NULL);
++    bg_pool_t *pool = bg_pool_start_named(1, q, "iotrim", it_pool_worker, NULL);
++    ASSERT_TRUE(pool != NULL);
++    ASSERT_EQ(queue_enqueue(q, &pooled), 0);
++    pthread_mutex_lock(&pooled.mu);
++    while (!pooled.done) pthread_cond_wait(&pooled.cv, &pooled.mu);
++    pthread_mutex_unlock(&pooled.mu);
++    bg_pool_stop(pool);
++    queue_free(q);
++    ASSERT_EQ(pooled.rc, 0);
++    ASSERT_EQ(pooled.mask_calls, 0u);
++
++    (void)remove_directory(IT_DIR);
++#else
++    printf("(skipped: needs Linux and no sanitizer) ");
++#endif
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST_HANDLE_BALANCED(test_output_prealloc_is_sized, tests_passed);
++    RUN_TEST(test_pool_thread_skips_sigmask, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
