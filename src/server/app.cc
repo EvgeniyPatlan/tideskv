@@ -439,7 +439,7 @@ void App::FillStorageStats(ServerStats& s) const {
     for (ColumnFamily cf : kAllColumnFamilies) {
       const CfStats& c = st->cf[CfIndex(cf)];
       ServerStats::CfIo io{std::string(ColumnFamilyName(cf)), c.flush_bytes_written, c.compaction_bytes_read,
-                           c.compaction_bytes_written, c.user_bytes_written, {}};
+                           c.compaction_bytes_written,        c.user_bytes_written,  {}};
       for (size_t l = 0; l < c.levels.size(); ++l) {
         if (l > 0) io.levels += ',';
         io.levels += "L" + std::to_string(l + 1) + "=" + std::to_string(c.levels[l].first) + "/" +

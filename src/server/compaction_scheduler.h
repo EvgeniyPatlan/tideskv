@@ -49,7 +49,9 @@ class CompactionScheduler final : public CommitListener {
     std::function<double()> dead_ratio = [] { return 0.2; };
     std::function<uint64_t()> subkey_keys;
     uint64_t collection_compaction_spacing = 4;  // 0 = compact at every threshold
-    std::function<std::chrono::steady_clock::time_point()> now = [] { return std::chrono::steady_clock::now(); };
+    std::function<std::chrono::steady_clock::time_point()> now = [] {
+      return std::chrono::steady_clock::now();
+    };
   };
 
   CompactionScheduler(Compactor& compactor, Options options)
@@ -81,7 +83,7 @@ class CompactionScheduler final : public CommitListener {
     bool checkpointed = false;  // its tombstones are in sstables: a retry needs no new checkpoint
   };
   void EnqueueCollectionsLocked();  // requires mu_
-  void EnqueueLocked(Job job);  // requires mu_
+  void EnqueueLocked(Job job);      // requires mu_
   Status RunJob(Job& job);
   void Loop();
 
@@ -91,9 +93,9 @@ class CompactionScheduler final : public CommitListener {
   std::condition_variable cv_;
   std::deque<Job> queue_;
   uint64_t collection_deletes_ = 0;  // since the last collection-triggered compaction
-  bool eval_pending_ = false;        // count and spacing allow a compaction; the dead ratio is still unchecked
-  bool unknown_elements_ = false;    // a counted delete had no element count: the ratio cannot be trusted
-  uint64_t deleted_elements_ = 0;    // elements of those collections (RangeDelete::elements)
+  bool eval_pending_ = false;      // count and spacing allow a compaction; the dead ratio is still unchecked
+  bool unknown_elements_ = false;  // a counted delete had no element count: the ratio cannot be trusted
+  uint64_t deleted_elements_ = 0;  // elements of those collections (RangeDelete::elements)
   std::chrono::steady_clock::time_point collection_not_before_{};  // spacing after the last subkey compaction
   bool last_round_busy_ = false;  // the worker's next wait is busy_retry, not tick
   std::atomic<uint64_t> completed_{0};
