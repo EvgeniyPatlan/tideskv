@@ -34,7 +34,8 @@ set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-btree-single-pass-leaves.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-btree-builder-arena.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-io-trim-syscalls.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compression-start-level.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compression-start-level.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-wake.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

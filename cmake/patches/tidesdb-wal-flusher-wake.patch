@@ -1,0 +1,828 @@
+diff --git a/src/io/block_manager.h b/src/io/block_manager.h
+--- a/src/io/block_manager.h
++++ b/src/io/block_manager.h
+@@ -129,8 +129,14 @@ typedef enum
+  * @param flush_thread the single flush thread that owns every pwrite in buffered mode
+  * @param flush_stop set at close so the flush thread drains the ring and exits
+  * @param flush_error errno set if a flush-thread pwrite or fdatasync failed
+- * @param flush_sleeping 1 while the flush thread is parked waiting for work
++ * @param flush_sleeping how the flush thread is parked: 0 awake, BM_FLUSH_PARKED waiting for the
++ *                       frontier record (every completing appender wakes it), BM_FLUSH_GATHERING
++ *                       letting staged records gather (only an urgent appender wakes it)
+  * @param durable_waiters count of appenders parked waiting for buf_flushed to advance
++ * @param flush_want the furthest offset a waiter has asked the flush thread to reach; outside
++ *                   sync-full it is what ends a gathering park early
++ * @param flush_gather_us how long the flush thread lets records gather outside sync-full,
++ *                        BM_BUF_GATHER_US; a field only so a test can widen it
+  * @param buf_mtx guards the buffered condition variables
+  * @param buf_work_cv the flush thread parks here when the ring has no released work
+  * @param buf_durable_cv appenders park here waiting for buf_flushed to advance
+@@ -167,6 +173,8 @@ typedef struct
+     _Atomic int flush_error;
+     _Atomic int flush_sleeping;
+     _Atomic int durable_waiters;
++    ATOMIC_ALIGN(8) _Atomic uint64_t flush_want;
++    _Atomic uint32_t flush_gather_us;
+     pthread_mutex_t buf_mtx;
+     pthread_cond_t buf_work_cv;
+     pthread_cond_t buf_durable_cv;
+diff --git a/src/io/block_manager_core.c b/src/io/block_manager_core.c
+--- a/src/io/block_manager_core.c
++++ b/src/io/block_manager_core.c
+@@ -218,6 +218,8 @@ static int bm_truncate_and_reset(block_manager_t *bm, uint64_t size)
+     if (bm->buffered)
+     {
+         atomic_store(&bm->buf_flushed, size);
++        /* a request past the new end would keep the flush thread from ever gathering again */
++        atomic_store(&bm->flush_want, size);
+     }
+     return 0;
+ }
+@@ -269,6 +271,8 @@ static void bm_init_fields(block_manager_t *m, const block_manager_sync_mode_t s
+     atomic_init(&m->flush_error, 0);
+     atomic_init(&m->flush_sleeping, 0);
+     atomic_init(&m->durable_waiters, 0);
++    atomic_init(&m->flush_want, 0);
++    atomic_init(&m->flush_gather_us, BM_BUF_GATHER_US);
+ 
+     m->sync_mode = sync_mode;
+     atomic_init(&m->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
+diff --git a/src/io/block_manager_internal.h b/src/io/block_manager_internal.h
+--- a/src/io/block_manager_internal.h
++++ b/src/io/block_manager_internal.h
+@@ -44,6 +44,18 @@
+ #define BM_BUF_DEFAULT_RING (8ull * 1024 * 1024)
+ #define BM_BUF_MIN_RING     (1ull * 1024 * 1024)
+ 
++/* outside sync-full no committer waits for the flush thread, so it is not woken per append: it
++ * lets staged records gather for up to BM_BUF_GATHER_US, or until the unflushed run reaches
++ * 1/BM_BUF_GATHER_WATERMARK_DIV of the ring, and writes them as one run. a waiter (sync-interval's
++ * commit, an fsync barrier, ring backpressure) asks for the flush itself through flush_want, so no
++ * wait is ever held to the window. shared because core seeds flush_gather_us at open */
++#define BM_BUF_GATHER_US            1000
++#define BM_BUF_GATHER_WATERMARK_DIV 2
++
++/* flush_sleeping states: 0 is awake */
++#define BM_FLUSH_PARKED    1 /* waiting for the frontier record; any completing appender wakes it */
++#define BM_FLUSH_GATHERING 2 /* gathering; only an urgent appender (watermark, waiter) wakes it */
++
+ /**
+  * bm_note_write_failure
+  * record the errno of a failed write or sync on the handle so block_manager_last_errno can tell a
+diff --git a/src/io/block_manager_write.c b/src/io/block_manager_write.c
+--- a/src/io/block_manager_write.c
++++ b/src/io/block_manager_write.c
+@@ -86,11 +86,11 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
+ #define BM_BUF_FLUSH_PARK_US 500  /* flush-thread park timeout, a missed-signal safety net */
+ #define BM_BUF_WAIT_PARK_US  2000 /* appender durability-wait park timeout */
+ 
+-/* the park timeout only exists to catch a wake that was somehow missed; bm_wake_flush is the real
+- * signal and is ordered against the appender's completion flag so it cannot be lost. holding the
+- * short timeout while nothing is arriving therefore buys nothing and costs a wakeup every half
+- * millisecond, which is most of an idle database's CPU. consecutive empty parks back the timeout
+- * off toward the ceiling, and any drained run resets it */
++/* the park timeout only exists to catch a wake that was somehow missed; bm_wake_after_stage and
++ * bm_request_flush are the real signals and are ordered against the flush thread's park decision
++ * so they cannot be lost. holding the short timeout while nothing is arriving therefore buys
++ * nothing and costs a wakeup every half millisecond, which is most of an idle database's CPU.
++ * consecutive empty parks back the timeout off toward the ceiling, and any drained run resets it */
+ #define BM_BUF_FLUSH_PARK_MAX_US 250000 /* idle ceiling, a quarter second */
+ #define BM_BUF_FLUSH_PARK_GROWTH 2      /* multiplier applied per consecutive empty park */
+ 
+@@ -301,18 +301,38 @@ static int bm_flush_drain(block_manager_t *bm)
+     return 1;
+ }
+ 
++/**
++ * bm_flush_urgent
++ * whether the flush thread must write now rather than let records keep gathering: the manager is
++ * stopping, a waiter asked for bytes past the flushed frontier, or the unflushed run has reached
++ * the ring's watermark
++ * @param bm the buffered block manager
++ * @param fl the flushed frontier, which only the flush thread advances
++ * @return non-zero when the flush is wanted now
++ */
++static int bm_flush_urgent(block_manager_t *bm, const uint64_t fl)
++{
++    if (atomic_load_explicit(&bm->flush_stop, memory_order_acquire)) return 1;
++    if (atomic_load_explicit(&bm->flush_want, memory_order_seq_cst) > fl) return 1;
++    const uint64_t reserved = atomic_load_explicit(&bm->current_file_size, memory_order_seq_cst);
++    return reserved - fl >= bm->ring_size / BM_BUF_GATHER_WATERMARK_DIV;
++}
++
+ /**
+  * bm_flush_park
+- * park the flush thread until the frontier record completes or the manager stops, spinning briefly
+- * first and then waiting on the work cond var with a timeout as a missed-signal net
++ * park the flush thread until the frontier record completes or the manager stops, optionally
++ * spinning briefly first, then waiting on the work cond var with a timeout as a missed-signal net
+  * @param bm the buffered block manager
+  * @param park_us in/out -- microseconds this thread has parked, accumulated across calls for the
+  *                stall statistics
++ * @param spin non-zero to spin before parking. only worth it right after a drain that wrote
++ *             something: once a park has already come back empty the next record is not a few
++ *             hundred cycles away, and under sync-full the records arrive an fsync apart anyway
+  */
+-static void bm_flush_park(block_manager_t *bm, long *park_us)
++static void bm_flush_park(block_manager_t *bm, long *park_us, const int spin)
+ {
+     const uint64_t fl = atomic_load_explicit(&bm->buf_flushed, memory_order_relaxed);
+-    for (int s = 0; s < BM_BUF_SPIN; s++)
++    for (int s = 0; spin && s < BM_BUF_SPIN; s++)
+     {
+         if (fl < atomic_load_explicit(&bm->current_file_size, memory_order_acquire) &&
+             bm_done(bm, fl))
+@@ -321,7 +341,7 @@ static void bm_flush_park(block_manager_t *bm, long *park_us)
+     }
+ 
+     pthread_mutex_lock(&bm->buf_mtx);
+-    atomic_store_explicit(&bm->flush_sleeping, 1, memory_order_seq_cst);
++    atomic_store_explicit(&bm->flush_sleeping, BM_FLUSH_PARKED, memory_order_seq_cst);
+     const uint64_t res2 = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+     if (!(fl < res2 && bm_done(bm, fl)) &&
+         !(atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == res2))
+@@ -335,10 +355,39 @@ static void bm_flush_park(block_manager_t *bm, long *park_us)
+     pthread_mutex_unlock(&bm->buf_mtx);
+ }
+ 
++/**
++ * bm_flush_gather
++ * outside sync-full, let staged records gather for up to flush_gather_us before the next drain, so
++ * a burst of commits costs one write and no appender has to wake this thread. ends early when the
++ * flush turns urgent (bm_flush_urgent); an appender or waiter that makes it urgent signals, and the
++ * seq_cst store of the parked state below pairs with their seq_cst publish-then-check so the wake
++ * cannot be lost
++ * @param bm the buffered block manager
++ */
++static void bm_flush_gather(block_manager_t *bm)
++{
++    const uint64_t fl = atomic_load_explicit(&bm->buf_flushed, memory_order_relaxed);
++    pthread_mutex_lock(&bm->buf_mtx);
++    atomic_store_explicit(&bm->flush_sleeping, BM_FLUSH_GATHERING, memory_order_seq_cst);
++    if (!bm_flush_urgent(bm, fl))
++    {
++        struct timespec ts;
++        tdb_wait_deadline(&ts, atomic_load_explicit(&bm->flush_gather_us, memory_order_relaxed));
++        pthread_cond_timedwait(&bm->buf_work_cv, &bm->buf_mtx, &ts);
++    }
++    atomic_store_explicit(&bm->flush_sleeping, 0, memory_order_seq_cst);
++    pthread_mutex_unlock(&bm->buf_mtx);
++}
++
+ /* the single writer for a buffered block manager, draining completed runs from the ring to the fd
+  * and parking when idle; appenders never wait on each other, they just set their done flag, so
+  * there is no in-order release convoy under thread oversubscription and only this thread touches
+- * the fd
++ * the fd.
++ * under sync-full every committer waits for its record, so a drain is followed at once by the next
++ * one and the thread parks only when the frontier is not ready. in the other modes a drain is
++ * followed by a gathering park (bm_flush_gather), so records reach the file within
++ * flush_gather_us or at the ring watermark, and a waiter cuts the park short. when a drain finds
++ * nothing it parks as under sync-full, so the first record after a quiet spell wakes it
+  * @param arg the block manager, passed as void* per the pthread start-routine signature
+  * @return always NULL; exits when flush_stop is set and the ring is drained, or on a flush error
+  */
+@@ -346,6 +395,8 @@ void *bm_flush_thread(void *arg)
+ {
+     block_manager_t *bm = (block_manager_t *)arg;
+     long park_us = BM_BUF_FLUSH_PARK_US;
++    /* the previous drain wrote something, so a brief spin may catch the next record */
++    int spin = 1;
+     for (;;)
+     {
+         /* exit on any flagged error -- this thread's own or one the oversized-record path set after
+@@ -358,6 +409,8 @@ void *bm_flush_thread(void *arg)
+         if (drained > 0)
+         {
+             park_us = BM_BUF_FLUSH_PARK_US; /* work arrived, go back to reacting immediately */
++            spin = 1;
++            if (!is_sync_full(bm)) bm_flush_gather(bm);
+             continue;
+         }
+ 
+@@ -366,7 +419,12 @@ void *bm_flush_thread(void *arg)
+         const uint64_t reserved =
+             atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+         if (atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == reserved) break;
+-        bm_flush_park(bm, &park_us);
++
++        /* park until the frontier record completes, in every mode: a gathering park here could
++         * catch the first record of a quiet spell mid-copy and hold it for a whole window, since
++         * its appender, seeing the thread gathering, would not wake it */
++        bm_flush_park(bm, &park_us, spin);
++        spin = 0;
+     }
+ 
+     pthread_mutex_lock(&bm->buf_mtx);
+@@ -375,12 +433,44 @@ void *bm_flush_thread(void *arg)
+     return NULL;
+ }
+ 
++/**
++ * bm_signal_flush
++ * signal the flush thread's work cond var
++ * @param bm the block manager
++ */
++static void bm_signal_flush(block_manager_t *bm)
++{
++    pthread_mutex_lock(&bm->buf_mtx);
++    pthread_cond_signal(&bm->buf_work_cv);
++    pthread_mutex_unlock(&bm->buf_mtx);
++}
++
++/**
++ * bm_request_flush
++ * outside sync-full, ask the flush thread to carry the frontier to need now instead of at the end
++ * of its gathering window: raise flush_want (seq_cst), then wake the thread if it is parked. the
++ * publish-then-check pairs with the thread's seq_cst parked-state store followed by its read of
++ * flush_want, so either it sees the request or this sees it parked. when flush_want already covers
++ * need, the waiter that raised it made the same check after its own store
++ * @param bm the block manager
++ * @param need the flushed offset the caller is about to wait for
++ */
++static void bm_request_flush(block_manager_t *bm, const uint64_t need)
++{
++    uint64_t want = atomic_load_explicit(&bm->flush_want, memory_order_relaxed);
++    while (want < need &&
++           !atomic_compare_exchange_weak_explicit(&bm->flush_want, &want, need,
++                                                  memory_order_seq_cst, memory_order_relaxed));
++    if (atomic_load_explicit(&bm->flush_sleeping, memory_order_seq_cst)) bm_signal_flush(bm);
++}
++
+ /**
+  * bm_wait_flushed
+  * block until the flush thread has advanced buf_flushed to at least need. serves both durability (a
+  * committer waiting for its record to reach the fd) and ring backpressure (an appender waiting for
+- * a slot to free). spins briefly, then parks on buf_durable_cv with a timeout as a missed-signal
+- * net.
++ * a slot to free). outside sync-full it first asks the flush thread for the bytes, since appends
++ * there do not wake it. spins briefly, then parks on buf_durable_cv with a timeout as a
++ * missed-signal net.
+  * @param bm the block manager
+  * @param need the flushed offset to wait for
+  * @return 0 once buf_flushed >= need, -1 if the flush thread reported an I/O error
+@@ -388,6 +478,7 @@ void *bm_flush_thread(void *arg)
+ int bm_wait_flushed(block_manager_t *bm, uint64_t need)
+ {
+     if (atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) >= need) return 0;
++    if (!is_sync_full(bm)) bm_request_flush(bm, need);
+ 
+     for (int s = 0; s < BM_BUF_SPIN; s++)
+     {
+@@ -418,12 +509,36 @@ int bm_wait_flushed(block_manager_t *bm, uint64_t need)
+  */
+ static inline void bm_wake_flush(block_manager_t *bm)
+ {
+-    if (atomic_load_explicit(&bm->flush_sleeping, memory_order_seq_cst))
++    if (atomic_load_explicit(&bm->flush_sleeping, memory_order_seq_cst)) bm_signal_flush(bm);
++}
++
++/**
++ * bm_wake_after_stage
++ * after staging [off, end), wake the flush thread only if something needs it. under sync-full every
++ * append wakes a parked thread, as a committer is about to wait. otherwise a gathering thread is
++ * woken only when the run reaches the watermark or a waiter asked for bytes this record may be
++ * holding up, and a thread parked on an empty ring (BM_FLUSH_PARKED) is woken by the first record.
++ * the seq_cst state load follows the caller's seq_cst done-flag store; see bm_request_flush for why
++ * a waiter's flush_want is visible here whenever the state read says the thread is parked after it
++ * @param bm the block manager
++ * @param off the staged run's first file offset
++ * @param end the staged run's end offset
++ */
++static inline void bm_wake_after_stage(block_manager_t *bm, const uint64_t off, const uint64_t end)
++{
++    const int state = atomic_load_explicit(&bm->flush_sleeping, memory_order_seq_cst);
++    if (!state) return;
++    if (state == BM_FLUSH_GATHERING && !is_sync_full(bm))
+     {
+-        pthread_mutex_lock(&bm->buf_mtx);
+-        pthread_cond_signal(&bm->buf_work_cv);
+-        pthread_mutex_unlock(&bm->buf_mtx);
++        if (atomic_load_explicit(&bm->flush_want, memory_order_seq_cst) > off)
++        {
++            bm_signal_flush(bm);
++            return;
++        }
++        const uint64_t fl = atomic_load_explicit(&bm->buf_flushed, memory_order_acquire);
++        if (fl >= end || end - fl < bm->ring_size / BM_BUF_GATHER_WATERMARK_DIV) return;
+     }
++    bm_signal_flush(bm);
+ }
+ 
+ /**
+@@ -436,8 +551,9 @@ static inline void bm_wake_flush(block_manager_t *bm)
+  * @param bm the block manager
+  * @param data the payload to frame and append
+  * @param size the payload size in bytes
+- * @param wake non-zero to signal the flush thread after staging, which a batch defers to its last
+- * record so one batch costs one signal rather than one per record
++ * @param wake non-zero to wake the flush thread after staging if it needs waking (see
++ * bm_wake_after_stage), which a batch defers to its last record so one batch costs at most one
++ * signal rather than one per record
+  * @return the reserved file offset the record was written at, or -1 on a flush I/O error
+  */
+ static int64_t bm_buffered_append(block_manager_t *bm, const void *data, const uint32_t size,
+@@ -507,7 +623,7 @@ static int64_t bm_buffered_append(block_manager_t *bm, const void *data, const u
+      * framed record. no waiting on other appenders; the flush thread advances over the contiguous
+      * run of set flags itself. seq_cst pairs with the flush thread's sleeping-flag StoreLoad. */
+     atomic_store_explicit(&bm->done_ring[off % R], (unsigned char)1, memory_order_seq_cst);
+-    if (wake) bm_wake_flush(bm);
++    if (wake) bm_wake_after_stage(bm, off, end);
+     return (int64_t)off;
+ }
+ 
+@@ -742,6 +858,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
+     if (bm->buffered)
+     {
+         size_t staged = 0;
++        uint64_t first_off = 0, last_end = 0;
+         for (size_t i = 0; i < count; i++)
+         {
+             if (!blocks[i])
+@@ -754,11 +871,14 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
+                 bm_buffered_append(bm, blocks[i]->data, (uint32_t)blocks[i]->size, 0);
+             if (off < 0) return -1;
+             offsets[i] = off;
++            if (staged == 0) first_off = (uint64_t)off;
++            last_end = (uint64_t)off + block_manager_framed_size((uint32_t)blocks[i]->size);
+             staged++;
+         }
+-        /* one signal for the whole batch rather than one per record; the flush thread coalesces the
+-         * staged run into the single large write this path would otherwise have issued itself */
+-        if (staged > 0) bm_wake_flush(bm);
++        /* at most one signal for the whole batch rather than one per record; the flush thread
++         * coalesces the staged run into the single large write this path would otherwise have
++         * issued itself */
++        if (staged > 0) bm_wake_after_stage(bm, first_off, last_end);
+         return (int)staged;
+     }
+ 
+diff --git a/test/wal_flusher__tests.c b/test/wal_flusher__tests.c
+new file mode 100644
+--- /dev/null
++++ b/test/wal_flusher__tests.c
+@@ -0,0 +1,464 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the buffered WAL's flush thread under each sync mode. outside sync-full a commit does not wait
++ * for its record to reach the file, so the flush thread lets staged records gather for a short
++ * window (or until the ring is half full) instead of being woken by every append; a committer that
++ * does wait (sync-interval, an fsync barrier, ring backpressure) asks for the flush itself. the
++ * signal count and the synced extent are observed by interposing libc in this binary
++ * (pthread_cond_signal, pwrite, fdatasync), so those checks run only on Linux without a sanitizer,
++ * whose runtime owns those symbols; elsewhere they pass without checking, saying so */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <dirent.h>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "../src/base/waitstat.h"
++#include "../src/io/block_manager.h"
++#include "../src/io/block_manager_internal.h" /* BM_FLUSH_GATHERING, BM_BUF_GATHER_* */
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define WF_FILE    "test_wal_flusher.log"
++#define WF_DB_DIR  "." PATH_SEPARATOR "test_wal_flusher_db"
++#define WF_RING    (1024u * 1024u)
++#define WF_APPENDS 10000
++/* between appends, about a client round trip, so each lands on a parked flusher */
++#define WF_GAP_US 20
++
++#if defined(__linux__) && defined(WAL_FLUSHER_INTERPOSE)
++#include <sys/syscall.h>
++
++static pthread_cond_t *_Atomic g_watch_cv = NULL;
++static _Atomic uint64_t g_signals = 0;
++static int (*g_real_signal)(pthread_cond_t *) = NULL;
++
++static _Atomic int g_watch_fd = -1;
++static _Atomic uint64_t g_written_end = 0; /* furthest byte pwritten to the watched fd */
++static _Atomic uint64_t g_synced_end = 0;  /* furthest byte a completed fdatasync covered */
++static _Atomic int g_watch_wal_syncs = 0;
++static _Atomic uint64_t g_wal_sync_count = 0;
++static _Atomic uint64_t g_wal_sync_last_us = 0;
++
++static void wf_raise(_Atomic uint64_t *at, const uint64_t v)
++{
++    uint64_t cur = atomic_load(at);
++    while (cur < v && !atomic_compare_exchange_weak(at, &cur, v));
++}
++
++int pthread_cond_signal(pthread_cond_t *c)
++{
++    if (c == atomic_load(&g_watch_cv)) atomic_fetch_add(&g_signals, 1);
++    return g_real_signal(c);
++}
++
++ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
++{
++    const ssize_t w = (ssize_t)syscall(SYS_pwrite64, fd, buf, n, off);
++    if (w > 0 && fd == atomic_load(&g_watch_fd))
++    {
++        wf_raise(&g_written_end, (uint64_t)off + (uint64_t)w);
++        /* a descriptor opened O_DSYNC is synced by the write itself, and sync-full skips the
++         * fdatasync on one */
++        if (fcntl(fd, F_GETFL) & O_DSYNC) wf_raise(&g_synced_end, (uint64_t)off + (uint64_t)w);
++    }
++    return w;
++}
++
++/* whether fd is a write-ahead log, by the name it was opened under */
++static int wf_fd_is_wal(const int fd)
++{
++    char link[64], target[512];
++    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++    const ssize_t n = readlink(link, target, sizeof(target) - 1);
++    if (n < 4) return 0;
++    target[n] = '\0';
++    return strcmp(target + n - 4, ".log") == 0;
++}
++
++int fdatasync(int fd)
++{
++    /* read before the sync: every byte written before it started is covered once it returns */
++    const uint64_t written = atomic_load(&g_written_end);
++    const int rc = (int)syscall(SYS_fdatasync, fd);
++    if (rc == 0 && fd == atomic_load(&g_watch_fd)) wf_raise(&g_synced_end, written);
++    if (rc == 0 && atomic_load(&g_watch_wal_syncs) && wf_fd_is_wal(fd))
++    {
++        atomic_store(&g_wal_sync_last_us, tdb_monotonic_us());
++        atomic_fetch_add(&g_wal_sync_count, 1);
++    }
++    return rc;
++}
++
++static void wf_interpose_init(void)
++{
++    g_real_signal = (int (*)(pthread_cond_t *))dlsym(RTLD_NEXT, "pthread_cond_signal");
++    ASSERT_TRUE(g_real_signal != NULL);
++}
++#define WF_OBSERVABLE 1
++#else
++static void wf_interpose_init(void)
++{
++}
++#define WF_OBSERVABLE 0
++#endif
++
++/* busy-wait rather than sleep: a sleep this short is rounded up to the timer slack */
++static void wf_spin_us(const uint64_t us)
++{
++    const uint64_t until = tdb_monotonic_us() + us;
++    while (tdb_monotonic_us() < until);
++}
++
++static block_manager_t *wf_open(const int sync_mode)
++{
++    (void)remove(WF_FILE);
++    block_manager_t *bm = NULL;
++    ASSERT_EQ(block_manager_open_buffered(&bm, WF_FILE, sync_mode, WF_RING), 0);
++    ASSERT_EQ(bm->buffered, 1);
++    return bm;
++}
++
++static uint64_t wf_flushed(block_manager_t *bm)
++{
++    uint64_t size = 0;
++    ASSERT_EQ(block_manager_get_size(bm, &size), 0);
++    return size;
++}
++
++/* reopen the file and count the records a reader sees, checking each one's payload */
++static int wf_count_records(const uint32_t payload)
++{
++    block_manager_t *bm = NULL;
++    ASSERT_EQ(block_manager_open(&bm, WF_FILE, BLOCK_MANAGER_SYNC_NONE), 0);
++    block_manager_cursor_t cursor;
++    ASSERT_EQ(block_manager_cursor_init_stack(&cursor, bm), 0);
++    int n = 0;
++    block_manager_block_t *block;
++    while ((block = block_manager_cursor_read_and_advance(&cursor)) != NULL)
++    {
++        ASSERT_EQ(block->size, payload);
++        ASSERT_EQ(((const unsigned char *)block->data)[0], (unsigned char)(n & 0xff));
++        block_manager_block_free(block);
++        n++;
++    }
++    ASSERT_EQ(block_manager_close(bm), 0);
++    return n;
++}
++
++/* sync-none acknowledges a commit once its record is staged, so nothing waits on the flush thread
++ * and waking it per append is pure cost: 10k appends spaced like commits from a client (each one
++ * finding the flush thread parked, which a tight loop would not) cost at most one signal per 64 of
++ * them, and every record still reaches the file */
++static void test_no_wake_per_append_in_sync_none(void)
++{
++    if (!WF_OBSERVABLE)
++    {
++        printf("(signals not observable in this build, skipped) ");
++        return;
++    }
++#if WF_OBSERVABLE
++    block_manager_t *bm = wf_open(BLOCK_MANAGER_SYNC_NONE);
++    unsigned char payload[16];
++    memset(payload, 0, sizeof(payload));
++    atomic_store(&g_signals, 0);
++    atomic_store(&g_watch_cv, &bm->buf_work_cv);
++    for (int i = 0; i < WF_APPENDS; i++)
++    {
++        payload[0] = (unsigned char)(i & 0xff);
++        ASSERT_TRUE(block_manager_write_raw(bm, payload, sizeof(payload)) >= 0);
++        wf_spin_us(WF_GAP_US);
++    }
++    const uint64_t signals = atomic_load(&g_signals);
++    atomic_store(&g_watch_cv, NULL);
++    printf("(%llu signals for %d appends) ", (unsigned long long)signals, WF_APPENDS);
++    ASSERT_TRUE(signals <= WF_APPENDS / 64);
++    ASSERT_EQ(block_manager_close(bm), 0);
++    ASSERT_EQ(wf_count_records(sizeof(payload)), WF_APPENDS);
++    (void)remove(WF_FILE);
++#endif
++}
++
++/* the durable appends of one sync-full handle: each returns only once its bytes are synced */
++static void wf_full_appends(block_manager_t *bm)
++{
++#if WF_OBSERVABLE
++    atomic_store(&g_written_end, 0);
++    atomic_store(&g_synced_end, 0);
++    atomic_store(&g_watch_fd, bm->fd);
++#endif
++    unsigned char payload[64];
++    memset(payload, 0, sizeof(payload));
++    for (int i = 0; i < 200; i++)
++    {
++        payload[0] = (unsigned char)(i & 0xff);
++        block_manager_block_t block = {.size = sizeof(payload), .data = payload, .inline_data = 0};
++        const int64_t off = block_manager_block_write_durable(bm, &block);
++        ASSERT_TRUE(off >= 0);
++        const uint64_t end = (uint64_t)off + block_manager_framed_size(sizeof(payload));
++        ASSERT_TRUE(wf_flushed(bm) >= end);
++#if WF_OBSERVABLE
++        ASSERT_TRUE(atomic_load(&g_synced_end) >= end);
++#endif
++    }
++#if WF_OBSERVABLE
++    atomic_store(&g_watch_fd, -1);
++#endif
++}
++
++/* sync-full: an append that waits returns only once a completed sync covers its bytes -- the
++ * O_DSYNC write of a handle opened sync-full, or the fdatasync of one switched to it at runtime --
++ * and the flush thread's sync failing fails the wait rather than reporting it durable */
++static void test_full_mode_still_durable(void)
++{
++    block_manager_t *bm = wf_open(BLOCK_MANAGER_SYNC_FULL);
++    wf_full_appends(bm);
++    ASSERT_EQ(block_manager_close(bm), 0);
++
++    bm = wf_open(BLOCK_MANAGER_SYNC_NONE);
++    block_manager_set_sync_mode(bm, BLOCK_MANAGER_SYNC_FULL);
++    wf_full_appends(bm);
++
++    /* the existing durability assertion (block_manager__tests.c, runtime_full_syncs_buffered):
++     * fdatasync on /dev/null fails with EINVAL, so a wait that returned without syncing would pass
++     */
++    const int null_fd = open("/dev/null", O_RDWR);
++    ASSERT_TRUE(null_fd >= 0);
++    ASSERT_TRUE(dup2(null_fd, bm->fd) >= 0);
++    close(null_fd);
++    const char payload[] = "full-mode-still-durable";
++    const int64_t off = block_manager_write_raw(bm, payload, sizeof(payload));
++    ASSERT_TRUE(off >= 0);
++    ASSERT_EQ(
++        block_manager_wait_durable(bm, (uint64_t)off + block_manager_framed_size(sizeof(payload))),
++        -1);
++    ASSERT_EQ(block_manager_last_errno(bm), EINVAL);
++    ASSERT_EQ(block_manager_close(bm), 0);
++    (void)remove(WF_FILE);
++}
++
++/* poll for cond for up to limit_us, returning how long it took or UINT64_MAX on timing out */
++#define WF_POLL(cond, limit_us)                                   \
++    ({                                                            \
++        const uint64_t wf_from = tdb_monotonic_us();              \
++        uint64_t wf_took = UINT64_MAX;                            \
++        for (;;)                                                  \
++        {                                                         \
++            if (cond)                                             \
++            {                                                     \
++                wf_took = tdb_monotonic_us() - wf_from;           \
++                break;                                            \
++            }                                                     \
++            if (tdb_monotonic_us() - wf_from > (limit_us)) break; \
++            usleep(100);                                          \
++        }                                                         \
++        wf_took;                                                  \
++    })
++
++#define WF_LONG_GATHER_US 10000000u /* ten seconds: anything that drains sooner was woken */
++#define WF_BIG_PAYLOAD    (64u * 1024u)
++
++/* a sync-none handle whose flush thread gathers for ten seconds, with one record already drained so
++ * the thread sits in its gathering park; returns the flushed frontier */
++static block_manager_t *wf_open_gathering(uint64_t *flushed)
++{
++    block_manager_t *bm = wf_open(BLOCK_MANAGER_SYNC_NONE);
++    atomic_store(&bm->flush_gather_us, WF_LONG_GATHER_US);
++    const unsigned char first[16] = {0};
++    const int64_t off = block_manager_write_raw(bm, first, sizeof(first));
++    ASSERT_TRUE(off >= 0);
++    const uint64_t end = (uint64_t)off + block_manager_framed_size(sizeof(first));
++    /* the first record after a quiet spell wakes the thread, which drains it and then gathers */
++    ASSERT_TRUE(WF_POLL(wf_flushed(bm) >= end, 2000000) != UINT64_MAX);
++    ASSERT_TRUE(WF_POLL(atomic_load(&bm->flush_sleeping) == BM_FLUSH_GATHERING, 2000000) !=
++                UINT64_MAX);
++    *flushed = end;
++    return bm;
++}
++
++/* filling the ring past half drains it at once, long before the gathering window ends; below half
++ * the records wait for the window, which also shows no append below the watermark woke the thread
++ */
++static void test_watermark_drains(void)
++{
++    uint64_t fl = 0;
++    block_manager_t *bm = wf_open_gathering(&fl);
++    unsigned char *payload = calloc(1, WF_BIG_PAYLOAD);
++    ASSERT_TRUE(payload != NULL);
++    const uint64_t framed = block_manager_framed_size(WF_BIG_PAYLOAD);
++    const int below = (int)((WF_RING / BM_BUF_GATHER_WATERMARK_DIV) / framed) - 1;
++    uint64_t end = fl;
++    for (int i = 0; i < below; i++)
++    {
++        const int64_t off = block_manager_write_raw(bm, payload, WF_BIG_PAYLOAD);
++        ASSERT_TRUE(off >= 0);
++        end = (uint64_t)off + framed;
++    }
++    ASSERT_TRUE(end - fl < WF_RING / BM_BUF_GATHER_WATERMARK_DIV);
++    usleep(20000);
++    ASSERT_EQ(wf_flushed(bm), fl);
++
++    /* two more cross the watermark */
++    for (int i = 0; i < 2; i++)
++    {
++        const int64_t off = block_manager_write_raw(bm, payload, WF_BIG_PAYLOAD);
++        ASSERT_TRUE(off >= 0);
++        end = (uint64_t)off + framed;
++    }
++    ASSERT_TRUE(end - fl >= WF_RING / BM_BUF_GATHER_WATERMARK_DIV);
++    const uint64_t took = WF_POLL(wf_flushed(bm) >= end, 2000000);
++    printf("(drained %llu bytes %llu us after the watermark) ", (unsigned long long)(end - fl),
++           (unsigned long long)took);
++    ASSERT_TRUE(took != UINT64_MAX);
++    free(payload);
++    ASSERT_EQ(block_manager_close(bm), 0);
++    (void)remove(WF_FILE);
++}
++
++/* the newest record in the database's logs holds key, by scanning every log file under dir */
++static int wf_logs_hold(const char *dir, const char *key)
++{
++    DIR *d = opendir(dir);
++    ASSERT_TRUE(d != NULL);
++    int found = 0;
++    struct dirent *ent;
++    while (!found && (ent = readdir(d)) != NULL)
++    {
++        const size_t n = strlen(ent->d_name);
++        if (n < 4 || strcmp(ent->d_name + n - 4, ".log") != 0) continue;
++        char path[1024];
++        snprintf(path, sizeof(path), "%s%s%s", dir, PATH_SEPARATOR, ent->d_name);
++        const int fd = open(path, O_RDONLY);
++        if (fd < 0) continue;
++        char buf[65536];
++        const ssize_t r = pread(fd, buf, sizeof(buf), 0);
++        close(fd);
++        if (r > 0 && memmem(buf, (size_t)r, key, strlen(key)) != NULL) found = 1;
++    }
++    closedir(d);
++    return found;
++}
++
++#define WF_INTERVAL_US 50000u
++#define WF_SCHED_US    20000u /* allowance for the ticker thread being scheduled late */
++
++/* sync-interval: a commit waits for its record to reach the file, and that wait does not sit out
++ * the gathering window -- the waiter asks for the flush. the interval tick's fsync barrier
++ * likewise, and the database's WAL is synced within the interval (plus the batching window and a
++ * scheduling allowance) of a commit */
++static void test_interval_mode_still_syncs(void)
++{
++    /* the block manager half: a durable append and a barrier on a ten-second gathering window */
++    uint64_t fl = 0;
++    block_manager_t *bm = wf_open_gathering(&fl);
++    const unsigned char payload[32] = {1};
++    block_manager_block_t block = {
++        .size = sizeof(payload), .data = (void *)payload, .inline_data = 0};
++    uint64_t from = tdb_monotonic_us();
++    int64_t off = block_manager_block_write_durable(bm, &block);
++    uint64_t took = tdb_monotonic_us() - from;
++    ASSERT_TRUE(off >= 0);
++    ASSERT_TRUE(wf_flushed(bm) >= (uint64_t)off + block_manager_framed_size(sizeof(payload)));
++    printf("(durable append %llu us, ", (unsigned long long)took);
++    ASSERT_TRUE(took < 1000000);
++
++    ASSERT_TRUE(WF_POLL(atomic_load(&bm->flush_sleeping) == BM_FLUSH_GATHERING, 2000000) !=
++                UINT64_MAX);
++#if WF_OBSERVABLE
++    atomic_store(&g_written_end, 0);
++    atomic_store(&g_synced_end, 0);
++    atomic_store(&g_watch_fd, bm->fd);
++#endif
++    off = block_manager_write_raw(bm, payload, sizeof(payload));
++    ASSERT_TRUE(off >= 0);
++    const uint64_t end = (uint64_t)off + block_manager_framed_size(sizeof(payload));
++    from = tdb_monotonic_us();
++    ASSERT_EQ(block_manager_escalate_fsync(bm), 0);
++    took = tdb_monotonic_us() - from;
++    ASSERT_TRUE(wf_flushed(bm) >= end);
++#if WF_OBSERVABLE
++    ASSERT_TRUE(atomic_load(&g_synced_end) >= end);
++    atomic_store(&g_watch_fd, -1);
++#endif
++    printf("barrier %llu us, ", (unsigned long long)took);
++    ASSERT_TRUE(took < 1000000);
++    ASSERT_EQ(block_manager_close(bm), 0);
++    (void)remove(WF_FILE);
++
++    /* the database half */
++    (void)remove_directory(WF_DB_DIR);
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = WF_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_INTERVAL;
++    cfg.memtable_sync_interval_us = WF_INTERVAL_US;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    ASSERT_EQ(tidesdb_create_column_family(db, "cf0", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cf0");
++    ASSERT_TRUE(cf != NULL);
++
++    for (int i = 0; i < 5; i++)
++    {
++        char key[32];
++        snprintf(key, sizeof(key), "wal-flusher-key-%d", i);
++#if WF_OBSERVABLE
++        const uint64_t syncs_before = atomic_load(&g_wal_sync_count);
++        atomic_store(&g_watch_wal_syncs, 1);
++#endif
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)"v",
++                                  1, -1),
++                  TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++        const uint64_t committed = tdb_monotonic_us();
++        tidesdb_txn_free(txn);
++        /* the commit returned, so its record is in the file already, not only in the ring */
++        ASSERT_TRUE(wf_logs_hold(WF_DB_DIR, key));
++#if WF_OBSERVABLE
++        const uint64_t synced = WF_POLL(atomic_load(&g_wal_sync_count) > syncs_before &&
++                                            atomic_load(&g_wal_sync_last_us) >= committed,
++                                        2 * (WF_INTERVAL_US + BM_BUF_GATHER_US + WF_SCHED_US));
++        atomic_store(&g_watch_wal_syncs, 0);
++        if (i == 0) printf("WAL synced %llu us after a commit) ", (unsigned long long)synced);
++        ASSERT_TRUE(synced <= WF_INTERVAL_US + BM_BUF_GATHER_US + WF_SCHED_US);
++#else
++        (void)committed;
++        if (i == 0) printf("WAL sync timing not observable in this build) ");
++#endif
++    }
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(WF_DB_DIR);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    wf_interpose_init();
++    RUN_TEST(test_no_wake_per_append_in_sync_none, tests_passed);
++    RUN_TEST(test_watermark_drains, tests_passed);
++    RUN_TEST(test_full_mode_still_durable, tests_passed);
++    RUN_TEST(test_interval_mode_still_syncs, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
