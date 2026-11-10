@@ -7,8 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+ARG TIDESKV_ALLOCATOR=mimalloc
 RUN cmake --preset release -DCMAKE_C_FLAGS=-fno-omit-frame-pointer -DCMAKE_CXX_FLAGS=-fno-omit-frame-pointer \
-      -DTIDESKV_BUILD_TESTS=OFF -DTIDESKV_BUILD_BENCH=OFF \
+      -DTIDESKV_ALLOCATOR="$TIDESKV_ALLOCATOR" -DTIDESKV_BUILD_TESTS=OFF -DTIDESKV_BUILD_BENCH=OFF \
     && cmake --build --preset release --target tideskv-server -j"$(nproc)"
 
 FROM ubuntu:24.04

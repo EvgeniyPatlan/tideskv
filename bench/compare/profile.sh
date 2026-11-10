@@ -53,12 +53,15 @@ build_prof_images() {
   fi
   tag=$(cd "$ROOT" && git rev-parse HEAD:src HEAD:cmake HEAD:CMakeLists.txt HEAD:CMakePresets.json HEAD:third_party \
           HEAD:bench/compare/prof-server.Dockerfile HEAD:bench/compare/prof-perf.Dockerfile | sha256sum | cut -c1-12)
+  # ALLOCATOR (env, default mimalloc) selects TIDESKV_ALLOCATOR for an allocator A/B; it is part of the image tag
+  local alloc=${ALLOCATOR:-mimalloc}
+  [[ $alloc == mimalloc ]] || tag=$tag-$alloc
   PROF_IMAGE=tideskv-prof:$tag PERF_IMAGE=tideskv-perf:$tag
   if ! docker image inspect "$PROF_IMAGE" >/dev/null 2>&1; then
     log "building $PROF_IMAGE"
     (cd "$ROOT" && git archive HEAD --add-file=bench/compare/prof-server.Dockerfile -- \
         src cmake CMakeLists.txt CMakePresets.json third_party) \
-      | docker build -q -t "$PROF_IMAGE" -f prof-server.Dockerfile - >/dev/null
+      | docker build -q -t "$PROF_IMAGE" --build-arg "TIDESKV_ALLOCATOR=$alloc" -f prof-server.Dockerfile - >/dev/null
   fi
   if ! docker image inspect "$PERF_IMAGE" >/dev/null 2>&1; then
     log "building $PERF_IMAGE"

@@ -161,6 +161,8 @@ write_server_conf() {
     sed -e "s/SYNC_MODE/$mode/" -e "s/^workers .*/workers $SERVER_WORKERS/" \
         -e "s/^block-cache-size .*/block-cache-size $cache/" -e "s/^compression .*/compression $COMPRESSION/" \
         "$HERE/tideskv.conf" >"$conf" || return
+    # TIDESKV_EXTRA_CONF (env): extra config lines separated by ';', appended last so they win (experiments)
+    if [[ -n ${TIDESKV_EXTRA_CONF:-} ]]; then tr ';' '\n' <<<"$TIDESKV_EXTRA_CONF" >>"$conf"; fi
   else
     mode=$([[ $level == strict ]] && echo yes || echo no)
     conf="$OUT/$server/kvrocks-$level.conf"
