@@ -101,6 +101,7 @@ if(INTEGRATION_SOURCES AND TARGET tideskv-server)
   add_executable(integration_tests ${INTEGRATION_SOURCES})
   target_link_libraries(integration_tests PRIVATE test_support GTest::gtest_main)
   target_compile_definitions(integration_tests PRIVATE TIDESKV_SERVER_BIN="$<TARGET_FILE:tideskv-server>")
+  target_compile_definitions(integration_tests PRIVATE TIDESKV_EXPECTED_ALLOCATOR="${TIDESKV_ALLOCATOR_NAME}")
   add_dependencies(integration_tests tideskv-server)
   tideskv_defaults(integration_tests)
   # Throughput-bound tests whose work cannot shrink without losing what they check, slow under a

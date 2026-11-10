@@ -71,6 +71,7 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
                               {"tcp_port", std::to_string(s.tcp_port)},
                               {"uptime_in_seconds", std::to_string(s.uptime_seconds)},
                               {"uptime_in_days", std::to_string(s.uptime_seconds / 86400)},
+                              {"mem_allocator", TIDESKV_ALLOCATOR_NAME},
                               {"workers", std::to_string(s.workers)}});
   }
   if (name == "clients") {

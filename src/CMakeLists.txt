@@ -36,9 +36,14 @@ target_link_libraries(tideskv_core
   PUBLIC spdlog::spdlog asio Threads::Threads
   PRIVATE tidesdb fpconv tideskv_lua tideskv_sha1)
 tideskv_defaults(tideskv_core)
+target_compile_definitions(tideskv_core PRIVATE TIDESKV_ALLOCATOR_NAME="${TIDESKV_ALLOCATOR_NAME}")
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/app/main.cc)
   add_executable(tideskv-server app/main.cc)
+  if(TIDESKV_ALLOCATOR STREQUAL "mimalloc")
+    # Third-party object: our warning flags and -Werror stay off it.
+    target_sources(tideskv-server PRIVATE $<TARGET_OBJECTS:mimalloc-obj>)
+  endif()
   target_link_libraries(tideskv-server PRIVATE tideskv_core)
   tideskv_defaults(tideskv-server)
 endif()

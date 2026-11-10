@@ -63,6 +63,28 @@ FetchContent_Declare(asio
   GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
   GIT_TAG asio-1-30-2)
 
+# --- mimalloc (pinned: v2.1.7): the process allocator, TidesDB's C code included ---
+# The server executable links mimalloc's object file, so its malloc/free/calloc/... definitions come first in
+# the global symbol scope and interpose libc's for every shared library the process loads (libtidesdb.so too).
+set(TIDESKV_MIMALLOC_VERSION "2.1.7")
+# What INFO's mem_allocator reports, and what the integration test expects.
+if(TIDESKV_ALLOCATOR STREQUAL "mimalloc")
+  set(TIDESKV_ALLOCATOR_NAME "mimalloc-${TIDESKV_MIMALLOC_VERSION}")
+else()
+  set(TIDESKV_ALLOCATOR_NAME "libc")
+endif()
+if(TIDESKV_ALLOCATOR STREQUAL "mimalloc")
+  set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+  set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v${TIDESKV_MIMALLOC_VERSION})
+  FetchContent_MakeAvailable(mimalloc)
+endif()
+
 FetchContent_MakeAvailable(tidesdb spdlog asio)
 
 add_library(asio INTERFACE)

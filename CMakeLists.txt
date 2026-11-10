@@ -13,6 +13,15 @@ option(TIDESKV_COMPRESSION "Build TidesDB with LZ4+Zstd (needs liblz4-dev libzst
 option(TIDESKV_COVERAGE "Clang source-based coverage" OFF)
 option(TIDESKV_WERROR "Treat warnings in our own targets as errors" OFF)
 set(TIDESKV_SANITIZE "" CACHE STRING "Sanitizer: empty, address or thread")
+set(TIDESKV_ALLOCATOR "mimalloc" CACHE STRING "Process allocator: mimalloc or system")
+set_property(CACHE TIDESKV_ALLOCATOR PROPERTY STRINGS mimalloc system)
+if(NOT TIDESKV_ALLOCATOR STREQUAL "mimalloc" AND NOT TIDESKV_ALLOCATOR STREQUAL "system")
+  message(FATAL_ERROR "TIDESKV_ALLOCATOR must be 'mimalloc' or 'system'")
+endif()
+# Sanitizers interpose malloc themselves, and a second interposer breaks them; coverage keeps the plain libc.
+if(TIDESKV_SANITIZE OR TIDESKV_COVERAGE)
+  set(TIDESKV_ALLOCATOR "system")
+endif()
 
 include(cmake/Sanitizers.cmake)
 include(cmake/Dependencies.cmake)
