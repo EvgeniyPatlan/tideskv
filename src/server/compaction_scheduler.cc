@@ -20,6 +20,7 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
     } else if (d.cf == ColumnFamily::kSubkey && d.lo.size() == encoding::ObjectPrefixSize()) {
       ++collection_deletes_;
       deleted_elements_ += d.elements;
+      if (d.elements == 0) unknown_elements_ = true;  // replicated, imported or rehomed: not hinted
     }
   }
   if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_) {
@@ -35,6 +36,7 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
 void CompactionScheduler::EnqueueCollectionsLocked() {
   collection_deletes_ = 0;
   deleted_elements_ = 0;
+  unknown_elements_ = false;
   eval_pending_ = false;
   EnqueueLocked({ColumnFamily::kSubkey});
   EnqueueLocked({ColumnFamily::kZScore});
@@ -52,7 +54,9 @@ void CompactionScheduler::EvaluateCollectionTrigger() {
   std::lock_guard lock(mu_);
   if (threshold == 0 || collection_deletes_ < threshold || options_.now() < collection_not_before_) return;
   // keys == 0: nothing in sstables to measure against, so the count decides
-  if (ratio > 0 && keys > 0 && static_cast<double>(deleted_elements_) < ratio * static_cast<double>(keys)) {
+  // unknown element counts or a long deferral: the count decides too
+  const bool ceiling = collection_deletes_ >= threshold * kMaxDeferralFactor;
+  if (!ceiling && !unknown_elements_ && ratio > 0 && keys > 0 && static_cast<double>(deleted_elements_) < ratio * static_cast<double>(keys)) {
     return;
   }
   EnqueueCollectionsLocked();

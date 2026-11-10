@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
-
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -136,6 +135,44 @@ TEST(CompactionScheduler, ZeroKeysFallsBackToCount) {  // everything still in me
   s.EvaluateCollectionTrigger();
   EXPECT_EQ(s.pending(), 0u);
   s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 5)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 2u);
+}
+
+// Replicated deletes, slot import and rehoming reach the scheduler without an element count: the ratio
+// can never be met for them, so the count threshold alone decides.
+TEST(CompactionScheduler, UnknownElementCountsFallBackToTheCountThreshold) {
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 1000000, 0.2));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});  // elements = 0
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 2u);
+}
+
+TEST(CompactionScheduler, UnknownFlagResetsAfterACompactionIsQueued) {
+  FakeCompactor c;
+  CompactionScheduler s(c, DeadOpts(3, 1000000, 0.2));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});
+  s.EvaluateCollectionTrigger();
+  ASSERT_EQ(s.RunPending(), 2u);
+  for (int i = 0; i < 3; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 0u);  // known counts again: 3 << 0.2 * 1000000
+}
+
+// The ratio may defer a compaction, but not for good: range-tombstone fragments pile up meanwhile.
+TEST(CompactionScheduler, RatioIsIgnoredAtTheDeferralCeiling) {
+  FakeCompactor c;
+  const uint64_t threshold = 3;
+  CompactionScheduler s(c, DeadOpts(threshold, 1000000000, 0.2));
+  const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
+  const uint64_t ceiling = threshold * CompactionScheduler::kMaxDeferralFactor;
+  for (uint64_t i = 0; i < ceiling - 1; ++i) s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
+  s.EvaluateCollectionTrigger();
+  EXPECT_EQ(s.pending(), 0u);
+  s.OnCommitted({Elements(ColumnFamily::kSubkey, obj, 1)});
   s.EvaluateCollectionTrigger();
   EXPECT_EQ(s.pending(), 2u);
 }
