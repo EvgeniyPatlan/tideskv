@@ -354,7 +354,8 @@ void ApplySettings(tidesdb_column_family_config_t* cfg, const FamilySettings& f)
   SetPipeline(cfg, f.compression);
   if (f.l1_file_count_trigger > 0) cfg->l1_file_count_trigger = f.l1_file_count_trigger;
   if (f.btree_block_size > 0) cfg->btree_klog_block_size = f.btree_block_size;
-  cfg->compression_start_level = f.compression_start_level;
+  // 1 encodes every level exactly like 0, and TidesDB persists it as 0, so keep it as 0 here
+  cfg->compression_start_level = f.compression_start_level > 1 ? f.compression_start_level : 0;
   cfg->dividing_level_offset = kDividingLevelOffset;
 }
 
@@ -522,16 +523,10 @@ Result<StorageStats> TidesStorage::Stats() {
     if (int rc = tidesdb_get_cf_stats(impl_->cfs[CfIndex(cf)], &st); rc != TDB_SUCCESS) {
       return FromTdb(rc, "get_cf_stats");
     }
-    out.cf[CfIndex(cf)] = {st.total_keys,
-                           st.total_tombstones,
-                           st.compaction_count,
-                           st.config.l1_file_count_trigger,
-                           st.config.dividing_level_offset,
-                           st.flush_bytes_written,
-                           st.compaction_bytes_read,
-                           st.compaction_bytes_written,
-                           st.user_bytes_written,
-                           {}};
+    out.cf[CfIndex(cf)] = {st.total_keys, st.total_tombstones, st.compaction_count,
+                           st.config.l1_file_count_trigger, st.config.dividing_level_offset,
+                           st.flush_bytes_written, st.compaction_bytes_read, st.compaction_bytes_written,
+                           st.user_bytes_written, {}};
     out.cf[CfIndex(cf)].btree_block_size = st.config.btree_klog_block_size;
     out.cf[CfIndex(cf)].compression_start_level = st.config.compression_start_level;
     for (int l = 0; l < st.num_levels && l < TDB_MAX_LEVELS; ++l) {

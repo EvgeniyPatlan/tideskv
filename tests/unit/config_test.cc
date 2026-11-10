@@ -116,7 +116,9 @@ TEST(Config, ValidatesValues) {
                                                         {"btree-block-size", "2kb"},
                                                         {"btree-block-size", "128kb"},
                                                         {"btree-block-size", "big"},
+                                                        {"btree-block-size", "5000"},
                                                         {"compression-start-level", "-1"},
+                                                        {"compression-start-level", "3"},
                                                         {"compression-start-level", "8"}}) {
     EXPECT_FALSE(c.Set(name, value, false).ok()) << name << "=" << value;
   }
@@ -600,10 +602,13 @@ TEST(Config, BtreeBlockSizeAndCompressionStartLevelAreParsedAndStartupOnly) {
   ASSERT_TRUE(c.Set("btree-block-size", "4kb", false).ok());
   ASSERT_TRUE(c.Set("btree-block-size", "64kb", false).ok());
   EXPECT_EQ(c.Snapshot().btree_block_size, 65536u);
-  ASSERT_TRUE(c.Set("compression-start-level", "7", false).ok());
+  ASSERT_TRUE(c.Set("compression-start-level", "1", false).ok());
+  ASSERT_TRUE(c.Set("btree-block-size", "12kb", false).ok());
+  EXPECT_EQ(c.Snapshot().btree_block_size, 12288u);
   ASSERT_TRUE(c.Set("compression-start-level", "0", false).ok());
   EXPECT_FALSE(c.Set("btree-block-size", "8kb", true).ok());
   EXPECT_FALSE(c.Set("compression-start-level", "1", true).ok());
+  EXPECT_FALSE(c.Set("compression-start-level", "7", false).ok());
 }
 
 }  // namespace

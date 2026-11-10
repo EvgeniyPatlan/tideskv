@@ -58,11 +58,12 @@ Status Memory(std::string_view v, uint64_t min, uint64_t* out) {
   return Status::Ok();
 }
 
-Status MemoryRange(std::string_view v, uint64_t lo, uint64_t hi, uint64_t* out) {
+// A memory value in [lo, hi] that is a whole multiple of `step` bytes.
+Status MemoryRange(std::string_view v, uint64_t lo, uint64_t hi, uint64_t step, uint64_t* out) {
   uint64_t parsed = 0;
-  if (!ParseMemory(v, &parsed) || parsed < lo || parsed > hi) {
+  if (!ParseMemory(v, &parsed) || parsed < lo || parsed > hi || parsed % step != 0) {
     return Status::InvalidArgument("argument must be a memory value between " + std::to_string(lo) + " and " +
-                                   std::to_string(hi) + " bytes");
+                                   std::to_string(hi) + " bytes, in multiples of " + std::to_string(step));
   }
   *out = parsed;
   return Status::Ok();
@@ -118,7 +119,9 @@ std::vector<Option> BaseOptions() {
        [](ConfigValues& c, std::string_view v) { return Memory(v, 0, &c.block_cache_size); },
        [](const ConfigValues& c) { return std::to_string(c.block_cache_size); }},
       {"btree-block-size", false,
-       [](ConfigValues& c, std::string_view v) { return MemoryRange(v, 4096, 65536, &c.btree_block_size); },
+       [](ConfigValues& c, std::string_view v) {
+         return MemoryRange(v, 4096, 65536, 4096, &c.btree_block_size);
+       },
        [](const ConfigValues& c) { return std::to_string(c.btree_block_size); }},
       {"client-query-buffer-limit", true,
        [](ConfigValues& c, std::string_view v) {
@@ -128,8 +131,12 @@ std::vector<Option> BaseOptions() {
       {"compression", false,
        [](ConfigValues& c, std::string_view v) { return Choice(v, {"no", "lz4", "zstd"}, &c.compression); },
        [](const ConfigValues& c) { return c.compression; }},
+      // 0-2 only. A deepen-by-move compaction moves the largest level's files down a level without
+      // rewriting them, so with a start level of 3 or more, files written uncompressed to L2 could end up as
+      // the largest level and stay uncompressed. At 2 or less every file that can become the largest level
+      // is written by a merge into level 2 or deeper, which compresses it. (TidesDB itself accepts 0-8.)
       {"compression-start-level", false,
-       [](ConfigValues& c, std::string_view v) { return SetInt(v, 0, 7, &c.compression_start_level); },
+       [](ConfigValues& c, std::string_view v) { return SetInt(v, 0, 2, &c.compression_start_level); },
        [](const ConfigValues& c) { return std::to_string(c.compression_start_level); }},
       {"dir", false,
        [](ConfigValues& c, std::string_view v) {

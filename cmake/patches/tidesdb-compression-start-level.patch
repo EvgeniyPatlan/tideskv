@@ -56,7 +56,7 @@ diff --git a/src/column_family/cf_config.c b/src/column_family/cf_config.c
      if (cfg->encoding_count > TDB_ENCODING_PIPELINE_MAX) return -1;
  
 -    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count;
-+    const size_t tail = cfg->compression_start_level != 0 ? CF_CONFIG_BLOB_START_LEVEL_SIZE : 0;
++    const size_t tail = cfg->compression_start_level > 1 ? CF_CONFIG_BLOB_START_LEVEL_SIZE : 0;
 +    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count + tail;
      uint8_t *buf = malloc(len);
      if (!buf) return -1;
@@ -92,7 +92,7 @@ diff --git a/src/column_family/cf_config.h b/src/column_family/cf_config.h
  /* on-disk version leading a serialized blob; a hard break (v10), so a blob whose version is not the
 - * current one is refused rather than misread */
 + * current one is refused rather than misread. compression_start_level follows the pipeline array as
-+ * four bytes, and only when it is not 0, so a default config serializes exactly as before and a
++ * four bytes, and only when it is above 1 (0 and 1 both encode every level), so a default config serializes exactly as before and a
 + * blob with the tail still reads under code that ignores it (it never reads past the pipeline) */
  #define CF_CONFIG_BLOB_VERSION 10
  
@@ -201,7 +201,7 @@ diff --git a/test/compression_start_level__tests.c b/test/compression_start_leve
 new file mode 100644
 --- /dev/null
 +++ b/test/compression_start_level__tests.c
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,312 @@
 +/**
 + *
 + * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
@@ -478,6 +478,14 @@ new file mode 100644
 +    out.compression_start_level = 5; /* decode must overwrite it, not leave it */
 +    ASSERT_EQ(cf_config_deserialize(plain, plain_len, &out), 0);
 +    ASSERT_EQ(out.compression_start_level, 0);
++
++    in.compression_start_level = 1; /* encodes every level like 0, so it adds no tail either */
++    uint8_t *one = NULL;
++    size_t one_len = 0;
++    ASSERT_EQ(cf_config_serialize(&in, &one, &one_len), 0);
++    ASSERT_EQ(one_len, plain_len);
++    ASSERT_EQ(memcmp(plain, one, plain_len), 0);
++    free(one);
 +
 +    in.compression_start_level = 3;
 +    uint8_t *tailed = NULL;

@@ -446,8 +446,8 @@ Settings are read in this order, and later sources win:
 | `l1-file-count-trigger` | `8` | no | Flush-tier tables per column family that start a merge |
 | `l0-stall-threshold` | `64` | no | Write backpressure: throttle from half this backlog (unflushed memtables or flush-tier tables), block at it |
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |
-| `compression-start-level` | `0` | no | First level whose tables are compressed, 0 to 7; `0` compresses every level, `2` leaves the flush tier (level 1) uncompressed so a merge pays for the codec once. Tables of both kinds stay readable |
-| `btree-block-size` | `4kb` | no | Size of a TidesDB btree node, 4kb to 64kb; larger nodes mean fewer, bigger reads per lookup and more bytes read per miss |
+| `compression-start-level` | `0` | no | First level whose tables are compressed, 0 to 2 (a higher one could leave the largest level uncompressed: a deepening compaction moves files down without rewriting them); `0` compresses every level, `2` leaves the flush tier (level 1) uncompressed so a merge pays for the codec once. Tables of both kinds stay readable |
+| `btree-block-size` | `4kb` | no | Size of a TidesDB btree node, 4kb to 64kb in multiples of 4kb; larger nodes mean fewer, bigger reads per lookup and more bytes read per miss |
 | `requirepass` | empty | yes | Password for `AUTH` |
 | `maxclients` | `10000` | yes | Connection limit |
 | `lua-time-limit` | `5000` ms | yes | When a long script starts answering `BUSY` |

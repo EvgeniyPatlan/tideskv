@@ -22,15 +22,15 @@ struct CfStats {
   uint64_t total_keys = 0;        // in sstables (not the memtable)
   uint64_t total_tombstones = 0;  // point + range tombstones in sstables
   uint64_t compaction_count = 0;
-  int l1_file_count_trigger = 0;                 // as configured on the family
-  int dividing_level_offset = 0;                 // as configured on the family
-  uint64_t flush_bytes_written = 0;              // on-disk bytes flushes wrote to L1
-  uint64_t compaction_bytes_read = 0;            // on-disk input bytes of compactions
-  uint64_t compaction_bytes_written = 0;         // on-disk output bytes of compactions
-  uint64_t user_bytes_written = 0;               // logical key+value bytes committed
+  int l1_file_count_trigger = 0;  // as configured on the family
+  int dividing_level_offset = 0;  // as configured on the family
+  uint64_t flush_bytes_written = 0;       // on-disk bytes flushes wrote to L1
+  uint64_t compaction_bytes_read = 0;     // on-disk input bytes of compactions
+  uint64_t compaction_bytes_written = 0;  // on-disk output bytes of compactions
+  uint64_t user_bytes_written = 0;        // logical key+value bytes committed
   std::vector<std::pair<int, uint64_t>> levels;  // (sstables, bytes) for L1..Ln, existing levels only
-  size_t btree_block_size = 0;                   // as configured on the family
-  int compression_start_level = 0;               // as configured on the family
+  size_t btree_block_size = 0;       // as configured on the family
+  int compression_start_level = 0;   // as configured on the family
 };
 
 struct StorageStats {
