@@ -19,10 +19,13 @@ namespace tideskv {
 //    (a range compaction cannot reclaim a FLUSHDB: see TidesStorage::Compact);
 //  - a subkey prefix of encoding::ObjectPrefixSize() bytes (a collection deleted: 11 slotted, 9
 //    slotless) -> counted; at the threshold the whole subkey and zscore CFs are compacted and the count
-//    restarts.
-// Each batch of jobs starts with one Checkpoint (range tombstones still in the memtable are not
+//    restarts. The next collection-triggered compaction waits collection_compaction_spacing times the
+//    last subkey compaction's length after it ended (it rewrites the whole CF), so a steady stream of
+//    big-collection DELs cannot keep one running for good; FLUSHDB/FLUSHALL jobs are never held back.
+// A job is checkpointed once before its first attempt (range tombstones still in the memtable are not
 // compacted). A failed job is retried on later ticks up to max_attempts, then counted as failed; Busy
-// (another compaction holds the CF) is retried on later ticks without using an attempt.
+// (another compaction holds the CF) is retried after busy_retry without using an attempt or another
+// checkpoint.
 // Queued jobs are deduplicated per CF.
 // All scheduler state is in memory only: queued compactions are lost on a crash or Stop (a startup
 // compaction pass is an M8 item).
@@ -32,6 +35,9 @@ class CompactionScheduler final : public CommitListener {
     std::chrono::milliseconds tick{200};
     int max_attempts = 5;
     std::function<uint64_t()> collection_delete_threshold = [] { return uint64_t{1000}; };  // 0 = never
+    std::chrono::milliseconds busy_retry{2000};
+    uint64_t collection_compaction_spacing = 4;  // 0 = compact at every threshold
+    std::function<std::chrono::steady_clock::time_point()> now = [] { return std::chrono::steady_clock::now(); };
   };
 
   CompactionScheduler(Compactor& compactor, Options options)
@@ -56,8 +62,10 @@ class CompactionScheduler final : public CommitListener {
   struct Job {
     ColumnFamily cf = ColumnFamily::kMeta;
     int attempts = 0;
+    bool checkpointed = false;  // its tombstones are in sstables: a retry needs no new checkpoint
   };
   void EnqueueLocked(Job job);  // requires mu_
+  Status RunJob(Job& job);
   void Loop();
 
   Compactor& compactor_;
@@ -66,6 +74,8 @@ class CompactionScheduler final : public CommitListener {
   std::condition_variable cv_;
   std::deque<Job> queue_;
   uint64_t collection_deletes_ = 0;  // since the last collection-triggered compaction
+  std::chrono::steady_clock::time_point collection_not_before_{};  // spacing after the last subkey compaction
+  bool last_round_busy_ = false;  // the worker's next wait is busy_retry, not tick
   std::atomic<uint64_t> completed_{0};
   std::atomic<uint64_t> failed_{0};
   std::atomic<bool> stop_{false};  // written under mu_; also read between jobs without it

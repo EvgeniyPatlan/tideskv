@@ -20,7 +20,7 @@ void CompactionScheduler::OnCommitted(const std::vector<RangeDelete>& deletes) {
       ++collection_deletes_;
     }
   }
-  if (threshold > 0 && collection_deletes_ >= threshold) {
+  if (threshold > 0 && collection_deletes_ >= threshold && options_.now() >= collection_not_before_) {
     collection_deletes_ = 0;
     EnqueueLocked({ColumnFamily::kSubkey});
     EnqueueLocked({ColumnFamily::kZScore});
@@ -40,15 +40,25 @@ size_t CompactionScheduler::RunPending() {
     jobs.swap(queue_);
   }
   if (jobs.empty()) return 0;
-  const Status checkpoint = compactor_.Checkpoint();
+  // One checkpoint for the jobs that never had one. Retrying a Busy job must not checkpoint again: each
+  // checkpoint rotates the memtable, and a rotation every retry tick flooded L1 with tiny flushes.
+  Status checkpoint = Status::Ok();
+  if (std::any_of(jobs.begin(), jobs.end(), [](const Job& j) { return !j.checkpointed; })) {
+    checkpoint = compactor_.Checkpoint();
+    if (checkpoint.ok()) {
+      for (Job& job : jobs) job.checkpointed = true;
+    }
+  }
   size_t finished = 0;
+  bool busy = false;
   for (Job& job : jobs) {
     if (stop_.load()) break;  // shutting down: drop the rest (neither completed nor failed)
-    const Status st = checkpoint.ok() ? compactor_.Compact(job.cf) : checkpoint;
+    const Status st = job.checkpointed ? RunJob(job) : checkpoint;
     if (st.ok()) {
       completed_.fetch_add(1, std::memory_order_relaxed);
       ++finished;
     } else if (st.code() == StatusCode::kBusy) {
+      busy = true;
       // Another compaction (TidesDB's own, usually) holds the CF. It ends by itself however long a big CF
       // or a slow machine makes it, so it is waited out on later ticks: never an attempt, never a failure.
       std::lock_guard lock(mu_);
@@ -63,7 +73,22 @@ size_t CompactionScheduler::RunPending() {
       ++finished;
     }
   }
+  std::lock_guard lock(mu_);
+  last_round_busy_ = busy;
   return finished;
+}
+
+// Compacts one job's CF. A finished subkey compaction (the collection-delete one rewrites the whole CF)
+// sets when the next collection-triggered one may start.
+Status CompactionScheduler::RunJob(Job& job) {
+  const auto start = options_.now();
+  Status st = compactor_.Compact(job.cf);
+  if (st.ok() && job.cf == ColumnFamily::kSubkey) {
+    const auto end = options_.now();
+    std::lock_guard lock(mu_);
+    collection_not_before_ = end + (end - start) * options_.collection_compaction_spacing;
+  }
+  return st;
 }
 
 size_t CompactionScheduler::pending() const {
@@ -97,7 +122,8 @@ void CompactionScheduler::Loop() {
     lock.unlock();
     RunPending();
     lock.lock();
-    cv_.wait_for(lock, options_.tick, [this] { return stop_.load(); });  // pace retries of failed jobs
+    // pace retries of failed jobs; a Busy CF is held by a compaction that can run for a minute
+    cv_.wait_for(lock, last_round_busy_ ? options_.busy_retry : options_.tick, [this] { return stop_.load(); });
   }
 }
 

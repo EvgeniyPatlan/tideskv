@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -138,6 +139,130 @@ TEST(CompactionScheduler, BusyIsWaitedOutAndNeverCountedAsAFailure) {
   EXPECT_EQ(s.RunPending(), 1u);
   EXPECT_EQ(s.completed(), 1u);
   EXPECT_EQ(s.failed(), 0u);
+}
+
+// A Busy job is requeued as it was: its checkpoint already put the tombstones in sstables, and checkpointing
+// again on every retry rotated a tiny memtable each time, which filled L1 with tiny flushes and stalled
+// every write behind TidesDB's admission throttle (W6, 2026-11-10).
+TEST(CompactionScheduler, BusyRetriesDoNotCheckpointAgain) {
+  FakeCompactor c;
+  c.busy_left = 3;
+  CompactionScheduler s(c, Opts(1000));
+  s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
+  for (int i = 0; i < 3; ++i) EXPECT_EQ(s.RunPending(), 0u);
+  EXPECT_EQ(s.RunPending(), 1u);
+  int checkpoints = 0;
+  for (const Call& call : c.Calls()) checkpoints += call.what == "checkpoint";
+  EXPECT_EQ(checkpoints, 1);
+}
+
+TEST(CompactionScheduler, ANewJobAfterABusyRetryStillGetsItsCheckpoint) {
+  FakeCompactor c;
+  c.busy_left = 1;
+  CompactionScheduler s(c, Opts(1000));
+  s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
+  EXPECT_EQ(s.RunPending(), 0u);                                         // meta busy: requeued
+  s.OnCommitted({Prefix(ColumnFamily::kExpire, encoding::DbPrefix(0))});  // a new job, never checkpointed
+  EXPECT_EQ(s.RunPending(), 2u);
+  const auto calls = c.Calls();
+  ASSERT_EQ(calls.size(), 5u);
+  EXPECT_EQ(calls[2].what, "checkpoint");
+}
+
+// A fake clock the compactor advances by the time each whole-CF compaction takes.
+struct FakeClock {
+  std::chrono::steady_clock::time_point t{};
+  std::function<std::chrono::steady_clock::time_point()> Fn() {
+    return [this] { return t; };
+  }
+};
+
+class TimedCompactor final : public Compactor {
+ public:
+  explicit TimedCompactor(FakeClock& clock) : clock_(clock) {}
+  Status Checkpoint() override { return Status::Ok(); }
+  Status Compact(ColumnFamily cf) override {
+    if (cf == ColumnFamily::kSubkey) clock_.t += std::chrono::seconds(10);
+    ++compacts[CfIndex(cf)];
+    return Status::Ok();
+  }
+  int compacts[kColumnFamilyCount] = {};
+
+ private:
+  FakeClock& clock_;
+};
+
+// The collection-delete compaction rewrites the whole subkey CF (87 s on the medium bench) and DELs of big
+// hashes reach the threshold every few seconds, so back-to-back runs took a core for good. The next one
+// waits collection_compaction_spacing times the last one's length after it ended (here 4 x 10 s).
+TEST(CompactionScheduler, CollectionCompactionsAreSpacedByTheirOwnLength) {
+  FakeClock clock;
+  TimedCompactor c(clock);
+  auto o = Opts(2);
+  o.now = clock.Fn();
+  o.collection_compaction_spacing = 4;
+  CompactionScheduler s(c, o);
+  auto del = [&s](int oid) { s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, oid))}); };
+  del(1);
+  del(2);
+  ASSERT_EQ(s.pending(), 2u);
+  EXPECT_EQ(s.RunPending(), 2u);  // subkey ends at t = 10 s
+  del(3);
+  del(4);
+  EXPECT_EQ(s.pending(), 0u) << "too soon: not before t = 50 s";
+  clock.t += std::chrono::seconds(39);  // t = 49 s
+  del(5);
+  EXPECT_EQ(s.pending(), 0u);
+  clock.t += std::chrono::seconds(1);  // t = 50 s: the deletes counted meanwhile are still owed a compaction
+  del(6);
+  EXPECT_EQ(s.pending(), 2u);
+  EXPECT_EQ(s.RunPending(), 2u);
+  EXPECT_EQ(c.compacts[CfIndex(ColumnFamily::kSubkey)], 2);
+}
+
+TEST(CompactionScheduler, FlushDbIsNotHeldBackBySpacing) {
+  FakeClock clock;
+  TimedCompactor c(clock);
+  auto o = Opts(1);
+  o.now = clock.Fn();
+  CompactionScheduler s(c, o);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, 1))});
+  EXPECT_EQ(s.RunPending(), 2u);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::DbPrefix(0))});  // FLUSHDB 0
+  EXPECT_EQ(s.pending(), 1u);
+}
+
+TEST(CompactionScheduler, SpacingZeroCompactsAtEveryThreshold) {
+  FakeClock clock;
+  TimedCompactor c(clock);
+  auto o = Opts(1);
+  o.now = clock.Fn();
+  o.collection_compaction_spacing = 0;
+  CompactionScheduler s(c, o);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, 1))});
+  EXPECT_EQ(s.RunPending(), 2u);
+  s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, 2))});
+  EXPECT_EQ(s.pending(), 2u);
+}
+
+// After a Busy round the worker waits busy_retry, not tick: a whole-CF compaction TidesDB started itself can
+// run for a minute, and polling it every tick did nothing but take locks.
+TEST(CompactionScheduler, WorkerWaitsBusyRetryAfterABusyRound) {
+  FakeCompactor c;
+  c.busy_left = 1;
+  auto o = Opts(1000);
+  o.tick = std::chrono::milliseconds(5);
+  o.busy_retry = std::chrono::milliseconds(400);
+  CompactionScheduler s(c, o);
+  s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
+  s.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  int compacts = 0;
+  for (const Call& call : c.Calls()) compacts += call.what == "compact";
+  EXPECT_EQ(compacts, 1) << "retried before busy_retry";
+  for (int i = 0; i < 400 && s.completed() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  s.Stop();
+  EXPECT_EQ(s.completed(), 1u);
 }
 
 class FailingCompactor final : public Compactor {
