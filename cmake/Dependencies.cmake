@@ -30,7 +30,8 @@ set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-merge-level-runs.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-random-read-hint.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-range-covering-index.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-partition-cursor.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compaction-partition-cursor.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-btree-single-pass-leaves.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

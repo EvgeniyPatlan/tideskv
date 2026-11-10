@@ -1,0 +1,1501 @@
+diff --git a/src/sstable/btree/btree_builder.c b/src/sstable/btree/btree_builder.c
+index bc75eac..7ef91d3 100644
+--- a/src/sstable/btree/btree_builder.c
++++ b/src/sstable/btree/btree_builder.c
+@@ -197,107 +197,172 @@ int btree_builder_new(btree_builder_t **builder, block_manager_t *bm, const btre
+     b->last_leaf_offset = -1;
+     b->prev_leaf_offset = -1;
+ 
+-    b->leaf_offsets_capacity = 256;
+-    b->leaf_offsets = calloc(b->leaf_offsets_capacity, sizeof(int64_t));
+-    if (!b->leaf_offsets)
+-    {
+-        btree_pending_leaf_free(b->current_leaf);
+-        free(b);
+-        return -1;
+-    }
+-
+     b->level_entries_capacity = 256;
+     b->level_entries = calloc(b->level_entries_capacity, sizeof(btree_level_entry_t));
+     if (!b->level_entries)
+     {
+-        free(b->leaf_offsets);
+         btree_pending_leaf_free(b->current_leaf);
+         free(b);
+         return -1;
+     }
+ 
+-    /* uncompressed leaves are staged before compression. with compression on,
+-     * stage them in a temp file so the klog receives only the final compressed
+-     * leaves -- staging them in the klog would leave the discarded uncompressed
+-     * copies behind as permanent dead weight. with compression off the first
+-     * write is already final, so stage straight into the klog. */
+-    b->leaf_bm = bm;
+-    if (b->config.codec_count > 0)
+-    {
+-        /* sizeof the suffix literal already includes its null terminator, so this
+-         * holds a full-length file_path plus the suffix without truncation */
+-        char tmp_path[MAX_FILE_PATH_LENGTH + sizeof(BTREE_LEAF_STAGE_SUFFIX)];
+-        snprintf(tmp_path, sizeof(tmp_path), "%s" BTREE_LEAF_STAGE_SUFFIX, bm->file_path);
+-        block_manager_t *tmp_bm = NULL;
+-        if (block_manager_open(&tmp_bm, tmp_path, BLOCK_MANAGER_SYNC_NONE) == 0 &&
+-            block_manager_truncate(tmp_bm) == 0)
+-        {
+-            b->leaf_bm = tmp_bm;
+-        }
+-        else if (tmp_bm)
+-        {
+-            /* temp file unavailable -- fall back to staging in the klog so the
+-             * build still succeeds (correctness over space) */
+-            (void)block_manager_close(tmp_bm);
+-        }
+-    }
+-
+     *builder = b;
+     return 0;
+ }
+ 
+ /**
+- * btree_builder_flush_leaf
+- * flushes the current pending leaf to storage
++ * btree_leaf_next_link_pos
++ * find where a serialized leaf's next link sits: after its type byte, its entry count and its
++ * prev link
++ * @param leaf the serialized leaf
++ * @param size its length
++ * @param pos receives the offset of the next link within leaf
++ * @return 0 on success, -1 when the bytes are too short to hold both links
++ */
++static int btree_leaf_next_link_pos(const uint8_t *leaf, size_t size, size_t *pos)
++{
++    uint64_t num_entries;
++    const size_t adv =
++        btree_varint_decode_bounded(leaf + BTREE_NODE_TYPE_BYTES, leaf + size, &num_entries);
++    const size_t at = BTREE_NODE_TYPE_BYTES + adv + BTREE_LEAF_LINK_BYTES;
++    if (adv == 0 || at + BTREE_LEAF_LINK_BYTES > size) return -1;
++    *pos = at;
++    return 0;
++}
++
++/**
++ * btree_builder_encode_leaf
++ * serialize the current leaf and, when the build compresses, encode it and frame it with the
++ * plaintext header that carries its sibling links. prev is the leaf written before it; next is left
++ * as none, for btree_builder_write_held_leaf to fill in. a reader of a compressed leaf takes both
++ * links from the header and overwrites the plaintext ones, so those stay as serialized
+  * @param builder the builder instance
+- * @return 0 on success, -1 on failure
++ * @param out receives the block to write, the caller's to free
++ * @param out_size receives its length
++ * @param next_pos receives where its next link sits
++ * @return 0 on success, -1 on a serialize, encode or allocation failure
+  */
+-static int btree_builder_flush_leaf(btree_builder_t *builder)
++static int btree_builder_encode_leaf(btree_builder_t *builder, uint8_t **out, size_t *out_size,
++                                     size_t *next_pos)
+ {
+-    if (!builder || !builder->current_leaf || builder->current_leaf->num_entries == 0)
++    uint8_t *serialized = NULL;
++    size_t serialized_size = 0;
++    if (btree_leaf_serialize(builder->current_leaf, builder->prev_leaf_offset, BTREE_LEAF_LINK_NONE,
++                             &serialized, &serialized_size) != 0)
++        return -1;
++
++    if (builder->config.codec_count == 0)
+     {
++        if (btree_leaf_next_link_pos(serialized, serialized_size, next_pos) != 0)
++        {
++            free(serialized);
++            return -1;
++        }
++        *out = serialized;
++        *out_size = serialized_size;
+         return 0;
+     }
+ 
+-    uint8_t *serialized = NULL;
+-    size_t serialized_size = 0;
+-
+-    if (btree_leaf_serialize(builder->current_leaf, builder->prev_leaf_offset, -1, &serialized,
+-                             &serialized_size) != 0)
++    size_t compressed_size = 0;
++    uint8_t *compressed = NULL;
++    if (tidesdb_encoding_stages_encode(builder->config.codec, builder->config.codec_count,
++                                       serialized, serialized_size, &compressed,
++                                       &compressed_size) != TDB_SUCCESS)
+     {
++        TDB_DEBUG_LOG(TDB_LOG_ERROR, "leaf encode failed, %d stages, %zu bytes",
++                      builder->config.codec_count, serialized_size);
++        free(serialized);
++        return -1;
++    }
++    free(serialized);
++    /* the header records the plaintext length in a u32 */
++    if (serialized_size > UINT32_MAX)
++    {
++        free(compressed);
+         return -1;
+     }
+ 
+-    /**** leaf nodes are written without compression during build phase
+-     ***  because next_offset links are backpatched after all leaves are written.
+-     **   compression is applied during the backpatch phase after patching.
+-     *    from_buffer transfers ownership and avoids redundant malloc+memcpy */
+-    block_manager_block_t *block =
+-        block_manager_block_create_from_buffer(serialized_size, serialized);
+-
+-    if (!block) return -1;
++    const size_t total_size = BTREE_COMPRESSED_NODE_HEADER_SIZE + compressed_size;
++    uint8_t *block = malloc(total_size);
++    if (!block)
++    {
++        free(compressed);
++        return -1;
++    }
++    encode_uint32_le_compat(block, (uint32_t)serialized_size);
++    encode_int64_le_compat(block + BTREE_COMPRESSED_NODE_PREV_OFF, builder->prev_leaf_offset);
++    encode_int64_le_compat(block + BTREE_COMPRESSED_NODE_NEXT_OFF, BTREE_LEAF_LINK_NONE);
++    memcpy(block + BTREE_COMPRESSED_NODE_HEADER_SIZE, compressed, compressed_size);
++    free(compressed);
+ 
+-    const int64_t offset = block_manager_block_write(builder->leaf_bm, block);
+-    block_manager_block_free(block);
++    *out = block;
++    *out_size = total_size;
++    *next_pos = BTREE_COMPRESSED_NODE_NEXT_OFF;
++    return 0;
++}
+ 
++/**
++ * btree_builder_write_held_leaf
++ * append the held leaf to the klog with its next link final. nothing else is written to the klog
++ * while leaves are being built -- the bloom partitions, range deletes, internal nodes and footer
++ * all follow the last leaf -- so the leaves sit back to back and a leaf with a successor links to
++ * the end of its own framed block. the block is written at the file's current end, which is where
++ * that link was computed from; any other offset fails the build rather than publish a broken chain
++ * @param builder the builder instance
++ * @param has_next 1 when another leaf follows this one, 0 when it is the last
++ * @return 0 on success or when no leaf is held, -1 on a write failure
++ */
++static int btree_builder_write_held_leaf(btree_builder_t *builder, int has_next)
++{
++    if (!builder->held_leaf) return 0;
++    if (builder->held_leaf_size > UINT32_MAX) return -1;
++
++    uint64_t at = 0;
++    if (block_manager_get_size(builder->bm, &at) != 0 || at > INT64_MAX) return -1;
++    const int64_t next =
++        has_next ? (int64_t)(at + block_manager_framed_size((uint32_t)builder->held_leaf_size))
++                 : BTREE_LEAF_LINK_NONE;
++    encode_int64_le_compat(builder->held_leaf + builder->held_next_pos, next);
++
++    const int64_t offset =
++        block_manager_write_raw(builder->bm, builder->held_leaf, (uint32_t)builder->held_leaf_size);
+     if (offset < 0) return -1;
+-
+-    /* track leaf offset for bidirectional linking */
+-    if (builder->num_leaf_offsets >= builder->leaf_offsets_capacity)
++    if (offset != (int64_t)at)
+     {
+-        const uint32_t new_cap = builder->leaf_offsets_capacity * 2;
+-        int64_t *new_offsets = realloc(builder->leaf_offsets, new_cap * sizeof(int64_t));
+-        if (!new_offsets) return -1;
+-        builder->leaf_offsets = new_offsets;
+-        builder->leaf_offsets_capacity = new_cap;
++        TDB_DEBUG_LOG(TDB_LOG_ERROR, "leaf landed at %lld, its links assumed %llu",
++                      (long long)offset, (unsigned long long)at);
++        return -1;
+     }
+-    builder->leaf_offsets[builder->num_leaf_offsets++] = offset;
+ 
+-    if (builder->first_leaf_offset < 0)
++    free(builder->held_leaf);
++    builder->held_leaf = NULL;
++    builder->held_leaf_size = 0;
++
++    if (builder->first_leaf_offset < 0) builder->first_leaf_offset = offset;
++    builder->last_leaf_offset = offset;
++    builder->prev_leaf_offset = offset;
++    /* the held leaf's separator is always the newest level entry: the next leaf adds its own only
++     * after this write */
++    builder->level_entries[builder->num_level_entries - 1].child_offset = offset;
++    return 0;
++}
++
++/**
++ * btree_builder_flush_leaf
++ * close the current pending leaf: write the leaf held before it, now known to have a successor,
++ * then encode this one and hold it in its place
++ * @param builder the builder instance
++ * @return 0 on success, -1 on failure
++ */
++static int btree_builder_flush_leaf(btree_builder_t *builder)
++{
++    if (!builder || !builder->current_leaf || builder->current_leaf->num_entries == 0)
+     {
+-        builder->first_leaf_offset = offset;
++        return 0;
+     }
+-    builder->last_leaf_offset = offset;
++
++    /* first, so this leaf's prev link can name where that one landed */
++    if (btree_builder_write_held_leaf(builder, 1) != 0) return -1;
+ 
+     if (builder->num_level_entries >= builder->level_entries_capacity)
+     {
+@@ -309,15 +374,26 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
+         builder->level_entries_capacity = new_cap;
+     }
+ 
++    uint8_t *block = NULL;
++    size_t block_size = 0;
++    size_t next_pos = 0;
++    if (btree_builder_encode_leaf(builder, &block, &block_size, &next_pos) != 0) return -1;
++
+     btree_level_entry_t *entry = &builder->level_entries[builder->num_level_entries];
+     entry->key = malloc(builder->current_leaf->first_key_size);
+-    if (!entry->key) return -1;
++    if (!entry->key)
++    {
++        free(block);
++        return -1;
++    }
+     memcpy(entry->key, builder->current_leaf->first_key, builder->current_leaf->first_key_size);
+     entry->key_size = builder->current_leaf->first_key_size;
+-    entry->child_offset = offset;
++    entry->child_offset = BTREE_LEAF_LINK_NONE; /* set when the leaf is written */
+     builder->num_level_entries++;
+ 
+-    builder->prev_leaf_offset = offset;
++    builder->held_leaf = block;
++    builder->held_leaf_size = block_size;
++    builder->held_next_pos = next_pos;
+     builder->node_count++;
+ 
+     btree_pending_leaf_free(builder->current_leaf);
+@@ -576,221 +652,6 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
+     return 0;
+ }
+ 
+-/**
+- * btree_backpatch_one_leaf
+- * write one uncompressed leaf's next-sibling offset in place and refresh the block checksum over it
+- * @param builder the builder instance
+- * @param leaf_offset the file offset of the leaf's block
+- * @param next_leaf_offset the offset the leaf's next link should carry
+- * @return 0 on success, -1 on a read or write failure
+- */
+-static int btree_backpatch_one_leaf(btree_builder_t *builder, int64_t leaf_offset,
+-                                    int64_t next_leaf_offset)
+-{
+-    block_manager_cursor_t cursor;
+-    cursor.bm = builder->leaf_bm;
+-    cursor.current_pos = (uint64_t)leaf_offset;
+-    cursor.block_size_valid = 0;
+-
+-    block_manager_block_t *block = block_manager_cursor_read(&cursor);
+-    if (!block) return -1;
+-
+-    /* walk to the next_offset field -- type(1) + num_entries(varint) + prev_offset(8) */
+-    uint8_t *block_data = (uint8_t *)block->data;
+-    size_t off = BTREE_NODE_TYPE_BYTES;
+-    uint64_t num_entries;
+-    /* bounded like the read path, even though these are bytes this builder wrote moments ago. a
+-     * decode that cannot run off the end whatever it is handed is one less thing to have to reason
+-     * about, and the bound costs nothing here */
+-    const size_t adv =
+-        btree_varint_decode_bounded(block_data + off, block_data + block->size, &num_entries);
+-    if (adv == 0 || off + adv + BTREE_LEAF_LINK_BYTES > block->size)
+-    {
+-        block_manager_block_free(block);
+-        return -1;
+-    }
+-    off += adv;
+-    off += BTREE_LEAF_LINK_BYTES;
+-
+-    /* patch the next-sibling offset little-endian, matching the serializer and the deserializer.
+-     * the same encoded bytes feed both the in-memory checksum recompute below and the disk write,
+-     * so the stored checksum covers exactly the bytes on disk. */
+-    uint8_t next_off_le[BTREE_LEAF_LINK_BYTES];
+-    encode_int64_le_compat(next_off_le, next_leaf_offset);
+-    memcpy(block_data + off, next_off_le, sizeof(next_off_le));
+-
+-    uint8_t checksum_bytes[BLOCK_MANAGER_CHECKSUM_LENGTH];
+-    encode_uint32_le_compat(checksum_bytes, block_manager_checksum(block->data, block->size));
+-
+-    int rc = block_manager_write_at(builder->leaf_bm, leaf_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE,
+-                                    checksum_bytes, sizeof(checksum_bytes));
+-    if (rc == 0)
+-        rc = block_manager_write_at(builder->leaf_bm,
+-                                    leaf_offset + (int64_t)(BLOCK_MANAGER_BLOCK_HEADER_SIZE + off),
+-                                    next_off_le, sizeof(next_off_le));
+-
+-    block_manager_block_free(block);
+-    return rc;
+-}
+-
+-/**
+- * btree_compress_one_leaf
+- * compress one staged leaf and write it to the tree's own block manager, with both sibling links
+- * left as placeholders for the patch pass. the links live in the block header rather than the
+- * compressed payload so they can be patched later without decompressing
+- * @param builder the builder instance
+- * @param src_offset the staged leaf's offset in the leaf block manager
+- * @param out_offset receives the offset the compressed leaf was written at
+- * @return 0 on success, -1 on a read, compression, allocation, or write failure
+- */
+-static int btree_compress_one_leaf(btree_builder_t *builder, int64_t src_offset,
+-                                   int64_t *out_offset)
+-{
+-    block_manager_cursor_t cursor;
+-    cursor.bm = builder->leaf_bm;
+-    cursor.current_pos = (uint64_t)src_offset;
+-    cursor.block_size_valid = 0;
+-
+-    block_manager_block_t *block = block_manager_cursor_read(&cursor);
+-    if (!block) return -1;
+-
+-    size_t compressed_size = 0;
+-    uint8_t *compressed = NULL;
+-    if (tidesdb_encoding_stages_encode(builder->config.codec, builder->config.codec_count,
+-                                       block->data, block->size, &compressed,
+-                                       &compressed_size) != TDB_SUCCESS)
+-    {
+-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "block encode failed, %d stages, %llu bytes",
+-                      builder->config.codec_count, (unsigned long long)block->size);
+-        compressed = NULL;
+-    }
+-    const uint32_t original_size = (uint32_t)block->size;
+-    block_manager_block_free(block);
+-    if (!compressed) return -1;
+-
+-    const size_t total_size = BTREE_COMPRESSED_NODE_HEADER_SIZE + compressed_size;
+-    uint8_t *block_data = malloc(total_size);
+-    if (!block_data)
+-    {
+-        free(compressed);
+-        return -1;
+-    }
+-    encode_uint32_le_compat(block_data, original_size);
+-    encode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_PREV_OFF, BTREE_LEAF_LINK_NONE);
+-    encode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_NEXT_OFF, BTREE_LEAF_LINK_NONE);
+-    memcpy(block_data + BTREE_COMPRESSED_NODE_HEADER_SIZE, compressed, compressed_size);
+-    free(compressed);
+-
+-    block_manager_block_t *new_block = block_manager_block_create(total_size, block_data);
+-    free(block_data);
+-    if (!new_block) return -1;
+-
+-    const int64_t new_offset = block_manager_block_write(builder->bm, new_block);
+-    block_manager_block_free(new_block);
+-    if (new_offset < 0) return -1;
+-
+-    *out_offset = new_offset;
+-    return 0;
+-}
+-
+-/**
+- * btree_patch_compressed_links
+- * fill in both sibling links in every compressed leaf's header now that all of their offsets are
+- * known, refreshing each block's checksum over the patched bytes. the links are read back
+- * little-endian by the node reader, so they are patched little-endian rather than in host order
+- * @param builder the builder instance
+- * @param new_offsets the offset each leaf was written at, in leaf order
+- * @return 0 on success, -1 on a write failure
+- */
+-static int btree_patch_compressed_links(btree_builder_t *builder, const int64_t *new_offsets)
+-{
+-    for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
+-    {
+-        const int64_t prev_leaf = (i == 0) ? BTREE_LEAF_LINK_NONE : new_offsets[i - 1];
+-        const int64_t next_leaf =
+-            (i + 1 < builder->num_leaf_offsets) ? new_offsets[i + 1] : BTREE_LEAF_LINK_NONE;
+-
+-        uint8_t link_le[BTREE_LEAF_LINK_BYTES];
+-        encode_int64_le_compat(link_le, prev_leaf);
+-        if (block_manager_write_at(
+-                builder->bm,
+-                new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + BTREE_COMPRESSED_NODE_PREV_OFF,
+-                link_le, sizeof(link_le)) != 0)
+-            return -1;
+-
+-        encode_int64_le_compat(link_le, next_leaf);
+-        if (block_manager_write_at(
+-                builder->bm,
+-                new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + BTREE_COMPRESSED_NODE_NEXT_OFF,
+-                link_le, sizeof(link_le)) != 0)
+-            return -1;
+-
+-        if (block_manager_update_checksum(builder->bm, new_offsets[i]) != 0) return -1;
+-    }
+-    return 0;
+-}
+-
+-/**
+- * btree_builder_compress_leaves
+- * move every staged leaf into the tree's block manager compressed, then relink them at their new
+- * locations and repoint the builder's leaf and level-entry offsets there
+- * @param builder the builder instance
+- * @return 0 on success, -1 on an allocation, compression, or write failure
+- */
+-static int btree_builder_compress_leaves(btree_builder_t *builder)
+-{
+-    /* a tree with no leaves has nothing to move, and the tail of this function reads the first and
+-     * last entries of the offset array unconditionally -- so an empty builder would index a
+-     * zero-length allocation. the only caller returns early on zero leaves, which is why this has
+-     * never fired, but the safety of this function should not depend on reading its caller */
+-    if (builder->num_leaf_offsets == 0) return 0;
+-
+-    int64_t *new_offsets = malloc(builder->num_leaf_offsets * sizeof(int64_t));
+-    if (!new_offsets) return -1;
+-
+-    for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
+-    {
+-        if (btree_compress_one_leaf(builder, builder->leaf_offsets[i], &new_offsets[i]) != 0)
+-        {
+-            free(new_offsets);
+-            return -1;
+-        }
+-    }
+-
+-    if (btree_patch_compressed_links(builder, new_offsets) != 0)
+-    {
+-        free(new_offsets);
+-        return -1;
+-    }
+-
+-    for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
+-        builder->leaf_offsets[i] = new_offsets[i];
+-    for (uint32_t i = 0; i < builder->num_level_entries && i < builder->num_leaf_offsets; i++)
+-        builder->level_entries[i].child_offset = new_offsets[i];
+-
+-    builder->first_leaf_offset = new_offsets[0];
+-    builder->last_leaf_offset = new_offsets[builder->num_leaf_offsets - 1];
+-
+-    free(new_offsets);
+-    return 0;
+-}
+-
+-static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
+-{
+-    if (!builder || builder->num_leaf_offsets == 0) return 0;
+-
+-    /* the leaves are still uncompressed here, so each next link is patched in place; only a run of
+-     * two or more leaves has anything to link */
+-    for (uint32_t i = 0; i + 1 < builder->num_leaf_offsets; i++)
+-        if (btree_backpatch_one_leaf(builder, builder->leaf_offsets[i],
+-                                     builder->leaf_offsets[i + 1]) != 0)
+-            return -1;
+-
+-    if (builder->config.codec_count > 0) return btree_builder_compress_leaves(builder);
+-
+-    return 0;
+-}
+-
+ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
+ {
+     if (!builder || !tree) return -1;
+@@ -803,7 +664,8 @@ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
+         }
+     }
+ 
+-    if (btree_builder_backpatch_leaf_links(builder) != 0)
++    /* the last leaf has no successor, and the internal levels route to its offset */
++    if (btree_builder_write_held_leaf(builder, 0) != 0)
+     {
+         return -1;
+     }
+@@ -849,18 +711,8 @@ void btree_builder_free(btree_builder_t *builder)
+ {
+     if (!builder) return;
+ 
+-    /* drop the temp leaf-staging file (only created when compression is on) */
+-    if (builder->leaf_bm && builder->leaf_bm != builder->bm)
+-    {
+-        char tmp_path[MAX_FILE_PATH_LENGTH];
+-        snprintf(tmp_path, sizeof(tmp_path), "%s", builder->leaf_bm->file_path);
+-        (void)block_manager_close(builder->leaf_bm);
+-        remove(tmp_path);
+-    }
+-
+     btree_pending_leaf_free(builder->current_leaf);
+-
+-    free(builder->leaf_offsets);
++    free(builder->held_leaf);
+ 
+     if (builder->level_entries)
+     {
+diff --git a/src/sstable/btree/btree_internal.h b/src/sstable/btree/btree_internal.h
+index 943ce80..533777c 100644
+--- a/src/sstable/btree/btree_internal.h
++++ b/src/sstable/btree/btree_internal.h
+@@ -12,8 +12,7 @@
+ #include <inttypes.h>
+ 
+ #include "base/encoding/compress.h"
+-#include "base/encoding/serialization.h" /* TDB_SSTABLE_KLOG_STAGE_EXT */
+-#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
++#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
+ #include "sstable/btree/btree.h"
+ #include "xxhash.h"
+ 
+@@ -31,9 +30,6 @@
+ /* fixed-size empty-leaf encoding -- type byte, num_entries=0 varint, prev/next int64 */
+ #define BTREE_LEAF_EMPTY_BUF_SIZE 32
+ 
+-/* suffix for the temp file uncompressed leaves are staged into before compression */
+-#define BTREE_LEAF_STAGE_SUFFIX TDB_SSTABLE_KLOG_STAGE_EXT
+-
+ /* a leaf's sibling links are int64 file offsets, and BTREE_LEAF_LINK_NONE means there is no sibling
+  */
+ #define BTREE_LEAF_LINK_BYTES 8
+@@ -206,16 +202,17 @@ typedef struct btree_level_entry_t
+  * btree_builder_t
+  * builder state for constructing B+tree from sorted data
+  * @param bm block manager for storage
+- * @param leaf_bm where uncompressed leaves stage -- a temp file when compression is on, so the real
+- * klog never keeps the discarded pre-compression copies
+  * @param config btree configuration
+  * @param current_leaf leaf node currently being built
+  * @param first_leaf_offset offset of first leaf in tree
+  * @param last_leaf_offset offset of last leaf in tree
+- * @param prev_leaf_offset offset of previously written leaf
+- * @param leaf_offsets array of all leaf offsets for backpatching
+- * @param num_leaf_offsets number of leaf offsets
+- * @param leaf_offsets_capacity capacity of leaf_offsets array
++ * @param prev_leaf_offset offset of the last leaf written to bm, -1 before the first
++ * @param held_leaf the most recent full leaf, encoded and framed for the klog but not yet written:
++ * whether its next link is a sibling or none is known only once another leaf fills or the build
++ * finishes. NULL when no leaf is held
++ * @param held_leaf_size length of held_leaf
++ * @param held_next_pos where held_leaf's next link sits -- in the block header for a compressed
++ * leaf, in the plaintext for an uncompressed one
+  * @param level_entries entries for building internal nodes
+  * @param num_level_entries number of level entries
+  * @param level_entries_capacity capacity of level_entries array
+@@ -231,7 +228,6 @@ typedef struct btree_level_entry_t
+ struct btree_builder_t
+ {
+     block_manager_t *bm;
+-    block_manager_t *leaf_bm;
+     btree_config_t config;
+ 
+     btree_pending_leaf_t *current_leaf;
+@@ -239,9 +235,9 @@ struct btree_builder_t
+     int64_t last_leaf_offset;
+     int64_t prev_leaf_offset;
+ 
+-    int64_t *leaf_offsets;
+-    uint32_t num_leaf_offsets;
+-    uint32_t leaf_offsets_capacity;
++    uint8_t *held_leaf;
++    size_t held_leaf_size;
++    size_t held_next_pos;
+ 
+     btree_level_entry_t *level_entries;
+     uint32_t num_level_entries;
+diff --git a/test/btree_single_pass__tests.c b/test/btree_single_pass__tests.c
+new file mode 100644
+index 0000000..c228c26
+--- /dev/null
++++ b/test/btree_single_pass__tests.c
+@@ -0,0 +1,720 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the btree builder writes each leaf to the klog once, encoded and framed, with both sibling links
++ * already final: leaves are appended back to back, so a leaf's next link is its own offset plus its
++ * framed size, and the last leaf is held in memory until the builder knows whether another follows.
++ * nothing else is written to the klog until the leaves are done, which is what makes the offsets
++ * predictable. every case runs with a real codec and with none, since the two store their links in
++ * different places (the compressed block header, the plaintext leaf) */
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/base/encoding/compress.h"
++#include "../src/base/encoding/encoding.h"
++#include "../src/base/encoding/serialization.h"
++#include "../src/base/errors.h"
++#include "../src/io/block_manager.h"
++#include "../src/sstable/btree/btree.h"
++#include "../src/sstable/btree/btree_internal.h"
++#include "test_utils.h"
++
++/* a table the builder wrote before this change, when compressed leaves were staged in a temp file
++ * and relinked at finish. generated once with --write-fixture on the unpatched tree */
++#include "fixtures/btree_lz4_staged_layout.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define SP_DIR      "." PATH_SEPARATOR "test_btree_single_pass"
++#define SP_DIR_MODE 0755
++#define SP_KLOG     SP_DIR PATH_SEPARATOR "1.klog"
++#define SP_KLOG_OLD SP_DIR PATH_SEPARATOR "old.klog"
++#define SP_KEY_MAX  32
++
++/* node size and input of the cross-version fixture; changing either means generating it again on a
++ * tree without this change */
++#define SP_FIXTURE_NODE_SIZE 512
++#define SP_FIXTURE_ENTRIES   64
++
++static tidesdb_encoding_registry_t g_reg;
++static tidesdb_encoding_stage_t g_lz4[1];
++
++typedef struct
++{
++    const char *name;
++    const tidesdb_encoding_stage_t *codec;
++    int codec_count;
++} sp_mode_t;
++
++static sp_mode_t g_modes[2];
++
++static int sp_init_codecs(void)
++{
++    if (tidesdb_encoding_registry_init(&g_reg) != TDB_SUCCESS) return 0;
++    const uint8_t lz4[1] = {TDB_COMPRESS_LZ4};
++    if (tidesdb_encoding_resolve(&g_reg, lz4, 1, g_lz4, 1) != 1) return 0;
++    g_modes[0] = (sp_mode_t){"lz4", g_lz4, 1};
++    g_modes[1] = (sp_mode_t){"none", NULL, 0};
++    return 1;
++}
++
++static void sp_fresh_dir(void)
++{
++    (void)remove_directory(SP_DIR);
++    ASSERT_EQ(mkdir(SP_DIR, SP_DIR_MODE), 0);
++}
++
++/* how many files the scratch directory holds besides the klog, and how many of them are leaf
++ * staging files */
++static void sp_scan_dir(int *stage_files, int *other_files)
++{
++    *stage_files = 0;
++    *other_files = 0;
++    DIR *d = opendir(SP_DIR);
++    ASSERT_TRUE(d != NULL);
++    const size_t ext_len = strlen(TDB_SSTABLE_KLOG_STAGE_EXT);
++    struct dirent *e;
++    while ((e = readdir(d)) != NULL)
++    {
++        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
++        if (strcmp(e->d_name, "1.klog") == 0) continue;
++        const size_t len = strlen(e->d_name);
++        if (len >= ext_len && strcmp(e->d_name + len - ext_len, TDB_SSTABLE_KLOG_STAGE_EXT) == 0)
++            (*stage_files)++;
++        else
++            (*other_files)++;
++    }
++    closedir(d);
++}
++
++static btree_config_t sp_config(const sp_mode_t *m, size_t node_size)
++{
++    return (btree_config_t){
++        .target_node_size = node_size, .codec = m->codec, .codec_count = m->codec_count};
++}
++
++static size_t sp_key(char *buf, uint64_t i)
++{
++    return (size_t)snprintf(buf, SP_KEY_MAX, "k%010" PRIu64, i);
++}
++
++/* one leaf as it sits on disk: its links, its framed length in the file, and its plaintext with
++ * the links zeroed so two layouts of the same entries can be compared byte for byte */
++typedef struct
++{
++    int64_t prev;
++    int64_t next;
++    uint64_t framed;
++    uint8_t *plain;
++    size_t plain_size;
++} sp_leaf_t;
++
++static void sp_zero_plain_links(uint8_t *plain, size_t plain_size, int64_t *prev, int64_t *next)
++{
++    ASSERT_TRUE(plain_size > BTREE_NODE_TYPE_BYTES);
++    ASSERT_EQ(plain[0], BTREE_NODE_LEAF);
++    uint64_t num_entries = 0;
++    const size_t adv = btree_varint_decode_bounded(plain + BTREE_NODE_TYPE_BYTES,
++                                                   plain + plain_size, &num_entries);
++    ASSERT_TRUE(adv > 0);
++    const size_t pos = BTREE_NODE_TYPE_BYTES + adv;
++    ASSERT_TRUE(pos + BTREE_LEAF_LINK_PATCH_BYTES <= plain_size);
++    if (prev) *prev = decode_int64_le_compat(plain + pos);
++    if (next) *next = decode_int64_le_compat(plain + pos + BTREE_LEAF_LINK_BYTES);
++    memset(plain + pos, 0, BTREE_LEAF_LINK_PATCH_BYTES);
++}
++
++static void sp_read_leaf(block_manager_t *bm, const sp_mode_t *m, int64_t off, sp_leaf_t *out)
++{
++    uint8_t *data = NULL;
++    uint32_t size = 0;
++    ASSERT_EQ(block_manager_read_block_data_at_offset(bm, (uint64_t)off, &data, &size), 0);
++    out->framed = block_manager_framed_size(size);
++    if (m->codec_count > 0)
++    {
++        ASSERT_TRUE(size > BTREE_COMPRESSED_NODE_HEADER_SIZE);
++        out->prev = decode_int64_le_compat(data + BTREE_COMPRESSED_NODE_PREV_OFF);
++        out->next = decode_int64_le_compat(data + BTREE_COMPRESSED_NODE_NEXT_OFF);
++        ASSERT_EQ(tidesdb_encoding_stages_decode(
++                      m->codec, m->codec_count, data + BTREE_COMPRESSED_NODE_HEADER_SIZE,
++                      size - BTREE_COMPRESSED_NODE_HEADER_SIZE, &out->plain, &out->plain_size),
++                  TDB_SUCCESS);
++        ASSERT_EQ(out->plain_size, decode_uint32_le_compat(data));
++        free(data);
++        sp_zero_plain_links(out->plain, out->plain_size, NULL, NULL);
++    }
++    else
++    {
++        out->plain = data;
++        out->plain_size = size;
++        sp_zero_plain_links(out->plain, out->plain_size, &out->prev, &out->next);
++    }
++}
++
++/* walk the leaf chain from the first leaf, checking every link against the layout: each leaf
++ * starts where the one before it ends, prev names the one before, and the last says there is no
++ * next. returns the number of leaves */
++static uint32_t sp_check_links(const btree_t *tree, const sp_mode_t *m)
++{
++    uint32_t leaves = 0;
++    int64_t off = tree->first_leaf_offset;
++    int64_t prev_off = BTREE_LEAF_LINK_NONE;
++    ASSERT_TRUE(off >= 0);
++    for (;;)
++    {
++        sp_leaf_t leaf;
++        sp_read_leaf(tree->bm, m, off, &leaf);
++        free(leaf.plain);
++        ASSERT_EQ(leaf.prev, prev_off);
++        leaves++;
++        if (leaf.next == BTREE_LEAF_LINK_NONE)
++        {
++            ASSERT_EQ(off, tree->last_leaf_offset);
++            break;
++        }
++        ASSERT_EQ(leaf.next, off + (int64_t)leaf.framed);
++        prev_off = off;
++        off = leaf.next;
++    }
++    return leaves;
++}
++
++/* every entry the cursor yields in one direction, checked against the expected keys */
++static void sp_expect_scan(btree_t *tree, char (*keys)[SP_KEY_MAX], uint64_t n, int backward)
++{
++    btree_cursor_t *c = NULL;
++    ASSERT_EQ(btree_cursor_init(&c, tree), 0);
++    ASSERT_EQ(backward ? btree_cursor_goto_last(c) : btree_cursor_goto_first(c), 0);
++    uint64_t seen = 0;
++    while (btree_cursor_valid(c) == 1)
++    {
++        uint8_t *k = NULL, *v = NULL;
++        size_t ks = 0, vs = 0;
++        uint64_t vlog = 0, seq = 0;
++        int64_t ttl = 0;
++        uint8_t del = 0;
++        ASSERT_EQ(btree_cursor_get(c, &k, &ks, &v, &vs, &vlog, &seq, &ttl, &del), 0);
++        ASSERT_TRUE(seen < n);
++        const uint64_t want = backward ? n - 1 - seen : seen;
++        ASSERT_EQ(ks, strlen(keys[want]));
++        ASSERT_EQ(memcmp(k, keys[want], ks), 0);
++        ASSERT_EQ(seq, want + 1);
++        seen++;
++        if ((backward ? btree_cursor_prev(c) : btree_cursor_next(c)) != 0) break;
++    }
++    ASSERT_EQ(seen, n);
++    ASSERT_EQ(btree_cursor_read_failed(c), 0);
++    btree_cursor_free(c);
++}
++
++static void test_no_stage_file(void)
++{
++    for (int mi = 0; mi < 2; mi++)
++    {
++        const sp_mode_t *m = &g_modes[mi];
++        sp_fresh_dir();
++        block_manager_t *bm = NULL;
++        ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++        const btree_config_t cfg = sp_config(m, 512);
++        btree_builder_t *b = NULL;
++        ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++
++        uint8_t value[64];
++        memset(value, 'v', sizeof(value));
++        uint64_t i = 0;
++        while (b->node_count < 200)
++        {
++            /* a batch, then look: neither a staging file nor anything else may sit beside the klog
++             * while the build runs */
++            for (int j = 0; j < 25; j++, i++)
++            {
++                char key[SP_KEY_MAX];
++                const size_t ks = sp_key(key, i);
++                ASSERT_EQ(
++                    btree_builder_add(b, (uint8_t *)key, ks, value, sizeof(value), 0, i + 1, 0, 0),
++                    0);
++            }
++            int stage = 0, other = 0;
++            sp_scan_dir(&stage, &other);
++            if (stage != 0)
++                printf("\n  %s: staging file beside the klog after %" PRIu64 " keys\n", m->name, i);
++            ASSERT_EQ(stage, 0);
++            ASSERT_EQ(other, 0);
++        }
++
++        btree_t *tree = NULL;
++        ASSERT_EQ(btree_builder_finish(b, &tree), 0);
++        int stage = 0, other = 0;
++        sp_scan_dir(&stage, &other);
++        ASSERT_EQ(stage, 0);
++        ASSERT_EQ(other, 0);
++        ASSERT_TRUE(sp_check_links(tree, m) >= 200);
++        btree_free(tree);
++        btree_builder_free(b);
++        (void)block_manager_close(bm);
++    }
++    (void)remove_directory(SP_DIR);
++}
++
++static void test_one_leaf_table(void)
++{
++    for (int mi = 0; mi < 2; mi++)
++    {
++        const sp_mode_t *m = &g_modes[mi];
++        sp_fresh_dir();
++        block_manager_t *bm = NULL;
++        ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++        const btree_config_t cfg = sp_config(m, BTREE_DEFAULT_NODE_SIZE);
++        btree_builder_t *b = NULL;
++        ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++
++        char keys[3][SP_KEY_MAX];
++        for (uint64_t i = 0; i < 3; i++)
++        {
++            const size_t ks = sp_key(keys[i], i * 10);
++            char value[32];
++            const int vs = snprintf(value, sizeof(value), "value-%" PRIu64, i);
++            ASSERT_EQ(btree_builder_add(b, (uint8_t *)keys[i], ks, (uint8_t *)value, (size_t)vs, 0,
++                                        i + 1, 0, 0),
++                      0);
++        }
++        btree_t *tree = NULL;
++        ASSERT_EQ(btree_builder_finish(b, &tree), 0);
++        ASSERT_EQ(tree->first_leaf_offset, tree->last_leaf_offset);
++        ASSERT_EQ(tree->root_offset, tree->first_leaf_offset);
++        ASSERT_EQ(sp_check_links(tree, m), 1u);
++
++        for (uint64_t i = 0; i < 3; i++)
++        {
++            uint8_t *v = NULL;
++            size_t vs = 0;
++            uint64_t vlog = 0, seq = 0;
++            int64_t ttl = 0;
++            uint8_t del = 0;
++            ASSERT_EQ(btree_get(tree, (uint8_t *)keys[i], strlen(keys[i]), &v, &vs, &vlog, &seq,
++                                &ttl, &del),
++                      0);
++            char want[32];
++            const int ws = snprintf(want, sizeof(want), "value-%" PRIu64, i);
++            ASSERT_EQ(vs, (size_t)ws);
++            ASSERT_EQ(memcmp(v, want, vs), 0);
++            ASSERT_EQ(seq, i + 1);
++            free(v);
++        }
++        sp_expect_scan(tree, keys, 3, 0);
++        sp_expect_scan(tree, keys, 3, 1);
++
++        btree_free(tree);
++        btree_builder_free(b);
++        (void)block_manager_close(bm);
++    }
++    (void)remove_directory(SP_DIR);
++}
++
++#define SP_MANY_KEYS  50000
++#define SP_MANY_SEEKS 1000
++
++static void test_cursor_both_ways_many_leaves(void)
++{
++    char(*keys)[SP_KEY_MAX] = malloc(SP_MANY_KEYS * sizeof(*keys));
++    ASSERT_TRUE(keys != NULL);
++    uint8_t value[200];
++    for (size_t i = 0; i < sizeof(value); i++) value[i] = (uint8_t)(i * 31 + 7);
++
++    for (int mi = 0; mi < 2; mi++)
++    {
++        const sp_mode_t *m = &g_modes[mi];
++        sp_fresh_dir();
++        block_manager_t *bm = NULL;
++        ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++        const btree_config_t cfg = sp_config(m, BTREE_DEFAULT_NODE_SIZE);
++        btree_builder_t *b = NULL;
++        ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++
++        /* even keys only, so a seek to an odd one has to land on the next even one */
++        srand(20261110);
++        for (uint64_t i = 0; i < SP_MANY_KEYS; i++)
++        {
++            const size_t ks = sp_key(keys[i], i * 2);
++            const size_t vs = 10 + (size_t)(rand() % 191);
++            ASSERT_EQ(btree_builder_add(b, (uint8_t *)keys[i], ks, value, vs, 0, i + 1, 0, 0), 0);
++        }
++        btree_t *tree = NULL;
++        ASSERT_EQ(btree_builder_finish(b, &tree), 0);
++        ASSERT_TRUE(sp_check_links(tree, m) > 100);
++
++        sp_expect_scan(tree, keys, SP_MANY_KEYS, 0);
++        sp_expect_scan(tree, keys, SP_MANY_KEYS, 1);
++
++        btree_cursor_t *c = NULL;
++        ASSERT_EQ(btree_cursor_init(&c, tree), 0);
++        for (int s = 0; s < SP_MANY_SEEKS; s++)
++        {
++            const uint64_t i = (uint64_t)rand() % SP_MANY_KEYS;
++            const int odd = rand() % 2;
++            if (odd && i == SP_MANY_KEYS - 1) continue; /* past the last key */
++            char target[SP_KEY_MAX];
++            const size_t ts = sp_key(target, i * 2 + (uint64_t)odd);
++            ASSERT_EQ(btree_cursor_seek(c, (uint8_t *)target, ts), 0);
++            ASSERT_EQ(btree_cursor_valid(c), 1);
++            uint8_t *k = NULL, *v = NULL;
++            size_t ks = 0, vs = 0;
++            uint64_t vlog = 0, seq = 0;
++            int64_t ttl = 0;
++            uint8_t del = 0;
++            ASSERT_EQ(btree_cursor_get(c, &k, &ks, &v, &vs, &vlog, &seq, &ttl, &del), 0);
++            const uint64_t want = i + (uint64_t)odd;
++            ASSERT_EQ(ks, strlen(keys[want]));
++            ASSERT_EQ(memcmp(k, keys[want], ks), 0);
++            ASSERT_EQ(seq, want + 1);
++        }
++        btree_cursor_free(c);
++
++        btree_free(tree);
++        btree_builder_free(b);
++        (void)block_manager_close(bm);
++    }
++    free(keys);
++    (void)remove_directory(SP_DIR);
++}
++
++static void test_links_are_contiguous(void)
++{
++    /* node sizes from one that holds a few entries to the default, so leaf counts range from many
++     * to two */
++    const size_t node_sizes[] = {128, 512, 4096};
++    const uint64_t counts[] = {2000, 2000, 120};
++    for (int mi = 0; mi < 2; mi++)
++    {
++        const sp_mode_t *m = &g_modes[mi];
++        for (size_t s = 0; s < sizeof(node_sizes) / sizeof(node_sizes[0]); s++)
++        {
++            sp_fresh_dir();
++            block_manager_t *bm = NULL;
++            ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++            const btree_config_t cfg = sp_config(m, node_sizes[s]);
++            btree_builder_t *b = NULL;
++            ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++            uint8_t value[48];
++            memset(value, 'x', sizeof(value));
++            for (uint64_t i = 0; i < counts[s]; i++)
++            {
++                char key[SP_KEY_MAX];
++                const size_t ks = sp_key(key, i);
++                ASSERT_EQ(
++                    btree_builder_add(b, (uint8_t *)key, ks, value, sizeof(value), 0, i + 1, 0, 0),
++                    0);
++            }
++            btree_t *tree = NULL;
++            ASSERT_EQ(btree_builder_finish(b, &tree), 0);
++            const uint32_t leaves = sp_check_links(tree, m);
++            ASSERT_TRUE(leaves >= 2);
++            /* the first leaf is the first block after the file header */
++            ASSERT_EQ(tree->first_leaf_offset, (int64_t)BLOCK_MANAGER_HEADER_SIZE);
++            btree_free(tree);
++            btree_builder_free(b);
++            (void)block_manager_close(bm);
++        }
++    }
++    (void)remove_directory(SP_DIR);
++}
++
++/* the fixture's input: tombstones, entries with a ttl and a vlog reference among plain ones */
++static void sp_fixture_entry(int i, char *key, size_t *ks, uint8_t *value, size_t *vs,
++                             uint64_t *vlog, int64_t *ttl, uint8_t *flags)
++{
++    *ks = (size_t)snprintf(key, SP_KEY_MAX, "fx%05d", i);
++    *vs = (size_t)snprintf((char *)value, 64, "value-%05d-%.*s", i, i % 23,
++                           "abcdefghijklmnopqrstuvw");
++    *vlog = (i % 13 == 5) ? (uint64_t)(1000 + i) : 0;
++    *ttl = (i % 7 == 3) ? (int64_t)(1700000000 + i) : 0;
++    *flags = (i % 11 == 4) ? BTREE_ENTRY_FLAG_TOMBSTONE : 0;
++}
++
++static btree_t *sp_build_fixture_input(block_manager_t *bm, btree_builder_t **out_builder)
++{
++    const btree_config_t cfg = sp_config(&g_modes[0], SP_FIXTURE_NODE_SIZE);
++    btree_builder_t *b = NULL;
++    ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++    for (int i = 0; i < SP_FIXTURE_ENTRIES; i++)
++    {
++        char key[SP_KEY_MAX];
++        uint8_t value[64];
++        size_t ks, vs;
++        uint64_t vlog;
++        int64_t ttl;
++        uint8_t flags;
++        sp_fixture_entry(i, key, &ks, value, &vs, &vlog, &ttl, &flags);
++        ASSERT_EQ(btree_builder_add(b, (uint8_t *)key, ks, value, vs, vlog, (uint64_t)(i + 1), ttl,
++                                    flags),
++                  0);
++    }
++    btree_t *tree = NULL;
++    ASSERT_EQ(btree_builder_finish(b, &tree), 0);
++    *out_builder = b;
++    return tree;
++}
++
++/* every entry of two trees, in order, compared field by field */
++static void sp_expect_same_entries(btree_t *a, btree_t *b)
++{
++    btree_cursor_t *ca = NULL, *cb = NULL;
++    ASSERT_EQ(btree_cursor_init(&ca, a), 0);
++    ASSERT_EQ(btree_cursor_init(&cb, b), 0);
++    ASSERT_EQ(btree_cursor_goto_first(ca), 0);
++    ASSERT_EQ(btree_cursor_goto_first(cb), 0);
++    int n = 0;
++    while (btree_cursor_valid(ca) == 1)
++    {
++        ASSERT_EQ(btree_cursor_valid(cb), 1);
++        uint8_t *ka, *va, *kb, *vb;
++        size_t ksa, vsa, ksb, vsb;
++        uint64_t la, sa, lb, sb;
++        int64_t ta, tb;
++        uint8_t da, db;
++        ASSERT_EQ(btree_cursor_get(ca, &ka, &ksa, &va, &vsa, &la, &sa, &ta, &da), 0);
++        ASSERT_EQ(btree_cursor_get(cb, &kb, &ksb, &vb, &vsb, &lb, &sb, &tb, &db), 0);
++        ASSERT_EQ(ksa, ksb);
++        ASSERT_EQ(memcmp(ka, kb, ksa), 0);
++        ASSERT_EQ(vsa, vsb);
++        if (la == 0 && vsa > 0) ASSERT_EQ(memcmp(va, vb, vsa), 0);
++        ASSERT_EQ(la, lb);
++        ASSERT_EQ(sa, sb);
++        ASSERT_EQ(ta, tb);
++        ASSERT_EQ(da, db);
++        n++;
++        const int ra = btree_cursor_next(ca);
++        const int rb = btree_cursor_next(cb);
++        ASSERT_EQ(ra, rb);
++        if (ra != 0) break;
++    }
++    ASSERT_EQ(n, SP_FIXTURE_ENTRIES);
++    btree_cursor_free(ca);
++    btree_cursor_free(cb);
++}
++
++static void test_old_and_new_layouts_read_identically(void)
++{
++    sp_fresh_dir();
++    FILE *f = fopen(SP_KLOG_OLD, "wb");
++    ASSERT_TRUE(f != NULL);
++    ASSERT_EQ(fwrite(sp_fixture_klog, 1, sizeof(sp_fixture_klog), f), sizeof(sp_fixture_klog));
++    ASSERT_EQ(fclose(f), 0);
++
++    block_manager_t *old_bm = NULL;
++    ASSERT_EQ(block_manager_open(&old_bm, SP_KLOG_OLD, BLOCK_MANAGER_SYNC_NONE), 0);
++    const btree_config_t cfg = sp_config(&g_modes[0], SP_FIXTURE_NODE_SIZE);
++    btree_t *old_tree = NULL;
++    ASSERT_EQ(btree_open(&old_tree, old_bm, &cfg, sp_fixture_root_offset,
++                         sp_fixture_first_leaf_offset, sp_fixture_last_leaf_offset),
++              0);
++
++    block_manager_t *new_bm = NULL;
++    ASSERT_EQ(block_manager_open(&new_bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++    btree_builder_t *nb = NULL;
++    btree_t *new_tree = sp_build_fixture_input(new_bm, &nb);
++    ASSERT_EQ(new_tree->entry_count, (uint64_t)SP_FIXTURE_ENTRIES);
++
++    /* both layouts hold well-formed contiguous chains of the same length */
++    const uint32_t old_leaves = sp_check_links(old_tree, &g_modes[0]);
++    const uint32_t new_leaves = sp_check_links(new_tree, &g_modes[0]);
++    ASSERT_EQ(old_leaves, new_leaves);
++    ASSERT_TRUE(old_leaves >= 3);
++
++    /* the same entries through the cursor and through point reads */
++    sp_expect_same_entries(old_tree, new_tree);
++    for (int i = 0; i < SP_FIXTURE_ENTRIES; i++)
++    {
++        char key[SP_KEY_MAX];
++        uint8_t value[64];
++        size_t ks, vs;
++        uint64_t vlog;
++        int64_t ttl;
++        uint8_t flags;
++        sp_fixture_entry(i, key, &ks, value, &vs, &vlog, &ttl, &flags);
++        btree_t *trees[2] = {old_tree, new_tree};
++        for (int t = 0; t < 2; t++)
++        {
++            uint8_t *v = NULL;
++            size_t gvs = 0;
++            uint64_t gvlog = 0, seq = 0;
++            int64_t gttl = 0;
++            uint8_t del = 0;
++            ASSERT_EQ(btree_get(trees[t], (uint8_t *)key, ks, &v, &gvs, &gvlog, &seq, &gttl, &del),
++                      0);
++            ASSERT_EQ(seq, (uint64_t)(i + 1));
++            ASSERT_EQ(gvlog, vlog);
++            ASSERT_EQ(gttl, ttl);
++            ASSERT_EQ(del != 0, flags != 0);
++            if (vlog == 0)
++            {
++                ASSERT_EQ(gvs, vs);
++                ASSERT_EQ(memcmp(v, value, vs), 0);
++            }
++            free(v);
++        }
++    }
++
++    /* leaf by leaf, the decoded payloads are the same bytes apart from the links. the old builder
++     * left the staging file's offsets in the plaintext links, so those differ by design; readers
++     * take the links from the block header */
++    int64_t oo = old_tree->first_leaf_offset;
++    int64_t no = new_tree->first_leaf_offset;
++    for (uint32_t i = 0; i < old_leaves; i++)
++    {
++        sp_leaf_t ol, nl;
++        sp_read_leaf(old_bm, &g_modes[0], oo, &ol);
++        sp_read_leaf(new_bm, &g_modes[0], no, &nl);
++        ASSERT_EQ(ol.plain_size, nl.plain_size);
++        ASSERT_EQ(memcmp(ol.plain, nl.plain, ol.plain_size), 0);
++        free(ol.plain);
++        free(nl.plain);
++        oo = ol.next;
++        no = nl.next;
++    }
++    ASSERT_EQ(oo, BTREE_LEAF_LINK_NONE);
++    ASSERT_EQ(no, BTREE_LEAF_LINK_NONE);
++
++    btree_free(old_tree);
++    btree_free(new_tree);
++    btree_builder_free(nb);
++    (void)block_manager_close(old_bm);
++    (void)block_manager_close(new_bm);
++    (void)remove_directory(SP_DIR);
++}
++
++static void test_failed_build_leaves_no_output(void)
++{
++    for (int mi = 0; mi < 2; mi++)
++    {
++        const sp_mode_t *m = &g_modes[mi];
++        sp_fresh_dir();
++        block_manager_t *bm = NULL;
++        ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++        const btree_config_t cfg = sp_config(m, 512);
++        btree_builder_t *b = NULL;
++        ASSERT_EQ(btree_builder_new(&b, bm, &cfg), 0);
++
++        uint8_t value[64];
++        memset(value, 'f', sizeof(value));
++        int failed = 0;
++        int broken = 0;
++        for (uint64_t i = 0; i < 5000 && !failed; i++)
++        {
++            /* once five leaves are built, every write to the klog fails: its descriptor now names
++             * a file opened read only */
++            if (!broken && b->node_count >= 5)
++            {
++                const int ro = open("/dev/null", O_RDONLY);
++                ASSERT_TRUE(ro >= 0);
++                ASSERT_TRUE(dup2(ro, bm->fd) == bm->fd);
++                (void)close(ro);
++                broken = 1;
++            }
++            char key[SP_KEY_MAX];
++            const size_t ks = sp_key(key, i);
++            if (btree_builder_add(b, (uint8_t *)key, ks, value, sizeof(value), 0, i + 1, 0, 0) != 0)
++                failed = 1;
++        }
++        ASSERT_TRUE(broken);
++        btree_t *tree = NULL;
++        if (!failed)
++        {
++            ASSERT_EQ(btree_builder_finish(b, &tree), -1);
++            failed = 1;
++        }
++        ASSERT_TRUE(tree == NULL);
++        btree_builder_free(b);
++
++        /* the builder leaves nothing of its own behind, so dropping the klog, as the flush and
++         * compaction drivers do on a failed build, leaves the directory empty */
++        int stage = 0, other = 0;
++        sp_scan_dir(&stage, &other);
++        ASSERT_EQ(stage, 0);
++        ASSERT_EQ(other, 0);
++        (void)block_manager_close(bm);
++        ASSERT_EQ(remove(SP_KLOG), 0);
++        DIR *d = opendir(SP_DIR);
++        ASSERT_TRUE(d != NULL);
++        int entries = 0;
++        struct dirent *e;
++        while ((e = readdir(d)) != NULL)
++            if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) entries++;
++        closedir(d);
++        ASSERT_EQ(entries, 0);
++    }
++    (void)remove_directory(SP_DIR);
++}
++
++/* write the fixture header: the klog bytes of the fixture input as this tree's builder lays them
++ * out, and the offsets a reader opens it with. run only on a tree without single-pass leaves */
++static int sp_write_fixture(const char *out_path)
++{
++    sp_fresh_dir();
++    block_manager_t *bm = NULL;
++    ASSERT_EQ(block_manager_open(&bm, SP_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++    btree_builder_t *b = NULL;
++    btree_t *tree = sp_build_fixture_input(bm, &b);
++    const int64_t root = tree->root_offset, first = tree->first_leaf_offset,
++                  last = tree->last_leaf_offset;
++    btree_free(tree);
++    btree_builder_free(b);
++    (void)block_manager_close(bm);
++
++    FILE *in = fopen(SP_KLOG, "rb");
++    ASSERT_TRUE(in != NULL);
++    FILE *out = fopen(out_path, "w");
++    ASSERT_TRUE(out != NULL);
++    fprintf(
++        out,
++        "/* generated by btree_single_pass__tests --write-fixture on the tree before\n"
++        " * tidesdb-btree-single-pass-leaves.patch: %d entries, lz4, node size %d. do not edit */\n"
++        "#ifndef BTREE_LZ4_STAGED_LAYOUT_H\n#define BTREE_LZ4_STAGED_LAYOUT_H\n\n"
++        "#include <stdint.h>\n\n",
++        SP_FIXTURE_ENTRIES, SP_FIXTURE_NODE_SIZE);
++    fprintf(out, "static const int64_t sp_fixture_root_offset = %" PRId64 ";\n", root);
++    fprintf(out, "static const int64_t sp_fixture_first_leaf_offset = %" PRId64 ";\n", first);
++    fprintf(out, "static const int64_t sp_fixture_last_leaf_offset = %" PRId64 ";\n\n", last);
++    fprintf(out, "static const unsigned char sp_fixture_klog[] = {");
++    int c;
++    size_t n = 0;
++    while ((c = fgetc(in)) != EOF)
++    {
++        fprintf(out, "%s0x%02x", n == 0 ? "\n    " : (n % 12 == 0 ? ",\n    " : ", "), c);
++        n++;
++    }
++    fprintf(out, "};\n\n#endif\n");
++    fclose(in);
++    ASSERT_EQ(fclose(out), 0);
++    (void)remove_directory(SP_DIR);
++    printf("wrote %zu bytes of klog to %s\n", n, out_path);
++    return 0;
++}
++
++int main(int argc, char **argv)
++{
++    ASSERT_TRUE(sp_init_codecs());
++    if (argc > 2 && strcmp(argv[1], "--write-fixture") == 0) return sp_write_fixture(argv[2]);
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_no_stage_file, tests_passed);
++    RUN_TEST(test_one_leaf_table, tests_passed);
++    RUN_TEST(test_cursor_both_ways_many_leaves, tests_passed);
++    RUN_TEST(test_links_are_contiguous, tests_passed);
++    RUN_TEST(test_old_and_new_layouts_read_identically, tests_passed);
++    RUN_TEST(test_failed_build_leaves_no_output, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
+diff --git a/test/fixtures/btree_lz4_staged_layout.h b/test/fixtures/btree_lz4_staged_layout.h
+new file mode 100644
+index 0000000..91b0d34
+--- /dev/null
++++ b/test/fixtures/btree_lz4_staged_layout.h
+@@ -0,0 +1,173 @@
++/* generated by btree_single_pass__tests --write-fixture on the tree before
++ * tidesdb-btree-single-pass-leaves.patch: 64 entries, lz4, node size 512. do not edit */
++#ifndef BTREE_LZ4_STAGED_LAYOUT_H
++#define BTREE_LZ4_STAGED_LAYOUT_H
++
++#include <stdint.h>
++
++static const int64_t sp_fixture_root_offset = 1793;
++static const int64_t sp_fixture_first_leaf_offset = 8;
++static const int64_t sp_fixture_last_leaf_offset = 1614;
++
++static const unsigned char sp_fixture_klog[] = {
++    0x42, 0x44, 0x54, 0x0a, 0x00, 0x00, 0x00, 0x00, 0xcf, 0x00, 0x00, 0x00,
++    0xb9, 0x44, 0x55, 0x4a, 0xf7, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xe7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xf7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x01, 0x09, 0xff,
++    0x01, 0x00, 0x33, 0x0f, 0x01, 0x00, 0x01, 0x00, 0xf0, 0x05, 0x07, 0x00,
++    0x08, 0x00, 0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0c, 0x00, 0x0d, 0x00,
++    0x0e, 0x00, 0x01, 0x00, 0x07, 0x0c, 0x1b, 0x00, 0x50, 0x06, 0x01, 0x0d,
++    0x00, 0x02, 0x07, 0x00, 0x30, 0x0e, 0x00, 0x04, 0x07, 0x00, 0xf0, 0x0e,
++    0x0f, 0x00, 0x06, 0x86, 0xc4, 0x9f, 0xd5, 0x0c, 0x02, 0x06, 0x01, 0x10,
++    0x00, 0x08, 0x00, 0x01, 0x06, 0x01, 0x11, 0xed, 0x07, 0x0a, 0x00, 0x04,
++    0x06, 0x01, 0x12, 0x00, 0x0c, 0x21, 0x00, 0x30, 0x13, 0x00, 0x0e, 0x07,
++    0x00, 0x80, 0x14, 0x00, 0x10, 0x00, 0x00, 0x66, 0x78, 0x30, 0x01, 0x00,
++    0xe0, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x76, 0x61, 0x6c,
++    0x75, 0x65, 0x2d, 0x12, 0x00, 0x26, 0x30, 0x2d, 0x0c, 0x00, 0x36, 0x31,
++    0x2d, 0x61, 0x0d, 0x00, 0x46, 0x32, 0x2d, 0x61, 0x62, 0x0e, 0x00, 0x56,
++    0x33, 0x2d, 0x61, 0x62, 0x63, 0x0f, 0x00, 0x10, 0x34, 0x0f, 0x00, 0x16,
++    0x64, 0x10, 0x00, 0x11, 0x36, 0x10, 0x00, 0x26, 0x65, 0x66, 0x12, 0x00,
++    0x13, 0x37, 0x12, 0x00, 0x16, 0x67, 0x13, 0x00, 0xa0, 0x38, 0x2d, 0x61,
++    0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0xcf, 0x00, 0x00, 0x00, 0x42,
++    0x54, 0x44, 0x42, 0xd4, 0x00, 0x00, 0x00, 0x16, 0xeb, 0xcb, 0x75, 0x32,
++    0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcb,
++    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x01, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x42, 0x01, 0x08, 0x08, 0x00, 0x01, 0x00, 0x22, 0x51,
++    0x02, 0x08, 0x00, 0xf0, 0x05, 0x00, 0x00, 0x07, 0x00, 0x09, 0x00, 0x0a,
++    0x00, 0x0b, 0x00, 0x0c, 0x00, 0x0d, 0x00, 0x0e, 0x00, 0x0a, 0x00, 0x07,
++    0x15, 0x16, 0x00, 0xf0, 0x08, 0x05, 0x02, 0x16, 0x00, 0x02, 0x94, 0xc4,
++    0x9f, 0xd5, 0x0c, 0x02, 0x06, 0x01, 0x17, 0x00, 0x04, 0x00, 0x00, 0x06,
++    0x01, 0x18, 0x00, 0x06, 0x07, 0x00, 0x30, 0x19, 0x00, 0x08, 0x07, 0x00,
++    0x30, 0x1a, 0x00, 0x0a, 0x07, 0x00, 0xf1, 0x12, 0x1b, 0x00, 0x0c, 0x00,
++    0x01, 0x06, 0x01, 0x1c, 0x00, 0x0e, 0x00, 0x00, 0x66, 0x78, 0x30, 0x30,
++    0x30, 0x30, 0x39, 0x31, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x76,
++    0x61, 0x6c, 0x75, 0x65, 0x2d, 0x13, 0x00, 0xa5, 0x2d, 0x61, 0x62, 0x63,
++    0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x15, 0x00, 0x26, 0x31, 0x30, 0x15,
++    0x00, 0x16, 0x6a, 0x16, 0x00, 0x17, 0x31, 0x16, 0x00, 0x16, 0x6b, 0x17,
++    0x00, 0x18, 0x32, 0x17, 0x00, 0x16, 0x6c, 0x18, 0x00, 0x19, 0x33, 0x18,
++    0x00, 0x16, 0x6d, 0x19, 0x00, 0x1a, 0x34, 0x19, 0x00, 0x16, 0x6e, 0x1a,
++    0x00, 0x1b, 0x35, 0x1a, 0x00, 0x16, 0x6f, 0x1b, 0x00, 0x18, 0x36, 0x1b,
++    0x00, 0x50, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0xd4, 0x00, 0x00, 0x00, 0x42,
++    0x54, 0x44, 0x42, 0xd6, 0x00, 0x00, 0x00, 0xac, 0x50, 0x09, 0x6c, 0x2b,
++    0x01, 0x00, 0x00, 0xe7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1,
++    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x01, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x51, 0x01, 0x08, 0x0f, 0x01, 0x00, 0x01, 0x00, 0x21,
++    0x8c, 0x03, 0x07, 0x00, 0xf0, 0x29, 0x00, 0x00, 0x00, 0x07, 0x00, 0x08,
++    0x00, 0x09, 0x00, 0x0b, 0x00, 0x0c, 0x00, 0x0d, 0x00, 0x0e, 0x00, 0x12,
++    0x00, 0x07, 0x1d, 0x00, 0x00, 0xa2, 0xc4, 0x9f, 0xd5, 0x0c, 0x02, 0x06,
++    0x01, 0x1e, 0xfa, 0x07, 0x02, 0x00, 0x04, 0x06, 0x01, 0x1f, 0x00, 0x04,
++    0x00, 0x00, 0x05, 0x02, 0x20, 0x00, 0x06, 0x00, 0x00, 0x06, 0x01, 0x21,
++    0x00, 0x08, 0x07, 0x00, 0x30, 0x22, 0x00, 0x0a, 0x07, 0x00, 0x30, 0x0c,
++    0x00, 0x0c, 0x07, 0x00, 0x41, 0x0d, 0x00, 0x0e, 0xb0, 0x36, 0x00, 0xf1,
++    0x06, 0x66, 0x78, 0x30, 0x30, 0x30, 0x31, 0x37, 0x38, 0x39, 0x32, 0x30,
++    0x31, 0x32, 0x33, 0x34, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x13, 0x00,
++    0xf6, 0x03, 0x2d, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
++    0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x1d, 0x00, 0x1e, 0x39,
++    0x1d, 0x00, 0x25, 0x72, 0x73, 0x1f, 0x00, 0x2f, 0x32, 0x30, 0x1f, 0x00,
++    0x01, 0x16, 0x74, 0x20, 0x00, 0x1f, 0x31, 0x20, 0x00, 0x02, 0x16, 0x75,
++    0x21, 0x00, 0x1f, 0x32, 0x21, 0x00, 0x04, 0x06, 0x22, 0x00, 0x24, 0x33,
++    0x2d, 0x0c, 0x00, 0x50, 0x30, 0x32, 0x34, 0x2d, 0x61, 0xd6, 0x00, 0x00,
++    0x00, 0x42, 0x54, 0x44, 0x42, 0xdd, 0x00, 0x00, 0x00, 0x0a, 0xe1, 0x3b,
++    0x3b, 0x07, 0x01, 0x00, 0x00, 0xcb, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x9e, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x01, 0x09, 0x51, 0x02, 0x00, 0x01,
++    0x00, 0x21, 0xa3, 0x04, 0x07, 0x00, 0xf0, 0x08, 0x00, 0x00, 0x00, 0x07,
++    0x00, 0x08, 0x00, 0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0d, 0x00, 0x0e,
++    0x00, 0x0f, 0x00, 0x1a, 0x00, 0x07, 0x0e, 0x19, 0x00, 0xc0, 0x06, 0x01,
++    0x0f, 0x00, 0x02, 0x00, 0x01, 0x06, 0x01, 0x10, 0x00, 0x04, 0x0e, 0x00,
++    0x30, 0x11, 0x00, 0x06, 0x07, 0x00, 0xa0, 0x12, 0x00, 0x08, 0x00, 0x00,
++    0x05, 0x02, 0x13, 0x00, 0x0a, 0x0e, 0x00, 0xf0, 0x00, 0x14, 0x87, 0x08,
++    0x0c, 0xbe, 0xc4, 0x9f, 0xd5, 0x0c, 0x06, 0x06, 0x01, 0x15, 0x00, 0x0e,
++    0x13, 0x00, 0xf1, 0x0c, 0x16, 0x00, 0x10, 0x00, 0x00, 0x66, 0x78, 0x30,
++    0x30, 0x30, 0x32, 0x35, 0x36, 0x37, 0x38, 0x39, 0x33, 0x30, 0x31, 0x32,
++    0x33, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x14, 0x00, 0x36, 0x2d, 0x61,
++    0x62, 0x0e, 0x00, 0x56, 0x36, 0x2d, 0x61, 0x62, 0x63, 0x0f, 0x00, 0x10,
++    0x37, 0x0f, 0x00, 0x16, 0x64, 0x10, 0x00, 0x11, 0x38, 0x10, 0x00, 0x16,
++    0x65, 0x11, 0x00, 0x12, 0x39, 0x11, 0x00, 0x15, 0x66, 0x12, 0x00, 0x23,
++    0x33, 0x30, 0x12, 0x00, 0x16, 0x67, 0x13, 0x00, 0x14, 0x32, 0x13, 0x00,
++    0x26, 0x68, 0x69, 0x15, 0x00, 0xc0, 0x33, 0x2d, 0x61, 0x62, 0x63, 0x64,
++    0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0xdd, 0x00, 0x00, 0x00, 0x42, 0x54,
++    0x44, 0x42, 0xd8, 0x00, 0x00, 0x00, 0x8f, 0x48, 0xda, 0xd7, 0x42, 0x01,
++    0x00, 0x00, 0xb1, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x04,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x51, 0x01, 0x08, 0x8c, 0x03, 0x00, 0x01, 0x00, 0x21, 0xf5,
++    0x05, 0x07, 0x00, 0xf0, 0x06, 0x00, 0x00, 0x00, 0x07, 0x00, 0x08, 0x00,
++    0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0c, 0x00, 0x0e, 0x00, 0x23, 0x00,
++    0x07, 0x17, 0x17, 0x00, 0x50, 0x06, 0x01, 0x18, 0x00, 0x02, 0x07, 0x00,
++    0x30, 0x19, 0x00, 0x04, 0x07, 0x00, 0xf0, 0x0d, 0x1a, 0x00, 0x06, 0x00,
++    0x01, 0x06, 0x01, 0x1b, 0x00, 0x08, 0xcc, 0xc4, 0x9f, 0xd5, 0x0c, 0x02,
++    0x06, 0x01, 0x1c, 0x00, 0x0a, 0x00, 0x00, 0x05, 0x02, 0x1d, 0x00, 0x0c,
++    0x20, 0x00, 0xf1, 0x0b, 0x1e, 0x00, 0x0e, 0x00, 0x00, 0x66, 0x78, 0x30,
++    0x30, 0x30, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x34, 0x30, 0x31,
++    0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x13, 0x00, 0xc6, 0x2d, 0x61, 0x62,
++    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x17, 0x00, 0x18,
++    0x35, 0x17, 0x00, 0x16, 0x6c, 0x18, 0x00, 0x19, 0x36, 0x18, 0x00, 0x16,
++    0x6d, 0x19, 0x00, 0x1a, 0x37, 0x19, 0x00, 0x16, 0x6e, 0x1a, 0x00, 0x1b,
++    0x38, 0x1a, 0x00, 0x16, 0x6f, 0x1b, 0x00, 0x1c, 0x39, 0x1b, 0x00, 0x15,
++    0x70, 0x1c, 0x00, 0x2d, 0x34, 0x30, 0x1c, 0x00, 0x16, 0x71, 0x1d, 0x00,
++    0x1a, 0x31, 0x1d, 0x00, 0x50, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0xd8, 0x00,
++    0x00, 0x00, 0x42, 0x54, 0x44, 0x42, 0xd1, 0x00, 0x00, 0x00, 0xbe, 0x68,
++    0x3b, 0x74, 0x05, 0x01, 0x00, 0x00, 0x9e, 0x03, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x67, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x01, 0x08, 0xa3, 0x04, 0x00,
++    0x01, 0x00, 0x21, 0x0a, 0x07, 0x07, 0x00, 0xf0, 0x06, 0x00, 0x00, 0x00,
++    0x07, 0x00, 0x08, 0x00, 0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0c, 0x00,
++    0x0d, 0x00, 0x2b, 0x00, 0x07, 0x1f, 0x17, 0x00, 0x50, 0x06, 0x01, 0x20,
++    0x00, 0x02, 0x07, 0x00, 0xf0, 0x07, 0x21, 0x94, 0x08, 0x04, 0x00, 0x04,
++    0x06, 0x01, 0x22, 0x00, 0x06, 0xda, 0xc4, 0x9f, 0xd5, 0x0c, 0x02, 0x06,
++    0x01, 0x0c, 0x00, 0x08, 0x1a, 0x00, 0x30, 0x0d, 0x00, 0x0a, 0x07, 0x00,
++    0xf1, 0x11, 0x0e, 0x00, 0x0c, 0x00, 0x01, 0x06, 0x01, 0x0f, 0x00, 0x0e,
++    0x00, 0x00, 0x66, 0x78, 0x30, 0x30, 0x30, 0x34, 0x32, 0x33, 0x34, 0x35,
++    0x36, 0x37, 0x38, 0x39, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x12, 0x00,
++    0xf6, 0x05, 0x2d, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
++    0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x1f, 0x00,
++    0x1f, 0x33, 0x1f, 0x00, 0x01, 0x16, 0x74, 0x20, 0x00, 0x1f, 0x35, 0x20,
++    0x00, 0x02, 0x26, 0x75, 0x76, 0x22, 0x00, 0x26, 0x36, 0x2d, 0x0c, 0x00,
++    0x36, 0x37, 0x2d, 0x61, 0x0d, 0x00, 0x46, 0x38, 0x2d, 0x61, 0x62, 0x0e,
++    0x00, 0x50, 0x39, 0x2d, 0x61, 0x62, 0x63, 0xd1, 0x00, 0x00, 0x00, 0x42,
++    0x54, 0x44, 0x42, 0xd7, 0x00, 0x00, 0x00, 0xf6, 0x98, 0x95, 0xaf, 0x15,
++    0x01, 0x00, 0x00, 0x86, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e,
++    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x01, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x51, 0x01, 0x09, 0xf5, 0x05, 0x00, 0x01, 0x00, 0x21,
++    0x2f, 0x08, 0x07, 0x00, 0xf0, 0x08, 0x00, 0x00, 0x00, 0x07, 0x00, 0x08,
++    0x00, 0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0c, 0x00, 0x0d, 0x00, 0x0e,
++    0x00, 0x33, 0x00, 0x07, 0x10, 0x19, 0x00, 0x50, 0x06, 0x01, 0x11, 0x00,
++    0x02, 0x07, 0x00, 0xe0, 0x12, 0x00, 0x04, 0xe8, 0xc4, 0x9f, 0xd5, 0x0c,
++    0x02, 0x06, 0x01, 0x13, 0x00, 0x06, 0x12, 0x00, 0x30, 0x14, 0x00, 0x08,
++    0x07, 0x00, 0x30, 0x15, 0x00, 0x0a, 0x07, 0x00, 0x30, 0x16, 0x00, 0x0c,
++    0x07, 0x00, 0xf1, 0x13, 0x17, 0xa1, 0x08, 0x0e, 0x00, 0x04, 0x06, 0x01,
++    0x18, 0x00, 0x10, 0x00, 0x00, 0x66, 0x78, 0x30, 0x30, 0x30, 0x35, 0x30,
++    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x76, 0x61, 0x6c, 0x75,
++    0x65, 0x2d, 0x13, 0x00, 0x56, 0x2d, 0x61, 0x62, 0x63, 0x64, 0x10, 0x00,
++    0x11, 0x31, 0x10, 0x00, 0x16, 0x65, 0x11, 0x00, 0x12, 0x32, 0x11, 0x00,
++    0x16, 0x66, 0x12, 0x00, 0x13, 0x33, 0x12, 0x00, 0x16, 0x67, 0x13, 0x00,
++    0x14, 0x34, 0x13, 0x00, 0x16, 0x68, 0x14, 0x00, 0x15, 0x35, 0x14, 0x00,
++    0x16, 0x69, 0x15, 0x00, 0x16, 0x36, 0x15, 0x00, 0x16, 0x6a, 0x16, 0x00,
++    0x14, 0x38, 0x16, 0x00, 0x50, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0xd7, 0x00,
++    0x00, 0x00, 0x42, 0x54, 0x44, 0x42, 0xa3, 0x00, 0x00, 0x00, 0x67, 0x7e,
++    0xf3, 0x50, 0xd7, 0x00, 0x00, 0x00, 0x67, 0x05, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xd7, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x01, 0x05, 0x0a, 0x07, 0x00,
++    0x01, 0x00, 0x13, 0xff, 0x01, 0x00, 0xf0, 0x13, 0x00, 0x00, 0x07, 0x00,
++    0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x3c, 0x00, 0x07, 0x19, 0x00, 0x00,
++    0xf6, 0xc4, 0x9f, 0xd5, 0x0c, 0x03, 0x05, 0x02, 0x1a, 0x00, 0x02, 0x00,
++    0x00, 0x06, 0x01, 0x1b, 0x00, 0x04, 0x07, 0x00, 0x30, 0x1c, 0x00, 0x06,
++    0x07, 0x00, 0xf1, 0x08, 0x1d, 0x00, 0x08, 0x00, 0x00, 0x66, 0x78, 0x30,
++    0x30, 0x30, 0x35, 0x39, 0x36, 0x30, 0x31, 0x32, 0x33, 0x76, 0x61, 0x6c,
++    0x75, 0x65, 0x2d, 0x10, 0x00, 0xe5, 0x2d, 0x61, 0x62, 0x63, 0x64, 0x65,
++    0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x19, 0x00, 0x2a, 0x36,
++    0x30, 0x19, 0x00, 0x16, 0x6e, 0x1a, 0x00, 0x1b, 0x31, 0x1a, 0x00, 0x16,
++    0x6f, 0x1b, 0x00, 0x1c, 0x32, 0x1b, 0x00, 0x16, 0x70, 0x1c, 0x00, 0x19,
++    0x33, 0x1c, 0x00, 0x50, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0xa3, 0x00, 0x00,
++    0x00, 0x42, 0x54, 0x44, 0x42, 0x5e, 0x00, 0x00, 0x00, 0x0c, 0x08, 0x86,
++    0x71, 0x51, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x51, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x02, 0x07, 0x08, 0x00, 0x01, 0x00,
++    0xf2, 0x00, 0xbe, 0x03, 0xc8, 0x03, 0xcc, 0x03, 0xda, 0x03, 0xd0, 0x03,
++    0xc2, 0x03, 0xce, 0x03, 0x07, 0x01, 0x00, 0x71, 0x66, 0x78, 0x30, 0x30,
++    0x30, 0x30, 0x39, 0x07, 0x00, 0x21, 0x31, 0x37, 0x07, 0x00, 0x21, 0x32,
++    0x35, 0x07, 0x00, 0x21, 0x33, 0x34, 0x07, 0x00, 0x21, 0x34, 0x32, 0x07,
++    0x00, 0x90, 0x35, 0x30, 0x66, 0x78, 0x30, 0x30, 0x30, 0x35, 0x39, 0x5e,
++    0x00, 0x00, 0x00, 0x42, 0x54, 0x44, 0x42};
++
++#endif

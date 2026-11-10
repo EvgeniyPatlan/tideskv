@@ -47,11 +47,17 @@ foreach(suite planner exec)
 endforeach()
 # TidesDB's block cache and merge iterator suites, holding the cases of cmake/patches/tidesdb-cache-* and
 # tidesdb-compaction-merge-level-runs.patch, the random read suite tidesdb-random-read-hint.patch adds,
-# the range covering suite tidesdb-range-covering-index.patch adds, and the partition suite
-# tidesdb-compaction-partition-cursor.patch adds
-foreach(suite cache merge_iter random_read range_covering compaction_partition)
+# the range covering suite tidesdb-range-covering-index.patch adds, the partition suite
+# tidesdb-compaction-partition-cursor.patch adds, the single-pass leaf suite
+# tidesdb-btree-single-pass-leaves.patch adds, and the upstream sstable suite that guards the builder it
+# changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
+# compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
+# it off)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass sstable)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
+  # the btree internals include xxhash.h, which TidesDB keeps under external/
+  target_include_directories(tidesdb_${suite}_tests SYSTEM PRIVATE ${tidesdb_SOURCE_DIR}/external)
   target_compile_definitions(tidesdb_${suite}_tests PRIVATE _GNU_SOURCE)
   target_link_libraries(tidesdb_${suite}_tests PRIVATE tidesdb)
 endforeach()
@@ -68,6 +74,10 @@ add_test(NAME TidesDbCompactionExec COMMAND tidesdb_exec_tests WORKING_DIRECTORY
 # the partition suite runs the exec suite's helpers, so the two share one scratch database and must not overlap
 add_test(NAME TidesDbCompactionPartition COMMAND tidesdb_compaction_partition_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(TidesDbCompactionExec TidesDbCompactionPartition PROPERTIES RESOURCE_LOCK compaction_scratch_db)
+# the single-pass leaf suite writes its scratch klogs under the working directory
+add_test(NAME TidesDbBtreeSinglePass COMMAND tidesdb_btree_single_pass_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the upstream sstable suite writes its scratch files under the working directory
+add_test(NAME TidesDbSstable COMMAND tidesdb_sstable_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)
