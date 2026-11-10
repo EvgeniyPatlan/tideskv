@@ -1,8 +1,27 @@
 diff --git a/src/column_family/column_family.c b/src/column_family/column_family.c
-index eb67409..3e55f2d 100644
+index eb67409..269ffab 100644
 --- a/src/column_family/column_family.c
 +++ b/src/column_family/column_family.c
-@@ -276,52 +276,21 @@ void cf_free(cf_t *cf)
+@@ -80,6 +80,10 @@ static int cf_load_entries(cf_t *cf, tidesdb_manifest_t *manifest, const int syn
+     const int matched = tidesdb_manifest_copy_entries(manifest, cf->cf_id, entries, count);
+     const int got = matched < count ? matched : count;
+     int result = 0;
++    /* one covering index for the whole load rather than one per table installed. a failed build
++     * at the end leaves the family answering covering queries by walking its tables, which is
++     * correct, so it does not fail the load */
++    (void)level_set_defer_covering(cf->levels, 1);
+     for (int i = 0; i < got && result == 0; i++)
+     {
+         sstable_t *sst = NULL;
+@@ -108,6 +112,7 @@ static int cf_load_entries(cf_t *cf, tidesdb_manifest_t *manifest, const int syn
+          */
+         if (sstable_unref(sst)) sstable_close(sst);
+     }
++    (void)level_set_defer_covering(cf->levels, 0);
+     free(entries);
+     return result;
+ }
+@@ -276,52 +281,21 @@ void cf_free(cf_t *cf)
      free(cf);
  }
  
@@ -62,7 +81,7 @@ index eb67409..3e55f2d 100644
  
  /* free a configuration displaced by a reconfigure, once the epoch says no reader holds it */
 diff --git a/src/column_family/level/level_set.c b/src/column_family/level/level_set.c
-index 6302b16..0de9958 100644
+index 6302b16..1437052 100644
 --- a/src/column_family/level/level_set.c
 +++ b/src/column_family/level/level_set.c
 @@ -13,6 +13,7 @@
@@ -73,7 +92,7 @@ index 6302b16..0de9958 100644
  
  /* a layout that is neither published nor on the retire list holds sstable references nothing will
   * ever give back, which surfaces only as a leaked handle long afterwards. counting the layouts
-@@ -24,6 +25,15 @@ int64_t level_live_layouts(void)
+@@ -24,6 +25,23 @@ int64_t level_live_layouts(void)
      return atomic_load_explicit(&level_live_layouts_count, memory_order_relaxed);
  }
  
@@ -86,10 +105,18 @@ index 6302b16..0de9958 100644
 +    return atomic_load_explicit(&level_live_covering_count, memory_order_relaxed);
 +}
 +
++/* every covering index ever built, so a test can tell one build from one per table */
++static _Atomic(int64_t) level_covering_builds_count;
++
++int64_t level_covering_builds(void)
++{
++    return atomic_load_explicit(&level_covering_builds_count, memory_order_relaxed);
++}
++
  /**
   * level_entry_t
   * one sstable's slot within a level -- the open handle plus the on-disk size that feeds size
-@@ -44,11 +54,18 @@ typedef struct
+@@ -44,11 +62,18 @@ typedef struct
   * listed sstable.
   * @param levels per-level arrays of entries, index level-1; L1 unordered, L2+ sorted by min_key
   * @param counts number of entries at each level
@@ -108,7 +135,15 @@ index 6302b16..0de9958 100644
  } level_layout_t;
  
  /**
-@@ -177,6 +194,11 @@ static void level_layout_reclaim(void *item, void *ctx)
+@@ -78,6 +103,7 @@ struct level_set
+     _Atomic(uint64_t) generation;
+     _Atomic(uint32_t) occupancy;
+     _Atomic(uint32_t) interval_tables;
++    int covering_deferred;
+ };
+ 
+ /**
+@@ -177,6 +203,11 @@ static void level_layout_reclaim(void *item, void *ctx)
          }
          free(lay->levels[i]);
      }
@@ -120,7 +155,7 @@ index 6302b16..0de9958 100644
      atomic_fetch_sub_explicit(&level_live_layouts_count, 1, memory_order_relaxed);
      free(lay);
  }
-@@ -248,6 +270,41 @@ static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const i
+@@ -248,6 +279,42 @@ static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const i
      return 0;
  }
  
@@ -154,6 +189,7 @@ index 6302b16..0de9958 100644
 +    if (range_tombstone_set_merge(sets, n, &merged) == TDB_SUCCESS)
 +    {
 +        lay->covering = merged;
++        atomic_fetch_add_explicit(&level_covering_builds_count, 1, memory_order_relaxed);
 +        atomic_fetch_add_explicit(&level_live_covering_count, 1, memory_order_relaxed);
 +    }
 +    free(sets);
@@ -162,16 +198,27 @@ index 6302b16..0de9958 100644
  /**
   * level_publish
   * install a freshly built layout as current and retire the old one for epoch-guarded reclamation
-@@ -265,6 +322,8 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
+@@ -265,6 +332,11 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
              if (range_tombstone_set_count(fresh->levels[i][j].sst->range_tombstones) > 0)
                  carrying++;
      }
 +    fresh->carrying = carrying;
-+    level_layout_build_covering(fresh);
++    /* a bulk load defers the index to one build once every table is in, where building it per
++     * install would merge every interval loaded so far once a table. a layout published meanwhile
++     * carries none, and a covering query walks its tables instead */
++    if (!ls->covering_deferred) level_layout_build_covering(fresh);
  
      /* the layout, the mask and the interval count are three words a reader loads one at a time, and
       * a publish changes all three. a reader that mixes them -- the old mask with the new layout, or
-@@ -547,3 +606,63 @@ int level_set_snapshot(level_set_t *ls, level_set_snapshot_entry_t *out, const i
+@@ -322,6 +394,7 @@ int level_set_create(level_set_t **out)
+     atomic_init(&ls->generation, 0);
+     atomic_init(&ls->occupancy, 0);
+     atomic_init(&ls->interval_tables, 0);
++    ls->covering_deferred = 0;
+     ls->retire.head = NULL;
+     *out = ls;
+     return 0;
+@@ -547,3 +620,97 @@ int level_set_snapshot(level_set_t *ls, level_set_snapshot_entry_t *out, const i
      tdb_epoch_exit(&ls->epoch);
      return total;
  }
@@ -235,11 +282,45 @@ index 6302b16..0de9958 100644
 +    tdb_epoch_exit(&ls->epoch);
 +    return covered;
 +}
++
++int level_set_defer_covering(level_set_t *ls, const int defer)
++{
++    if (!ls) return -1;
++    pthread_mutex_lock(&ls->write_lock);
++    ls->covering_deferred = defer ? 1 : 0;
++    level_layout_t *cur = atomic_load_explicit(&ls->layout, memory_order_acquire);
++    if (defer || cur->carrying == 0 || cur->covering)
++    {
++        pthread_mutex_unlock(&ls->write_lock);
++        return 0;
++    }
++
++    /* a published layout is immutable, so the index arrives on a copy of it, published in its place
++     * like any other change. the entries are copied as they stand, already in level order */
++    level_layout_t *fresh = level_layout_alloc(cur->counts);
++    if (!fresh)
++    {
++        pthread_mutex_unlock(&ls->write_lock);
++        return -1;
++    }
++    for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
++    {
++        for (int j = 0; j < cur->counts[i]; j++)
++        {
++            sstable_ref(cur->levels[i][j].sst);
++            fresh->levels[i][j] = cur->levels[i][j];
++        }
++        fresh->counts[i] = cur->counts[i];
++    }
++    level_publish(ls, fresh);
++    pthread_mutex_unlock(&ls->write_lock);
++    return 0;
++}
 diff --git a/src/column_family/level/level_set.h b/src/column_family/level/level_set.h
-index ea8abce..47f5699 100644
+index ea8abce..f26983e 100644
 --- a/src/column_family/level/level_set.h
 +++ b/src/column_family/level/level_set.h
-@@ -229,4 +229,35 @@ uint32_t level_set_occupancy(const level_set_t *ls);
+@@ -229,4 +229,56 @@ uint32_t level_set_occupancy(const level_set_t *ls);
   */
  uint32_t level_set_interval_tables(const level_set_t *ls);
  
@@ -250,6 +331,27 @@ index ea8abce..47f5699 100644
 + * @return the live index count
 + */
 +int64_t level_live_covering_indexes(void);
++
++/**
++ * level_covering_builds
++ * how many covering indexes have been built since the process started, so a test can count the
++ * builds an operation does
++ * @return the build count
++ */
++int64_t level_covering_builds(void);
++
++/**
++ * level_set_defer_covering
++ * hold off building the covering index across a run of installs, for a bulk load that would
++ * otherwise rebuild it once per table. while deferred a published layout carries no index and a
++ * covering query walks its tables, which answers the same. ending the deferral publishes the
++ * current layout again with its index built once, when any table carries an interval
++ * @param ls the level set
++ * @param defer 1 to defer, 0 to end the deferral and build
++ * @return 0 on success, -1 on a bad argument or when the republish could not be allocated -- the
++ *         set then keeps answering by walking its tables until the next publish builds the index
++ */
++int level_set_defer_covering(level_set_t *ls, int defer);
 +
 +/**
 + * level_set_covering_fragments
@@ -607,10 +709,10 @@ index 8034aae..d310339 100644
   * the newest sequence at or below snapshot_seq whose tombstone covers key -- what a read compares
 diff --git a/test/range_covering__tests.c b/test/range_covering__tests.c
 new file mode 100644
-index 0000000..de8b783
+index 0000000..c37519d
 --- /dev/null
 +++ b/test/range_covering__tests.c
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,697 @@
 +/**
 + *
 + * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
@@ -632,6 +734,7 @@ index 0000000..de8b783
 +
 +#include "../src/base/errors.h"
 +#include "../src/base/keycmp.h"
++#include "../src/column_family/cf_config.h"
 +#include "../src/compaction/compaction_exec.h"
 +#include "../src/flush/flush.h"
 +#include "../src/range_tombstone/range_tombstone.h"
@@ -1110,6 +1213,106 @@ index 0000000..de8b783
 +    ASSERT_EQ(level_live_covering_indexes(), 0);
 +}
 +
++/* opening a family installs its tables one at a time, and building the index on each install would
++ * merge every interval loaded so far once a table. the load builds it once, after the last table */
++#define RC_OPEN_TABLES 40
++
++void test_open_builds_index_once(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    for (int i = 0; i < RC_OPEN_TABLES; i++)
++    {
++        char lo[16], hi[16], key[16];
++        snprintf(lo, sizeof(lo), "p%03d", i);
++        snprintf(hi, sizeof(hi), "p%03d~", i);
++        snprintf(key, sizeof(key), "x%03d", i);
++        rc_range(&db, lo, hi, (uint64_t)(2 * i + 2));
++        rc_put(&db, key, (uint64_t)(2 * i + 3));
++        rc_flush(&db);
++    }
++    ASSERT_EQ((int)level_set_interval_tables(db.cf->levels), RC_OPEN_TABLES);
++
++    uint8_t *blob = NULL;
++    size_t blob_len = 0;
++    tidesdb_column_family_config_t saved;
++    cf_config_get(db.cf, &saved);
++    ASSERT_EQ(cf_config_serialize(&saved, &blob, &blob_len), 0);
++    cf_free(db.cf);
++    db.cf = NULL;
++
++    const int64_t before = level_covering_builds();
++    ASSERT_EQ(cf_open(RC_DB_DIR, db.manifest, 0, "cf0", blob, blob_len, NULL, db.vlog, db.cache,
++                      &db.fdm, BLOCK_MANAGER_SYNC_NONE, NULL, NULL, &db.cf),
++              0);
++    free(blob);
++    ASSERT_EQ(level_covering_builds() - before, 1);
++    ASSERT_EQ(level_set_count(db.cf->levels, LEVEL_SET_L1), RC_OPEN_TABLES);
++    ASSERT_TRUE(level_set_covering_fragments(db.cf->levels) > 0);
++    ASSERT_EQ(level_live_covering_indexes(), 1);
++
++    for (int i = 0; i < RC_OPEN_TABLES; i++)
++    {
++        char key[16];
++        snprintf(key, sizeof(key), "p%03d5", i);
++        uint64_t seq = 0;
++        ASSERT_EQ(
++            cf_range_tombstone_covering(db.cf, (const uint8_t *)key, strlen(key), UINT64_MAX, &seq),
++            1);
++        ASSERT_EQ(seq, (uint64_t)(2 * i + 2));
++        ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)key, strlen(key),
++                                              (uint64_t)(2 * i + 1), &seq),
++                  0);
++    }
++
++    /* the deferral ended with the load, so the next flush builds its index as usual */
++    rc_range(&db, "q", "r", 1000);
++    rc_flush(&db);
++    uint64_t seq = 0;
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"qq", 2, UINT64_MAX, &seq), 1);
++    ASSERT_EQ(seq, 1000);
++    ASSERT_EQ(level_live_covering_indexes(), 1);
++
++    rc_db_close(&db);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++}
++
++/* while the index is deferred a layout carries none, and a covering query walks the tables -- the
++ * same answer the index gives */
++void test_deferred_layout_walks_tables(void)
++{
++    rc_db_t db;
++    rc_db_open(&db);
++    ASSERT_EQ(level_set_defer_covering(db.cf->levels, 1), 0);
++    rc_range(&db, "a", "c", 50);
++    rc_put(&db, "z", 51);
++    rc_flush(&db);
++    rc_range(&db, "b", "bb", 70);
++    rc_put(&db, "z", 71);
++    rc_flush(&db);
++    ASSERT_EQ(level_set_covering_fragments(db.cf->levels), 0);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++
++    uint64_t seq = 0;
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 60, &seq), 1);
++    ASSERT_EQ(seq, 50);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 80, &seq), 1);
++    ASSERT_EQ(seq, 70);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 40, &seq), 0);
++
++    const int64_t before = level_covering_builds();
++    ASSERT_EQ(level_set_defer_covering(db.cf->levels, 0), 0);
++    ASSERT_EQ(level_covering_builds() - before, 1);
++    ASSERT_TRUE(level_set_covering_fragments(db.cf->levels) > 0);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 60, &seq), 1);
++    ASSERT_EQ(seq, 50);
++    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"b", 1, 80, &seq), 1);
++    ASSERT_EQ(seq, 70);
++
++    rc_db_close(&db);
++    ASSERT_EQ(level_live_covering_indexes(), 0);
++}
++
 +/* ===== readers against layouts changing under them ===== */
 +
 +#define RC_READERS 4
@@ -1202,6 +1405,8 @@ index 0000000..de8b783
 +    RUN_TEST_HANDLE_BALANCED(test_covering_respects_snapshot, tests_passed);
 +    RUN_TEST_HANDLE_BALANCED(test_no_intervals_no_index, tests_passed);
 +    RUN_TEST_HANDLE_BALANCED(test_index_survives_layout_change_under_readers, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_open_builds_index_once, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_deferred_layout_walks_tables, tests_passed);
 +    PRINT_TEST_RESULTS(tests_passed, tests_failed);
 +    return tests_failed > 0 ? 1 : 0;
 +}
