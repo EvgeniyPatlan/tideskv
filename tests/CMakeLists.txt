@@ -53,7 +53,7 @@ endforeach()
 # changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
-foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass sstable)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena sstable)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   # the btree internals include xxhash.h, which TidesDB keeps under external/
@@ -76,6 +76,8 @@ add_test(NAME TidesDbCompactionPartition COMMAND tidesdb_compaction_partition_te
 set_tests_properties(TidesDbCompactionExec TidesDbCompactionPartition PROPERTIES RESOURCE_LOCK compaction_scratch_db)
 # the single-pass leaf suite writes its scratch klogs under the working directory
 add_test(NAME TidesDbBtreeSinglePass COMMAND tidesdb_btree_single_pass_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the arena suite writes its scratch klogs under the working directory
+add_test(NAME TidesDbBtreeArena COMMAND tidesdb_btree_arena_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the upstream sstable suite writes its scratch files under the working directory
 add_test(NAME TidesDbSstable COMMAND tidesdb_sstable_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
