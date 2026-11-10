@@ -152,7 +152,9 @@ TEST(CompactionScheduler, UnknownElementCountsFallBackToTheCountThreshold) {
 
 TEST(CompactionScheduler, UnknownFlagResetsAfterACompactionIsQueued) {
   FakeCompactor c;
-  CompactionScheduler s(c, DeadOpts(3, 1000000, 0.2));
+  CompactionScheduler::Options o = DeadOpts(3, 1000000, 0.2);
+  o.collection_compaction_spacing = 0;  // only the reset, not the spacing, may hold the second round
+  CompactionScheduler s(c, o);
   const std::string obj = encoding::SubkeyPrefix(0, 1, 42);
   for (int i = 0; i < 3; ++i) s.OnCommitted({Prefix(ColumnFamily::kSubkey, obj)});
   s.EvaluateCollectionTrigger();
