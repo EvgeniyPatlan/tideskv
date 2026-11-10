@@ -115,6 +115,7 @@ fio curve follows the table.
 - The ratio is TidesKV ops/s divided by Kvrocks ops/s; above 1 means TidesKV is ahead.
 - Latencies are memtier's totals, in milliseconds.
 - CPU µs/op is the server container's CPU time (its cgroup's `cpu.stat usage_usec`, read before and after the timed run) per request. Peak memory comes from `docker stats`.
+- Disk B/op is the server cgroup's `io.stat` bytes written over the timed run per request (never `docker stats`, which counts block I/O several times here). TidesKV compaction B/op is the sum over column families of the `cf_*_compaction_bytes_written` growth in `INFO persistence` (saved as `<W>.info0`/`.info1`) per request; Kvrocks has no such counter. Runs from before these files existed show blank cells.
 - `ERR` cells name their cause under the table.
 - The W6 line shows the achieved DEL rate against the target. A server below 90% of the target gets a note, because its reads ran against fewer deletes.
 

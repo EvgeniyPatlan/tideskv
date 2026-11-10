@@ -338,6 +338,54 @@ def _cellof(cells, server, level, w):
     return [c for c in cells if (c["server"], c["level"], c["workload"]) == (server, level, w)][0]
 
 
+
+PERSIST0 = os.path.join(HERE, "testdata", "persistence.info0")
+PERSIST1 = os.path.join(HERE, "testdata", "persistence.info1")
+
+
+class DiskBytesTest(unittest.TestCase):
+    def test_disk_bytes_per_op(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.io", "1800000\n")
+            _write(t, "tideskv/relaxed/W1.json", open(SETGET).read().replace("416298", "18000"))
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertAlmostEqual(c["disk_bytes_per_op"], 100.0)
+            self.assertIsNone(c["compaction_bytes_per_op"])
+
+    def test_compaction_bytes_per_op(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.json", open(SETGET).read().replace("416298", "18000"))
+            shutil.copy(PERSIST0, os.path.join(t, "tideskv/relaxed/W1.info0"))
+            shutil.copy(PERSIST1, os.path.join(t, "tideskv/relaxed/W1.info1"))
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertAlmostEqual(c["compaction_bytes_per_op"], 50.0)  # (600000 meta + 300000 subkey + 0 zscore) / 18000
+            k = _cellof(report.collect(t), "kvrocks", "relaxed", "W1")
+            self.assertIsNone(k["compaction_bytes_per_op"])
+
+    def test_old_run_without_io_files_renders(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            meta, cells, disks, configs = report.load(t)
+            for c in cells:
+                self.assertIsNone(c["disk_bytes_per_op"])
+                self.assertIsNone(c["compaction_bytes_per_op"])
+            md = report.render(meta, cells, disks, configs)
+            self.assertIn("TidesKV disk B/op | Kvrocks disk B/op | TidesKV compaction B/op", md)
+            self.assertEqual(report.main([t]), 0)
+
+    def test_garbage_io_and_info_are_none(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_run(t)
+            _write(t, "tideskv/relaxed/W1.io", "junk\n")
+            _write(t, "tideskv/relaxed/W1.info0", "x\n")
+            _write(t, "tideskv/relaxed/W1.info1", "y\n")
+            c = _cellof(report.collect(t), "tideskv", "relaxed", "W1")
+            self.assertIsNone(c["disk_bytes_per_op"])
+            self.assertIsNone(c["compaction_bytes_per_op"])
+
+
 class FinalFixTest(unittest.TestCase):
     def test_cpu_from_cgroup_delta_wins_over_stats(self):
         with tempfile.TemporaryDirectory() as t:

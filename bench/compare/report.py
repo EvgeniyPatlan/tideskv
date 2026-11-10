@@ -99,6 +99,30 @@ def read_cpu_usec(path):
     return v if v >= 0 else None
 
 
+def read_io_bytes(path):
+    """Server cgroup bytes written over the timed run (.io), or None."""
+    return read_cpu_usec(path)
+
+
+def parse_cf_counter(text, suffix="compaction_bytes_written"):
+    """{cf name: value} for the cf_<name>_<suffix> lines of INFO persistence (lines end in \\r\\n)."""
+    out = {}
+    for line in text.splitlines():
+        k, sep, v = line.strip().partition(":")
+        if sep and k.startswith("cf_") and k.endswith("_" + suffix) and v.strip().isdigit():
+            out[k[3:-len(suffix) - 1]] = int(v.strip())
+    return out
+
+
+def compaction_bytes_per_op(info0, info1, count):
+    """Sum over column families of the compaction bytes written between two INFO snapshots, per op; None if unknown."""
+    a, b = parse_cf_counter(info0), parse_cf_counter(info1)
+    if not count or not b:
+        return None
+    delta = sum(max(0, v - a.get(cf, 0)) for cf, v in b.items())
+    return delta / float(count)
+
+
 def _read(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read().strip()
@@ -123,6 +147,7 @@ def log_tail(run_dir, server, n=20):
 def _cell(run_dir, server, level, w):
     cell = {"server": server, "level": level, "workload": w, "ops": None, "p50": None, "p99": None,
             "p999": None, "cpu_us_per_op": None, "mem_peak_bytes": None, "del_ops": None,
+            "disk_bytes_per_op": None, "compaction_bytes_per_op": None,
             "settle_s": None, "settle_capped": False, "error": None}
     d = os.path.join(run_dir, server, level)
     if not os.path.isdir(d):
@@ -159,6 +184,14 @@ def _cell(run_dir, server, level, w):
     usec = read_cpu_usec(os.path.join(d, w + ".cpu"))
     if usec is not None:
         cell["cpu_us_per_op"] = usec / float(m["count"])
+    wbytes = read_io_bytes(os.path.join(d, w + ".io"))
+    if wbytes is not None:
+        cell["disk_bytes_per_op"] = wbytes / float(m["count"])
+    try:
+        cell["compaction_bytes_per_op"] = compaction_bytes_per_op(
+            _read(os.path.join(d, w + ".info0")), _read(os.path.join(d, w + ".info1")), m["count"])
+    except BAD_INPUT:
+        pass
     if w == "W6" and os.path.exists(os.path.join(d, "W6-del.json")):
         try:
             cell["del_ops"] = parse_memtier(os.path.join(d, "W6-del.json"))["ops"]
@@ -285,14 +318,18 @@ def render(meta, cells, disks, configs, run_dir=None):
                     notes.append("- %s %s: %s" % (NAMES[c["server"]], w, c["error"]))
         out += [""]
         out += ["| W | TidesKV CPU µs/op | Kvrocks CPU µs/op | TidesKV peak mem | Kvrocks peak mem "
-                "| TidesKV settle s | Kvrocks settle s |",
-                "|---|---|---|---|---|---|---|"]
+                "| TidesKV settle s | Kvrocks settle s | TidesKV disk B/op | Kvrocks disk B/op "
+                "| TidesKV compaction B/op |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
         for w in WORKLOADS:
             t, k = by[("tideskv", lv, w)], by[("kvrocks", lv, w)]
             f = lambda c: "–" if c["cpu_us_per_op"] is None else "%.1f" % c["cpu_us_per_op"]
             g = lambda c: "–" if c["mem_peak_bytes"] is None else _gib(c["mem_peak_bytes"])
             h = lambda c: _fmt_settle(c["settle_s"], c["settle_capped"])
-            out.append("| %s | %s | %s | %s | %s | %s | %s |" % (w, f(t), f(k), g(t), g(k), h(t), h(k)))
+            b = lambda c, key: "" if c[key] is None else "%.1f" % c[key]
+            out.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                w, f(t), f(k), g(t), g(k), h(t), h(k),
+                b(t, "disk_bytes_per_op"), b(k, "disk_bytes_per_op"), b(t, "compaction_bytes_per_op")))
         out += _w6_lines(meta, by, lv)
         if notes:
             out += ["", "Errors:"] + notes

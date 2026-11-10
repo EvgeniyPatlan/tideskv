@@ -194,6 +194,7 @@ run_workload() {
   ( while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
     >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
   local cpu0 cpu1
+  if [[ $CUR == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info0" || true; fi
   cpu0=$(cg_sample) || cpu0=""
   if memtier "$base" "${common[@]}" --test-time="$DURATION" "${RUN_ARGS[@]}"; then
     echo ok >"$OUT/$base.status"
@@ -201,7 +202,11 @@ run_workload() {
     echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
   fi
   cpu1=$(cg_sample) || cpu1=""
-  if [[ -n $cpu0 && -n $cpu1 ]]; then echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"; fi
+  if [[ -n $cpu0 && -n $cpu1 ]]; then
+    echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"
+    echo $(( ${cpu1##* } - ${cpu0##* } )) >"$OUT/$base.io"
+  fi
+  if [[ $CUR == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
   stop_sampler "$stats_pid"
   if [[ -n $del_pid ]] && ! wait "$del_pid"; then
     echo "W6 DEL memtier failed; see $CUR/$level/W6-del.log" >>"$OUT/$base.status"

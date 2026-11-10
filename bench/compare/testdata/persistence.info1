@@ -1,0 +1,7 @@
+cf_meta_compaction_bytes_written:600100
+cf_meta_levels:L1=2/4096
+cf_subkey_compaction_bytes_written:301000
+cf_subkey_levels:L1=1/10,L2=3/20
+cf_zscore_compaction_bytes_written:5
+cf_zscore_levels:
+cf_sys_flush_bytes_written:9
