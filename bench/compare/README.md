@@ -116,6 +116,9 @@ fio curve follows the table.
 - Latencies are memtier's totals, in milliseconds.
 - CPU µs/op is the server container's CPU time (its cgroup's `cpu.stat usage_usec`, read before and after the timed run) per request. Peak memory comes from `docker stats`.
 - Disk B/op is the server cgroup's `io.stat` bytes written over the timed run per request (never `docker stats`, which counts block I/O several times here). TidesKV compaction B/op is the sum over column families of the `cf_*_compaction_bytes_written` growth in `INFO persistence` (saved as `<W>.info0`/`.info1`) per request; Kvrocks has no such counter. Runs from before these files existed show blank cells.
+- Disk B/op counts only writes inside the timed window, so later writeback (notably relaxed Kvrocks, which flushes after the window) is excluded.
+- Compaction bytes are counted when a compaction job commits, so over a 60-180 s window the values are noisy: a job that straddles the window edge lands wholly on one side.
+- W6 has no post-window settle, so compaction pushed past the window is not counted.
 - `ERR` cells name their cause under the table.
 - The W6 line shows the achieved DEL rate against the target. A server below 90% of the target gets a note, because its reads ran against fewer deletes.
 

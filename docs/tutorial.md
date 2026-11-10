@@ -362,7 +362,7 @@ What follows from this layout:
 - `HGET user:1 name` reads one `subkey` entry, not the whole hash, so large hashes, sets and sorted sets stay cheap.
 - `ZRANGEBYSCORE` is a range scan over `zscore`, because scores are stored in an order-preserving encoding.
 - The slot is in every key, so a cluster migration copies one slot with one prefix scan.
-- Each collection has an object id in its sub-keys. `DEL` of a big hash removes all of its sub-keys with one range delete, not one delete per field. After `compaction-collection-deletes` (1000) such deletes, TidesKV compacts the `subkey` and `zscore` column families to reclaim the space.
+- Each collection has an object id in its sub-keys. `DEL` of a big hash removes all of its sub-keys with one range delete, not one delete per field. Once `compaction-collection-deletes` (default 1000) such deletes have happened, TidesKV compacts the `subkey` and `zscore` column families to reclaim the space, provided the deleted elements are at least `compaction-collection-dead-ratio` (default 0.2) of the live sub-keys. Deletes whose element count is unknown (on replicas, slot imports) skip that check, and it is also skipped once the delete count reaches 64 times the threshold, so a compaction is never deferred for good. Setting the ratio to 0 compacts at the count threshold alone.
 
 ### Durability
 
