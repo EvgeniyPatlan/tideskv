@@ -1,0 +1,46 @@
+diff --git a/test/wal_flusher__tests.c b/test/wal_flusher__tests.c
+--- a/test/wal_flusher__tests.c
++++ b/test/wal_flusher__tests.c
+@@ -44,6 +44,8 @@ static int tests_failed = 0;
+ #define WF_APPENDS 10000
+ /* between appends, about a client round trip, so each lands on a parked flusher */
+ #define WF_GAP_US 20
++/* signals allowed beyond the per-64 allowance and one per stall: the first append, which wakes a thread parked on an empty ring */
++#define WF_STALL_SLACK 4
+ 
+ #if defined(__linux__) && defined(WAL_FLUSHER_INTERPOSE)
+ #include <sys/syscall.h>
+@@ -180,18 +182,31 @@ static void test_no_wake_per_append_in_sync_none(void)
+     block_manager_t *bm = wf_open(BLOCK_MANAGER_SYNC_NONE);
+     unsigned char payload[16];
+     memset(payload, 0, sizeof(payload));
++    /* the flush thread parks (and so is woken by the next append) only when a whole gathering
++     * window passes with nothing staged. on a loaded host the appender is descheduled for such a
++     * stretch now and then, each one costing a signal. so count the stretches of at least half a
++     * window between appends and allow one signal for each; per-append signalling still gives
++     * thousands against a handful of stretches */
++    const uint64_t stall_us = atomic_load(&bm->flush_gather_us) / 2;
++    uint64_t stalls = 0;
+     atomic_store(&g_signals, 0);
+     atomic_store(&g_watch_cv, &bm->buf_work_cv);
++    uint64_t last = tdb_monotonic_us();
+     for (int i = 0; i < WF_APPENDS; i++)
+     {
+         payload[0] = (unsigned char)(i & 0xff);
+         ASSERT_TRUE(block_manager_write_raw(bm, payload, sizeof(payload)) >= 0);
+         wf_spin_us(WF_GAP_US);
++        const uint64_t now = tdb_monotonic_us();
++        if (now - last >= stall_us) stalls++;
++        last = now;
+     }
+     const uint64_t signals = atomic_load(&g_signals);
+     atomic_store(&g_watch_cv, NULL);
+-    printf("(%llu signals for %d appends) ", (unsigned long long)signals, WF_APPENDS);
+-    ASSERT_TRUE(signals <= WF_APPENDS / 64);
++    const uint64_t bound = WF_APPENDS / 64 + stalls + WF_STALL_SLACK;
++    printf("(%llu signals for %d appends, bound %llu, %llu stalls) ", (unsigned long long)signals,
++           WF_APPENDS, (unsigned long long)bound, (unsigned long long)stalls);
++    ASSERT_TRUE(signals <= bound);
+     ASSERT_EQ(block_manager_close(bm), 0);
+     ASSERT_EQ(wf_count_records(sizeof(payload)), WF_APPENDS);
+     (void)remove(WF_FILE);
