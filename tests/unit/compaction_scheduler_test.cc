@@ -290,7 +290,7 @@ TEST(CompactionScheduler, ANewJobAfterABusyRetryStillGetsItsCheckpoint) {
   c.busy_left = 1;
   CompactionScheduler s(c, Opts(1000));
   s.OnCommitted({Prefix(ColumnFamily::kMeta, encoding::DbPrefix(0))});
-  EXPECT_EQ(s.RunPending(), 0u);                                         // meta busy: requeued
+  EXPECT_EQ(s.RunPending(), 0u);                                          // meta busy: requeued
   s.OnCommitted({Prefix(ColumnFamily::kExpire, encoding::DbPrefix(0))});  // a new job, never checkpointed
   EXPECT_EQ(s.RunPending(), 2u);
   const auto calls = c.Calls();
@@ -331,7 +331,9 @@ TEST(CompactionScheduler, CollectionCompactionsAreSpacedByTheirOwnLength) {
   o.now = clock.Fn();
   o.collection_compaction_spacing = 4;
   CompactionScheduler s(c, o);
-  auto del = [&s](int oid) { s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, oid))}); };
+  auto del = [&s](int oid) {
+    s.OnCommitted({Prefix(ColumnFamily::kSubkey, encoding::SubkeyPrefix(0, 1, oid))});
+  };
   del(1);
   del(2);
   ASSERT_EQ(s.pending(), 2u);
@@ -389,7 +391,8 @@ TEST(CompactionScheduler, WorkerWaitsBusyRetryAfterABusyRound) {
   int compacts = 0;
   for (const Call& call : c.Calls()) compacts += call.what == "compact";
   EXPECT_EQ(compacts, 1) << "retried before busy_retry";
-  for (int i = 0; i < 400 && s.completed() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  for (int i = 0; i < 400 && s.completed() == 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   s.Stop();
   EXPECT_EQ(s.completed(), 1u);
 }

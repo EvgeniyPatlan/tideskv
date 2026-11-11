@@ -243,7 +243,7 @@ TEST(ClusterRouting, ScriptCallsToAFencedSlotAnswerTryagain) {  // a fenced slot
   RoutedA h;
   auto s = std::make_shared<cluster::SlotStates>();
   s->fenced.set(3300);
-  h.cluster.manager->PublishStates(s);
+  h.cluster.PublishStates(s);
   EXPECT_EQ(h.Run({"SET", "b", "1"}), Err(cluster::kErrTryAgainFenced));  // Route's fast path
   EXPECT_NE(h.Run({"EVAL", "return redis.call('set', 'b', 'x')", "0"}).find("TRYAGAIN"), std::string::npos);
   EXPECT_EQ(h.Run({"GET", "b"}), kNil);

@@ -118,6 +118,15 @@ struct ClusterHarness {
     ASSERT_TRUE(manager->SetNodes(nodes, version, false).ok());
   }
 
+  // Publishes hand-made migration states, bypassing MigrationService. ClusterManager::PublishStates leaves
+  // the read-modify-write to its caller (MigrationService::record_mu_), and each Push posts a transition
+  // Mutate to the migrate worker; one still running would publish its copy of the older states over
+  // `next`. So the worker drains first: nothing else publishes states until the test acts again.
+  void PublishStates(const std::shared_ptr<const cluster::SlotStates>& next) {
+    ASSERT_TRUE(migration->AwaitIdle(std::chrono::seconds(10))) << "the migrate worker never went idle";
+    manager->PublishStates(next);
+  }
+
   // What App::RefreshRedirect does (D16, M7b D18).
   void RefreshRedirect() {
     const std::lock_guard lock(redirect_mu);

@@ -56,7 +56,8 @@ void CompactionScheduler::EvaluateCollectionTrigger() {
   // keys == 0: nothing in sstables to measure against, so the count decides
   // unknown element counts or a long deferral: the count decides too
   const bool ceiling = collection_deletes_ >= threshold * kMaxDeferralFactor;
-  if (!ceiling && !unknown_elements_ && ratio > 0 && keys > 0 && static_cast<double>(deleted_elements_) < ratio * static_cast<double>(keys)) {
+  if (!ceiling && !unknown_elements_ && ratio > 0 && keys > 0 &&
+      static_cast<double>(deleted_elements_) < ratio * static_cast<double>(keys)) {
     return;
   }
   EnqueueCollectionsLocked();
@@ -162,7 +163,8 @@ void CompactionScheduler::Loop() {
     RunPending();
     lock.lock();
     // pace retries of failed jobs; a Busy CF is held by a compaction that can run for a minute
-    cv_.wait_for(lock, last_round_busy_ ? options_.busy_retry : options_.tick, [this] { return stop_.load(); });
+    cv_.wait_for(lock, last_round_busy_ ? options_.busy_retry : options_.tick,
+                 [this] { return stop_.load(); });
   }
 }
 
