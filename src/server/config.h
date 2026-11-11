@@ -29,11 +29,13 @@ struct ConfigValues {
   double compaction_collection_dead_ratio = 0.2;
   uint64_t sync_interval_us = 1'000'000;
   uint64_t block_cache_size = 4ULL << 30;
-  uint64_t memtable_size = 256ULL << 20;
+  uint64_t memtable_size = 64ULL << 20;
   // M8: TidesDB merge trigger (flush-tier tables) and write backpressure threshold; see StorageOptions.
   // Raised from TidesDB's 4 and 16, which stalled every writer while a merge rewrote a large level.
   // 64, not 32: a list workload's meta rewrite holds both merge threads long enough for the replog's
-  // flush tier to reach 16 tables. The cost is a higher ceiling on queued memtables (64 x memtable-size).
+  // flush tier to reach 16 tables. The cost is a higher ceiling on queued memtables: up to 64 x memtable-size
+  // (4 GB at the default 64 MB) can sit in memory before writers block, so raising memtable-size raises it
+  // too.
   int l1_file_count_trigger = 8;
   int l0_stall_threshold = 64;
   // Size of a TidesDB btree node (4kb-64kb; the default is TidesDB's own, so nothing changes unless set) and
