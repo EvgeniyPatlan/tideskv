@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "encoding/key_codec.h"
 #include "exec/engine.h"
@@ -107,6 +109,99 @@ TEST(TidesStorage, CheckpointSucceeds) {
   auto s = MustOpen(OptionsFor(dir));
   ASSERT_NE(s, nullptr);
   EXPECT_TRUE(s->Checkpoint().ok());
+}
+
+// TidesDB holds every in-flight commit's range deletes in one 32-slot table and a full table
+// conflicts, so overlapping commits of up to kMaxNativeRangeDeletes ranges each must not fail.
+TEST(TidesStorage, ConcurrentRangeDeleteCommitsAllSucceed) {
+  constexpr int kThreads = 4;
+  constexpr int kTxns = 50;
+  constexpr int kRanges = 30;
+  TempDir dir;
+  auto s = MustOpen(OptionsFor(dir));
+  ASSERT_NE(s, nullptr);
+  std::atomic<int> ok{0};
+  std::vector<std::string> failures(kThreads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kTxns; ++i) {
+        auto txn = s->BeginWrite();
+        if (!txn.ok()) {
+          failures[t] = txn.status().ToString();
+          return;
+        }
+        for (int k = 0; k < kRanges; ++k) {
+          const std::string prefix = std::to_string(t) + ":" + std::to_string(i) + ":" + std::to_string(k);
+          if (Status st = (*txn)->DeletePrefix(ColumnFamily::kSubkey, prefix); !st.ok()) {
+            failures[t] = st.ToString();
+            return;
+          }
+        }
+        if (Status st = (*txn)->Put(ColumnFamily::kMeta, std::to_string(t) + ":" + std::to_string(i), "v");
+            !st.ok()) {
+          failures[t] = st.ToString();
+          return;
+        }
+        if (Status st = (*txn)->Commit(); !st.ok()) {
+          failures[t] = "commit " + std::to_string(i) + ": " + st.ToString();
+          return;
+        }
+        ok.fetch_add(1);
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+  for (int t = 0; t < kThreads; ++t) EXPECT_EQ(failures[t], "") << "thread " << t;
+  EXPECT_EQ(ok.load(), kThreads * kTxns);
+}
+
+// A checkpoint rotates the memtable and waits for the flush queue; writers keep committing all along.
+TEST(TidesStorage, CheckpointSucceedsUnderConcurrentCommits) {
+  constexpr int kThreads = 4;
+  constexpr int kCheckpoints = 20;
+  TempDir dir;
+  StorageOptions o = OptionsFor(dir);
+  o.memtable_size = 256 * 1024;
+  auto s = MustOpen(o);
+  ASSERT_NE(s, nullptr);
+  std::atomic<bool> stop{false};
+  std::atomic<int> commits{0};
+  std::vector<std::string> failures(kThreads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      const std::string value(1024, 'v');
+      for (int i = 0; !stop.load(); ++i) {
+        auto txn = s->BeginWrite();
+        if (!txn.ok()) {
+          failures[t] = txn.status().ToString();
+          return;
+        }
+        if (Status st = (*txn)->Put(ColumnFamily::kMeta, std::to_string(t) + ":" + std::to_string(i), value);
+            !st.ok()) {
+          failures[t] = st.ToString();
+          return;
+        }
+        if (Status st = (*txn)->Commit(); !st.ok()) {
+          failures[t] = "commit " + std::to_string(i) + ": " + st.ToString();
+          return;
+        }
+        commits.fetch_add(1);
+      }
+    });
+  }
+  std::vector<std::string> checkpoint_failures;
+  for (int c = 0; c < kCheckpoints; ++c) {
+    if (Status st = s->Checkpoint(); !st.ok()) {
+      checkpoint_failures.push_back(std::to_string(c) + ": " + st.ToString());
+    }
+  }
+  stop.store(true);
+  for (auto& th : threads) th.join();
+  EXPECT_TRUE(checkpoint_failures.empty()) << checkpoint_failures.front();
+  for (int t = 0; t < kThreads; ++t) EXPECT_EQ(failures[t], "") << "thread " << t;
+  EXPECT_GT(commits.load(), 0);
 }
 
 StorageOptions OptionsWith(const TempDir& dir, Compression c) {

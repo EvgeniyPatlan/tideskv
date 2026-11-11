@@ -2,6 +2,8 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <set>
 #include <string>
@@ -197,10 +199,60 @@ class TidesReadView final : public ReadView {
   CfHandles cfs_;
 };
 
+// TidesDB keeps the range deletes of every in-flight commit in ONE table of
+// TDB_MVCC_MAX_RANGE_RESERVATIONS (32, src/txn/mvcc.h:59) slots, and a full table fails the commit
+// with a conflict. Commits overlap, so each takes its ranges' slots from this budget first.
+inline constexpr size_t kTidesRangeHoldSlots = 32;
+static_assert(kMaxNativeRangeDeletes <= kTidesRangeHoldSlots, "one txn's native ranges must fit the table");
+
+// Counting semaphore over the engine's range-hold slots. Acquire is all-or-nothing: it waits until n
+// slots are free and takes them together, so two commits can never each hold half of what they need.
+class RangeHoldBudget {
+ public:
+  explicit RangeHoldBudget(size_t slots) : free_(slots) {}
+  RangeHoldBudget(const RangeHoldBudget&) = delete;
+  RangeHoldBudget& operator=(const RangeHoldBudget&) = delete;
+
+  void Acquire(size_t n) {
+    std::unique_lock lock(mu_);
+    cv_.wait(lock, [&] { return free_ >= n; });
+    free_ -= n;
+  }
+  void Release(size_t n) {
+    {
+      const std::lock_guard lock(mu_);
+      free_ += n;
+    }
+    cv_.notify_all();  // waiters need different counts: wake them all to re-check
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  size_t free_;
+};
+
+// Holds n slots of a RangeHoldBudget for its lifetime (none when n == 0, without touching the budget).
+class RangeHoldGuard {
+ public:
+  RangeHoldGuard(RangeHoldBudget& budget, size_t n) : budget_(budget), n_(n) {
+    if (n_ != 0) budget_.Acquire(n_);
+  }
+  ~RangeHoldGuard() {
+    if (n_ != 0) budget_.Release(n_);
+  }
+  RangeHoldGuard(const RangeHoldGuard&) = delete;
+  RangeHoldGuard& operator=(const RangeHoldGuard&) = delete;
+
+ private:
+  RangeHoldBudget& budget_;
+  size_t n_;
+};
+
 class TidesWriteTxn final : public WriteTxn {
  public:
-  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs, std::mutex& commit_mu)
-      : txn_(txn), cfs_(cfs), commit_mu_(commit_mu) {}
+  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs, RangeHoldBudget& ranges)
+      : txn_(txn), cfs_(cfs), ranges_(ranges) {}
   ~TidesWriteTxn() override { tidesdb_txn_free(txn_); }  // rolls back if still open
 
   Result<std::string> Get(ColumnFamily cf, std::string_view key) override {
@@ -221,10 +273,10 @@ class TidesWriteTxn final : public WriteTxn {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
     return FromTdb(tidesdb_txn_delete(txn_, Cf(cf), Bytes(key), key.size()), "delete");
   }
-  // D2 (M6a): TidesDB 10.1.1 holds at most 32 distinct range intervals per commit (global table,
-  // TDB_MVCC_MAX_RANGE_RESERVATIONS). Past kMaxNativeRangeDeletes distinct ranges, further ones are
-  // applied as point deletes of the keys currently in range (this txn's own buffered writes
-  // included): the same result at O(keys in range).
+  // D2 (M6a): TidesDB 10.1.1 holds at most 32 distinct range intervals across all in-flight commits
+  // (one table per database, TDB_MVCC_MAX_RANGE_RESERVATIONS; see RangeHoldBudget). Past
+  // kMaxNativeRangeDeletes distinct ranges, further ones are applied as point deletes of the keys
+  // currently in range (this txn's own buffered writes included): the same result at O(keys in range).
   Status DeletePrefix(ColumnFamily cf, std::string_view prefix) override {
     if (Status st = Check(ValidatePrefix(prefix)); !st.ok()) return st;
     // Tagged "\x01" + prefix so the triple never equals a DeleteRange triple.
@@ -262,8 +314,10 @@ class TidesWriteTxn final : public WriteTxn {
 
   Status Commit() override {
     if (Status st = Check(Status::Ok()); !st.ok()) return st;
-    finished_ = true;                        // a failed commit is final too; callers retry the whole command
-    const std::lock_guard lock(commit_mu_);  // D1: see TidesStorage::Impl::commit_mu
+    finished_ = true;  // a failed commit is final too; callers retry the whole command
+    // Commits overlap (TidesDB's commit gate keeps each one atomic across memtable rotations); only
+    // their range deletes share a table, so a commit with ranges first waits for room in it.
+    const RangeHoldGuard hold(ranges_, native_ranges_.size());
     return FromTdb(tidesdb_txn_commit(txn_), "commit");
   }
   Status Rollback() override {
@@ -314,7 +368,7 @@ class TidesWriteTxn final : public WriteTxn {
 
   tidesdb_txn_t* txn_;
   CfHandles cfs_;
-  std::mutex& commit_mu_;
+  RangeHoldBudget& ranges_;
   std::set<std::tuple<ColumnFamily, std::string, std::string>> native_ranges_;
   bool finished_ = false;
 };
@@ -409,10 +463,8 @@ struct TidesStorage::Impl {
   CfHandles cfs{};
   Compression compression = Compression::kNone;
   uint64_t family_config_updates = 0;  // issued by Open to families that already existed
-  // D1 (M6a): TidesDB 10.1.1 can tear or lose concurrently committed txns across a memtable
-  // rotation on kill -9 (notes/m6-research/tidesdb-replication.md §5.2). Every commit and
-  // checkpoint (a forced rotation) runs under this mutex until upstream fixes the split-apply race.
-  std::mutex commit_mu;
+  // Per database: the engine's range-hold table belongs to one tidesdb_t, and a process may open several.
+  RangeHoldBudget range_holds{kTidesRangeHoldSlots};
   ~Impl() {
     if (db != nullptr) tidesdb_close(db);
   }
@@ -456,7 +508,7 @@ Result<std::unique_ptr<WriteTxn>> TidesStorage::BeginWrite() {
   tidesdb_txn_t* txn = nullptr;
   const int rc = tidesdb_txn_begin_with_isolation(impl_->db, TDB_ISOLATION_READ_COMMITTED, &txn);
   if (rc != TDB_SUCCESS) return FromTdb(rc, "txn_begin");
-  return std::unique_ptr<WriteTxn>(std::make_unique<TidesWriteTxn>(txn, impl_->cfs, impl_->commit_mu));
+  return std::unique_ptr<WriteTxn>(std::make_unique<TidesWriteTxn>(txn, impl_->cfs, impl_->range_holds));
 }
 
 Result<std::unique_ptr<ReadView>> TidesStorage::BeginRead() {
@@ -483,10 +535,7 @@ Status TidesStorage::Backup(const std::string& dir) {
   return FromTdb(tidesdb_backup(impl_->db, dir.c_str()), "backup");
 }
 
-Status TidesStorage::Checkpoint() {
-  const std::lock_guard lock(impl_->commit_mu);  // D1: a forced rotation must not split a commit
-  return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint");
-}
+Status TidesStorage::Checkpoint() { return FromTdb(tidesdb_checkpoint(impl_->db), "checkpoint"); }
 
 std::string_view CompressionName(Compression c) {
   switch (c) {

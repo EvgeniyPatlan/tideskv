@@ -34,9 +34,9 @@ Status ApplyReplOps(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
 // The replication log (M6a D3): the only writer of the replog CF. Commit() serialises
 // "seq = last+1 → put replog[seq] → commit → publish" so seq order is commit order and the
 // watermark (last committed seq) has no gaps. Lock order: taken after the gate, key stripes,
-// ScriptEngine::mu_ and WatchRegistry shards; it takes only the storage commit mutex beneath it
-// (ActivateAndSnapshot also creates a storage snapshot under it, M6b D2).
-// Never call into ReplLog while holding the storage commit mutex.
+// ScriptEngine::mu_ and WatchRegistry shards; it takes no storage mutex beneath it; TidesDB's commit
+// gate keeps commits atomic across memtable rotations (ActivateAndSnapshot also creates a storage
+// snapshot under it, M6b D2).
 //
 // repl-backlog-lazy (`lazy`): with no replica the log is dormant. Commit still takes seq = last+1 and
 // advances cum_bytes by the batch's encoded size, but writes no record; first_retained() stays last()+1,
