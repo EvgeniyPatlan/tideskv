@@ -73,6 +73,11 @@ Result<DecodedMetadata> DecodeMetadata(std::string_view in) {
   return d;
 }
 
+bool MetaIsSpecial(std::string_view in) {
+  if (in.size() < kHeaderSize || static_cast<ValueType>(in[0]) != ValueType::kString) return true;
+  return coding::DecodeFixed64BE(in.data() + 2) != 0;
+}
+
 bool PeekMetaOid(std::string_view in, uint64_t* oid) {
   if (in.size() < kHeaderSize || !IsKnownType(static_cast<uint8_t>(in[0]))) return false;
   const auto type = static_cast<ValueType>(in[0]);

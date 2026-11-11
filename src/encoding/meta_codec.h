@@ -38,6 +38,10 @@ struct DecodedMetadata {
 std::string EncodeMetadata(const Metadata& meta, std::string_view string_payload = {});
 Result<DecodedMetadata> DecodeMetadata(std::string_view encoded);
 
+// False only for a well-formed STRING header whose expire_ms is 0 (type byte [0], expire i64 BE [2..10));
+// true for collections, TTLs and anything malformed (conservative). Allocation-free, no full decode.
+bool MetaIsSpecial(std::string_view encoded);
+
 // M7b D2: a collection's oid in an encoded meta record, and the record with another oid (in place). False
 // for a string record or a malformed one.
 bool PeekMetaOid(std::string_view encoded, uint64_t* oid);

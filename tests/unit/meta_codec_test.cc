@@ -110,3 +110,27 @@ TEST(MetaCodec, PeeksAndRewritesACollectionsOidAndLeavesStringsAlone) {  // M7b 
 
 }  // namespace
 }  // namespace tideskv::encoding
+
+namespace tideskv::encoding {
+namespace {
+
+TEST(MetaCodec, MetaIsSpecialMatchesDecode) {
+  for (ValueType t :
+       {ValueType::kString, ValueType::kHash, ValueType::kList, ValueType::kSet, ValueType::kZSet}) {
+    for (int64_t expire : {int64_t{0}, int64_t{5}}) {
+      Metadata m;
+      m.type = t;
+      m.expire_ms = expire;
+      EXPECT_EQ(MetaIsSpecial(EncodeMetadata(m, "p")), m.IsCollection() || m.expire_ms != 0)
+          << static_cast<int>(t) << " " << expire;
+    }
+  }
+  EXPECT_TRUE(MetaIsSpecial(""));
+  EXPECT_TRUE(MetaIsSpecial(std::string(9, '\x01')));
+  std::string bad_type = EncodeMetadata(Metadata{}, "p");
+  bad_type[0] = 9;
+  EXPECT_TRUE(MetaIsSpecial(bad_type));
+}
+
+}  // namespace
+}  // namespace tideskv::encoding
