@@ -36,6 +36,7 @@ class SpecialKeyFilter final : public MetaPutHook {
   // enabled && state() == kReady && !MayContain(meta_key)
   bool SkipReadAllowed(std::string_view meta_key) const noexcept;
 
+  // Relaxed: a performance toggle only. Anything needing it for correctness must order it via the gate.
   void set_enabled(bool on) noexcept;
   bool enabled() const noexcept;
 

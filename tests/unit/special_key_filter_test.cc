@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdio>
+#include <new>
 #include <random>
 #include <string>
 #include <thread>
@@ -98,6 +100,18 @@ TEST(SpecialKeyFilter, GrowthAndSaturation) {
   EXPECT_EQ(f.state(), SpecialKeyFilter::State::kSaturated);
   EXPECT_EQ(f.state_name(), "saturated");
   EXPECT_FALSE(f.SkipReadAllowed("never-inserted"));
+  EXPECT_FALSE(f.SkipReadAllowed("k0"));
+}
+
+TEST(SpecialKeyFilter, FailedResetKeepsTheOldFilterIntact) {
+  SpecialKeyFilter f(1000, size_t{1} << 58);
+  for (int i = 0; i < 100; ++i) f.Insert("k" + std::to_string(i));
+  const size_t bytes = f.Bytes(), count = f.Count(), cap = f.Capacity();
+  EXPECT_THROW(f.Reset(size_t{1} << 50), std::bad_alloc);
+  EXPECT_EQ(f.Bytes(), bytes);
+  EXPECT_EQ(f.Count(), count);
+  EXPECT_EQ(f.Capacity(), cap);
+  for (int i = 0; i < 100; ++i) EXPECT_TRUE(f.MayContain("k" + std::to_string(i)));
 }
 
 TEST(SpecialKeyFilter, ConcurrentInsertAndQuery) {

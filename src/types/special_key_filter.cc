@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 #include "encoding/meta_codec.h"
 
@@ -33,11 +34,14 @@ SpecialKeyFilter::SpecialKeyFilter(size_t initial_capacity, size_t max_bytes)
   Allocate(initial_capacity);
 }
 
+// Strong guarantee: if the allocation throws, the old bits, block count, capacity and count stay as they
+// were.
 void SpecialKeyFilter::Allocate(size_t capacity) {
   capacity = std::max<size_t>(1, std::min(capacity, max_capacity_));
-  const size_t bits = capacity * kBitsPerKey;
-  blocks_ = std::max<size_t>(1, (bits + 511) / 512);
-  words_.reset(new std::atomic<uint64_t>[blocks_ * kWordsPerBlock]());
+  const size_t blocks = std::max<size_t>(1, (capacity * kBitsPerKey + 511) / 512);
+  std::unique_ptr<std::atomic<uint64_t>[]> words(new std::atomic<uint64_t>[blocks * kWordsPerBlock]());
+  words_ = std::move(words);
+  blocks_ = blocks;
   capacity_.store(capacity, std::memory_order_relaxed);
   count_.store(0, std::memory_order_relaxed);
 }
@@ -78,7 +82,7 @@ void SpecialKeyFilter::set_enabled(bool on) noexcept { enabled_.store(on, std::m
 bool SpecialKeyFilter::enabled() const noexcept { return enabled_.load(std::memory_order_relaxed); }
 
 void SpecialKeyFilter::Reset(size_t capacity) {
-  Allocate(capacity);
+  Allocate(capacity);  // may throw std::bad_alloc: the old filter and its state are then left intact
   state_.store(State::kBuilding, std::memory_order_release);
 }
 
