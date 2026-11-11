@@ -55,8 +55,8 @@ bool FillMixed(RespClient& c, const std::string& p, int rounds) {
   return true;
 }
 
-TEST(SpecialKeysIT, RestartScanFindsSpecials) {
-  TestServer server{TIDESKV_SERVER_BIN};
+// 250 special keys (h/z/l/s/t0..49) and 1000 plain strings (p0..999), then a restart.
+void FillAndRestart(TestServer& server) {
   {
     auto c = server.Connect();
     for (int i = 0; i < 50; ++i) {
@@ -70,12 +70,37 @@ TEST(SpecialKeysIT, RestartScanFindsSpecials) {
     for (int i = 0; i < 1000; ++i) ASSERT_EQ(c->Command({"SET", "p" + std::to_string(i), "v"}).str, "OK");
   }
   server.Restart();
+}
+
+int64_t SkippedReads(RespClient& c) { return InfoField(c, "stats", "blind_set_skipped_reads"); }
+
+TEST(SpecialKeysIT, RestartScanFindsSpecials) {
+  TestServer server{TIDESKV_SERVER_BIN};
+  ASSERT_NO_FATAL_FAILURE(FillAndRestart(server));
   auto c = server.Connect();
   ASSERT_TRUE(WaitFor([&] { return FilterReady(*c); }, std::chrono::seconds(10)));
   const SpecialKeys k = DebugSpecialKeys(*c);
   EXPECT_EQ(k.state, "ready");
   EXPECT_EQ(k.specials, 250);
   EXPECT_EQ(k.missing, 0);
+}
+
+// B1: after the startup scan, a plain key is SET blind and a collection is still read (and replaced).
+TEST(SpecialKeysIT, RestartThenBlindSet) {
+  TestServer server{TIDESKV_SERVER_BIN};
+  ASSERT_NO_FATAL_FAILURE(FillAndRestart(server));
+  auto c = server.Connect();
+  ASSERT_TRUE(WaitFor([&] { return FilterReady(*c); }, std::chrono::seconds(10)));
+  const int64_t s0 = SkippedReads(*c);
+  ASSERT_EQ(c->Command({"SET", "plain", "v"}).str, "OK");
+  EXPECT_EQ(SkippedReads(*c), s0 + 1);
+  ASSERT_EQ(c->Command({"SET", "h7", "v"}).str, "OK");
+  EXPECT_EQ(SkippedReads(*c), s0 + 1);
+  EXPECT_EQ(c->Command({"TYPE", "h7"}).str, "string");
+  EXPECT_EQ(c->Command({"HLEN", "h7"}).type, RespValue::Type::kError);
+  ASSERT_EQ(c->Command({"SET", "t7", "w"}).str, "OK");
+  EXPECT_EQ(SkippedReads(*c), s0 + 1);
+  EXPECT_EQ(c->Command({"TTL", "t7"}).integer, -1);
 }
 
 using SpecialKeysReplIT = ReplPairIT;
@@ -113,6 +138,36 @@ TEST_F(SpecialKeysReplIT, ReplicaKeepsFilterComplete) {
   EXPECT_EQ(rk.state, "ready");
   EXPECT_EQ(rk.missing, 0);
   EXPECT_EQ(rk.specials, mk.specials);
+}
+
+// B1: a promoted replica (its filter fed by the master's stream) SETs over a hash and a TTL key with a read,
+// and a plain key blind; the expire index stays consistent.
+TEST_F(SpecialKeysReplIT, PromotedReplicaBlindSetIsCorrect) {
+  auto m = master.Connect();
+  auto r = replica.Connect();
+  ASSERT_EQ(m->Command({"HSET", "h", "f", "v"}).integer, 1);
+  ASSERT_EQ(m->Command({"SET", "t", "v", "EX", "100"}).str, "OK");
+  ASSERT_EQ(m->Command({"SET", "s", "v"}).str, "OK");
+  const int64_t offset = InfoField(*m, "replication", "master_repl_offset");
+  ASSERT_TRUE(WaitFor([&] { return InfoField(*r, "replication", "slave_repl_offset") >= offset; },
+                      std::chrono::seconds(10)));
+  ASSERT_EQ(r->Command({"REPLICAOF", "NO", "ONE"}).str, "OK");
+  ASSERT_TRUE(WaitFor([&] { return FilterReady(*r); }, std::chrono::seconds(10)));
+  const int64_t s0 = SkippedReads(*r);
+  ASSERT_EQ(r->Command({"SET", "h", "x"}).str, "OK");
+  EXPECT_EQ(r->Command({"TYPE", "h"}).str, "string");
+  ASSERT_EQ(r->Command({"SET", "t", "w"}).str, "OK");
+  EXPECT_EQ(r->Command({"TTL", "t"}).integer, -1);
+  EXPECT_EQ(SkippedReads(*r), s0);
+  ASSERT_EQ(r->Command({"SET", "s", "w"}).str, "OK");
+  EXPECT_EQ(SkippedReads(*r), s0 + 1);
+  EXPECT_EQ(r->Command({"GET", "s"}).str, "w");
+  const RespValue idx = r->Command({"DEBUG", "DIGEST-INDEX"});
+  ASSERT_EQ(idx.elements.size(), 4u) << ToDebugString(idx);
+  EXPECT_EQ(idx.elements[2].integer, 0);  // missing
+  EXPECT_EQ(idx.elements[3].integer, 0);  // orphans
+  const SpecialKeys k = DebugSpecialKeys(*r);
+  EXPECT_EQ(k.missing, 0);
 }
 
 }  // namespace

@@ -9,6 +9,7 @@
 
 #include "common/status.h"
 #include "storage/storage.h"
+#include "types/special_key_filter.h"
 
 // String type logic (spec §4.4) over one ReadView/WriteTxn. No networking, no threads.
 namespace tideskv {
@@ -19,11 +20,15 @@ struct SetOptions {
   bool get = false;       // report the old value (SET ... GET, GETSET)
   bool keep_ttl = false;  // KEEPTTL
   int64_t expire_ms = 0;  // absolute deadline; 0 = none; ignored with keep_ttl
+  // B1: non-null: the SET may skip its read when the filter allows (blind SET). Checked inside the WriteFn,
+  // so under the key stripe and the gate, after any earlier writer's filter insert.
+  const SpecialKeyFilter* special = nullptr;
 };
 
 struct SetResult {
   bool written = false;
   std::optional<std::string> old_value;  // filled only when SetOptions::get
+  bool read_skipped = false;             // B1: written blind, without LoadForWrite
 };
 
 using KeyValue = std::pair<std::string_view, std::string_view>;
@@ -35,9 +40,11 @@ Status StringSet(WriteTxn& txn, uint8_t db, std::string_view key, std::string_vi
                  const SetOptions& opts, int64_t now_ms, SetResult* out);
 Result<std::optional<std::string>> StringGetDel(WriteTxn& txn, uint8_t db, std::string_view key,
                                                 int64_t now_ms);
-// MSET (only_if_none_exist = false) and MSETNX. Returns whether anything was written.
+// MSET (only_if_none_exist = false) and MSETNX. Returns whether anything was written. With `special`
+// (MSET only) each key may be written blind as by StringSet; *skipped_reads (if given) counts those keys.
 Result<bool> StringMultiSet(WriteTxn& txn, uint8_t db, const std::vector<KeyValue>& pairs,
-                            bool only_if_none_exist, int64_t now_ms);
+                            bool only_if_none_exist, int64_t now_ms,
+                            const SpecialKeyFilter* special = nullptr, size_t* skipped_reads = nullptr);
 // MGET: nullopt for missing, expired and non-string keys.
 Result<std::vector<std::optional<std::string>>> StringMultiGet(ReadView& view, uint8_t db,
                                                                const std::vector<std::string_view>& keys,

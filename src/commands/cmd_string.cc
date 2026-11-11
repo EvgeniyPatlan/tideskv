@@ -20,6 +20,7 @@ void DoSet(ExecContext& ctx, std::string_view key, std::string_view value, const
     return StringSet(txn, ctx.session.db, key, value, opts, now_ms, &result);
   });
   if (!ok) return;
+  if (result.read_skipped) ctx.server.special_keys().NoteSkippedRead();
   if (opts.get) return ReplyOptional(ctx, result.old_value);
   result.written ? ctx.reply.SimpleString("OK") : ctx.reply.Null();
 }
@@ -37,6 +38,7 @@ void Set(ExecContext& ctx, const ArgList& argv) {
     if (!when.ok()) return ReplyError(ctx, when.status());
     opts.expire_ms = *when;
   }
+  opts.special = &ctx.server.special_keys();
   DoSet(ctx, argv[1], argv[2], opts);
 }
 
@@ -56,6 +58,7 @@ void SetExGeneric(ExecContext& ctx, const ArgList& argv, ExpireUnit unit, std::s
   if (!when.ok()) return ReplyError(ctx, when.status());
   SetOptions opts;
   opts.expire_ms = *when;
+  opts.special = &ctx.server.special_keys();
   DoSet(ctx, argv[1], argv[3], opts);
 }
 
@@ -108,10 +111,14 @@ void MSetGeneric(ExecContext& ctx, const ArgList& argv, bool nx) {
     keys.push_back(argv[i]);
   }
   bool written = false;
+  size_t skipped = 0;
+  SpecialKeyFilter& special = ctx.server.special_keys();
   const Status st = ctx.server.engine().Write(ctx.session.db, keys, [&](WriteTxn& txn, int64_t now_ms) {
-    return MoveInto(StringMultiSet(txn, ctx.session.db, pairs, nx, now_ms), &written);
+    return MoveInto(StringMultiSet(txn, ctx.session.db, pairs, nx, now_ms, nx ? nullptr : &special, &skipped),
+                    &written);
   });
   if (!st.ok()) return ReplyError(ctx, st);
+  for (size_t i = 0; i < skipped; ++i) special.NoteSkippedRead();
   nx ? ctx.reply.Integer(written ? 1 : 0) : ctx.reply.SimpleString("OK");
 }
 

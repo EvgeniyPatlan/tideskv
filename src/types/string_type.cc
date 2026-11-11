@@ -5,6 +5,7 @@
 
 #include "common/number_format.h"
 #include "common/string_util.h"
+#include "encoding/key_codec.h"
 #include "types/errors.h"
 #include "types/object_store.h"
 
@@ -14,6 +15,13 @@ namespace {
 using Condition = SetOptions::Condition;
 
 Status WrongType() { return Status::UserError(std::string(kErrWrongType)); }
+
+// B1: a key that never was a collection or had a TTL is missing or a plain string without one, and for
+// both the read path's write set is the same: the string's meta record (WriteString deletes no expire
+// entry for a TTL-less string and drops collection data only for a collection), so reading is skipped.
+bool SkipRead(const SpecialKeyFilter* special, uint8_t db, std::string_view key) {
+  return special != nullptr && special->SkipReadAllowed(encoding::MetaKeyFor(db, key));
+}
 
 }  // namespace
 
@@ -29,6 +37,12 @@ Result<std::optional<std::string>> StringGet(ReadView& view, uint8_t db, std::st
 Status StringSet(WriteTxn& txn, uint8_t db, std::string_view key, std::string_view value,
                  const SetOptions& opts, int64_t now_ms, SetResult* out) {
   *out = SetResult{};
+  if (opts.condition == Condition::kAlways && !opts.get && !opts.keep_ttl &&
+      !(opts.expire_ms != 0 && opts.expire_ms <= now_ms) && SkipRead(opts.special, db, key)) {
+    out->written = true;
+    out->read_skipped = true;
+    return WriteString(txn, db, key, value, opts.expire_ms, StoredObject{});
+  }
   auto old = LoadForWrite(txn, db, key, now_ms);
   if (!old.ok()) return old.status();
   if (opts.get && old->live()) {
@@ -58,7 +72,9 @@ Result<std::optional<std::string>> StringGetDel(WriteTxn& txn, uint8_t db, std::
 }
 
 Result<bool> StringMultiSet(WriteTxn& txn, uint8_t db, const std::vector<KeyValue>& pairs,
-                            bool only_if_none_exist, int64_t now_ms) {
+                            bool only_if_none_exist, int64_t now_ms, const SpecialKeyFilter* special,
+                            size_t* skipped_reads) {
+  if (skipped_reads != nullptr) *skipped_reads = 0;
   if (only_if_none_exist) {
     for (const auto& [key, value] : pairs) {
       auto obj = LoadForWrite(txn, db, key, now_ms);
@@ -67,6 +83,11 @@ Result<bool> StringMultiSet(WriteTxn& txn, uint8_t db, const std::vector<KeyValu
     }
   }
   for (const auto& [key, value] : pairs) {
+    if (!only_if_none_exist && SkipRead(special, db, key)) {
+      if (Status st = WriteString(txn, db, key, value, 0, StoredObject{}); !st.ok()) return st;
+      if (skipped_reads != nullptr) ++*skipped_reads;
+      continue;
+    }
     auto old = LoadForWrite(txn, db, key, now_ms);
     if (!old.ok()) return old.status();
     if (Status st = WriteString(txn, db, key, value, 0, *old); !st.ok()) return st;
