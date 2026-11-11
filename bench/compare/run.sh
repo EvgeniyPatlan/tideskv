@@ -3,7 +3,7 @@
 # Usage: bench/compare/run.sh [--quick|--medium|--large [--no-w7-sweep]] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
 #   --relaxed-mode defaults to none; --out defaults to build/bench/<UTC timestamp> and must not hold a non-empty data/
 #   --large runs W7 (256 KiB values) only; with --smoke on 512 keys and 10/30 s phases
-#   env (defaults): SERVER_CPUS 0-3, SERVER_MEM 8g (large 4g), CLIENT_CPUS 8-11, THREADS 4, CLIENTS 50,
+#   env (defaults): SERVER_CPUS 0-3, SERVER_MEM 8g (large 4g), CLIENT_CPUS 8-15, THREADS 4, CLIENTS 50,
 #     WARMUP/DURATION 60/180 (quick 10/30; medium as full), QUIESCE_MAX 600 (quick 60), all in seconds
 # shellcheck source-path=SCRIPTDIR disable=SC2034  # ROOT, SIZE and DIRTY are read by lib.sh and the phases Task 4 adds
 set -euo pipefail

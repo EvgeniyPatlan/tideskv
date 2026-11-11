@@ -29,7 +29,7 @@ struct ConfigValues {
   double compaction_collection_dead_ratio = 0.2;
   uint64_t sync_interval_us = 1'000'000;
   uint64_t block_cache_size = 4ULL << 30;
-  uint64_t memtable_size = 64ULL << 20;
+  uint64_t memtable_size = 256ULL << 20;
   // M8: TidesDB merge trigger (flush-tier tables) and write backpressure threshold; see StorageOptions.
   // Raised from TidesDB's 4 and 16, which stalled every writer while a merge rewrote a large level.
   // 64, not 32: a list workload's meta rewrite holds both merge threads long enough for the replog's

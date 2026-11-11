@@ -7,7 +7,7 @@ CLI_IMAGE=redis:7.2.5
 # W7's disk ceiling (fio 3.13). Pinned by digest; run_fio skips and says so in meta.json when it cannot be pulled.
 FIO_IMAGE=xridge/fio@sha256:c58227616c9d2ef4c7d9c762a382d5921608ee3cf4b6aef7d99c4f964089d9c3
 SERVER_CPUS=${SERVER_CPUS:-0-3}
-CLIENT_CPUS=${CLIENT_CPUS:-8-11}
+CLIENT_CPUS=${CLIENT_CPUS:-8-15}
 SERVER_MEM=${SERVER_MEM:-8g}
 # Docker's default is soft 1024 / hard 524288: Kvrocks raises its soft limit itself, TidesKV does not and clamps its
 # SST cache, so both get the same explicit limit.

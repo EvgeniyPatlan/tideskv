@@ -238,7 +238,7 @@ write_meta
 meta() { python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))[sys.argv[2]]; print(v)' "$OUT/meta.json" "$1"; }
 check meta-threads "$(meta threads)" 4
 check meta-clients "$(meta clients)" 50
-check meta-client-cpus "$(meta client_cpus)" 8-11
+check meta-client-cpus "$(meta client_cpus)" 8-15
 check meta-flags "$(meta memtier_run_flags)" "--distinct-client-seed --randomize"
 check meta-w6-target "$(meta w6_del_target_per_s)" 20
 check meta-w6-clients "$(meta w6_del_clients)" 20

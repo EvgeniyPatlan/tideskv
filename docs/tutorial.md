@@ -333,7 +333,7 @@ TidesDB is a log-structured merge-tree (LSM-tree) engine, the same family as Roc
 **How a write reaches disk:**
 
 1. The engine hands TidesDB one batch per command, or per `EXEC` or script.
-2. TidesDB appends the batch to its write-ahead log (WAL) and inserts it into the memtable, a sorted structure in memory (`memtable-size`, 64 MB by default). The write is acknowledged.
+2. TidesDB appends the batch to its write-ahead log (WAL) and inserts it into the memtable, a sorted structure in memory (`memtable-size`, 256 MB by default). The write is acknowledged.
 3. A full memtable is flushed to disk as an immutable sorted file, an SSTable.
 4. Background compaction merges SSTables into fewer, larger ones and drops overwritten or deleted entries.
 
@@ -442,7 +442,7 @@ Settings are read in this order, and later sources win:
 | `sync-mode` | `interval` | no | `none`, `interval` or `full` |
 | `sync-interval-us` | `1000000` | no | fsync period for `interval` |
 | `block-cache-size` | `4gb` | no | TidesDB read cache |
-| `memtable-size` | `64mb` | no | TidesDB write buffer |
+| `memtable-size` | `256mb` | no | TidesDB write buffer |
 | `l1-file-count-trigger` | `8` | no | Flush-tier tables per column family that start a merge |
 | `l0-stall-threshold` | `64` | no | Write backpressure: throttle from half this backlog (unflushed memtables or flush-tier tables), block at it |
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |

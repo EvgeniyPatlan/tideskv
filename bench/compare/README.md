@@ -19,7 +19,7 @@ Options:
 - `--no-w7-sweep`: with `--large` (an error without it), skip the R32 pass at workers 16.
 
 Environment:
-- `SERVER_CPUS` (default `0-3`), `SERVER_MEM` (`8g`) and `CLIENT_CPUS` (`8-11`) set the limits.
+- `SERVER_CPUS` (default `0-3`), `SERVER_MEM` (`8g`) and `CLIENT_CPUS` (`8-15`) set the limits.
   On this host (i9-12900HK) `0-3` is 2 physical cores with SMT, not 4 cores; meta.json records the core count.
 - `WARMUP` and `DURATION` are in seconds (defaults 60 and 180, quick 10 and 30, medium as full).
 - `THREADS` and `CLIENTS` are memtier's settings (defaults 4 and 50).

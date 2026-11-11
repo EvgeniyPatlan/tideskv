@@ -29,7 +29,7 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(v.port, 6666);
   EXPECT_EQ(v.sync_mode, "interval");
   EXPECT_EQ(v.block_cache_size, 4ULL << 30);
-  EXPECT_EQ(v.memtable_size, 64ULL << 20);
+  EXPECT_EQ(v.memtable_size, 256ULL << 20);
   EXPECT_EQ(v.maxclients, 10000);
   EXPECT_EQ(v.client_query_buffer_limit, 1ULL << 30);
   EXPECT_TRUE(v.requirepass.empty());
