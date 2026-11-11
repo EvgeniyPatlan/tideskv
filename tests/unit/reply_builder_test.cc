@@ -122,5 +122,25 @@ TEST(ReplyBuilder, BigNumberAndVerbatimWithFormat) {
   EXPECT_EQ(pad.buffer(), "=5\r\nmd :x\r\n");
 }
 
+TEST(ReplyBuilder, SwapOutKeepsCapacity) {
+  std::string out;
+  out.reserve(4096);
+  ReplyBuilder r;
+  r.SimpleString("OK");
+  r.SwapOut(&out);
+  EXPECT_EQ(out, "+OK\r\n");
+  EXPECT_TRUE(r.empty());
+  EXPECT_GE(r.buffer().capacity(), 4096u);
+}
+
+TEST(ReplyBuilder, SwapOutDropsHugeBuffer) {
+  std::string out(1 << 20, 'x');
+  ReplyBuilder r;
+  r.Integer(1);
+  r.SwapOut(&out);
+  EXPECT_EQ(out, ":1\r\n");
+  EXPECT_LT(r.buffer().capacity(), ReplyBuilder::kMaxRetainedCapacity);
+}
+
 }  // namespace
 }  // namespace tideskv::resp

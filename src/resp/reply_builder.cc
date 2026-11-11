@@ -76,4 +76,13 @@ void ReplyBuilder::BigNumber(std::string_view digits) {
 
 std::string ReplyBuilder::Take() { return std::exchange(buf_, std::string()); }
 
+void ReplyBuilder::SwapOut(std::string* out) {
+  buf_.swap(*out);
+  if (buf_.capacity() > kMaxRetainedCapacity) {
+    std::string().swap(buf_);  // move-assigning an SSO string would keep the big allocation
+  } else {
+    buf_.clear();
+  }
+}
+
 }  // namespace tideskv::resp

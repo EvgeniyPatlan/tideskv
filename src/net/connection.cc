@@ -117,7 +117,7 @@ void Connection::AfterInput() {
 void Connection::StartWrite() {
   if (writing_ || closed_) return;
   writing_ = true;
-  out_ = reply_.Take();
+  reply_.SwapOut(&out_);  // out_ is idle: writing_ was false
   asio::async_write(socket_, asio::buffer(out_),
                     [self = shared_from_this()](std::error_code ec, size_t) { self->OnWrite(ec); });
 }
