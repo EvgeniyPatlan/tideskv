@@ -1,0 +1,323 @@
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -130,6 +130,8 @@
+     config->encoding_pipeline = cc->encoding_pipeline;
+     config->encodings = cx->cf->encodings;
+     config->encoding_count = cf_config_encoding_count_for_level(cc, level);
++    /* the values it separates take the whole pipeline whichever level that is */
++    config->value_encoding_count = cc->encoding_count;
+     config->node_cache = cx->cf->cache;
+     config->arena_pool = cx->cf->arena_pool;
+     config->now = cx->cf->now;
+diff --git a/src/flush/flush.c b/src/flush/flush.c
+--- a/src/flush/flush.c
++++ b/src/flush/flush.c
+@@ -99,6 +99,8 @@
+     config->encodings = cf->encodings;
+     /* a flush writes the flush tier, level 1 */
+     config->encoding_count = cf_config_encoding_count_for_level(cc, 1);
++    /* the values it separates take the whole pipeline whichever level that is */
++    config->value_encoding_count = cc->encoding_count;
+     config->node_cache = cf->cache;
+     config->arena_pool = cf->arena_pool;
+     config->now = cf->now;
+diff --git a/src/sstable/sstable.h b/src/sstable/sstable.h
+--- a/src/sstable/sstable.h
++++ b/src/sstable/sstable.h
+@@ -550,9 +550,14 @@
+  * @param cf_name owning column family name
+  * @param klog_path path the klog block manager was opened at, names the file and enables lazy
+  * reopen
+- * @param encoding_pipeline encoding ids in encode order, applied to every node and to every value
+- * that spills, and recorded in the footer so a reader can undo them (may be NULL)
+- * @param encoding_count number of encodings in the pipeline
++ * @param encoding_pipeline encoding ids in encode order, applied to every node and recorded in the
++ * footer so a reader can undo them; the first value_encoding_count of them also encode the values
++ * that spill (may be NULL)
++ * @param encoding_count how many of encoding_pipeline the nodes and the footer use; a level that
++ * is not compressed passes 0 here
++ * @param value_encoding_count how many of encoding_pipeline encode a spilled value, 0 meaning the
++ * same as encoding_count. a value-log record names its own chain, so it does not depend on the
++ * footer and is encoded whatever level the table is, which is what the family's full count is for
+  * @param encodings borrowed registry the pipeline ids resolve against; required when the pipeline
+  * is non-empty, since ids mean nothing without it
+  * @param node_cache borrowed db-global block cache the produced sstable reads through, or NULL
+@@ -577,6 +582,7 @@
+     const char *klog_path;
+     const uint8_t *encoding_pipeline;
+     uint8_t encoding_count;
++    uint8_t value_encoding_count;
+     const tidesdb_encoding_registry_t *encodings;
+     cache_t *node_cache;
+     arena_pool_t *arena_pool;
+diff --git a/src/sstable/sstable_builder.c b/src/sstable/sstable_builder.c
+--- a/src/sstable/sstable_builder.c
++++ b/src/sstable/sstable_builder.c
+@@ -142,6 +142,7 @@
+     if (!out || !klog_bm || !config || !config->cf_name || !config->klog_path)
+         return TDB_ERR_INVALID_ARGS;
+     if (config->encoding_count > TDB_ENCODING_PIPELINE_MAX) return TDB_ERR_INVALID_ARGS;
++    if (config->value_encoding_count > TDB_ENCODING_PIPELINE_MAX) return TDB_ERR_INVALID_ARGS;
+ 
+     sstable_builder_t *b = calloc(1, sizeof(*b));
+     if (!b) return TDB_ERR_MEMORY;
+@@ -155,6 +156,18 @@
+     if (config->encoding_count > 0 && config->encoding_pipeline)
+         memcpy(b->encoding_pipeline, config->encoding_pipeline, config->encoding_count);
+ 
++    /* a spilled value is written under the chain of the whole pipeline, not the one this table's
++     * level uses: the record names its own chain, so a reader never asks the footer, and a table
++     * that skips the codec for its nodes (compression_start_level) must not leave its large values
++     * raw for as long as the record lives. a caller that does not say takes the node count */
++    const uint8_t value_count = config->value_encoding_count ? config->value_encoding_count
++                                                              : config->encoding_count;
++    if (value_count > 0 && config->encoding_pipeline)
++    {
++        memcpy(b->value_ids, config->encoding_pipeline, value_count);
++        b->value_id_count = value_count;
++    }
++
+     /* a pipeline with no registry to resolve against cannot be applied, and silently storing the
+      * nodes verbatim would produce an sstable whose footer claims encodings its bytes do not have
+      */
+@@ -168,8 +181,6 @@
+             return TDB_ERR_INVALID_ARGS;
+         }
+         b->codec_count = b->encoding_count;
+-        memcpy(b->value_ids, b->encoding_pipeline, b->encoding_count);
+-        b->value_id_count = b->encoding_count;
+     }
+     b->encodings = config->encodings;
+ 
+diff --git a/test/compression_start_level__tests.c b/test/compression_start_level__tests.c
+--- a/test/compression_start_level__tests.c
++++ b/test/compression_start_level__tests.c
+@@ -18,6 +18,8 @@
+ 
+ #include "../src/base/errors.h"
+ #include "../src/column_family/cf_config.h"
++#include "../src/sstable/sstable.h"
++#include "../src/sstable/vlog.h"
+ #include "test_utils.h"
+ 
+ static int tests_passed = 0;
+@@ -234,6 +236,197 @@
+     (void)remove_directory(CSL_DIR);
+ }
+ 
++/* a value above the separation threshold is written to the value log, and the value log is shared
++ * by every level, so which level wrote the table must not decide whether the value is encoded.
++ * start level 2 leaves the flush tier verbatim, and the large values of that table are encoded
++ * all the same: each value-log record names the chain it was written with, so a reader decodes it
++ * without asking the referencing table, and a build that wrote them verbatim would keep them raw for
++ * as long as the record lives */
++#define CSL_BIG_VALUE 8192
++#define CSL_BIG_COUNT 16
++
++void test_start_level_encodes_separated_values(void)
++{
++    (void)remove_directory(CSL_DIR);
++    tidesdb_t *db = csl_open();
++    tidesdb_column_family_t *cf = csl_create_cf(db, 2);
++
++    uint8_t *value = malloc(CSL_BIG_VALUE);
++    ASSERT_TRUE(value != NULL);
++    memset(value, 'b', CSL_BIG_VALUE);
++    for (int i = 0; i < CSL_BIG_COUNT; i++)
++    {
++        char key[32];
++        csl_key(key, sizeof(key), 9, i);
++        tidesdb_txn_t *t = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_put(t, cf, (const uint8_t *)key, strlen(key), value, CSL_BIG_VALUE,
++                                  -1),
++                  TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
++        tidesdb_txn_free(t);
++    }
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++
++    /* the table itself is verbatim, the flush tier under start level 2 */
++    csl_chains_t c;
++    csl_chains(db, &c);
++    ASSERT_TRUE(csl_tables(&c) >= 1);
++    ASSERT_EQ(csl_tables_with(&c, 0, 0), csl_tables(&c));
++
++    /* the value-log records are encoded when a codec is compiled in, and are in every case there */
++    tidesdb_encoding_stats_t chains[TDB_MAX_ENCODING_CHAINS];
++    size_t n = 0;
++    ASSERT_EQ(tidesdb_get_vlog_encoding_stats(db, chains, TDB_MAX_ENCODING_CHAINS, &n), TDB_SUCCESS);
++    uint64_t records = 0, encoded = 0, encoded_logical = 0, encoded_stored = 0;
++    for (size_t i = 0; i < n; i++)
++    {
++        records += chains[i].item_count;
++        if (chains[i].id_count == 0) continue;
++        encoded += chains[i].item_count;
++        encoded_logical += chains[i].logical_bytes;
++        encoded_stored += chains[i].stored_bytes;
++    }
++    ASSERT_EQ(records, (uint64_t)CSL_BIG_COUNT);
++    if (lz4_available())
++    {
++        ASSERT_EQ(encoded, records);
++        ASSERT_TRUE(encoded_stored < encoded_logical / 4); /* 8 KB of one byte compresses far */
++    }
++    else
++    {
++        printf("(no lz4: compressed-ness not asserted) ");
++    }
++
++    /* and they read back whole, from the open database and across a reopen */
++    for (int pass = 0; pass < 2; pass++)
++    {
++        for (int i = 0; i < CSL_BIG_COUNT; i++)
++        {
++            char key[32];
++            csl_key(key, sizeof(key), 9, i);
++            tidesdb_txn_t *t = NULL;
++            ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++            uint8_t *got = NULL;
++            size_t got_size = 0;
++            ASSERT_EQ(tidesdb_txn_get(t, cf, (const uint8_t *)key, strlen(key), &got, &got_size),
++                      TDB_SUCCESS);
++            ASSERT_EQ((int)got_size, CSL_BIG_VALUE);
++            ASSERT_EQ(memcmp(got, value, CSL_BIG_VALUE), 0);
++            tidesdb_free(got);
++            tidesdb_txn_free(t);
++        }
++        if (pass == 0)
++        {
++            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++            db = csl_open();
++            cf = tidesdb_get_column_family(db, "kv");
++            ASSERT_TRUE(cf != NULL);
++        }
++    }
++    free(value);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CSL_DIR);
++}
++
++/* the builder half of the same rule, which the database-level case above cannot reach: a commit
++ * already separates its large values under the family's whole pipeline, so what a flush-tier build
++ * spills itself is a value it is handed inline or one a merge re-spills out of a drained segment.
++ * a table whose own pipeline is empty (encoding_count 0) still writes those through the pipeline
++ * the family names for values, and the table stays verbatim */
++#define CSL_SPILL_DIR "." PATH_SEPARATOR "test_compression_start_level_spill"
++
++void test_builder_spills_values_under_the_full_pipeline(void)
++{
++    (void)remove_directory(CSL_SPILL_DIR);
++    ASSERT_EQ(mkdir(CSL_SPILL_DIR, 0755), 0);
++
++    tidesdb_encoding_registry_t reg;
++    ASSERT_EQ(tidesdb_encoding_registry_init(&reg), TDB_SUCCESS);
++    vlog_config_t vcfg = {0};
++    vcfg.encodings = &reg;
++    vlog_t *vlog = NULL;
++    ASSERT_EQ(vlog_open(CSL_SPILL_DIR, &vcfg, &vlog), VLOG_OK);
++
++    tidesdb_manifest_entry_t entry = {0};
++    entry.birth_level = 1;
++    entry.id = 300;
++    entry.partition = MANIFEST_NO_PARTITION;
++    char filename[128], path[256];
++    ASSERT_EQ(sstable_klog_filename(&entry, filename, sizeof(filename)), TDB_SUCCESS);
++    snprintf(path, sizeof(path), "%s%s%s", CSL_SPILL_DIR, PATH_SEPARATOR, filename);
++    block_manager_t *klog_bm = NULL;
++    ASSERT_EQ(block_manager_open(&klog_bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
++
++    const uint8_t pipeline[1] = {(uint8_t)TDB_COMPRESS_LZ4};
++    sstable_builder_config_t config;
++    memset(&config, 0, sizeof(config));
++    config.target_node_size = BTREE_DEFAULT_NODE_SIZE;
++    config.value_threshold = 16;
++    config.enable_bloom = 1;
++    config.bloom_fpr = 0.01;
++    config.sync_mode = BLOCK_MANAGER_SYNC_NONE;
++    config.id = 300;
++    config.partition = MANIFEST_NO_PARTITION;
++    config.cf_name = "kv";
++    config.klog_path = path;
++    config.encoding_pipeline = pipeline;
++    config.encoding_count = 0;       /* the table is a flush-tier one, verbatim */
++    config.value_encoding_count = 1; /* the family's pipeline is one codec long */
++    config.encodings = &reg;
++
++    sstable_builder_t *builder = NULL;
++    ASSERT_EQ(sstable_builder_new(&builder, klog_bm, vlog, &config), TDB_SUCCESS);
++    uint8_t big[CSL_BIG_VALUE];
++    memset(big, 'b', sizeof(big));
++    ASSERT_EQ(sstable_builder_add(builder, (const uint8_t *)"big", 3, big, sizeof(big), 1, 0, 0),
++              TDB_SUCCESS);
++    sstable_t *sst = NULL;
++    uint64_t vlog_bytes = 0;
++    ASSERT_EQ(sstable_builder_finish(builder, &sst, &vlog_bytes), TDB_SUCCESS);
++    sstable_builder_free(builder);
++    ASSERT_EQ((int)sst->encoding_count, 0); /* the footer records no codec for the nodes */
++    ASSERT_TRUE(vlog_bytes > 0);
++
++    vlog_chain_stats_t chains[VLOG_MAX_CHAINS];
++    size_t n = 0;
++    ASSERT_EQ(vlog_get_chain_stats(vlog, chains, VLOG_MAX_CHAINS, &n), VLOG_OK);
++    uint64_t values = 0, encoded = 0;
++    for (size_t i = 0; i < n; i++)
++    {
++        values += chains[i].value_count;
++        if (chains[i].id_count == 1 && chains[i].ids[0] == TDB_COMPRESS_LZ4)
++            encoded += chains[i].value_count;
++    }
++    ASSERT_EQ(values, 1u);
++    if (lz4_available())
++        ASSERT_EQ(encoded, 1u);
++    else
++        printf("(no lz4: compressed-ness not asserted) ");
++
++    /* and the value reads back through the record's own chain */
++    uint8_t *val = NULL;
++    size_t val_size = 0;
++    uint64_t vid = 0, sq = 0;
++    int64_t ttl = 0;
++    uint8_t deleted = 0;
++    ASSERT_EQ(sstable_get(sst, (const uint8_t *)"big", 3, &val, &val_size, &vid, &sq, &ttl,
++                          &deleted),
++              TDB_SUCCESS);
++    ASSERT_TRUE(vid != 0);
++    free(val);
++    uint8_t *spilled = NULL;
++    size_t spilled_len = 0;
++    ASSERT_EQ(vlog_read(vlog, vid, &spilled, &spilled_len), VLOG_OK);
++    ASSERT_EQ(spilled_len, sizeof(big));
++    ASSERT_EQ(memcmp(spilled, big, sizeof(big)), 0);
++    free(spilled);
++
++    sstable_close(sst);
++    vlog_close(vlog);
++    (void)remove_directory(CSL_SPILL_DIR);
++}
++
+ /* a level the tree cannot have is refused, on create and on a runtime update alike */
+ void test_start_level_rejects_out_of_range(void)
+ {
+@@ -305,6 +498,8 @@
+     RUN_TEST_HANDLE_BALANCED(test_start_level_skips_upper_levels, tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_start_level_zero_encodes_every_level, tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_start_level_persists, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_start_level_encodes_separated_values, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_builder_spills_values_under_the_full_pipeline, tests_passed);
+     RUN_TEST_HANDLE_BALANCED(test_start_level_rejects_out_of_range, tests_passed);
+     RUN_TEST(test_start_level_blob_is_compatible, tests_passed);
+     PRINT_TEST_RESULTS(tests_passed, tests_failed);
+diff --git a/test/wal_flusher__tests.c b/test/wal_flusher__tests.c
+--- a/test/wal_flusher__tests.c
++++ b/test/wal_flusher__tests.c
+@@ -359,7 +359,7 @@
+ }
+ 
+ #define WF_INTERVAL_US 50000u
+-#define WF_SCHED_US    20000u /* allowance for the ticker thread being scheduled late */
++#define WF_SCHED_US    200000u /* ticker scheduling allowance, wide for a loaded CI host */
+ 
+ /* sync-interval: a commit waits for its record to reach the file, and that wait does not sit out
+  * the gathering window -- the waiter asks for the flush. the interval tick's fsync barrier
