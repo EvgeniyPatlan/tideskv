@@ -1,5 +1,6 @@
 #include "exec/repl_log.h"
 
+#include <cassert>
 #include <string>
 #include <utility>
 
@@ -136,8 +137,10 @@ Status ReplLog::Recover() {
     cum = head_cum;
     first = last + 1;
   }
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
   cum_ = cum;
+  window_.clear();
+  next_ = last + 1;
   first_.store(first, std::memory_order_release);
   last_.store(last, std::memory_order_release);
   load_incomplete_.store(incomplete, std::memory_order_release);
@@ -152,45 +155,92 @@ Status ReplLog::Recover() {
     if (Status st = (*txn)->Delete(ColumnFamily::kSys, kSysReplHead); !st.ok()) return st;
     if (Status st = (*txn)->Commit(); !st.ok()) return st;
   }
-  return lazy_ ? Status::Ok() : ActivateLocked();
+  return lazy_ ? Status::Ok() : ActivateLocked(lock);
 }
 
 Status ReplLog::AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum) {
   if (Status st = txn.Put(ColumnFamily::kReplog, encoding::ReplogKey(seq), record); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
   cum_ = cum;
+  next_ = seq + 1;
   last_.store(seq, std::memory_order_release);
   advanced_.notify_all();
   return Status::Ok();
 }
 
-// Dormant: the seq, cum and publication of AppendAndCommit without the record. first_retained() follows
-// last()+1. The first unlogged commit carries sys/repl_head, so a crash before PersistHead never lets
-// recovery offer the records before it for CONTINUE.
+// Dormant, head-carrying: the seq, cum and publication of AppendAndCommit without the record, still under
+// mu_. first_retained() follows last()+1. The first unlogged commit carries sys/repl_head, so a crash
+// before PersistHead never lets recovery offer the records before it for CONTINUE. It stays serialized:
+// were it windowed and failed while later ones succeeded, no head would be on disk (plan, r4 §3.4 fix).
 Status ReplLog::CommitUnlogged(WriteTxn& txn, uint64_t seq, size_t size) {
   const uint64_t cum = cum_ + size;
-  if (!unlogged_) {
-    if (Status st = txn.Put(ColumnFamily::kSys, kSysReplHead, EncodeHead(seq, cum)); !st.ok()) return st;
-  }
+  if (Status st = txn.Put(ColumnFamily::kSys, kSysReplHead, EncodeHead(seq, cum)); !st.ok()) return st;
   if (Status st = txn.Commit(); !st.ok()) return st;
-  if (!unlogged_) head_seq_ = seq;
+  head_seq_ = seq;
   unlogged_ = true;
   cum_ = cum;
+  next_ = seq + 1;
   first_.store(seq + 1, std::memory_order_release);
   last_.store(seq, std::memory_order_release);
   advanced_.notify_all();
   return Status::Ok();
 }
 
+// Dormant after the head: draw, commit without mu_, finish. The slot keeps last()/cum_bytes() from passing
+// this seq until its commit is done, and DrainLocked from passing it at all.
+Status ReplLog::CommitWindowed(std::unique_lock<std::mutex>& lock, WriteTxn& txn, size_t size,
+                               uint64_t* seq) {
+  *seq = next_++;
+  window_.push_back(Slot{SlotState::kPending, size});
+  lock.unlock();
+  const Status st = txn.Commit();
+  lock.lock();
+  FinishLocked(*seq, st.ok());
+  return st;
+}
+
+void ReplLog::FinishLocked(uint64_t seq, bool ok) {
+  const uint64_t last = last_.load(std::memory_order_relaxed);
+  if (!ok && seq == next_ - 1) {
+    window_.pop_back();  // nobody drew after it: the seq is taken back, as if never drawn
+    --next_;
+  } else {
+    window_[seq - last - 1].state = ok ? SlotState::kDone : SlotState::kFailed;
+  }
+  uint64_t published = last;
+  while (!window_.empty() && window_.front().state != SlotState::kPending) {
+    if (window_.front().state == SlotState::kDone) cum_ += window_.front().size;
+    window_.pop_front();  // a failed seq is consumed as an empty one: cum stays
+    ++published;
+  }
+  if (published != last) {
+    first_.store(published + 1, std::memory_order_release);
+    last_.store(published, std::memory_order_release);
+    advanced_.notify_all();
+  }
+  if (window_.empty()) window_cv_.notify_all();
+}
+
+void ReplLog::DrainLocked(std::unique_lock<std::mutex>& lock) {
+  ++drainers_;
+  window_cv_.wait(lock, [&] { return window_.empty(); });
+  --drainers_;
+  window_cv_.notify_all();  // draws waiting for drainers_ == 0
+}
+
 Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) {
   if (ops.empty()) return txn.Commit();
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  // A pending drain goes first, so a fence or an activation is never starved by a stream of draws; the
+  // state below is read after the wait, since the drainer may change it.
+  window_cv_.wait(lock, [&] { return drainers_ == 0; });
   // Fenced (replica): refuse without touching txn; the caller's failure path rolls it back as for
   // any failed commit (RunTxn destroys it, Batch::Commit calls Rollback). Checked under mu_ so that
   // FenceLocalWrites(true) is a barrier (CF1).
   if (fenced()) return Status::UserError(std::string(kErrReadOnlyReplica));
-  const uint64_t seq = last_.load(std::memory_order_relaxed) + 1;
+  uint64_t seq = next_;
   if (active()) {
+    assert(window_.empty() && "an active log's commits never overlap (activation drains the window)");
     const std::string record = encoding::EncodeReplogBatch(ops, clock_.NowMs(), cum_);
     // R12: a batch no replica would accept is refused like a fenced commit: nothing taken, nothing written.
     if (record.size() > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
@@ -198,7 +248,11 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
   } else {
     const size_t size = encoding::ReplogBatchSize(ops);
     if (size > max_batch_bytes()) return Status::UserError(std::string(kErrTooLargeToReplicate));
-    if (Status st = CommitUnlogged(txn, seq, size); !st.ok()) return st;
+    if (!unlogged_) {
+      if (Status st = CommitUnlogged(txn, seq, size); !st.ok()) return st;
+    } else if (Status st = CommitWindowed(lock, txn, size, &seq); !st.ok()) {
+      return st;
+    }
   }
   engine_internal::t_last_commit_seq = seq;  // this thread's write, for WAIT (M6b D9)
   ++engine_internal::t_commit_count;         // M7a D24: detect a write by count, not by seq change
@@ -206,7 +260,8 @@ Status ReplLog::Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops) 
 }
 
 void ReplLog::FenceLocalWrites(bool fenced) {
-  std::lock_guard lock(mu_);  // waits for an in-flight commit section to finish
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);  // waits out every commit that already drew a seq
   fenced_.store(fenced, std::memory_order_release);
 }
 
@@ -225,7 +280,8 @@ Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view p
   if (!encoding::PeekReplogHeader(payload, &timestamp_ms, &cum)) {
     return Status::Corruption("replicated batch has no valid header");
   }
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);  // before reading last_ and cum_: a local commit may still be finishing
   // G1: a partial load's keyspace is no base for the stream (the abort, or a full load, comes first).
   if (load_incomplete()) return Status::Internal("replicated batch during an unfinished full-sync load");
   const uint64_t expected = last_.load(std::memory_order_relaxed) + 1;
@@ -241,7 +297,7 @@ Status ReplLog::CommitReplicated(WriteTxn& txn, uint64_t seq, std::string_view p
     return Status::Corruption("replicated batch " + std::to_string(seq) + " has cum_bytes " +
                               std::to_string(cum) + ", expected " + std::to_string(cum_ + payload.size()));
   }
-  if (Status st = ActivateLocked(); !st.ok()) return st;
+  if (Status st = ActivateLocked(lock); !st.ok()) return st;
   return AppendAndCommit(txn, seq, payload, cum);
 }
 
@@ -259,9 +315,11 @@ uint64_t ReplLog::WaitBeyond(uint64_t seq, std::chrono::milliseconds timeout) co
 void ReplLog::SetFirstRetained(uint64_t first) { first_.store(first, std::memory_order_release); }
 
 // One txn: range-delete replog[first .. up_to] and persist repl_first = up_to + 1 (D18). Begun and
-// committed under mu_: no commit section runs meanwhile, and the keys it writes are disjoint from any
-// commit section's (replog[last()+1] and keyspace CFs), so it cannot hit or cause a kConflict.
-Status ReplLog::TrimLocked(uint64_t up_to) {
+// committed under mu_ after draining the window: no commit runs meanwhile, and the keys it writes are
+// disjoint from any commit section's (replog[last()+1] and keyspace CFs), so it cannot hit or cause a
+// kConflict.
+Status ReplLog::TrimLocked(std::unique_lock<std::mutex>& lock, uint64_t up_to) {
+  DrainLocked(lock);
   const uint64_t last = last_.load(std::memory_order_relaxed);
   if (up_to >= last) {
     return Status::InvalidArgument("cannot trim the replication log to " + std::to_string(up_to) +
@@ -284,20 +342,22 @@ Status ReplLog::TrimLocked(uint64_t up_to) {
 }
 
 Status ReplLog::Trim(uint64_t up_to) {
-  std::lock_guard lock(mu_);
-  return TrimLocked(up_to);
+  std::unique_lock lock(mu_);
+  return TrimLocked(lock, up_to);
 }
 
 Status ReplLog::TrimUnlessFenced(uint64_t up_to, bool* trimmed) {
   *trimmed = false;
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);  // before the fence check: TrimLocked's own drain would release mu_ after it
   if (fenced()) return Status::Ok();
-  if (Status st = TrimLocked(up_to); !st.ok()) return st;
+  if (Status st = TrimLocked(lock, up_to); !st.ok()) return st;
   *trimmed = true;
   return Status::Ok();
 }
 
-Status ReplLog::ActivateLocked() {
+Status ReplLog::ActivateLocked(std::unique_lock<std::mutex>& lock) {
+  DrainLocked(lock);  // the baseline is last(), so every drawn seq must have published
   if (active()) return Status::Ok();
   if (unlogged_) {
     const uint64_t seq = last_.load(std::memory_order_relaxed);
@@ -325,10 +385,12 @@ Status ReplLog::ActivateLocked() {
 }
 
 Status ReplLog::Activate() {
-  std::lock_guard lock(mu_);
-  return ActivateLocked();
+  std::unique_lock lock(mu_);
+  return ActivateLocked(lock);
 }
 
+// No drain: (last_, cum_) is the published pair, which never includes an unfinished seq, so the head
+// is exact even while later commits are in flight (they reach the next PersistHead).
 Status ReplLog::PersistHead() {
   std::lock_guard lock(mu_);
   const uint64_t seq = last_.load(std::memory_order_relaxed);
@@ -342,8 +404,8 @@ Status ReplLog::PersistHead() {
 }
 
 Result<SyncSnapshot> ReplLog::ActivateAndSnapshot() {
-  std::lock_guard lock(mu_);
-  if (Status st = ActivateLocked(); !st.ok()) return st;
+  std::unique_lock lock(mu_);
+  if (Status st = ActivateLocked(lock); !st.ok()) return st;
   auto view = storage_.BeginSnapshot();
   if (!view.ok()) return view.status();
   return SyncSnapshot{std::move(view).value(), last_.load(std::memory_order_relaxed)};
@@ -353,13 +415,15 @@ void ReplLog::SetBaselineLocked(uint64_t last, uint64_t cum, uint64_t first) {
   unlogged_ = false;  // every load step deletes sys/repl_head
   head_seq_ = 0;
   cum_ = cum;
+  next_ = last + 1;
   first_.store(first, std::memory_order_release);
   last_.store(last, std::memory_order_release);
   advanced_.notify_all();
 }
 
 Status ReplLog::CommitLoadStart(WriteTxn& txn) {
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);
   if (!fenced()) return Status::Internal("full-sync load while local writes are not fenced");
   if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
@@ -381,7 +445,8 @@ Status ReplLog::CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view reco
     if (!batch.ok()) return Status::Corruption("full-sync baseline record: " + batch.status().message());
     cum = batch->cum_bytes;
   }
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);
   if (!fenced()) return Status::Internal("full-sync load while local writes are not fenced");
   if (seq > 0) {
     std::string first;
@@ -401,7 +466,8 @@ Status ReplLog::CommitLoadEnd(WriteTxn& txn, uint64_t seq, std::string_view reco
 // followed by applied batches, or a restart), so "marker => discard to a consistent seq-0 node" holds
 // unconditionally and a discarded node can never ask to continue a history its keyspace lost.
 Status ReplLog::CommitLoadAbort(WriteTxn& txn) {
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  DrainLocked(lock);
   if (Status st = txn.DeleteRange(ColumnFamily::kReplog, kWholeCfLo, ""); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kReplFirstKey); !st.ok()) return st;
   if (Status st = txn.Delete(ColumnFamily::kSys, kBaselineUnknownKey); !st.ok()) return st;

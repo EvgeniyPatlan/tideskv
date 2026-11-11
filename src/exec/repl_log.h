@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -31,19 +32,29 @@ struct SyncSnapshot {
 // Applies `ops` to txn in order, exactly as recorded (M6a D5/D11). Stops at the first failure.
 Status ApplyReplOps(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
 
-// The replication log (M6a D3): the only writer of the replog CF. Commit() serialises
-// "seq = last+1 → put replog[seq] → commit → publish" so seq order is commit order and the
-// watermark (last committed seq) has no gaps. Lock order: taken after the gate, key stripes,
-// ScriptEngine::mu_ and WatchRegistry shards; it takes no storage mutex beneath it; TidesDB's commit
-// gate keeps commits atomic across memtable rotations (ActivateAndSnapshot also creates a storage
-// snapshot under it, M6b D2).
+// The replication log (M6a D3): the only writer of the replog CF. Every commit draws seq = next_ under mu_,
+// and last() (the watermark) and cum_bytes() are published strictly in seq order, so the watermark never
+// passes a seq whose commit has not finished and has no gaps. Lock order: taken after the gate, key
+// stripes, ScriptEngine::mu_ and WatchRegistry shards; it takes no storage mutex beneath it; TidesDB's
+// commit gate keeps commits atomic across memtable rotations.
 //
-// repl-backlog-lazy (`lazy`): with no replica the log is dormant. Commit still takes seq = last+1 and
+// Active log: "seq → put replog[seq] → commit → publish" runs entirely under mu_, so seq order is commit
+// order and commits do not overlap (v1; overlapping them needs filler records and a gap-aware Recover,
+// r4 §3.4 item 3). Dormant log: the head-carrying first unlogged commit runs the same way; every later one
+// draws its seq and a pending slot of the publication window under mu_, commits with mu_ released, and then
+// finishes its slot. The window publishes its front while it is not pending: a failed commit that is not
+// the newest is consumed as an empty seq (no record exists while dormant, so only cum and sys/repl_head see
+// it, and they stay consistent); a failed newest one takes its seq back. Everything that relies on "no
+// commit runs meanwhile" (the fence, activation and so snapshots, trims, load steps) first drains the
+// window (DrainLocked), and new draws wait while a drain is pending.
+//
+// repl-backlog-lazy (`lazy`): with no replica the log is dormant. Commit still takes the next seq and
 // advances cum_bytes by the batch's encoded size, but writes no record; first_retained() stays last()+1,
 // so nothing committed while dormant is ever offered for CONTINUE. The first snapshot that needs the log
 // (a PSYNC, a slot migration), a replicated batch or a full-sync load activates it; it then stays active,
 // across restarts too (a log with records starts active). sys/repl_head keeps last and cum over a restart
-// while no record does: the first unlogged commit writes it in that commit's txn, PersistHead refreshes it.
+// while no record does: the first unlogged commit writes it in that commit's txn, PersistHead refreshes it
+// from the published (last, cum) pair.
 class ReplLog {
  public:
   // lazy = false (tests, repl-backlog-lazy no): always active.
@@ -56,9 +67,11 @@ class ReplLog {
   Status Recover();
   // Commits txn; if ops is non-empty first appends replog[last+1] = their batch. kUserError with
   // the READONLY text while local writes are fenced (replica), and with kErrTooLargeToReplicate when the
-  // encoded batch exceeds max_batch_bytes() (R12). On failure nothing is consumed.
+  // encoded batch exceeds max_batch_bytes() (R12). On failure nothing is consumed, except that a dormant
+  // commit that fails while a later-drawn one is still in flight leaves its seq consumed as an empty seq.
   // txn must be the underlying transaction, not a RecordingTxn (which refuses the replog CF).
-  // Dormant: no record; the first unlogged commit puts sys/repl_head on txn instead.
+  // Dormant: no record; the first unlogged commit puts sys/repl_head on txn instead. A dormant commit may
+  // return before last() reaches its seq (an earlier-drawn commit is still in flight).
   Status Commit(WriteTxn& txn, const std::vector<encoding::ReplOp>& ops);
   // OidAllocator and other standalone writers: one small txn of `ops` through Commit.
   Status CommitStandalone(const std::vector<encoding::ReplOp>& ops);
@@ -75,7 +88,7 @@ class ReplLog {
   uint64_t cum_bytes() const;  // cum_bytes of last(); 0 if empty
   // Blocks until last() > seq or the timeout passes; returns last().
   uint64_t WaitBeyond(uint64_t seq, std::chrono::milliseconds timeout) const;
-  // Raising the fence is a barrier (CF1): it waits out a local commit already inside the commit section,
+  // Raising the fence is a barrier (CF1): it drains every local commit that already drew a seq (DrainLocked),
   // and Commit checks the fence under the same lock, so once this returns no local commit takes a seq.
   void FenceLocalWrites(bool fenced);
   bool fenced() const { return fenced_.load(std::memory_order_acquire); }
@@ -86,37 +99,39 @@ class ReplLog {
   void SetFirstRetained(uint64_t first);
   // Backlog trimming (D18): one txn range-deletes replog[.. up_to] (from the start of the CF, so an
   // activation's baseline just below first_retained() goes too) and persists
-  // sys/repl_first = up_to + 1; it is begun and committed under mu_, so it never interleaves with a
-  // commit section, and then first_retained() becomes up_to + 1. Not refused by the fence: a replica's
-  // applier trims between batches. InvalidArgument when up_to >= last(): the newest batch is always kept,
-  // so last and cum_bytes survive a restart. Nothing to do (Ok) when up_to < first_retained().
+  // sys/repl_first = up_to + 1; it is begun and committed under mu_ after draining the window, so it never
+  // interleaves with a commit, and then first_retained() becomes up_to + 1. Not refused by the fence: a
+  // replica's applier trims between batches. InvalidArgument when up_to >= last(): the newest batch is always
+  // kept, so last and cum_bytes survive a restart. Nothing to do (Ok) when up_to < first_retained().
   // Conflicts: the txn writes only replog keys below last() and sys/repl_first; a commit section writes
   // replog[last()+1] and keyspace CFs, and only Activate (also under mu_) writes repl_first besides, so
   // the two never conflict.
   Status Trim(uint64_t up_to);
-  // The master's trimmer thread: Trim, unless local writes are fenced (checked under mu_), in which case
-  // nothing is written and *trimmed is false. Once FenceLocalWrites(true) returns, no such trim commits.
+  // The master's trimmer thread: Trim, unless local writes are fenced (checked under mu_ after the drain), in
+  // which case nothing is written and *trimmed is false. Once FenceLocalWrites(true) returns, no such trim
+  // commits.
   Status TrimUnlessFenced(uint64_t up_to, bool* trimmed);
 
-  // Activates a dormant log, then takes BeginSnapshot() and last() together under mu_: no commit section
-  // runs in between, so the view holds exactly the commits <= seq (spike s_snapcut), and replog[seq]
-  // (when seq > 0) for the full sync's LOADEND.
+  // Drains the window and activates a dormant log, then takes BeginSnapshot() and last() together under
+  // mu_: no commit runs in between, so the view holds exactly the commits <= seq (spike s_snapcut), and
+  // replog[seq] (when seq > 0) for the full sync's LOADEND.
   Result<SyncSnapshot> ActivateAndSnapshot();
-  // Under mu_; nothing to do when active. When commits went unlogged, one txn puts the baseline
-  // replog[S] (S = last(): no ops, cum_bytes = cum_bytes()), persists sys/repl_first = S + 1 (S itself
-  // was not logged, so no replica that lacks it may continue from it), deletes sys/repl_head and the
+  // Under mu_, after draining the window; nothing to do when active. When commits went unlogged, one txn puts
+  // the baseline replog[S] (S = last(): no ops, cum_bytes = cum_bytes()), persists sys/repl_first = S + 1 (S
+  // itself was not logged, so no replica that lacks it may continue from it), deletes sys/repl_head and the
   // records below S (left from an earlier active period). It writes only keys a commit section never
   // writes, so it cannot conflict with one. Not fence-checked: a demoted node may be promoted later.
   Status Activate();
   bool active() const { return active_.load(std::memory_order_acquire); }
   // Dormant with unlogged commits: puts sys/repl_head = (last, cum) unless it already holds last. Under
-  // mu_, so an older head never overwrites a newer one. The trimmer thread calls it every tick, and the
+  // mu_, so an older head never overwrites a newer one. No drain: it writes the published pair, which never
+  // covers a seq still in flight. The trimmer thread calls it every tick, and the
   // app at a clean shutdown; a crash loses at most the commits since (the replid rotates at the next
   // master start, and a replica beyond the history's end gets a full resync).
   Status PersistHead();
   bool load_incomplete() const { return load_incomplete_.load(std::memory_order_acquire); }
-  // A replica's full-sync load (M6b D5). Each commits `txn` (already holding that step's keyspace writes)
-  // under mu_. Start and End require the fence (kInternal otherwise).
+  // A replica's full-sync load (M6b D5). Each drains the window, then commits `txn` (already holding that
+  // step's keyspace writes) under mu_. Start and End require the fence (kInternal otherwise).
   // Start: + DeleteRange(the whole replog), Delete(sys/repl_first), Delete(sys/repl_baseline_unknown),
   // Delete(sys/repl_head), Put(the marker). Then last = cum = 0, first = 1, and the log is active.
   Status CommitLoadStart(WriteTxn& txn);
@@ -132,22 +147,36 @@ class ReplLog {
   Status CommitLoadAbort(WriteTxn& txn);
 
  private:
+  // A seq of the dormant publication window (last_+1 .. next_-1) whose commit runs outside mu_.
+  enum class SlotState : uint8_t { kPending, kDone, kFailed };
+  struct Slot {
+    SlotState state = SlotState::kPending;
+    size_t size = 0;  // the batch's encoded size: what cum_ advances by once the slot publishes
+  };
+
   // Requires mu_: puts replog[seq] = record on txn, commits it and publishes seq.
   Status AppendAndCommit(WriteTxn& txn, uint64_t seq, std::string_view record, uint64_t cum);
-  // Requires mu_, dormant: commits txn as seq (of encoded size `size`) without a record.
+  // Requires mu_, dormant, !unlogged_: commits txn as seq (of encoded size `size`) without a record,
+  // carrying sys/repl_head; serialized like an active commit.
   Status CommitUnlogged(WriteTxn& txn, uint64_t seq, size_t size);
+  // Dormant and unlogged_: draws seq into the window, commits txn without mu_, then finishes the slot.
+  Status CommitWindowed(std::unique_lock<std::mutex>& lock, WriteTxn& txn, size_t size, uint64_t* seq);
+  // Requires mu_: waits (releasing mu_) until every drawn seq has finished; new draws wait meanwhile.
+  void DrainLocked(std::unique_lock<std::mutex>& lock);
+  // Requires mu_: marks seq's slot done or failed and publishes the window's finished front.
+  void FinishLocked(uint64_t seq, bool ok);
   Status RecoverLast(ReadView& view, uint64_t* last, uint64_t* cum);
   Status RecoverFirst(ReadView& view, uint64_t last, uint64_t* first);
   Status RecoverLoadMarker(ReadView& view, bool* incomplete);
   Status RecoverHead(ReadView& view, bool* found, uint64_t* seq, uint64_t* cum);
-  Status ActivateLocked();            // requires mu_
-  Status TrimLocked(uint64_t up_to);  // requires mu_
-  // Requires mu_: the in-memory log after a load step committed.
+  Status ActivateLocked(std::unique_lock<std::mutex>& lock);              // requires mu_; drains first
+  Status TrimLocked(std::unique_lock<std::mutex>& lock, uint64_t up_to);  // requires mu_; drains first
+  // Requires mu_ and a drained window: the in-memory log after a load step committed.
   void SetBaselineLocked(uint64_t last, uint64_t cum, uint64_t first);
 
   Storage& storage_;
   const Clock& clock_;
-  mutable std::mutex mu_;  // the commit section
+  mutable std::mutex mu_;  // seq draws, publication, and the serialized commit sections
   mutable std::condition_variable advanced_;
   std::atomic<uint64_t> last_{0};
   std::atomic<uint64_t> first_{1};
@@ -159,6 +188,12 @@ class ReplLog {
   std::atomic<bool> active_{true};
   bool unlogged_ = false;  // guarded by mu_: last_ is in no record; sys/repl_head is on disk, past them
   uint64_t head_seq_ = 0;  // guarded by mu_: the seq sys/repl_head holds (meaningful while unlogged_)
+  // The publication window, all guarded by mu_. Invariant: next_ == last_ + 1 + window_.size(); the window
+  // is non-empty only while dormant and unlogged_.
+  std::deque<Slot> window_;            // seqs last_+1 .. next_-1, in order
+  uint64_t next_ = 1;                  // the next seq to draw
+  int drainers_ = 0;                   // threads in DrainLocked; draws wait while > 0
+  std::condition_variable window_cv_;  // the window emptied, or a drainer left
 };
 
 }  // namespace tideskv
