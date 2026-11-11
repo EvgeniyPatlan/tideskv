@@ -180,7 +180,7 @@ diff --git a/src/memtable/commit_gate.h b/src/memtable/commit_gate.h
 new file mode 100644
 --- /dev/null
 +++ b/src/memtable/commit_gate.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,125 @@
 +/**
 + *
 + * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
@@ -209,17 +209,21 @@ new file mode 100644
 + * G2 sequence separation -- every sequence in memtable g is below every sequence in memtable g+1.
 + *    the draw and the apply are both inside the gate and the swap is exclusive, so once a close
 + *    returns every drawn sequence is applied (or decided aborted), and every later draw is higher.
++ *    the one exception is a prepare, which leaves before marking its sequence aborted; that
++ *    sequence never carries a version, and the mark after the leave never blocks.
 + * G3 no wait cycle -- a holder waits only on the WAL flush thread (ring space, durability), the
-+ *    value log and the skip list; never on rotate_lock, a flush, admission pacing or the visibility
-+ *    watermark. admission pacing and the claims come before enter, wait_visible after leave, and
-+ *    nothing inside the gate takes rotate_lock (the commit-path rotation runs after the commit
-+ *    returns). the rotator holds rotate_lock and then closes the gate, so there is one closer.
++ *    value log, the skip list and validation's source reads; never on rotate_lock, a flush,
++ *    admission pacing or the visibility watermark. admission pacing and the claims come before
++ *    enter, wait_visible after leave, and nothing inside the gate takes rotate_lock (the
++ *    commit-path rotation runs after the commit returns). the rotator holds rotate_lock and then
++ *    closes the gate, so there is one closer.
 + * G4 unchanged contract -- a commit still returns only once durable per the sync mode and visible.
 + *
 + * caveats:
 + * - ring pacing (l0_pace_against_ring, a usleep inside the WAL append) runs inside the gate. it is
 + *   not a cycle, since the ring drains on its own thread, but a rotation can wait out a paced
-+ *   commit.
++ *   commit. validation (txn_validate, txn_validate_writes) also runs inside and may read sstables,
++ *   which a rotation likewise waits out.
 + * - a prepare leaves right after its PREPARE record (and the reads record ahead of it), since no
 + *   apply follows in that call. its sequence never carries a version, so G2 is not at stake.
 + *
@@ -227,7 +231,9 @@ new file mode 100644
 + * with the closer's seq_cst store of closed and load of inflight. an arrival that finds the gate
 + * closed undoes its add, wakes the closer if it was the last one in, and waits for the open. this
 + * is writer-preferring by construction: a plain pthread rwlock prefers readers and would starve the
-+ * rotator under continuous commits, and tdb_wprwlock_t takes a mutex on every enter */
++ * rotator under continuous commits, and tdb_wprwlock_t takes a mutex on every enter. arrivals get
++ * no fairness: one woken by an open can be turned away by the next close, which is bounded by the
++ * rotation rate, since rotations are serialised and each needs a full memtable or a forced flush */
 +
 +/**
 + * tdb_commit_gate_t
@@ -704,7 +710,7 @@ diff --git a/test/commit_gate__tests.c b/test/commit_gate__tests.c
 new file mode 100644
 --- /dev/null
 +++ b/test/commit_gate__tests.c
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,512 @@
 +/**
 + *
 + * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
@@ -873,6 +879,7 @@ new file mode 100644
 +{
 +    tdb_commit_gate_t *gate;
 +    _Atomic(int) *stop;
++    _Atomic(int) *holders; /* loopers past enter and not yet at leave */
 +} cg_looper_arg_t;
 +
 +static void *cg_looper(void *arg)
@@ -881,21 +888,27 @@ new file mode 100644
 +    while (!atomic_load(a->stop))
 +    {
 +        tdb_commit_gate_enter(a->gate);
++        atomic_fetch_add(a->holders, 1);
 +        usleep(CG_PREF_HOLD_US);
++        atomic_fetch_sub(a->holders, 1);
 +        tdb_commit_gate_leave(a->gate);
 +    }
 +    return NULL;
 +}
 +
 +/* commits arriving without pause never starve a rotation: the closed flag turns them away, so a
-+ * close waits only for the ones already inside */
++ * close waits only for the ones already inside. what a close guarantees is that no one is past the
++ * gate, counted here by the loopers themselves -- inflight may still hold an arrival that has seen
++ * the closed flag and is backing out */
 +void test_writer_preference(void)
 +{
 +    tdb_commit_gate_t g;
 +    ASSERT_EQ(tdb_commit_gate_init(&g), 0);
 +    _Atomic(int) stop;
 +    atomic_init(&stop, 0);
-+    cg_looper_arg_t arg = {.gate = &g, .stop = &stop};
++    _Atomic(int) holders;
++    atomic_init(&holders, 0);
++    cg_looper_arg_t arg = {.gate = &g, .stop = &stop, .holders = &holders};
 +    pthread_t t[CG_PREF_THREADS];
 +    for (int i = 0; i < CG_PREF_THREADS; i++)
 +        ASSERT_EQ(pthread_create(&t[i], NULL, cg_looper, &arg), 0);
@@ -907,7 +920,7 @@ new file mode 100644
 +        const uint64_t from = tdb_monotonic_us();
 +        tdb_commit_gate_close(&g);
 +        const uint64_t took = tdb_monotonic_us() - from;
-+        ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++        ASSERT_EQ(atomic_load(&holders), 0);
 +        tdb_commit_gate_open(&g);
 +        if (took > worst) worst = took;
 +        ASSERT_TRUE(took < CG_PREF_CLOSE_US);
