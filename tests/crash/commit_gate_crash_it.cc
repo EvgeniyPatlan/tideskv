@@ -32,6 +32,7 @@ constexpr int kValueLen = 100;
 constexpr int kDefaultIters = 3;
 constexpr int kKillBaseMs = 300;
 constexpr int kKillJitterMs = 1500;
+constexpr int kFirstAckTimeoutS = 30;  // bound on the wait for the first acknowledged commit
 constexpr int kFlushEveryUs = 3000;
 constexpr size_t kAckSlack = 200;  // txns past the ack to inspect: committed but not yet acknowledged
 constexpr int kChildSetupFailed = 3;
@@ -240,6 +241,13 @@ void RunScenario(const Scenario& sc) {
     const pid_t pid = fork();
     ASSERT_GE(pid, 0) << "fork failed";
     if (pid == 0) RunChild(db_path, ack_paths, sc);
+    // the kill delay counts from the first acknowledged commit, not from the fork: on a loaded host
+    // the child's open alone can outlast the delay. A child that never acks within the bound falls
+    // through and fails the progress assert below
+    const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kFirstAckTimeoutS);
+    while (SumAcks(ack_paths) == 0 && std::chrono::steady_clock::now() < ack_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(kill_after_ms));
     // read before the kill: a child that never got past open would pass every check below with
     // nothing acknowledged, so the round has to show it was killed mid-commit, not before one
