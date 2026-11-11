@@ -46,6 +46,9 @@ struct ConfigValues {
   // B1: a plain SET may skip its pre-write read of a key the special-key filter says never was a
   // collection or had a TTL (runtime; "no" makes every SET read, as before).
   bool blind_set = true;
+  // B3: each TidesDB memtable keeps a whole-key bloom (1/64 of memtable-size, at least 64 KB) so a point
+  // read skips the memtables that cannot hold its key (startup only).
+  bool memtable_bloom = true;
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   int64_t busy_reply_threshold_ms = 5000;  // busy-reply-threshold / lua-time-limit (M5b)

@@ -89,6 +89,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   so.l0_stall_threshold = v.l0_stall_threshold;
   so.btree_block_size = v.btree_block_size;
   so.compression_start_level = v.compression_start_level;
+  so.memtable_bloom = v.memtable_bloom;
   so.compression = v.compression == "zstd" ? Compression::kZstd
                    : v.compression == "no" ? Compression::kNone
                                            : Compression::kLz4;

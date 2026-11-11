@@ -443,6 +443,7 @@ Settings are read in this order, and later sources win:
 | `sync-interval-us` | `1000000` | no | fsync period for `interval` |
 | `block-cache-size` | `4gb` | no | TidesDB read cache |
 | `memtable-size` | `64mb` | no | TidesDB write buffer; queued memtables can reach 64 x this (4 GB by default) before writes block |
+| `memtable-bloom` | `yes` | no | Give each memtable a whole-key bloom filter, so a point read (`GET`, the read before a write) skips the memtables that cannot hold its key instead of searching each one. Each filter takes 1/64 of `memtable-size` (1 MB at the default), at least 64 KB, on top of it; `no` searches every memtable |
 | `l1-file-count-trigger` | `8` | no | Flush-tier tables per column family that start a merge |
 | `l0-stall-threshold` | `64` | no | Write backpressure: throttle from half this backlog (unflushed memtables or flush-tier tables), block at it |
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |

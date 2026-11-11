@@ -45,7 +45,10 @@ set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-test-load.patch"
   # an iterator opens a level run's table cursors only as a seek or step reaches each table, and asks
   # the run's intervals from the tables it pinned rather than through their cursors
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-lazy-level-cursors.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-lazy-level-cursors.patch"
+  # memtable_whole_key_bloom: each memtable keeps a whole-key bloom in front of its skip list, so a point
+  # read skips the memtables that cannot hold its key instead of descending each one's skip list
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-memtable-bloom.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

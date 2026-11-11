@@ -59,6 +59,9 @@ struct StorageOptions {
   size_t btree_block_size = 0;
   int compression_start_level = 0;
   Compression compression = Compression::kLz4;
+  // A whole-key bloom in front of each memtable's skip list (TidesDB memtable_whole_key_bloom): point reads
+  // skip the memtables that cannot hold the key. Costs 1/64 of memtable_size per memtable, at least 64 KB.
+  bool memtable_bloom = false;
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.

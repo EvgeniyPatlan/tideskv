@@ -60,6 +60,20 @@ TEST(Config, BlindSetRuntimeToggle) {
   EXPECT_TRUE(s.special_keys_.enabled());
 }
 
+TEST(Config, MemtableBloomDefaultsYesStartupOnly) {
+  EXPECT_TRUE(Config().Snapshot().memtable_bloom);
+  const auto got = Config().Get("memtable-bloom");
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].second, "yes");
+  Config c;
+  ASSERT_TRUE(c.Set("memtable-bloom", "no", /*at_runtime=*/false).ok());
+  EXPECT_FALSE(c.Snapshot().memtable_bloom);
+  EXPECT_EQ(c.Get("memtable-bloom")[0].second, "no");
+  EXPECT_FALSE(c.Set("memtable-bloom", "maybe", false).ok());
+  EXPECT_FALSE(c.Set("memtable-bloom", "yes", /*at_runtime=*/true).ok());  // startup only
+  EXPECT_FALSE(c.Snapshot().memtable_bloom);
+}
+
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
   test::TempDir dir;
   Config c;
@@ -170,7 +184,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 49u);
+  EXPECT_EQ(c.Get("*").size(), 50u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {

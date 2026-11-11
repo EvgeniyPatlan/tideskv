@@ -1,0 +1,1020 @@
+diff --git a/include/db.h b/include/db.h
+index 5b31af7..bc97753 100644
+--- a/include/db.h
++++ b/include/db.h
+@@ -370,6 +370,11 @@ typedef struct tidesdb_column_family_config_t
+  * snapshot and its write reservations, which keeps the reclamation floor down and stops compaction
+  * dropping old versions, so a caller that may leak transactions should bound them. a single
+  * transaction can override this with tidesdb_txn_set_timeout
++ * @param memtable_whole_key_bloom non-zero to give every memtable a whole-key bloom filter in front
++ * of its skip list, so a point read passes over a memtable that cannot hold its key without
++ * searching it. each memtable's filter takes a sixty-fourth of memtable_write_buffer_size, at least
++ * 64 KiB, on top of that budget; it pays off where most point reads miss the memtables. 0, the
++ * default, searches every memtable as before
+  */
+ typedef struct tidesdb_config_t
+ {
+@@ -391,6 +396,7 @@ typedef struct tidesdb_config_t
+     int memtable_l0_queue_stall_threshold;
+     int memtable_idle_flush_seconds;
+     int64_t txn_timeout_seconds;
++    int memtable_whole_key_bloom;
+ } tidesdb_config_t;
+ 
+ /* ===== statistics ===== */
+diff --git a/src/db.c b/src/db.c
+index 232504d..3602c0e 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -81,6 +81,7 @@ tidesdb_config_t tidesdb_default_config(void)
+     c.vlog_segment_size = TDB_DEFAULT_VLOG_SEGMENT_SIZE;
+     c.memtable_l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL;
+     c.memtable_idle_flush_seconds = TDB_DEFAULT_IDLE_FLUSH_SECONDS;
++    c.memtable_whole_key_bloom = 0;
+     return c;
+ }
+ 
+diff --git a/src/engine/engine_internal.h b/src/engine/engine_internal.h
+index 69d2ae1..a3c2ca7 100644
+--- a/src/engine/engine_internal.h
++++ b/src/engine/engine_internal.h
+@@ -73,6 +73,14 @@ int engine_drop_cf_locked(tidesdb_t *db, const char *name);
+  */
+ int engine_durable_sync_mode(int sync_mode);
+ 
++/**
++ * engine_memtable_bloom_bytes
++ * the whole-key filter each memtable this database creates gets, from its config
++ * @param db the database
++ * @return the filter size in bytes, or 0 when memtable_whole_key_bloom is off
++ */
++size_t engine_memtable_bloom_bytes(const tidesdb_t *db);
++
+ /**
+  * engine_open_wal
+  * open a WAL for a memtable generation in buffered append mode
+diff --git a/src/engine/engine_l0.c b/src/engine/engine_l0.c
+index 88db33b..2d390ce 100644
+--- a/src/engine/engine_l0.c
++++ b/src/engine/engine_l0.c
+@@ -353,11 +353,11 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
+     cost->gen = gen;
+     const uint64_t mt_from = engine_monotonic_us();
+     tidesdb_memtable_t *new_mt =
+-        new_wal == NULL
+-            ? NULL
+-            : tidesdb_memtable_create(new_wal, gen, gen, db->config.memtable_skip_list_max_level,
+-                                      db->config.memtable_skip_list_probability, &db->now_seconds,
+-                                      db->arena);
++        new_wal == NULL ? NULL
++                        : tidesdb_memtable_create_with_bloom(
++                              new_wal, gen, gen, db->config.memtable_skip_list_max_level,
++                              db->config.memtable_skip_list_probability, &db->now_seconds,
++                              db->arena, engine_memtable_bloom_bytes(db));
+     cost->create_us = engine_monotonic_us() - mt_from;
+ 
+     const uint64_t pub_from = engine_monotonic_us();
+@@ -381,6 +381,12 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
+     return TDB_ERR_IO;
+ }
+ 
++size_t engine_memtable_bloom_bytes(const tidesdb_t *db)
++{
++    if (!db->config.memtable_whole_key_bloom) return 0;
++    return tidesdb_memtable_bloom_bytes(db->config.memtable_write_buffer_size);
++}
++
+ void engine_maybe_rotate(tidesdb_t *db)
+ {
+     if (!tidesdb_l0_active_full(db->l0)) return;
+diff --git a/src/engine/engine_recovery.c b/src/engine/engine_recovery.c
+index 3e0f800..ad5d06e 100644
+--- a/src/engine/engine_recovery.c
++++ b/src/engine/engine_recovery.c
+@@ -654,9 +654,12 @@ static int engine_install_generation(tidesdb_t *db, uint64_t gen, int is_first,
+     const int orc =
+         sealed ? engine_open_wal_sealed(db, wal_path, &wal) : engine_open_wal(db, wal_path, &wal);
+     if (orc != 0) return TDB_ERR_IO;
+-    tidesdb_memtable_t *mt = tidesdb_memtable_create(
++    /* a replayed generation takes its records through the same apply a live commit does, so the
++     * filter it is created with holds every key it replays */
++    tidesdb_memtable_t *mt = tidesdb_memtable_create_with_bloom(
+         wal, gen, gen, db->config.memtable_skip_list_max_level,
+-        db->config.memtable_skip_list_probability, &db->now_seconds, db->arena);
++        db->config.memtable_skip_list_probability, &db->now_seconds, db->arena,
++        engine_memtable_bloom_bytes(db));
+     if (!mt)
+     {
+         engine_close_wal(db, wal);
+diff --git a/src/internal/types.h b/src/internal/types.h
+index fd25c3a..e765076 100644
+--- a/src/internal/types.h
++++ b/src/internal/types.h
+@@ -68,6 +68,11 @@
+  * @param seq_floor the high sequence of the memtable this one replaced, set by the rotation while
+  * the commit gate is closed. every sequence applied here must be above it (G2 in
+  * memtable/commit_gate.h); one that is not is counted, never refused. in memory only
++ * @param bloom the whole-key bloom over every prefixed key this memtable's skip list has taken, a
++ * point read's way past a memtable that cannot hold its key; NULL when the database runs without
++ * one (memtable/memtable_bloom.h). fixed at create, before the memtable is reachable
++ * @param bloom_blocks how many 64-byte blocks bloom holds, 0 with no bloom
++ * @param bloom_mem the allocation bloom is aligned within, which the free releases
+  */
+ typedef struct tidesdb_memtable_t
+ {
+@@ -85,6 +90,9 @@ typedef struct tidesdb_memtable_t
+     tdb_wprwlock_t range_tombstone_lock;
+     _Atomic(uint64_t) high_seq;
+     _Atomic(uint64_t) seq_floor;
++    _Atomic(uint64_t) *bloom;
++    uint32_t bloom_blocks;
++    void *bloom_mem;
+ } tidesdb_memtable_t;
+ 
+ #endif /* __TIDESDB_INTERNAL_TYPES_H__ */
+diff --git a/src/memtable/l0_internal.h b/src/memtable/l0_internal.h
+index 5ea5a77..b198f0d 100644
+--- a/src/memtable/l0_internal.h
++++ b/src/memtable/l0_internal.h
+@@ -49,6 +49,15 @@ tidesdb_memtable_t *l0_pin_active_read(tidesdb_l0_t *l0);
+  */
+ void l0_unpin_read(tidesdb_memtable_t *mt);
+ 
++/**
++ * tidesdb_l0_skiplist_probes
++ * how many skip list point lookups the L0 read path has made in this process, a relaxed running
++ * count summed over per-thread stripes. a test reads it before and after a batch of gets to learn
++ * how many memtables the whole-key filter let through; nothing in the engine reads it
++ * @return the count so far
++ */
++uint64_t tidesdb_l0_skiplist_probes(void);
++
+ /**
+  * l0_pending_node_t
+  * one immutable awaiting a quiet moment to be freed
+diff --git a/src/memtable/l0_read.c b/src/memtable/l0_read.c
+index 6a5beb7..576a0d7 100644
+--- a/src/memtable/l0_read.c
++++ b/src/memtable/l0_read.c
+@@ -11,6 +11,7 @@
+ #include "base/encoding/serialization.h" /* tdb_build_prefixed_key, TDB_CF_PREFIX_SIZE */
+ #include "base/errors.h"                 /* TDB_ERR_BUSY */
+ #include "l0_internal.h"
++#include "memtable_bloom.h" /* the whole-key filter a point read asks before the skip list */
+ 
+ /* the L0 read path -- resolving one key against the active memtable and the sealed immutables at a
+  * snapshot ceiling. it answers with the newest version at or below that ceiling, which is either a
+@@ -22,6 +23,38 @@
+  */
+ #define TDB_L0_IMMUTABLE_SNAP_TRIES 8
+ 
++/* the skip list lookup count is striped over cache lines, a thread keeping to one stripe, so the
++ * read path every worker runs does not bounce one shared line on every get */
++#define TDB_L0_PROBE_STRIPES     64
++#define TDB_L0_PROBE_STRIPE_SIZE 64
++
++typedef struct
++{
++    _Atomic(uint64_t) n;
++    uint8_t pad[TDB_L0_PROBE_STRIPE_SIZE - sizeof(_Atomic(uint64_t))];
++} l0_probe_stripe_t;
++
++static l0_probe_stripe_t l0_probe_stripes[TDB_L0_PROBE_STRIPES];
++static _Atomic(unsigned) l0_probe_next_stripe;
++static _Thread_local int l0_probe_stripe = -1;
++
++static void l0_count_probe(void)
++{
++    if (l0_probe_stripe < 0)
++        l0_probe_stripe =
++            (int)(atomic_fetch_add_explicit(&l0_probe_next_stripe, 1, memory_order_relaxed) %
++                  TDB_L0_PROBE_STRIPES);
++    atomic_fetch_add_explicit(&l0_probe_stripes[l0_probe_stripe].n, 1, memory_order_relaxed);
++}
++
++uint64_t tidesdb_l0_skiplist_probes(void)
++{
++    uint64_t total = 0;
++    for (int i = 0; i < TDB_L0_PROBE_STRIPES; i++)
++        total += atomic_load_explicit(&l0_probe_stripes[i].n, memory_order_relaxed);
++    return total;
++}
++
+ /* the visibility predicate the skip list consults per version, so an abandoned commit's entries are
+  * skipped in favour of an older visible version rather than hiding the key outright */
+ static int l0_version_visible(void *ctx, uint64_t seq)
+@@ -75,10 +108,20 @@ static int l0_read_mt(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt, const uint
+     if (seq_floor > 0 && atomic_load_explicit(&mt->high_seq, memory_order_acquire) <= seq_floor)
+         return -1;
+ 
++    /* a memtable whose filter rules the key out holds no version of it, so the descent is skipped
++     * and the read goes on as a skip list miss would. the range tombstones below are not in the
++     * filter and are asked either way (memtable/memtable_bloom.h says why a filter answer is never
++     * staler than the skip list's) */
+     uint64_t seq = 0;
+-    const int rc =
+-        skip_list_get_with_seq(mt->skip_list, pkey, pkey_size, value, value_size, vlog_id, ttl,
+-                               deleted, &seq, snapshot, l0_version_visible, (void *)l0);
++    int rc = -1;
++    if (tidesdb_memtable_bloom_may_contain(mt, pkey, pkey_size))
++    {
++        l0_count_probe();
++        rc = skip_list_get_with_seq(mt->skip_list, pkey, pkey_size, value, value_size, vlog_id, ttl,
++                                    deleted, &seq, snapshot, l0_version_visible, (void *)l0);
++    }
++    else if (vlog_id)
++        *vlog_id = 0;
+ 
+     /* a range tombstone deletes the key from its own sequence on, so it beats a version older than
+      * itself and loses to a newer one. that is the ordinary contest between two versions of a key,
+diff --git a/src/memtable/memtable.c b/src/memtable/memtable.c
+index 9bdd9df..083783a 100644
+--- a/src/memtable/memtable.c
++++ b/src/memtable/memtable.c
+@@ -15,6 +15,7 @@
+ #include "base/log.h"                    /* TDB_DEBUG_LOG for the admission trace */
+ #include "base/waitstat.h"               /* tdb_wait_deadline and the condvar clock it pairs with */
+ #include "l0_internal.h"
++#include "memtable_bloom.h" /* the whole-key filter every put sets before its skip list insert */
+ 
+ /* a writer the policy blocks re-reads L0 pressure on this cadence, for at most this many reads. the
+  * product is the ceiling a single write can be held for, after which it is admitted regardless --
+@@ -34,15 +35,61 @@
+  * key_size + varint value_size */
+ #define TDB_L0_WAL_REC_MAX_HEADER (TDB_L0_WAL_MAX_VARINT * 4 + 1)
+ 
++size_t tidesdb_memtable_bloom_bytes(const size_t write_buffer_size)
++{
++    const size_t share = write_buffer_size / TDB_MEMTABLE_BLOOM_BUFFER_SHARE;
++    return share > TDB_MEMTABLE_BLOOM_MIN_BYTES ? share : TDB_MEMTABLE_BLOOM_MIN_BYTES;
++}
++
++/* give a memtable a zeroed filter of about bytes, in whole cache-line blocks on a cache-line
++ * boundary so a probe touches one line */
++static int memtable_bloom_alloc(tidesdb_memtable_t *mt, const size_t bytes)
++{
++    mt->bloom = NULL;
++    mt->bloom_blocks = 0;
++    mt->bloom_mem = NULL;
++    if (bytes == 0) return 0;
++
++    size_t blocks = bytes / TDB_MEMTABLE_BLOOM_BLOCK_BYTES;
++    if (blocks == 0) blocks = 1;
++    if (blocks > UINT32_MAX) blocks = UINT32_MAX;
++    void *mem = calloc(1, blocks * TDB_MEMTABLE_BLOOM_BLOCK_BYTES + TDB_MEMTABLE_BLOOM_BLOCK_BYTES);
++    if (!mem) return -1;
++    const uintptr_t aligned = ((uintptr_t)mem + TDB_MEMTABLE_BLOOM_BLOCK_BYTES - 1) &
++                              ~(uintptr_t)(TDB_MEMTABLE_BLOOM_BLOCK_BYTES - 1);
++    mt->bloom_mem = mem;
++    mt->bloom = (_Atomic(uint64_t) *)aligned;
++    mt->bloom_blocks = (uint32_t)blocks;
++    return 0;
++}
++
+ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, uint64_t generation,
+                                             int max_level, float probability, _Atomic(int64_t) *now,
+                                             arena_pool_t *pool)
++{
++    return tidesdb_memtable_create_with_bloom(wal, id, generation, max_level, probability, now,
++                                              pool, 0);
++}
++
++tidesdb_memtable_t *tidesdb_memtable_create_with_bloom(block_manager_t *wal, uint64_t id,
++                                                       uint64_t generation, int max_level,
++                                                       float probability, _Atomic(int64_t) *now,
++                                                       arena_pool_t *pool, size_t bloom_bytes)
+ {
+     tidesdb_memtable_t *mt = malloc(sizeof(*mt));
+     if (!mt) return NULL;
+ 
++    /* the filter is complete before the memtable can be reached, so no reader or writer ever sees
++     * the pointer change */
++    if (memtable_bloom_alloc(mt, bloom_bytes) != 0)
++    {
++        free(mt);
++        return NULL;
++    }
++
+     if (skip_list_new_with_arena(&mt->skip_list, max_level, probability, now, pool) != 0)
+     {
++        free(mt->bloom_mem);
+         free(mt);
+         return NULL;
+     }
+@@ -67,6 +114,7 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
+     if (tdb_wprwlock_init(&mt->range_tombstone_lock) != 0)
+     {
+         skip_list_free(mt->skip_list);
++        free(mt->bloom_mem);
+         free(mt);
+         return NULL;
+     }
+@@ -79,6 +127,7 @@ void tidesdb_memtable_free(tidesdb_memtable_t *mt)
+     if (mt->skip_list) skip_list_free(mt->skip_list);
+     range_tombstone_set_free(mt->range_tombstones);
+     tdb_wprwlock_destroy(&mt->range_tombstone_lock);
++    free(mt->bloom_mem);
+     free(mt);
+ }
+ 
+@@ -396,6 +445,7 @@ int tidesdb_l0_put(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size
+ 
+     /* wal append before apply so the record is durable before it becomes visible */
+     int created = 0;
++    tidesdb_memtable_bloom_add(mt, pkey, pkey_size); /* before the insert: memtable_bloom.h */
+     int rc = l0_wal_append_kv(atomic_load_explicit(&mt->wal, memory_order_acquire), pkey, pkey_size,
+                               value, value_size, ttl, seq, flags);
+     if (rc == TDB_SUCCESS &&
+@@ -475,6 +525,7 @@ static int l0_apply_entry(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *ke
+     /* the txn backend already wrote this entry to the WAL as part of the commit batch, so apply
+      * only makes it visible in the skip_list */
+     int created = 0;
++    tidesdb_memtable_bloom_add(mt, pkey, pkey_size); /* before the insert: memtable_bloom.h */
+     const int put = vlog_id != 0
+                         ? skip_list_put_reference_with_seq(mt->skip_list, pkey, pkey_size, vlog_id,
+                                                            value_size, ttl, seq, flags, &created)
+diff --git a/src/memtable/memtable.h b/src/memtable/memtable.h
+index 48a2a4e..e2d6c02 100644
+--- a/src/memtable/memtable.h
++++ b/src/memtable/memtable.h
+@@ -48,6 +48,35 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
+                                             int max_level, float probability, _Atomic(int64_t) *now,
+                                             arena_pool_t *pool);
+ 
++/**
++ * tidesdb_memtable_create_with_bloom
++ * tidesdb_memtable_create, with a whole-key filter in front of the skip list so a point read skips
++ * this memtable when the key cannot be in it (memtable/memtable_bloom.h)
++ * @param wal the open write-ahead log block manager this memtable appends to
++ * @param id unique identifier for this memtable
++ * @param generation rotation generation counter
++ * @param max_level skip_list maximum level
++ * @param probability skip_list level probability
++ * @param now borrowed db-wide clock, as tidesdb_memtable_create takes it
++ * @param pool borrowed chunk pool the list's node arena draws from, or NULL
++ * @param bloom_bytes the filter's size in bytes, rounded down to whole 64-byte blocks; 0 for none
++ * @return the memtable, or NULL on allocation failure (the caller keeps ownership of wal)
++ */
++tidesdb_memtable_t *tidesdb_memtable_create_with_bloom(block_manager_t *wal, uint64_t id,
++                                                       uint64_t generation, int max_level,
++                                                       float probability, _Atomic(int64_t) *now,
++                                                       arena_pool_t *pool, size_t bloom_bytes);
++
++/**
++ * tidesdb_memtable_bloom_bytes
++ * the filter a memtable of a database with this write buffer gets: a sixty-fourth of the buffer,
++ * and never under 64 KiB. about one bit per eight bytes of buffer, which at the hundred-odd bytes a
++ * small entry costs is a dozen bits a key
++ * @param write_buffer_size the database's memtable rotation threshold in bytes
++ * @return the filter size in bytes
++ */
++size_t tidesdb_memtable_bloom_bytes(size_t write_buffer_size);
++
+ /**
+  * tidesdb_memtable_free
+  * free a memtable pairing, freeing its skip_list; the WAL is not closed here since its lifetime is
+diff --git a/src/memtable/memtable_bloom.h b/src/memtable/memtable_bloom.h
+new file mode 100644
+index 0000000..457ebdd
+--- /dev/null
++++ b/src/memtable/memtable_bloom.h
+@@ -0,0 +1,148 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++#ifndef __TIDESDB_MEMTABLE_BLOOM_H__
++#define __TIDESDB_MEMTABLE_BLOOM_H__
++
++#include <stdatomic.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "../internal/types.h"
++#include "xxhash.h"
++
++/* the whole-key bloom a memtable keeps in front of its skip list, so a point read skips a memtable
++ * that cannot hold its key instead of descending the list to learn that. most point reads miss the
++ * memtables -- the key lives in an sstable, or nowhere -- and the descent is a cache miss per
++ * level.
++ *
++ * the filter is blocked: an array of 512-bit blocks, each key hashed to one block and to six bits
++ * inside it, so a probe reads one cache line. the words are atomics written with a relaxed
++ * fetch-or and read with relaxed loads. it is set over the prefixed key, the form the skip list
++ * sorts on, so one filter serves every column family. it is never cleared: the memtable is
++ * write-once and freed whole.
++ *
++ * why a read never misses a key the skip list would have shown it:
++ *  - a write sets the key's bits before the skip list insert, on the same thread, so the bits are
++ *    sequenced before the insert and before everything the commit does after it -- raising the
++ *    memtable's high sequence (release), leaving the commit gate, and marking its sequence decided
++ *    in the clock's ring (release, src/txn/mvcc.c). commits overlap under the gate, but each one's
++ *    bits are sequenced before its own mark, and whichever committer carries the watermark over a
++ *    sequence first loads that sequence's slot with acquire, then moves visible_seq with an acq_rel
++ *    swap -- so the watermark passes a sequence only once every commit at or below it has marked,
++ *    and the chain mark -> slot load -> swap -> a reader's acquire of visible_seq orders the bits
++ *    before the read. a reader that acquires visible sequence S therefore happens-after the bit
++ *    sets of every commit at or below S, and its relaxed loads of
++ *    those words see the bits (read-after-write coherence; the words only ever gain bits). a commit
++ *    above S may or may not show in the filter, and the skip list would hide it at snapshot S
++ *    anyway. a read at the latest sequence (UINT64_MAX) that races a commit is free to see it or
++ *    not, with or without the filter, exactly as a skip list descent racing the insert is.
++ *  - a writer that finds its bits already set by another writer skips the store. the load that
++ *    found them read-from that writer's fetch-or, and coherence carries it to any reader ordered
++ *    after this writer's publication, so the skip changes nothing above.
++ *  - a conflict probe (tidesdb_l0_has_newer) runs on the same footing: it only trusts a memtable's
++ *    answer for commits that raised its high sequence before giving up their claims, and the bits
++ *    are sequenced before that raise.
++ *  - rotation: a commit pins the active memtable and writes the bits and the skip list entry of
++ *    that one memtable, so whichever memtable holds the entry holds its bits. the rotation closes
++ * the commit gate exclusively, so no write is in flight into the old active once it is an
++ * immutable, and every write it took is already in its own filter.
++ *  - recovery: WAL replay applies its records through the same apply as a live commit
++ *    (tidesdb_l0_apply_entries), into memtables the engine created with a filter, so a replayed
++ *    memtable's filter holds every key it replayed.
++ *  - tombstones are skip list entries like any other and set bits; a range tombstone is not, and
++ *    the reader consults the memtable's interval set whatever the filter says.
++ *  - an abandoned commit leaves its bits set. that is a false positive, which costs one descent.
++ */
++
++/* the smallest filter a memtable gets, and the share of the write buffer one gets above it */
++#define TDB_MEMTABLE_BLOOM_MIN_BYTES    (64u * 1024u)
++#define TDB_MEMTABLE_BLOOM_BUFFER_SHARE 64u
++
++/* one block is a cache line of eight words, and a key sets this many of its 512 bits */
++#define TDB_MEMTABLE_BLOOM_BLOCK_BYTES 64u
++#define TDB_MEMTABLE_BLOOM_BLOCK_WORDS 8u
++#define TDB_MEMTABLE_BLOOM_PROBES      6
++#define TDB_MEMTABLE_BLOOM_BIT_BITS    9 /* log2 of the bits in a block */
++
++/* the second hash the in-block bits come from: splitmix64's finalizer over the key's hash, whose
++ * high half already picked the block */
++static inline uint64_t tdb_memtable_bloom_mix(uint64_t z)
++{
++    z ^= z >> 30;
++    z *= 0xbf58476d1ce4e5b9ULL;
++    z ^= z >> 27;
++    z *= 0x94d049bb133111ebULL;
++    z ^= z >> 31;
++    return z;
++}
++
++/* the block a hash lands in, scaled onto the block count rather than masked, so the count need not
++ * be a power of two */
++static inline _Atomic(uint64_t) *tdb_memtable_bloom_block(const tidesdb_memtable_t *mt,
++                                                          const uint64_t h)
++{
++    const uint64_t idx = ((h >> 32) * (uint64_t)mt->bloom_blocks) >> 32;
++    return mt->bloom + idx * TDB_MEMTABLE_BLOOM_BLOCK_WORDS;
++}
++
++/**
++ * tidesdb_memtable_bloom_add
++ * set a prefixed key's bits in the memtable's filter; called before the key's skip list insert
++ * @param mt the memtable, which may have no filter
++ * @param pkey the key with its column family prefix
++ * @param pkey_size length of pkey
++ */
++static inline void tidesdb_memtable_bloom_add(tidesdb_memtable_t *mt, const uint8_t *pkey,
++                                              const size_t pkey_size)
++{
++    if (!mt->bloom) return;
++    const uint64_t h = XXH3_64bits(pkey, pkey_size);
++    _Atomic(uint64_t) *block = tdb_memtable_bloom_block(mt, h);
++    uint64_t want[TDB_MEMTABLE_BLOOM_BLOCK_WORDS] = {0};
++    uint64_t g = tdb_memtable_bloom_mix(h);
++    for (int i = 0; i < TDB_MEMTABLE_BLOOM_PROBES; i++, g >>= TDB_MEMTABLE_BLOOM_BIT_BITS)
++    {
++        const unsigned bit = (unsigned)(g & ((1u << TDB_MEMTABLE_BLOOM_BIT_BITS) - 1u));
++        want[bit >> 6] |= 1ULL << (bit & 63u);
++    }
++    /* a word already holding its bits is left alone, so a hot key's line is read, not written */
++    for (unsigned w = 0; w < TDB_MEMTABLE_BLOOM_BLOCK_WORDS; w++)
++    {
++        if (want[w] == 0) continue;
++        const uint64_t cur = atomic_load_explicit(&block[w], memory_order_relaxed);
++        if ((cur & want[w]) != want[w])
++            atomic_fetch_or_explicit(&block[w], want[w], memory_order_relaxed);
++    }
++}
++
++/**
++ * tidesdb_memtable_bloom_may_contain
++ * whether the memtable's skip list may hold a prefixed key
++ * @param mt the memtable
++ * @param pkey the key with its column family prefix
++ * @param pkey_size length of pkey
++ * @return 0 when the filter rules the key out, 1 when it may be there or there is no filter
++ */
++static inline int tidesdb_memtable_bloom_may_contain(const tidesdb_memtable_t *mt,
++                                                     const uint8_t *pkey, const size_t pkey_size)
++{
++    if (!mt->bloom) return 1;
++    const uint64_t h = XXH3_64bits(pkey, pkey_size);
++    _Atomic(uint64_t) *block = tdb_memtable_bloom_block(mt, h);
++    uint64_t g = tdb_memtable_bloom_mix(h);
++    for (int i = 0; i < TDB_MEMTABLE_BLOOM_PROBES; i++, g >>= TDB_MEMTABLE_BLOOM_BIT_BITS)
++    {
++        const unsigned bit = (unsigned)(g & ((1u << TDB_MEMTABLE_BLOOM_BIT_BITS) - 1u));
++        if (!(atomic_load_explicit(&block[bit >> 6], memory_order_relaxed) & (1ULL << (bit & 63u))))
++            return 0;
++    }
++    return 1;
++}
++
++#endif /* __TIDESDB_MEMTABLE_BLOOM_H__ */
+diff --git a/test/memtable_bloom__tests.c b/test/memtable_bloom__tests.c
+new file mode 100644
+index 0000000..9a014da
+--- /dev/null
++++ b/test/memtable_bloom__tests.c
+@@ -0,0 +1,485 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the whole-key bloom a memtable keeps in front of its skip list (memtable/memtable_bloom.h). a
++ * point read must skip the skip list of a memtable that cannot hold its key, and must never skip
++ * one that does: not while a writer is committing and rotating under it, not past a point or range
++ * delete, not after the memtable was rebuilt from its log. with the filter off every memtable is
++ * searched, as before */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/base/encoding/serialization.h" /* tdb_build_prefixed_key */
++#include "../src/column_family/column_family.h" /* cf_t, the handle's cf index */
++#include "../src/engine/engine.h"               /* engine_force_rotate */
++#include "../src/engine/engine_types.h"         /* db->l0, db->flush_lock, db->active_wal_gen */
++#include "../src/memtable/l0_internal.h"        /* tidesdb_l0_skiplist_probes */
++#include "../src/memtable/memtable.h"
++#include "../src/memtable/memtable_bloom.h"
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++static const char *mb_exe = NULL;
++
++#define MB_DB_DIR     "." PATH_SEPARATOR "test_memtable_bloom_db"
++#define MB_CF         "cf0"
++#define MB_CHILD_FLAG "--memtable-bloom-child"
++#define MB_PHASE_FILL "fill"
++
++/* one memtable large enough to hold every key the absent-key case writes without rotating, so
++ * its filter is a megabyte: about 80 bits a key */
++#define MB_BIG_BUFFER (64u << 20)
++#define MB_KEYS       100000
++#define MB_BATCH      1000
++/* 100k absent gets against 100k keys in one filter; the false positives must stay this low */
++#define MB_ABSENT_PROBE_LIMIT 2000
++
++/* the concurrent case: small memtables so it rotates many times, one key per commit */
++#define MB_SMALL_BUFFER   (256u << 10)
++#define MB_CONC_KEYS      200000
++#define MB_MIN_ROTATIONS  3
++#define MB_LOCKED_RETRIES 1000
++
++/* the recovery case */
++#define MB_RECOVER_KEYS        10000
++#define MB_RECOVER_FP_LIMIT    200
++#define MB_RECOVER_ROUNDS      5
++#define MB_MAX_PINNED          64
++#define MB_RECOVER_SYNC_PERIOD (60ull * 1000 * 1000)
++
++#define MB_VALUE "value-for-the-bloom-tests"
++
++static void mb_key(char *buf, size_t cap, const char *prefix, int i)
++{
++    snprintf(buf, cap, "%s%08d", prefix, i);
++}
++
++static tidesdb_config_t mb_config(const int bloom, const size_t buffer)
++{
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = MB_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_write_buffer_size = buffer;
++    cfg.memtable_idle_flush_seconds = 0;
++    cfg.num_flush_threads = 1;
++    cfg.memtable_whole_key_bloom = bloom;
++    return cfg;
++}
++
++static tidesdb_t *mb_open(const tidesdb_config_t *cfg, const int create_cf,
++                          tidesdb_column_family_t **cf)
++{
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(cfg, &db), TDB_SUCCESS);
++    if (create_cf)
++    {
++        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++        const int rc = tidesdb_create_column_family(db, MB_CF, &cc);
++        ASSERT_EQ(rc, TDB_SUCCESS);
++    }
++    *cf = tidesdb_get_column_family(db, MB_CF);
++    ASSERT_TRUE(*cf != NULL);
++    return db;
++}
++
++/* commit keys [from, to) under prefix, count per transaction */
++static void mb_fill(tidesdb_t *db, tidesdb_column_family_t *cf, const char *prefix, int from,
++                    int to, int per_txn)
++{
++    for (int i = from; i < to;)
++    {
++        tidesdb_txn_t *txn = NULL;
++        int rc = tidesdb_txn_begin(db, &txn);
++        ASSERT_EQ(rc, TDB_SUCCESS);
++        for (int j = 0; j < per_txn && i < to; j++, i++)
++        {
++            char key[32];
++            mb_key(key, sizeof(key), prefix, i);
++            rc = tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key),
++                                 (const uint8_t *)MB_VALUE, sizeof(MB_VALUE), -1);
++            ASSERT_EQ(rc, TDB_SUCCESS);
++        }
++        rc = tidesdb_txn_commit(txn);
++        ASSERT_EQ(rc, TDB_SUCCESS);
++        tidesdb_txn_free(txn);
++    }
++}
++
++/* one get in its own read-committed transaction, retried while contention reports locked */
++static int mb_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
++{
++    for (int attempt = 0; attempt < MB_LOCKED_RETRIES; attempt++)
++    {
++        tidesdb_txn_t *txn = NULL;
++        int rc = tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn);
++        ASSERT_EQ(rc, TDB_SUCCESS);
++        uint8_t *value = NULL;
++        size_t value_size = 0;
++        rc = tidesdb_txn_get_notrack(txn, cf, (const uint8_t *)key, strlen(key), &value,
++                                     &value_size);
++        if (rc == TDB_SUCCESS)
++        {
++            ASSERT_EQ(value_size, sizeof(MB_VALUE));
++            ASSERT_EQ(memcmp(value, MB_VALUE, sizeof(MB_VALUE)), 0);
++            free(value);
++        }
++        tidesdb_txn_free(txn);
++        if (rc != TDB_ERR_LOCKED) return rc;
++    }
++    return TDB_ERR_LOCKED;
++}
++
++/* how many of keys [from, to) under prefix a get finds */
++static int mb_count_found(tidesdb_t *db, tidesdb_column_family_t *cf, const char *prefix, int from,
++                          int to)
++{
++    int found = 0;
++    for (int i = from; i < to; i++)
++    {
++        char key[32];
++        mb_key(key, sizeof(key), prefix, i);
++        const int rc = mb_get(db, cf, key);
++        ASSERT_TRUE(rc == TDB_SUCCESS || rc == TDB_ERR_NOT_FOUND);
++        if (rc == TDB_SUCCESS) found++;
++    }
++    return found;
++}
++
++/* 100k absent and 100k present gets against one memtable of 100k keys. with the filter the absent
++ * ones reach the skip list only as false positives; without it every get searches it */
++static void mb_absent_and_present(const int bloom)
++{
++    (void)remove_directory(MB_DB_DIR);
++    const tidesdb_config_t cfg = mb_config(bloom, MB_BIG_BUFFER);
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = mb_open(&cfg, 1, &cf);
++
++    const uint64_t gen_before = atomic_load(&db->active_wal_gen);
++    mb_fill(db, cf, "k", 0, MB_KEYS, MB_BATCH);
++    /* still the one memtable: nothing rotated, nothing queued */
++    ASSERT_EQ(atomic_load(&db->active_wal_gen), gen_before);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), 0);
++
++    const uint64_t p0 = tidesdb_l0_skiplist_probes();
++    ASSERT_EQ(mb_count_found(db, cf, "a", 0, MB_KEYS), 0);
++    const uint64_t absent_probes = tidesdb_l0_skiplist_probes() - p0;
++
++    const uint64_t p1 = tidesdb_l0_skiplist_probes();
++    ASSERT_EQ(mb_count_found(db, cf, "k", 0, MB_KEYS), MB_KEYS);
++    const uint64_t present_probes = tidesdb_l0_skiplist_probes() - p1;
++
++    printf("(bloom %d: %llu probes for %d absent gets, %llu for %d present) ", bloom,
++           (unsigned long long)absent_probes, MB_KEYS, (unsigned long long)present_probes, MB_KEYS);
++    fflush(stdout);
++    if (bloom)
++        ASSERT_TRUE(absent_probes <= MB_ABSENT_PROBE_LIMIT);
++    else
++        ASSERT_EQ(absent_probes, (uint64_t)MB_KEYS);
++    ASSERT_EQ(present_probes, (uint64_t)MB_KEYS);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(MB_DB_DIR);
++}
++
++void test_bloom_skips_absent_keys(void)
++{
++    mb_absent_and_present(1);
++}
++
++typedef struct
++{
++    tidesdb_t *db;
++    tidesdb_column_family_t *cf;
++    _Atomic(int) committed; /* keys k_0 .. k_{committed-1} have returned from their commit */
++} mb_conc_t;
++
++static void *mb_conc_writer(void *arg)
++{
++    mb_conc_t *c = (mb_conc_t *)arg;
++    for (int i = 0; i < MB_CONC_KEYS; i++)
++    {
++        mb_fill(c->db, c->cf, "k", i, i + 1, 1);
++        atomic_store_explicit(&c->committed, i + 1, memory_order_release);
++    }
++    return NULL;
++}
++
++/* a reader chasing a writer: the newest key whose commit returned is always found, across
++ * rotations, because a commit's filter bits are set before its sequence is visible */
++static void mb_concurrent_insert(const int bloom)
++{
++    (void)remove_directory(MB_DB_DIR);
++    const tidesdb_config_t cfg = mb_config(bloom, MB_SMALL_BUFFER);
++    mb_conc_t c;
++    c.db = mb_open(&cfg, 1, &c.cf);
++    atomic_init(&c.committed, 0);
++    const uint64_t gen_before = atomic_load(&c.db->active_wal_gen);
++
++    pthread_t writer;
++    ASSERT_EQ(pthread_create(&writer, NULL, mb_conc_writer, &c), 0);
++    uint64_t reads = 0;
++    int last = 0;
++    while (last < MB_CONC_KEYS)
++    {
++        last = atomic_load_explicit(&c.committed, memory_order_acquire);
++        if (last == 0) continue;
++        char key[32];
++        mb_key(key, sizeof(key), "k", last - 1);
++        const int rc = mb_get(c.db, c.cf, key);
++        if (rc != TDB_SUCCESS) printf("(key %s not found: %d) ", key, rc);
++        ASSERT_EQ(rc, TDB_SUCCESS);
++        reads++;
++    }
++    ASSERT_EQ(pthread_join(writer, NULL), 0);
++    const uint64_t rotations = atomic_load(&c.db->active_wal_gen) - gen_before;
++    printf("(bloom %d: %llu chasing reads over %llu rotations) ", bloom, (unsigned long long)reads,
++           (unsigned long long)rotations);
++    fflush(stdout);
++    ASSERT_TRUE(rotations >= MB_MIN_ROTATIONS);
++
++    ASSERT_EQ(tidesdb_close(c.db), TDB_SUCCESS);
++    (void)remove_directory(MB_DB_DIR);
++}
++
++void test_bloom_sees_concurrent_insert(void)
++{
++    mb_concurrent_insert(1);
++}
++
++static void mb_delete(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
++{
++    tidesdb_txn_t *txn = NULL;
++    int rc = tidesdb_txn_begin(db, &txn);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    rc = tidesdb_txn_delete(txn, cf, (const uint8_t *)key, strlen(key));
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    rc = tidesdb_txn_commit(txn);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    tidesdb_txn_free(txn);
++}
++
++static void mb_delete_range(tidesdb_t *db, tidesdb_column_family_t *cf, const char *lo,
++                            const char *hi)
++{
++    tidesdb_txn_t *txn = NULL;
++    int rc = tidesdb_txn_begin(db, &txn);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    rc = tidesdb_txn_delete_range(txn, cf, (const uint8_t *)lo, strlen(lo), (const uint8_t *)hi,
++                                  strlen(hi));
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    rc = tidesdb_txn_commit(txn);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    tidesdb_txn_free(txn);
++}
++
++/* a key in an immutable, deleted in the active one: by a point delete, which is in the active's
++ * filter, and by a range delete, which is not -- the range check runs whatever the filter says */
++static void mb_deletes_win(const int bloom)
++{
++    (void)remove_directory(MB_DB_DIR);
++    const tidesdb_config_t cfg = mb_config(bloom, MB_BIG_BUFFER);
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = mb_open(&cfg, 1, &cf);
++
++    /* the flush worker claims under this lock, so holding it keeps the sealed memtable in L0 */
++    pthread_mutex_lock(&db->flush_lock);
++    mb_fill(db, cf, "d", 0, 10, 10);
++    mb_fill(db, cf, "r", 0, 10, 10);
++    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), 1);
++
++    /* the active memtable holds something else, so its filter is not empty */
++    mb_fill(db, cf, "x", 0, 10, 10);
++    char key[32];
++    mb_key(key, sizeof(key), "d", 3);
++    mb_delete(db, cf, key);
++    mb_delete_range(db, cf, "r00000002", "r00000005");
++
++    ASSERT_EQ(mb_get(db, cf, key), TDB_ERR_NOT_FOUND);
++    for (int i = 0; i < 10; i++)
++    {
++        mb_key(key, sizeof(key), "r", i);
++        const int want = i >= 2 && i < 5 ? TDB_ERR_NOT_FOUND : TDB_SUCCESS;
++        ASSERT_EQ(mb_get(db, cf, key), want);
++    }
++    ASSERT_EQ(mb_count_found(db, cf, "d", 0, 10), 9);
++    ASSERT_EQ(mb_count_found(db, cf, "x", 0, 10), 10);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), 1); /* all of it was read with the immutable in L0 */
++    pthread_mutex_unlock(&db->flush_lock);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(MB_DB_DIR);
++}
++
++void test_deletes_and_range_tombstones_still_win(void)
++{
++    mb_deletes_win(1);
++}
++
++/* the child of the recovery case: commit the keys and die without a close, so the reopen replays
++ * them from the log. interval sync waits for each record to reach the file, which outlives the
++ * process; the long period keeps fsync out of the loop */
++static void mb_child_fill(void)
++{
++    tidesdb_config_t cfg = mb_config(1, MB_BIG_BUFFER);
++    cfg.memtable_sync_mode = TDB_SYNC_INTERVAL;
++    cfg.memtable_sync_interval_us = MB_RECOVER_SYNC_PERIOD;
++    tidesdb_t *db = NULL;
++    if (tidesdb_open(&cfg, &db) != TDB_SUCCESS) _exit(1);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    if (tidesdb_create_column_family(db, MB_CF, &cc) != TDB_SUCCESS) _exit(1);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, MB_CF);
++    if (!cf) _exit(1);
++    mb_fill(db, cf, "k", 0, MB_RECOVER_KEYS, 100);
++    _exit(0); /* no close: nothing is flushed, the keys live only in the log */
++}
++
++/* whether the reopened database still holds the replayed generation unclaimed by a flush, and if
++ * so that its filter holds every replayed key and few of the absent ones. the caller holds the
++ * flush claim lock, so a generation found unclaimed stays in L0 until it lets go */
++static int mb_check_replayed_filter(tidesdb_t *db, uint32_t cf_index)
++{
++    tidesdb_memtable_t *pinned[MB_MAX_PINNED];
++    int n = 0;
++    ASSERT_EQ(tidesdb_l0_pin_memtables(db->l0, pinned, MB_MAX_PINNED, &n), TDB_SUCCESS);
++    int checked = 0;
++    for (int i = 0; i < n; i++)
++    {
++        tidesdb_memtable_t *mt = pinned[i];
++        ASSERT_TRUE(mt->bloom != NULL); /* the replayed and the fresh active alike */
++        if (skip_list_count_entries(mt->skip_list) == 0 || atomic_load(&mt->claimed)) continue;
++        int present = 0, false_pos = 0;
++        for (int k = 0; k < MB_RECOVER_KEYS; k++)
++        {
++            char key[32];
++            uint8_t pkey[64];
++            mb_key(key, sizeof(key), "k", k);
++            tdb_build_prefixed_key(cf_index, (const uint8_t *)key, strlen(key), pkey);
++            present +=
++                tidesdb_memtable_bloom_may_contain(mt, pkey, TDB_CF_PREFIX_SIZE + strlen(key));
++            mb_key(key, sizeof(key), "a", k);
++            tdb_build_prefixed_key(cf_index, (const uint8_t *)key, strlen(key), pkey);
++            false_pos +=
++                tidesdb_memtable_bloom_may_contain(mt, pkey, TDB_CF_PREFIX_SIZE + strlen(key));
++        }
++        ASSERT_EQ(present, MB_RECOVER_KEYS);
++        ASSERT_TRUE(false_pos <= MB_RECOVER_FP_LIMIT);
++        checked = 1;
++    }
++    tidesdb_l0_unpin_memtables(pinned, n);
++    return checked;
++}
++
++/* keys only the log holds come back after a crash, and the memtable the replay rebuilt has them in
++ * its filter: the gets find every one, and search a skip list once for each present key -- the
++ * replayed memtable's; the fresh active's filter is empty -- and for few of the absent ones */
++void test_recovery_fills_bloom(void)
++{
++    int checked = 0;
++    for (int round = 0; round < MB_RECOVER_ROUNDS && !checked; round++)
++    {
++        (void)remove_directory(MB_DB_DIR);
++        int exit_code = -1;
++        ASSERT_EQ(test_spawn_self(mb_exe, MB_CHILD_FLAG, MB_PHASE_FILL, "0", &exit_code), 0);
++        ASSERT_EQ(exit_code, 0);
++
++        const tidesdb_config_t cfg = mb_config(1, MB_BIG_BUFFER);
++        tidesdb_column_family_t *cf = NULL;
++        tidesdb_t *db = mb_open(&cfg, 0, &cf);
++        /* the open queues the replayed generation for flush at once, so whether a worker claimed it
++         * before this lock was taken is a race a round may lose; a lost round is run again */
++        pthread_mutex_lock(&db->flush_lock);
++        checked = mb_check_replayed_filter(db, (uint32_t)((cf_t *)cf)->cf_id);
++
++        const uint64_t p0 = tidesdb_l0_skiplist_probes();
++        ASSERT_EQ(mb_count_found(db, cf, "a", 0, MB_RECOVER_KEYS), 0);
++        ASSERT_EQ(mb_count_found(db, cf, "k", 0, MB_RECOVER_KEYS), MB_RECOVER_KEYS);
++        const uint64_t probes = tidesdb_l0_skiplist_probes() - p0;
++        pthread_mutex_unlock(&db->flush_lock);
++        printf("(round %d: replayed memtable %s, %llu probes for %d gets) ", round,
++               checked ? "in L0" : "claimed by a flush", (unsigned long long)probes,
++               2 * MB_RECOVER_KEYS);
++        fflush(stdout);
++        ASSERT_TRUE(probes <= (uint64_t)MB_RECOVER_KEYS + MB_RECOVER_FP_LIMIT);
++        if (checked) ASSERT_TRUE(probes >= (uint64_t)MB_RECOVER_KEYS);
++
++        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    }
++    ASSERT_TRUE(checked);
++    (void)remove_directory(MB_DB_DIR);
++}
++
++/* the filter off: the same workloads give the same answers, and every get searches every memtable
++ */
++void test_bloom_off_matches(void)
++{
++    mb_absent_and_present(0);
++    mb_concurrent_insert(0);
++    mb_deletes_win(0);
++
++    (void)remove_directory(MB_DB_DIR);
++    const tidesdb_config_t cfg = mb_config(0, MB_BIG_BUFFER);
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = mb_open(&cfg, 1, &cf);
++    tidesdb_memtable_t *pinned[MB_MAX_PINNED];
++    int n = 0;
++    ASSERT_EQ(tidesdb_l0_pin_memtables(db->l0, pinned, MB_MAX_PINNED, &n), TDB_SUCCESS);
++    for (int i = 0; i < n; i++) ASSERT_TRUE(pinned[i]->bloom == NULL);
++    tidesdb_l0_unpin_memtables(pinned, n);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(MB_DB_DIR);
++}
++
++/* the filter's sizing: a sixty-fourth of the buffer, never under 64 KiB */
++void test_bloom_sizing(void)
++{
++    ASSERT_EQ(tidesdb_memtable_bloom_bytes(0), (size_t)TDB_MEMTABLE_BLOOM_MIN_BYTES);
++    ASSERT_EQ(tidesdb_memtable_bloom_bytes(1u << 20), (size_t)TDB_MEMTABLE_BLOOM_MIN_BYTES);
++    ASSERT_EQ(tidesdb_memtable_bloom_bytes(64u << 20), (size_t)(1u << 20));
++    tidesdb_memtable_t *mt =
++        tidesdb_memtable_create_with_bloom(NULL, 0, 0, 12, 0.25f, NULL, NULL, 100000);
++    ASSERT_TRUE(mt != NULL);
++    ASSERT_EQ(mt->bloom_blocks, 100000u / TDB_MEMTABLE_BLOOM_BLOCK_BYTES);
++    ASSERT_EQ((uintptr_t)mt->bloom % TDB_MEMTABLE_BLOOM_BLOCK_BYTES, 0u);
++    const uint8_t k[] = "some-key";
++    ASSERT_EQ(tidesdb_memtable_bloom_may_contain(mt, k, sizeof(k)), 0);
++    tidesdb_memtable_bloom_add(mt, k, sizeof(k));
++    ASSERT_EQ(tidesdb_memtable_bloom_may_contain(mt, k, sizeof(k)), 1);
++    tidesdb_memtable_free(mt);
++}
++
++int main(int argc, char **argv)
++{
++    mb_exe = argv[0];
++    if (argc >= 3 && strcmp(argv[1], MB_CHILD_FLAG) == 0)
++    {
++        if (strcmp(argv[2], MB_PHASE_FILL) == 0) mb_child_fill();
++        return 2;
++    }
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_bloom_sizing, tests_passed);
++    RUN_TEST(test_bloom_skips_absent_keys, tests_passed);
++    RUN_TEST(test_bloom_sees_concurrent_insert, tests_passed);
++    RUN_TEST(test_deletes_and_range_tombstones_still_win, tests_passed);
++    RUN_TEST(test_recovery_fills_bloom, tests_passed);
++    RUN_TEST(test_bloom_off_matches, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

@@ -490,6 +490,7 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
   if (o.flush_threads != 0) cfg.num_flush_threads = o.flush_threads;
   if (o.compaction_threads != 0) cfg.num_compaction_threads = o.compaction_threads;
   if (o.l0_stall_threshold != 0) cfg.memtable_l0_queue_stall_threshold = o.l0_stall_threshold;
+  cfg.memtable_whole_key_bloom = o.memtable_bloom ? 1 : 0;
 
   const int rc = tidesdb_open(&cfg, &impl->db);
   if (rc == TDB_ERR_LOCKED) {
