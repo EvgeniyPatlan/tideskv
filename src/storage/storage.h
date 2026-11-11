@@ -92,6 +92,15 @@ class WriteTxn : public ReadView {
   virtual void HintRangeElements(uint64_t /*n*/) {}
 };
 
+// B1: told about every Put to ColumnFamily::kMeta, after the key validated and before the engine buffers
+// it, whatever the transaction later does (commit, rollback, savepoint rollback). Called on the writer's
+// thread; must be cheap, never block and never call the Storage.
+class MetaPutHook {
+ public:
+  virtual ~MetaPutHook() = default;
+  virtual void OnMetaPut(std::string_view meta_key, std::string_view value) noexcept = 0;
+};
+
 // ReadViews and WriteTxns must be destroyed before the Storage that created them.
 class Storage {
  public:
@@ -99,6 +108,9 @@ class Storage {
   virtual Result<std::unique_ptr<WriteTxn>> BeginWrite() = 0;     // read-committed
   virtual Result<std::unique_ptr<ReadView>> BeginRead() = 0;      // latest committed data
   virtual Result<std::unique_ptr<ReadView>> BeginSnapshot() = 0;  // frozen point in time
+  // Installs the hook (null = none). Call before the first BeginWrite whose transaction may Put meta;
+  // each WriteTxn reads it once at BeginWrite. A decorator forwards to the storage that executes the Puts.
+  virtual void SetMetaPutHook(MetaPutHook* hook) = 0;
 };
 
 }  // namespace tideskv

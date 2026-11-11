@@ -38,6 +38,7 @@ class FaultyStorage final : public Storage {
     return inner_.BeginRead();
   }
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+  void SetMetaPutHook(MetaPutHook* hook) override { inner_.SetMetaPutHook(hook); }
   std::shared_ptr<const InMemoryStorage::Tables> Current() const {
     return inner_.Current();
   }  // CommandHarness compares snapshots

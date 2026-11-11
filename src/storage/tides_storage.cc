@@ -1,6 +1,7 @@
 #include "storage/tides_storage.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -251,8 +252,8 @@ class RangeHoldGuard {
 
 class TidesWriteTxn final : public WriteTxn {
  public:
-  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs, RangeHoldBudget& ranges)
-      : txn_(txn), cfs_(cfs), ranges_(ranges) {}
+  TidesWriteTxn(tidesdb_txn_t* txn, CfHandles cfs, RangeHoldBudget& ranges, MetaPutHook* meta_hook)
+      : txn_(txn), cfs_(cfs), ranges_(ranges), meta_hook_(meta_hook) {}
   ~TidesWriteTxn() override { tidesdb_txn_free(txn_); }  // rolls back if still open
 
   Result<std::string> Get(ColumnFamily cf, std::string_view key) override {
@@ -266,6 +267,7 @@ class TidesWriteTxn final : public WriteTxn {
 
   Status Put(ColumnFamily cf, std::string_view key, std::string_view value) override {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
+    if (meta_hook_ != nullptr && cf == ColumnFamily::kMeta) meta_hook_->OnMetaPut(key, value);
     return FromTdb(tidesdb_txn_put(txn_, Cf(cf), Bytes(key), key.size(), Bytes(value), value.size(), 0),
                    "put");
   }
@@ -369,6 +371,7 @@ class TidesWriteTxn final : public WriteTxn {
   tidesdb_txn_t* txn_;
   CfHandles cfs_;
   RangeHoldBudget& ranges_;
+  MetaPutHook* meta_hook_;  // read once at BeginWrite
   std::set<std::tuple<ColumnFamily, std::string, std::string>> native_ranges_;
   bool finished_ = false;
 };
@@ -465,6 +468,7 @@ struct TidesStorage::Impl {
   uint64_t family_config_updates = 0;  // issued by Open to families that already existed
   // Per database: the engine's range-hold table belongs to one tidesdb_t, and a process may open several.
   RangeHoldBudget range_holds{kTidesRangeHoldSlots};
+  std::atomic<MetaPutHook*> meta_hook{nullptr};
   ~Impl() {
     if (db != nullptr) tidesdb_close(db);
   }
@@ -508,8 +512,11 @@ Result<std::unique_ptr<WriteTxn>> TidesStorage::BeginWrite() {
   tidesdb_txn_t* txn = nullptr;
   const int rc = tidesdb_txn_begin_with_isolation(impl_->db, TDB_ISOLATION_READ_COMMITTED, &txn);
   if (rc != TDB_SUCCESS) return FromTdb(rc, "txn_begin");
-  return std::unique_ptr<WriteTxn>(std::make_unique<TidesWriteTxn>(txn, impl_->cfs, impl_->range_holds));
+  return std::unique_ptr<WriteTxn>(
+      std::make_unique<TidesWriteTxn>(txn, impl_->cfs, impl_->range_holds, impl_->meta_hook.load()));
 }
+
+void TidesStorage::SetMetaPutHook(MetaPutHook* hook) { impl_->meta_hook.store(hook); }
 
 Result<std::unique_ptr<ReadView>> TidesStorage::BeginRead() {
   tidesdb_txn_t* txn = nullptr;

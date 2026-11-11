@@ -44,6 +44,7 @@ class ThrowingStorage final : public Storage {
     return inner_.BeginRead();
   }
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+  void SetMetaPutHook(MetaPutHook* hook) override { inner_.SetMetaPutHook(hook); }
 
  private:
   Storage& inner_;
@@ -57,6 +58,7 @@ class UserErrorStorage final : public Storage {
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override { return inner_.BeginWrite(); }
   Result<std::unique_ptr<ReadView>> BeginRead() override { return Status::UserError("ERR injected"); }
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+  void SetMetaPutHook(MetaPutHook* hook) override { inner_.SetMetaPutHook(hook); }
 
  private:
   Storage& inner_;

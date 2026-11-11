@@ -592,5 +592,64 @@ TEST_P(StorageContractTest, ReopenPreservesCommittedData) {
   EXPECT_EQ(ReadCommitted(storage(), ColumnFamily::kSys, "oid_hwm"), "42");
 }
 
+class RecordingHook final : public MetaPutHook {
+ public:
+  void OnMetaPut(std::string_view key, std::string_view value) noexcept override {
+    calls.emplace_back(std::string(key), std::string(value));
+  }
+  Rows calls;
+};
+
+TEST_P(StorageContractTest, MetaPutHookSeesEveryMetaPut) {
+  RecordingHook hook;
+  storage().SetMetaPutHook(&hook);
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "a", "1").ok());
+  ASSERT_TRUE((*txn)->Put(kSub, "b", "2").ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "c", "3").ok());
+  ASSERT_TRUE((*txn)->Savepoint("s").ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "d", "4").ok());
+  ASSERT_TRUE((*txn)->RollbackToSavepoint("s").ok());
+  ASSERT_TRUE((*txn)->Commit().ok());
+  EXPECT_EQ(hook.calls, (Rows{{"a", "1"}, {"c", "3"}, {"d", "4"}}));
+  storage().SetMetaPutHook(nullptr);
+}
+
+TEST_P(StorageContractTest, MetaPutHookFiresBeforeCommit) {
+  RecordingHook hook;
+  storage().SetMetaPutHook(&hook);
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE((*txn)->Put(kMeta, "x", "v").ok());
+  EXPECT_EQ(hook.calls.size(), 1u);
+  ASSERT_TRUE((*txn)->Rollback().ok());
+  EXPECT_EQ(hook.calls.size(), 1u);
+  storage().SetMetaPutHook(nullptr);
+}
+
+TEST_P(StorageContractTest, MetaPutHookSkipsInvalidPuts) {
+  RecordingHook hook;
+  storage().SetMetaPutHook(&hook);
+  auto txn = storage().BeginWrite();
+  ASSERT_TRUE(txn.ok());
+  EXPECT_TRUE((*txn)->Put(kMeta, "", "v").code() == StatusCode::kInvalidArgument);
+  EXPECT_TRUE(hook.calls.empty());
+  ASSERT_TRUE((*txn)->Put(kMeta, "k", "v").ok());
+  ASSERT_TRUE((*txn)->Commit().ok());
+  EXPECT_FALSE((*txn)->Put(kMeta, "late", "v").ok());
+  EXPECT_EQ(hook.calls, (Rows{{"k", "v"}}));
+  storage().SetMetaPutHook(nullptr);
+}
+
+TEST_P(StorageContractTest, NullMetaPutHookIsNone) {
+  RecordingHook hook;
+  storage().SetMetaPutHook(&hook);
+  storage().SetMetaPutHook(nullptr);
+  MustPut(storage(), kMeta, "k", "v");
+  EXPECT_TRUE(hook.calls.empty());
+  EXPECT_EQ(ReadCommitted(storage(), kMeta, "k"), "v");
+}
+
 }  // namespace
 }  // namespace tideskv::test

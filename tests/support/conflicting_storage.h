@@ -50,6 +50,7 @@ class ConflictingStorage final : public Storage {
   }
   Result<std::unique_ptr<ReadView>> BeginRead() override { return inner_.BeginRead(); }
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override { return inner_.BeginSnapshot(); }
+  void SetMetaPutHook(MetaPutHook* hook) override { inner_.SetMetaPutHook(hook); }
 
  private:
   InMemoryStorage inner_;

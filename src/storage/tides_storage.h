@@ -80,6 +80,7 @@ class TidesStorage final : public Storage, public Compactor {
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override;
   Result<std::unique_ptr<ReadView>> BeginRead() override;
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override;
+  void SetMetaPutHook(MetaPutHook* hook) override;
 
   Status Backup(const std::string& dir);  // consistent, directly-openable copy
   Status Checkpoint() override;           // flush + fsync WAL/vlog/manifest

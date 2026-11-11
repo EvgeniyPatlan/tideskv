@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
@@ -32,6 +33,8 @@ class InMemoryStorage final : public Storage {
   Result<std::unique_ptr<WriteTxn>> BeginWrite() override;
   Result<std::unique_ptr<ReadView>> BeginRead() override;
   Result<std::unique_ptr<ReadView>> BeginSnapshot() override;
+  void SetMetaPutHook(MetaPutHook* hook) override { meta_hook_.store(hook); }
+  MetaPutHook* meta_hook() const { return meta_hook_.load(); }
 
   // Used by the transaction/view implementations.
   std::shared_ptr<const Tables> Current() const;
@@ -40,6 +43,7 @@ class InMemoryStorage final : public Storage {
  private:
   mutable std::mutex mu_;
   std::shared_ptr<const Tables> tables_;
+  std::atomic<MetaPutHook*> meta_hook_{nullptr};
 };
 
 }  // namespace tideskv

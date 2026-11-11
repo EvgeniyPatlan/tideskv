@@ -140,7 +140,7 @@ class MemoryReadView final : public ReadView {
 
 class MemoryWriteTxn final : public WriteTxn {
  public:
-  explicit MemoryWriteTxn(InMemoryStorage& s) : storage_(s) {}
+  explicit MemoryWriteTxn(InMemoryStorage& s) : storage_(s), meta_hook_(s.meta_hook()) {}
 
   Result<std::string> Get(ColumnFamily cf, std::string_view key) override {
     if (Status st = Check(ValidateKey(key)); !st.ok()) return st;
@@ -169,7 +169,10 @@ class MemoryWriteTxn final : public WriteTxn {
   }
 
   Status Put(ColumnFamily cf, std::string_view key, std::string_view value) override {
-    return Buffer(ValidateKey(key), Op{Op::Kind::kPut, cf, std::string(key), std::string(value)});
+    const Status st = Check(ValidateKey(key));
+    if (!st.ok()) return st;
+    if (meta_hook_ != nullptr && cf == ColumnFamily::kMeta) meta_hook_->OnMetaPut(key, value);
+    return Buffer(Status::Ok(), Op{Op::Kind::kPut, cf, std::string(key), std::string(value)});
   }
   Status Delete(ColumnFamily cf, std::string_view key) override {
     return Buffer(ValidateKey(key), Op{Op::Kind::kDelete, cf, std::string(key), {}});
@@ -236,6 +239,7 @@ class MemoryWriteTxn final : public WriteTxn {
   }
 
   InMemoryStorage& storage_;
+  MetaPutHook* meta_hook_;
   std::vector<Op> ops_;
   std::vector<std::pair<std::string, size_t>> savepoints_;
   bool finished_ = false;
