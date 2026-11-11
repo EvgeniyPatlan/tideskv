@@ -41,7 +41,7 @@ set(TIDESDB_PATCHES
   # a synchronous flush and a checkpoint wait for the memtables queued when they were called, not for
   # an empty queue that writers outrunning flush never leave
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-flush-wait-called-generations.patch"
-  # the flusher test's signal bound allows one signal per stretch the appender stalls a gathering window
+  # the flusher test's signal bound allows for a loaded host: a signal per appender stall plus one per ten appends
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-test-load.patch"
   # an iterator opens a level run's table cursors only as a seek or step reaches each table, and asks
   # the run's intervals from the tables it pinned rather than through their cursors
