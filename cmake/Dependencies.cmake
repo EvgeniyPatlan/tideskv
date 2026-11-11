@@ -42,7 +42,10 @@ set(TIDESDB_PATCHES
   # an empty queue that writers outrunning flush never leave
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-flush-wait-called-generations.patch"
   # the flusher test's signal bound allows one signal per stretch the appender stalls a gathering window
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-test-load.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-test-load.patch"
+  # an iterator opens a level run's table cursors only as a seek or step reaches each table, and asks
+  # the run's intervals from the tables it pinned rather than through their cursors
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-lazy-level-cursors.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

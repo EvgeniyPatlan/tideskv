@@ -1,0 +1,1167 @@
+diff --git a/src/column_family/cf_iter.c b/src/column_family/cf_iter.c
+index 12cfce2..2d7e2b8 100644
+--- a/src/column_family/cf_iter.c
++++ b/src/column_family/cf_iter.c
+@@ -40,8 +40,9 @@ struct cf_iter
+     sstable_t **ssts; /* referenced sstables, level by level, deep levels in key order */
+     int *levels;      /* the level of each sstable, parallel to ssts */
+     int n_ssts;
+-    sstable_iter_t **iters;          /* one per sstable */
+-    level_merge_source_t *runs;      /* one per level below L1 read as a single source */
++    sstable_iter_t **iters;     /* one slot per sstable, a run's opened when first reached */
++    level_merge_source_t *runs; /* one per level below L1 read as a single source */
++    int *rt_idx; /* n_ssts ints, each run's slice listing its tables that carry intervals */
+     writeset_merge_source_t *ws_src; /* optional read-your-own-writes overlay, owned, freed here */
+     merge_source_t
+         *sources; /* ws overlay, then n_mts memtables, then L1 sstables and deeper levels */
+@@ -200,14 +201,19 @@ static int cf_iter_collect_ssts(cf_iter_t *it, cf_t *cf)
+ 
+ /* the sources the sstables make: each L1 table one of its own, since L1 tables overlap, and each
+  * deeper level one for its whole run when it holds more than one table, so a seek descends only the
+- * table that can hold the key. returns the number of sources written, or -1 on allocation failure
+- */
+-static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out)
++ * table that can hold the key. a table that is a source of its own has its cursor opened here; a
++ * run's cursors are left for the run to open as the walk reaches them, so building an iterator
++ * costs the L1 tables and the levels rather than every table the family holds. writes the number
++ * of sources to n_out
++ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or what opening a single table's cursor reported */
++static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out, int *n_out)
+ {
++    *n_out = 0;
+     if (it->n_ssts > 0)
+     {
+         it->runs = calloc((size_t)it->n_ssts, sizeof(*it->runs));
+-        if (!it->runs) return -1;
++        it->rt_idx = malloc((size_t)it->n_ssts * sizeof(*it->rt_idx));
++        if (!it->runs || !it->rt_idx) return TDB_ERR_MEMORY;
+     }
+     int n = 0, runs = 0;
+     for (int i = 0; i < it->n_ssts;)
+@@ -216,12 +222,24 @@ static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out)
+         if (it->levels[i] > LEVEL_SET_L1)
+             while (end < it->n_ssts && it->levels[end] == it->levels[i]) end++;
+         if (end - i > 1)
+-            level_merge_source(&it->runs[runs++], &it->ssts[i], &it->iters[i], end - i, &out[n++]);
++        {
++            level_merge_source(&it->runs[runs++], &it->ssts[i], &it->iters[i], &it->rt_idx[i],
++                               end - i, CF_ITER_USE_CACHE, &out[n++]);
++        }
+         else
++        {
++            /* carry the sstable's own result out rather than calling every failure an i/o error.
++             * it reports a reader budget it cannot honour as busy, which is retryable back
++             * pressure and nothing like a read that failed, and a caller told i/o has no way to
++             * tell the two apart */
++            const int rc = sstable_iter_new(it->ssts[i], CF_ITER_USE_CACHE, &it->iters[i]);
++            if (rc != TDB_SUCCESS) return rc;
+             sstable_merge_source(it->iters[i], &out[n++]);
++        }
+         i = end;
+     }
+-    return n;
++    *n_out = n;
++    return TDB_SUCCESS;
+ }
+ 
+ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
+@@ -253,17 +271,9 @@ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
+                                    (uint32_t)cf->cf_id, snapshot);
+         memtable_merge_source(&it->views[i], &it->sources[ws_off + i]);
+     }
+-    for (int i = 0; i < it->n_ssts; i++)
+-    {
+-        /* carry the sstable's own result out rather than calling every failure an i/o error. it
+-         * reports a reader budget it cannot honour as busy, which is retryable back pressure and
+-         * nothing like a read that failed, and a caller told i/o has no way to tell the two apart
+-         */
+-        const int rc = sstable_iter_new(it->ssts[i], CF_ITER_USE_CACHE, &it->iters[i]);
+-        if (rc != TDB_SUCCESS) return rc;
+-    }
+-    const int tables = cf_iter_table_sources(it, &it->sources[ws_off + it->n_mts]);
+-    if (tables < 0) return TDB_ERR_MEMORY;
++    int tables = 0;
++    const int rc = cf_iter_table_sources(it, &it->sources[ws_off + it->n_mts], &tables);
++    if (rc != TDB_SUCCESS) return rc;
+     return merge_iter_new(it->sources, ws_off + it->n_mts + tables, snapshot, MERGE_ITER_RESOLVE,
+                           &it->merge);
+ }
+@@ -317,7 +327,7 @@ void cf_iter_free(cf_iter_t *it)
+     merge_iter_free(it->merge);
+     if (it->cursors)
+         for (int i = 0; i < it->n_mts; i++) skip_list_cursor_free(it->cursors[i]);
+-    if (it->iters)
++    if (it->iters) /* a run's slot stays NULL until its table is reached, which frees as a no-op */
+         for (int i = 0; i < it->n_ssts; i++) sstable_iter_free(it->iters[i]);
+     if (it->mts) tidesdb_l0_unpin_memtables(it->mts, it->n_mts);
+     if (it->ssts)
+@@ -329,6 +339,7 @@ void cf_iter_free(cf_iter_t *it)
+     free(it->cursors);
+     free(it->iters);
+     free(it->runs);
++    free(it->rt_idx);
+     free(it->mts);
+     free(it->ssts);
+     free(it->levels);
+diff --git a/src/compaction/compaction_exec.c b/src/compaction/compaction_exec.c
+index 5782f4d..ead0cba 100644
+--- a/src/compaction/compaction_exec.c
++++ b/src/compaction/compaction_exec.c
+@@ -663,15 +663,20 @@ static int ce_merge_inputs(const compaction_ctx_t *cx, const compaction_job_t *j
+     sstable_iter_t **iters = calloc((size_t)runs->n, sizeof(*iters));
+     merge_source_t *sources = calloc((size_t)runs->n_runs, sizeof(*sources));
+     level_merge_source_t *levels = calloc((size_t)runs->n_runs, sizeof(*levels));
+-    if (!iters || !sources || !levels)
++    int *rt_idx = malloc((size_t)(runs->n > 0 ? runs->n : 1) * sizeof(*rt_idx));
++    if (!iters || !sources || !levels || !rt_idx)
+     {
+         free(iters);
+         free(sources);
+         free(levels);
++        free(rt_idx);
+         return TDB_ERR_MEMORY;
+     }
+ 
+     int rc = TDB_SUCCESS;
++    /* a compaction reads every input table through, so its cursors are opened here up front and a
++     * table that cannot be read fails the job before it writes anything; the run sources then
++     * find every slot filled and never open one themselves */
+     for (int i = 0; i < runs->n && rc == TDB_SUCCESS; i++)
+         if (sstable_iter_new(runs->ssts[i], 0, &iters[i]) != TDB_SUCCESS) /* bypass the cache */
+             rc = TDB_ERR_IO;
+@@ -679,8 +684,8 @@ static int ce_merge_inputs(const compaction_ctx_t *cx, const compaction_job_t *j
+     for (int r = 0, at = 0; r < runs->n_runs && rc == TDB_SUCCESS; at += runs->run_len[r++])
+     {
+         if (runs->run_len[r] > 1)
+-            level_merge_source(&levels[r], &runs->ssts[at], &iters[at], runs->run_len[r],
+-                               &sources[r]);
++            level_merge_source(&levels[r], &runs->ssts[at], &iters[at], &rt_idx[at],
++                               runs->run_len[r], 0, &sources[r]);
+         else
+             sstable_merge_source(iters[at], &sources[r]);
+     }
+@@ -697,6 +702,7 @@ static int ce_merge_inputs(const compaction_ctx_t *cx, const compaction_job_t *j
+     free(iters);
+     free(sources);
+     free(levels);
++    free(rt_idx);
+     return rc;
+ }
+ 
+diff --git a/src/iter/merge_level_source.c b/src/iter/merge_level_source.c
+index ceea618..fd20913 100644
+--- a/src/iter/merge_level_source.c
++++ b/src/iter/merge_level_source.c
+@@ -17,7 +17,31 @@
+  * at a time: a seek binary-searches the run for the one table that can hold the target and descends
+  * that table alone, and a step that runs off the end of a table carries on into its neighbour. a
+  * merge given each table as a source of its own descends every one of them on every seek, which is
+- * what an equality lookup through a long-lived iterator paid per level */
++ * what an equality lookup through a long-lived iterator paid per level.
++ *
++ * a table's cursor is opened the first time the walk lands on it, not when the source is built: an
++ * iterator over a run of a hundred tables that reads ten keys out of one of them opened, filled and
++ * freed a hundred cursors before, and opens one or two now. every helper below that touches table i
++ * goes through lv_iter for its cursor first, and a cursor that will not open fails the source the
++ * way a failed read does, so the merge reports io rather than a scan with the table's keys missing.
++ * the intervals the run carries are answered from the tables themselves, which hold them decoded
++ * from open on, so asking whether one covers a key opens nothing either */
++
++/* the cursor of table i, opened in its slot the first time a walk reaches it; NULL with the
++ * source failed when it cannot be opened, whatever the reason, since a table the walk cannot read
++ * is keys the scan would silently go without */
++static sstable_iter_t *lv_iter(level_merge_source_t *s, const int i)
++{
++    if (s->iters[i]) return s->iters[i];
++    sstable_iter_t *it = NULL;
++    if (sstable_iter_new(s->ssts[i], s->use_cache, &it) != TDB_SUCCESS)
++    {
++        s->failed = 1;
++        return NULL;
++    }
++    s->iters[i] = it;
++    return it;
++}
+ 
+ /* whether the positioned cursor is on an entry */
+ static int lv_on_entry(const level_merge_source_t *s)
+@@ -25,10 +49,13 @@ static int lv_on_entry(const level_merge_source_t *s)
+     return s->cur >= 0 && s->cur < s->n && sstable_iter_valid(s->iters[s->cur]);
+ }
+ 
+-/* note a read the positioned cursor failed, so the merge learns of it however the walk moves on */
++/* note a read the positioned cursor failed, so the merge learns of it however the walk moves on; a
++ * table whose cursor never opened has already failed the source */
+ static void lv_note_failure(level_merge_source_t *s)
+ {
+-    if (s->cur >= 0 && s->cur < s->n && sstable_iter_read_failed(s->iters[s->cur])) s->failed = 1;
++    if (s->cur >= 0 && s->cur < s->n && s->iters[s->cur] &&
++        sstable_iter_read_failed(s->iters[s->cur]))
++        s->failed = 1;
+ }
+ 
+ /* position on the first entry at or after table i, stepping over tables with no entries; stops at a
+@@ -38,8 +65,9 @@ static int lv_forward_from(level_merge_source_t *s, int i)
+     for (; i < s->n; i++)
+     {
+         s->cur = i;
+-        if (sstable_iter_seek_first(s->iters[i]) == TDB_SUCCESS && sstable_iter_valid(s->iters[i]))
+-            return 1;
++        sstable_iter_t *it = lv_iter(s, i);
++        if (!it) return 0;
++        if (sstable_iter_seek_first(it) == TDB_SUCCESS && sstable_iter_valid(it)) return 1;
+         lv_note_failure(s);
+         if (s->failed) return 0;
+     }
+@@ -53,8 +81,9 @@ static int lv_backward_from(level_merge_source_t *s, int i)
+     for (; i >= 0; i--)
+     {
+         s->cur = i;
+-        if (sstable_iter_seek_last(s->iters[i]) == TDB_SUCCESS && sstable_iter_valid(s->iters[i]))
+-            return 1;
++        sstable_iter_t *it = lv_iter(s, i);
++        if (!it) return 0;
++        if (sstable_iter_seek_last(it) == TDB_SUCCESS && sstable_iter_valid(it)) return 1;
+         lv_note_failure(s);
+         if (s->failed) return 0;
+     }
+@@ -150,9 +179,9 @@ static int lv_seek(void *ctx, const uint8_t *key, size_t key_size)
+         return 0;
+     }
+     s->cur = i;
+-    if (sstable_iter_seek(s->iters[i], key, key_size) == TDB_SUCCESS &&
+-        sstable_iter_valid(s->iters[i]))
+-        return 1;
++    sstable_iter_t *it = lv_iter(s, i);
++    if (!it) return 0;
++    if (sstable_iter_seek(it, key, key_size) == TDB_SUCCESS && sstable_iter_valid(it)) return 1;
+     lv_note_failure(s);
+     if (s->failed) return 0;
+     return lv_forward_from(s, i + 1);
+@@ -169,8 +198,9 @@ static int lv_seek_for_prev(void *ctx, const uint8_t *key, size_t key_size)
+         return 0;
+     }
+     s->cur = i;
+-    if (sstable_iter_seek_for_prev(s->iters[i], key, key_size) == TDB_SUCCESS &&
+-        sstable_iter_valid(s->iters[i]))
++    sstable_iter_t *it = lv_iter(s, i);
++    if (!it) return 0;
++    if (sstable_iter_seek_for_prev(it, key, key_size) == TDB_SUCCESS && sstable_iter_valid(it))
+         return 1;
+     lv_note_failure(s);
+     if (s->failed) return 0;
+@@ -199,16 +229,20 @@ static int lv_read_failed(void *ctx)
+ }
+ 
+ /* the newest interval any table of the run carries over the key. an interval is not bounded by the
+- * keys of the table carrying it, so every table is asked, not only the one a seek would pick */
++ * keys of the table carrying it, so every carrier is asked, not only the table a seek would pick.
++ * the carriers are the tables this source was built over, which the iterator pinned when it was
++ * created, and each is asked through the set it holds decoded -- never through a cursor, which
++ * would open a table the walk does not read, and never through the family's covering index, which
++ * describes the layout published now rather than the one this iterator pinned */
+ static int lv_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
+                      uint64_t *out_seq)
+ {
+     const level_merge_source_t *s = (const level_merge_source_t *)ctx;
+     int found = 0;
+     uint64_t newest = 0;
+-    for (int i = 0; i < s->n; i++)
++    for (int r = 0; r < s->n_rt; r++)
+     {
+-        const range_tombstone_set_t *intervals = sstable_iter_intervals(s->iters[i]);
++        const range_tombstone_set_t *intervals = s->ssts[s->rt_idx[r]]->range_tombstones;
+         uint64_t seq = 0;
+         if (!intervals ||
+             range_tombstone_max_covering(intervals, key, key_size, snapshot, &seq) != 1)
+@@ -220,12 +254,18 @@ static int lv_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t sn
+     return found;
+ }
+ 
+-void level_merge_source(level_merge_source_t *s, sstable_t *const *ssts,
+-                        sstable_iter_t *const *iters, const int n, merge_source_t *out)
++void level_merge_source(level_merge_source_t *s, sstable_t *const *ssts, sstable_iter_t **iters,
++                        int *rt_idx, const int n, const int use_cache, merge_source_t *out)
+ {
+     if (!s || !out) return;
+     s->ssts = ssts;
+     s->iters = iters;
++    s->rt_idx = rt_idx;
++    s->n_rt = 0;
++    for (int i = 0; i < n; i++)
++        if (ssts[i]->range_tombstones && range_tombstone_set_count(ssts[i]->range_tombstones) > 0)
++            rt_idx[s->n_rt++] = i;
++    s->use_cache = use_cache;
+     s->n = n;
+     s->cur = -1;
+     s->failed = 0;
+diff --git a/src/iter/merge_sources.h b/src/iter/merge_sources.h
+index 21a5566..46ac577 100644
+--- a/src/iter/merge_sources.h
++++ b/src/iter/merge_sources.h
+@@ -35,18 +35,27 @@ void sstable_merge_source(sstable_iter_t *it, merge_source_t *out);
+ /**
+  * level_merge_source_t
+  * one level below L1 read as a single source, a run of sstables sorted by key that never overlap,
+- * with one of its cursors positioned at a time
++ * with one of its cursors positioned at a time. a table's cursor is opened the first time a seek or
++ * a step lands on it, so an iterator over a long run pays only for the tables it reads
+  * @param ssts the run's sstables in key order, borrowed
+- * @param iters one cursor per sstable, parallel to ssts, borrowed
++ * @param iters one cursor slot per sstable, parallel to ssts, owned by the caller; a NULL slot is
++ * opened in place when the walk first reaches its table, and the caller frees every slot that is
++ * not NULL
++ * @param rt_idx the indexes of the tables carrying intervals, in caller storage of n ints
++ * @param n_rt how many of rt_idx are filled
++ * @param use_cache what a cursor opened here reads through, as sstable_iter_new takes it
+  * @param n how many
+  * @param cur the positioned table, -1 before the first and n past the last
+- * @param failed non-zero when a read in the run failed since the last seek, so the merge learns of
+- * it however the walk moved on
++ * @param failed non-zero when a read in the run failed since the last seek, or a cursor could not
++ * be opened, so the merge learns of it however the walk moved on
+  */
+ typedef struct
+ {
+     sstable_t *const *ssts;
+-    sstable_iter_t *const *iters;
++    sstable_iter_t **iters;
++    int *rt_idx;
++    int n_rt;
++    int use_cache;
+     int n;
+     int cur;
+     int failed;
+@@ -56,15 +65,23 @@ typedef struct
+  * level_merge_source
+  * fill a merge source that reads a whole level below L1 as one, descending only the table that can
+  * hold a sought key and stepping from table to table across their boundaries; the tables must be
+- * sorted by key and must not overlap, which every level below L1 guarantees
++ * sorted by key and must not overlap, which every level below L1 guarantees. a cursor the walk
++ * reaches in a NULL slot is opened then; one that cannot be opened fails the source, which the
++ * merge reports as an io error. the intervals the run carries are read off the tables themselves,
++ * so answering whether one covers a key opens no cursor
+  * @param s the state to keep, owned by the caller and kept in place for the source's life
+  * @param ssts the level's sstables in key order
+- * @param iters one cursor per sstable, parallel to ssts
++ * @param iters one cursor slot per sstable, parallel to ssts; any may be NULL, to be opened when
++ * first reached, and the caller frees every slot that is not NULL once the source is done
++ * @param rt_idx caller storage for n ints, kept in place for the source's life, which this fills
++ * with the indexes of the tables carrying intervals
+  * @param n how many, at least one
++ * @param use_cache non-zero for a cursor opened here to read through the node cache, 0 to read
++ * straight from disk
+  * @param out the source to fill
+  */
+-void level_merge_source(level_merge_source_t *s, sstable_t *const *ssts,
+-                        sstable_iter_t *const *iters, int n, merge_source_t *out);
++void level_merge_source(level_merge_source_t *s, sstable_t *const *ssts, sstable_iter_t **iters,
++                        int *rt_idx, int n, int use_cache, merge_source_t *out);
+ 
+ /* stack room for the prefixed form of a key while a memtable view is asked about its intervals */
+ #define MERGE_SOURCE_PREFIXED_KEY_STACK 128
+diff --git a/src/sstable/sstable.h b/src/sstable/sstable.h
+index 99d3fa1..56eddb8 100644
+--- a/src/sstable/sstable.h
++++ b/src/sstable/sstable.h
+@@ -416,6 +416,15 @@ const range_tombstone_set_t *sstable_iter_intervals(const sstable_iter_t *it);
+  */
+ int sstable_iter_new(sstable_t *sst, int use_cache, sstable_iter_t **out);
+ 
++/**
++ * sstable_iters_opened
++ * how many cursors sstable_iter_new has opened in this process, a relaxed running count. a test
++ * reads it before and after a walk to learn how many tables the walk descended, which is what an
++ * iterator that opens its level runs' cursors lazily is held to
++ * @return the count of successful opens so far
++ */
++int64_t sstable_iters_opened(void);
++
+ /**
+  * sstable_iter_seek
+  * position the cursor at the first key greater than or equal to the search key
+diff --git a/src/sstable/sstable_read.c b/src/sstable/sstable_read.c
+index 597f02a..b64dd6a 100644
+--- a/src/sstable/sstable_read.c
++++ b/src/sstable/sstable_read.c
+@@ -343,6 +343,15 @@ static int64_t sstable_iter_now(const sstable_iter_t *it)
+     return sstable_clock_read(it->now);
+ }
+ 
++/* every cursor opened, counted relaxed: a test's measure of how many tables a walk descended, and
++ * not a figure anything in the engine reads */
++static _Atomic(int64_t) sstable_iters_opened_count;
++
++int64_t sstable_iters_opened(void)
++{
++    return atomic_load_explicit(&sstable_iters_opened_count, memory_order_relaxed);
++}
++
+ int sstable_iter_new(sstable_t *sst, const int use_cache, sstable_iter_t **out)
+ {
+     if (!sst || !out) return TDB_ERR_INVALID_ARGS;
+@@ -369,6 +378,7 @@ int sstable_iter_new(sstable_t *sst, const int use_cache, sstable_iter_t **out)
+     it->now = sst->now;
+     it->intervals = sst->range_tombstones;
+     atomic_store_explicit(&sst->last_access_time, sstable_now(sst), memory_order_relaxed);
++    atomic_fetch_add_explicit(&sstable_iters_opened_count, 1, memory_order_relaxed);
+ 
+     *out = it;
+     return TDB_SUCCESS;
+diff --git a/test/lazy_level_cursors__tests.c b/test/lazy_level_cursors__tests.c
+new file mode 100644
+index 0000000..c4acb61
+--- /dev/null
++++ b/test/lazy_level_cursors__tests.c
+@@ -0,0 +1,751 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* a level below L1 is one merge source over a run of tables, and an iterator opens the cursor of a
++ * table in the run only when a seek or a step first lands on it. these cases hold that to what it
++ * must keep: an iterator over a long run opens the tables it reads and no others, every position
++ * any mix of seeks and steps reaches matches a model of the visible keys, an interval one table of
++ * the run carries still deletes keys another table holds without the carrier's cursor ever being
++ * opened, and a cursor that cannot be opened when it is first reached is an io error the iterator
++ * reports and frees cleanly. each case runs over uncompressed tables and over lz4 ones */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../src/base/errors.h"
++#include "../src/base/keycmp.h"
++#include "../src/column_family/cf_iter.h"
++#include "../src/compaction/compaction_exec.h"
++#include "../src/flush/flush.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define LZ_DB_DIR    "." PATH_SEPARATOR "test_lazy_level_cursors_db"
++#define LZ_MAX_LEVEL 12
++#define LZ_PROB      0.25f
++#define LZ_RUN_LEVEL 2
++
++/* the most keys and intervals a model case writes, bounding the model's arrays */
++#define LZ_MODEL_KEYS   1400
++#define LZ_MODEL_RANGES 16
++
++typedef struct
++{
++    tidesdb_encoding_registry_t reg;
++    vlog_t *vlog;
++    cache_t *cache;
++    fd_manager_t fdm;
++    tidesdb_manifest_t *manifest;
++    char manifest_path[256];
++    tidesdb_l0_t *l0;
++    cf_t *cf;
++    _Atomic(uint64_t) next_id;
++    uint64_t generation;
++    int lz4;
++} lz_db_t;
++
++/* the newest version written of each key and every interval laid, which decide what a scan sees */
++typedef struct
++{
++    uint64_t seq[LZ_MODEL_KEYS]; /* 0 when the key was never written */
++    int deleted[LZ_MODEL_KEYS];
++    int range_lo[LZ_MODEL_RANGES];
++    int range_hi[LZ_MODEL_RANGES]; /* -1 for unbounded above */
++    uint64_t range_seq[LZ_MODEL_RANGES];
++    int n_ranges;
++    int visible[LZ_MODEL_KEYS]; /* the visible keys in order, filled by lz_model_settle */
++    int n_visible;
++} lz_model_t;
++
++static int lz4_available(void)
++{
++    return tidesdb_compression_available(TDB_COMPRESS_LZ4) != 0;
++}
++
++static void lz_db_open(lz_db_t *db, int lz4)
++{
++    memset(db, 0, sizeof(*db));
++    db->lz4 = lz4;
++    (void)remove_directory(LZ_DB_DIR);
++    ASSERT_EQ(mkdir(LZ_DB_DIR, 0755), 0);
++    ASSERT_EQ(tidesdb_encoding_registry_init(&db->reg), 0);
++    const vlog_config_t vc = {.sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
++    ASSERT_EQ(vlog_open(LZ_DB_DIR, &vc, &db->vlog), VLOG_OK);
++    db->cache = cache_create(NULL);
++    ASSERT_EQ(fd_manager_init(&db->fdm, 0), 0);
++    snprintf(db->manifest_path, sizeof(db->manifest_path), "%s%sMANIFEST", LZ_DB_DIR,
++             PATH_SEPARATOR);
++    db->manifest = tidesdb_manifest_open(db->manifest_path);
++    ASSERT_TRUE(db->manifest != NULL);
++
++    tidesdb_column_family_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    snprintf(cfg.name, sizeof(cfg.name), "%s", "cf0");
++    cfg.level_size_ratio = 10;
++    cfg.min_levels = 3;
++    cfg.btree_klog_block_size = 4096;
++    if (lz4)
++    {
++        cfg.encoding_pipeline[0] = TDB_COMPRESS_LZ4;
++        cfg.encoding_count = 1;
++    }
++    ASSERT_EQ(
++        cf_create(LZ_DB_DIR, 0, &cfg, &db->reg, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf),
++        0);
++    ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
++
++    db->l0 = tidesdb_l0_create(64 * 1024, 8, LZ_MAX_LEVEL, LZ_PROB, NULL, NULL);
++    tidesdb_l0_set_active(db->l0,
++                          tidesdb_memtable_create(NULL, 0, 0, LZ_MAX_LEVEL, LZ_PROB, NULL, NULL));
++    atomic_init(&db->next_id, 100);
++    db->generation = 1;
++}
++
++static void lz_db_close(lz_db_t *db)
++{
++    tidesdb_l0_destroy(db->l0);
++    cf_free(db->cf);
++    tidesdb_manifest_close(db->manifest);
++    fd_manager_destroy(&db->fdm);
++    cache_destroy(db->cache);
++    vlog_close(db->vlog);
++    (void)remove_directory(LZ_DB_DIR);
++}
++
++static void lz_key(char *buf, size_t cap, int key)
++{
++    snprintf(buf, cap, "k%05d", key);
++}
++
++static void lz_value(char *buf, size_t cap, uint64_t seq)
++{
++    snprintf(buf, cap, "v%llu", (unsigned long long)seq);
++}
++
++/* write one version of key into the active memtable, a tombstone when deleted */
++static void lz_put(lz_db_t *db, lz_model_t *m, int key, uint64_t seq, int deleted)
++{
++    char k[16], v[32];
++    lz_key(k, sizeof(k), key);
++    lz_value(v, sizeof(v), seq);
++    ASSERT_EQ(tidesdb_l0_apply(db->l0, 0, (const uint8_t *)k, strlen(k),
++                               deleted ? NULL : (const uint8_t *)v, deleted ? 0 : strlen(v), -1,
++                               seq, deleted ? SKIP_LIST_FLAG_DELETED : 0),
++              TDB_SUCCESS);
++    if (m && key < LZ_MODEL_KEYS && seq > m->seq[key])
++    {
++        m->seq[key] = seq;
++        m->deleted[key] = deleted;
++    }
++}
++
++/* lay [lo, hi) at seq into the active memtable, hi -1 for unbounded above */
++static void lz_range(lz_db_t *db, lz_model_t *m, int lo, int hi, uint64_t seq)
++{
++    char l[16], h[16];
++    lz_key(l, sizeof(l), lo);
++    lz_key(h, sizeof(h), hi);
++    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db->l0, 0, (const uint8_t *)l, strlen(l),
++                                               hi < 0 ? NULL : (const uint8_t *)h,
++                                               hi < 0 ? 0 : strlen(h), seq),
++              TDB_SUCCESS);
++    if (m)
++    {
++        ASSERT_TRUE(m->n_ranges < LZ_MODEL_RANGES);
++        m->range_lo[m->n_ranges] = lo;
++        m->range_hi[m->n_ranges] = hi;
++        m->range_seq[m->n_ranges] = seq;
++        m->n_ranges++;
++    }
++}
++
++/* rotate the active memtable and flush it into one L1 table, returning its id */
++static uint64_t lz_flush(lz_db_t *db)
++{
++    db->generation++;
++    ASSERT_EQ(
++        tidesdb_l0_rotate(db->l0, tidesdb_memtable_create(NULL, db->generation, db->generation,
++                                                          LZ_MAX_LEVEL, LZ_PROB, NULL, NULL)),
++        TDB_SUCCESS);
++    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(db->l0);
++    const uint64_t id = atomic_load(&db->next_id);
++    cf_t *cfs[1] = {db->cf};
++    flush_ctx_t fx = {.l0 = db->l0,
++                      .cfs = cfs,
++                      .n_cfs = 1,
++                      .manifest = db->manifest,
++                      .manifest_path = db->manifest_path,
++                      .next_sstable_id = &db->next_id,
++                      .fdm = &db->fdm,
++                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                      .value_threshold = 1u << 20};
++    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
++    return id;
++}
++
++/* move the given L1 tables down to level as they are, the way the planner deepens a family, so
++ * they form one run there */
++static void lz_move(lz_db_t *db, const uint64_t *ids, int n, int level)
++{
++    const compaction_job_t move = {.input_ids = ids,
++                                   .n_inputs = n,
++                                   .target_level = level,
++                                   .is_largest_level = 1,
++                                   .split = COMPACTION_SPLIT_NONE,
++                                   .is_move = 1};
++    const compaction_ctx_t cx = {.cf = db->cf,
++                                 .manifest = db->manifest,
++                                 .manifest_path = db->manifest_path,
++                                 .next_sstable_id = &db->next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = 1u << 20};
++    ASSERT_EQ(compaction_exec(&cx, &move), TDB_SUCCESS);
++    ASSERT_EQ(level_set_count(db->cf->levels, level), n);
++}
++
++/* the run's tables at level, referenced in key order; the caller drops them with lz_unref_all */
++static int lz_level_tables(lz_db_t *db, int level, sstable_t **out, int cap)
++{
++    const int total = level_set_snapshot(db->cf->levels, NULL, 0);
++    level_set_snapshot_entry_t *all = calloc((size_t)total + 1, sizeof(*all));
++    ASSERT_TRUE(all != NULL);
++    ASSERT_EQ(level_set_snapshot(db->cf->levels, all, total), total);
++    int n = 0;
++    for (int i = 0; i < total; i++)
++    {
++        if (all[i].level == level && n < cap)
++            out[n++] = all[i].sst;
++        else if (sstable_unref(all[i].sst))
++            sstable_close(all[i].sst);
++    }
++    free(all);
++    return n;
++}
++
++static void lz_unref_all(sstable_t **t, int n)
++{
++    for (int i = 0; i < n; i++)
++        if (sstable_unref(t[i])) sstable_close(t[i]);
++}
++
++/* every table the run holds was written with the family's codec, so the lz4 case reads lz4 */
++static void lz_assert_codec(lz_db_t *db, int level)
++{
++    sstable_t *t[64];
++    const int n = lz_level_tables(db, level, t, 64);
++    ASSERT_TRUE(n > 0);
++    for (int i = 0; i < n; i++) ASSERT_EQ(t[i]->codec_count > 0, db->lz4 != 0);
++    lz_unref_all(t, n);
++}
++
++/* a run of n tables at the run level, table f holding keys [f * per, f * per + per) stepped by
++ * stride, every version at seq base + key, none deleted. returns nothing; the model learns each */
++static void lz_build_run(lz_db_t *db, lz_model_t *m, int n, int per, int stride, uint64_t base)
++{
++    uint64_t ids[64];
++    ASSERT_TRUE(n <= 64);
++    for (int f = 0; f < n; f++)
++    {
++        for (int i = 0; i < per; i++)
++        {
++            const int key = (f * per + i) * stride;
++            lz_put(db, m, key, base + (uint64_t)key, 0);
++        }
++        ids[f] = lz_flush(db);
++    }
++    lz_move(db, ids, n, LZ_RUN_LEVEL);
++}
++
++/* the key the iterator sits on, as the integer it names */
++static int lz_current(cf_iter_t *it)
++{
++    const uint8_t *key = NULL, *value = NULL;
++    size_t key_size = 0, value_size = 0;
++    uint64_t seq = 0, vlog = 0;
++    int64_t ttl = 0;
++    uint8_t deleted = 0;
++    ASSERT_EQ(cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog, &ttl, &deleted),
++              TDB_SUCCESS);
++    ASSERT_EQ(deleted, 0);
++    ASSERT_TRUE(key_size == 6 && key[0] == 'k');
++    char buf[8];
++    memcpy(buf, key + 1, 5);
++    buf[5] = '\0';
++    const int k = atoi(buf);
++    /* the value names the version that won, which is the newest the model holds for the key */
++    char want[32];
++    lz_value(want, sizeof(want), seq);
++    ASSERT_EQ(value_size, strlen(want));
++    ASSERT_EQ(memcmp(value, want, value_size), 0);
++    return k;
++}
++
++static int lz_seek(cf_iter_t *it, int key)
++{
++    char k[16];
++    lz_key(k, sizeof(k), key);
++    return cf_iter_seek(it, (const uint8_t *)k, strlen(k));
++}
++
++static int lz_seek_for_prev(cf_iter_t *it, int key)
++{
++    char k[16];
++    lz_key(k, sizeof(k), key);
++    return cf_iter_seek_for_prev(it, (const uint8_t *)k, strlen(k));
++}
++
++/* list the visible keys in order: the newest version is live and no newer interval covers it */
++static void lz_model_settle(lz_model_t *m)
++{
++    m->n_visible = 0;
++    for (int k = 0; k < LZ_MODEL_KEYS; k++)
++    {
++        if (m->seq[k] == 0 || m->deleted[k]) continue;
++        int covered = 0;
++        for (int r = 0; r < m->n_ranges && !covered; r++)
++            covered = k >= m->range_lo[r] && (m->range_hi[r] < 0 || k < m->range_hi[r]) &&
++                      m->range_seq[r] > m->seq[k];
++        if (!covered) m->visible[m->n_visible++] = k;
++    }
++}
++
++/* the model's position after a seek to key: the first visible key at or after it */
++static int lz_model_seek(const lz_model_t *m, int key)
++{
++    int lo = 0, hi = m->n_visible;
++    while (lo < hi)
++    {
++        const int mid = lo + (hi - lo) / 2;
++        if (m->visible[mid] < key)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    return lo;
++}
++
++/* the iterator is where the model says, n_visible or -1 meaning off either end */
++static void lz_assert_at(cf_iter_t *it, int rc, const lz_model_t *m, int pos)
++{
++    if (pos < 0 || pos >= m->n_visible)
++    {
++        ASSERT_EQ(rc, TDB_ERR_NOT_FOUND);
++        ASSERT_FALSE(cf_iter_valid(it));
++        return;
++    }
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    ASSERT_TRUE(cf_iter_valid(it));
++    ASSERT_EQ(lz_current(it), m->visible[pos]);
++}
++
++/* ---- LazyCursorsOpenOnlyTouchedTables ---- */
++
++#define LZ_TOUCH_TABLES 40
++#define LZ_TOUCH_PER    20
++#define LZ_TOUCH_TABLE  17
++#define LZ_TOUCH_STEPS  5
++
++/* a seek into one table of a 40-table run and a few steps along it open that table's cursor and at
++ * most its neighbour's, never the other 38 */
++static void lz_open_only_touched(int lz4)
++{
++    lz_db_t db;
++    lz_db_open(&db, lz4);
++    lz_build_run(&db, NULL, LZ_TOUCH_TABLES, LZ_TOUCH_PER, 1, 1000);
++    lz_assert_codec(&db, LZ_RUN_LEVEL);
++
++    const int64_t before = sstable_iters_opened();
++    cf_iter_t *it = NULL;
++    ASSERT_EQ(cf_iter_new(db.cf, db.l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
++    const int target = LZ_TOUCH_TABLE * LZ_TOUCH_PER + 5;
++    ASSERT_EQ(lz_seek(it, target), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), target);
++    for (int s = 1; s <= LZ_TOUCH_STEPS; s++)
++    {
++        ASSERT_EQ(cf_iter_next(it), TDB_SUCCESS);
++        ASSERT_EQ(lz_current(it), target + s);
++    }
++    const int64_t opened = sstable_iters_opened() - before;
++    printf("(opened %lld of %d) ", (long long)opened, LZ_TOUCH_TABLES);
++    ASSERT_TRUE(opened >= 1 && opened <= 2);
++    cf_iter_free(it);
++    lz_db_close(&db);
++}
++
++static void test_lazy_cursors_open_only_touched_tables(void)
++{
++    lz_open_only_touched(0);
++}
++
++static void test_lazy_cursors_open_only_touched_tables_lz4(void)
++{
++    if (!lz4_available()) return;
++    lz_open_only_touched(1);
++}
++
++/* ---- LazyMatchesModel ---- */
++
++#define LZ_MODEL_TABLES 30
++#define LZ_MODEL_PER    20
++#define LZ_MODEL_STRIDE 2 /* the run holds even keys, so a seek to an odd one falls between */
++#define LZ_MODEL_OPS    5000
++#define LZ_MODEL_SEED   0x9e3779b9u
++
++static uint32_t lz_rand(uint32_t *state)
++{
++    *state = *state * 1664525u + 1013904223u;
++    return *state >> 8;
++}
++
++/* a run of 30 tables, some of which carry intervals reaching across several of their neighbours,
++ * beneath two overlapping L1 tables with versions, tombstones and intervals of their own */
++static void lz_model_build(lz_db_t *db, lz_model_t *m)
++{
++    uint64_t ids[LZ_MODEL_TABLES];
++    for (int f = 0; f < LZ_MODEL_TABLES; f++)
++    {
++        for (int i = 0; i < LZ_MODEL_PER; i++)
++        {
++            const int key = (f * LZ_MODEL_PER + i) * LZ_MODEL_STRIDE;
++            lz_put(db, m, key, 1000 + (uint64_t)key, key % 14 == 6);
++        }
++        /* intervals newer than every run version, each spanning tables other than its carrier */
++        if (f == 5) lz_range(db, m, 170, 290, 5000);   /* tables 4 to 7 */
++        if (f == 20) lz_range(db, m, 720, 1006, 5001); /* tables 18 to 25 */
++        if (f == 2) lz_range(db, m, 1101, 1113, 5002); /* inside table 27, carried by table 2 */
++        if (f == 29) lz_range(db, m, 1180, -1, 5003);  /* the tail, unbounded */
++        ids[f] = lz_flush(db);
++    }
++    lz_move(db, ids, LZ_MODEL_TABLES, LZ_RUN_LEVEL);
++
++    /* the first L1 table: odd keys of its own, newer versions of some deleted run keys, and
++     * tombstones over some live ones */
++    for (int k = 1; k < LZ_MODEL_KEYS - 100; k += 18) lz_put(db, m, k, 9000 + (uint64_t)k, 0);
++    for (int k = 180; k < 280; k += 10) lz_put(db, m, k, 9000 + (uint64_t)k, 0);
++    for (int k = 400; k < 460; k += 6) lz_put(db, m, k, 9000 + (uint64_t)k, 1);
++    lz_put(db, m, 1190, 9500, 0); /* past the unbounded interval, newer than it */
++    lz_flush(db);
++
++    /* the second, newest: an interval hiding part of the first's keys and the run's, then versions
++     * newer than it inside it */
++    lz_range(db, m, 500, 560, 11000);
++    for (int k = 510; k < 540; k += 8) lz_put(db, m, k, 11100 + (uint64_t)k, 0);
++    for (int k = 600; k < 700; k += 4) lz_put(db, m, k, 11100 + (uint64_t)k, 0);
++    lz_flush(db);
++    ASSERT_EQ(level_set_count(db->cf->levels, LEVEL_SET_L1), 2);
++    lz_model_settle(m);
++    ASSERT_TRUE(m->n_visible > 100);
++}
++
++static void lz_matches_model(int lz4)
++{
++    lz_db_t db;
++    lz_db_open(&db, lz4);
++    lz_model_t *m = calloc(1, sizeof(*m));
++    ASSERT_TRUE(m != NULL);
++    lz_model_build(&db, m);
++    lz_assert_codec(&db, LZ_RUN_LEVEL);
++
++    cf_iter_t *it = NULL;
++    ASSERT_EQ(cf_iter_new(db.cf, db.l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
++    uint32_t state = LZ_MODEL_SEED;
++    int pos = -1; /* the model's position, -1 or n_visible off an end */
++    int valid = 0;
++    for (int op = 0; op < LZ_MODEL_OPS; op++)
++    {
++        /* steps when positioned, else the seek of the same direction in their place */
++        const uint32_t pick = lz_rand(&state) % 10;
++        const int key = (int)(lz_rand(&state) % (LZ_MODEL_KEYS + 20));
++        int rc;
++        if (pick < 4 && valid)
++        {
++            rc = cf_iter_next(it);
++            pos++;
++        }
++        else if (pick >= 4 && pick < 7 && valid)
++        {
++            rc = cf_iter_prev(it);
++            pos--;
++        }
++        else if (pick < 4 || pick == 7)
++        {
++            rc = lz_seek(it, key);
++            pos = lz_model_seek(m, key);
++        }
++        else if (pick < 9)
++        {
++            rc = lz_seek_for_prev(it, key);
++            pos = lz_model_seek(m, key + 1) - 1;
++        }
++        else if (lz_rand(&state) & 1)
++        {
++            rc = cf_iter_seek_first(it);
++            pos = 0;
++        }
++        else
++        {
++            rc = cf_iter_seek_last(it);
++            pos = m->n_visible - 1;
++        }
++        lz_assert_at(it, rc, m, pos);
++        valid = pos >= 0 && pos < m->n_visible;
++    }
++
++    /* and a whole walk each way */
++    int n = 0;
++    for (int rc = cf_iter_seek_first(it); rc == TDB_SUCCESS; rc = cf_iter_next(it))
++        ASSERT_EQ(lz_current(it), m->visible[n++]);
++    ASSERT_EQ(n, m->n_visible);
++    for (int rc = cf_iter_seek_last(it); rc == TDB_SUCCESS; rc = cf_iter_prev(it))
++        ASSERT_EQ(lz_current(it), m->visible[--n]);
++    ASSERT_EQ(n, 0);
++
++    cf_iter_free(it);
++    free(m);
++    lz_db_close(&db);
++}
++
++static void test_lazy_matches_model(void)
++{
++    lz_matches_model(0);
++}
++
++static void test_lazy_matches_model_lz4(void)
++{
++    if (!lz4_available()) return;
++    lz_matches_model(1);
++}
++
++/* ---- CoversWithoutCursor ---- */
++
++#define LZ_COVER_TABLES  32
++#define LZ_COVER_PER     20
++#define LZ_COVER_CARRIER 3
++#define LZ_COVER_HELD    30
++
++/* an interval table 3 carries deletes keys table 30 holds. a seek onto one of them lands on the
++ * first key past the interval, and only table 30's cursor is opened to get there -- the carrier is
++ * asked through the intervals it holds in memory, not through a cursor */
++static void lz_covers_without_cursor(int lz4)
++{
++    lz_db_t db;
++    lz_db_open(&db, lz4);
++    uint64_t ids[LZ_COVER_TABLES];
++    const int held = LZ_COVER_HELD * LZ_COVER_PER;
++    for (int f = 0; f < LZ_COVER_TABLES; f++)
++    {
++        for (int i = 0; i < LZ_COVER_PER; i++)
++        {
++            const int key = f * LZ_COVER_PER + i;
++            lz_put(&db, NULL, key, 1000 + (uint64_t)key, 0);
++        }
++        if (f == LZ_COVER_CARRIER) lz_range(&db, NULL, held + 4, held + 9, 5000);
++        ids[f] = lz_flush(&db);
++    }
++    lz_move(&db, ids, LZ_COVER_TABLES, LZ_RUN_LEVEL);
++    lz_assert_codec(&db, LZ_RUN_LEVEL);
++
++    const int64_t before = sstable_iters_opened();
++    cf_iter_t *it = NULL;
++    ASSERT_EQ(cf_iter_new(db.cf, db.l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
++    ASSERT_EQ(lz_seek(it, held + 5), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), held + 9);
++    ASSERT_EQ(lz_seek_for_prev(it, held + 8), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), held + 3);
++    ASSERT_EQ(cf_iter_next(it), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), held + 9);
++    const int64_t opened = sstable_iters_opened() - before;
++    printf("(opened %lld of %d) ", (long long)opened, LZ_COVER_TABLES);
++    ASSERT_EQ(opened, 1);
++    cf_iter_free(it);
++    lz_db_close(&db);
++}
++
++static void test_covers_without_cursor(void)
++{
++    lz_covers_without_cursor(0);
++}
++
++static void test_covers_without_cursor_lz4(void)
++{
++    if (!lz4_available()) return;
++    lz_covers_without_cursor(1);
++}
++
++/* ---- TombstoneOnlyTableInRun ---- */
++
++#define LZ_TOMB_PER 20
++
++/* a run holding a table with an interval and no keys: walks either way skip what it covers, and
++ * the keyless table is stepped over like any other */
++static void lz_tombstone_only_table(int lz4)
++{
++    lz_db_t db;
++    lz_db_open(&db, lz4);
++    lz_model_t *m = calloc(1, sizeof(*m));
++    ASSERT_TRUE(m != NULL);
++    uint64_t ids[5];
++    int n = 0;
++    for (int f = 0; f < 2; f++)
++    {
++        for (int i = 0; i < LZ_TOMB_PER; i++) lz_put(&db, m, f * LZ_TOMB_PER + i, 1000, 0);
++        ids[n++] = lz_flush(&db);
++    }
++    lz_range(&db, m, 25, 55, 5000); /* across the second table and the third */
++    ids[n++] = lz_flush(&db);
++    for (int f = 2; f < 4; f++)
++    {
++        for (int i = 0; i < LZ_TOMB_PER; i++) lz_put(&db, m, f * LZ_TOMB_PER + i, 1000, 0);
++        ids[n++] = lz_flush(&db);
++    }
++    lz_move(&db, ids, n, LZ_RUN_LEVEL);
++    lz_model_settle(m);
++    ASSERT_EQ(m->n_visible, 4 * LZ_TOMB_PER - 30);
++
++    cf_iter_t *it = NULL;
++    ASSERT_EQ(cf_iter_new(db.cf, db.l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
++    int seen = 0;
++    for (int rc = cf_iter_seek_first(it); rc == TDB_SUCCESS; rc = cf_iter_next(it))
++        ASSERT_EQ(lz_current(it), m->visible[seen++]);
++    ASSERT_EQ(seen, m->n_visible);
++    for (int rc = cf_iter_seek_last(it); rc == TDB_SUCCESS; rc = cf_iter_prev(it))
++        ASSERT_EQ(lz_current(it), m->visible[--seen]);
++    ASSERT_EQ(seen, 0);
++    ASSERT_EQ(lz_seek(it, 30), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), 55);
++    ASSERT_EQ(cf_iter_prev(it), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), 24);
++    ASSERT_EQ(lz_seek_for_prev(it, 50), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), 24);
++    ASSERT_EQ(cf_iter_next(it), TDB_SUCCESS);
++    ASSERT_EQ(lz_current(it), 55);
++    cf_iter_free(it);
++    free(m);
++    lz_db_close(&db);
++}
++
++static void test_tombstone_only_table_in_run(void)
++{
++    lz_tombstone_only_table(0);
++}
++
++static void test_tombstone_only_table_in_run_lz4(void)
++{
++    if (!lz4_available()) return;
++    lz_tombstone_only_table(1);
++}
++
++/* ---- LazyOpenFailureIsIo ---- */
++
++#define LZ_FAIL_TABLES 10
++#define LZ_FAIL_PER    20
++#define LZ_FAIL_TABLE  6
++
++/* a table whose klog cannot be reopened when a walk first reaches it. the iterator reports io --
++ * at the seek or step that reached it, or, opening every cursor up front, when it is built -- and
++ * frees cleanly either way; a seek elsewhere after the failure still reads */
++static void lz_open_failure_is_io(int lz4)
++{
++    lz_db_t db;
++    lz_db_open(&db, lz4);
++    lz_build_run(&db, NULL, LZ_FAIL_TABLES, LZ_FAIL_PER, 1, 1000);
++
++    sstable_t *t[LZ_FAIL_TABLES];
++    ASSERT_EQ(lz_level_tables(&db, LZ_RUN_LEVEL, t, LZ_FAIL_TABLES), LZ_FAIL_TABLES);
++    sstable_t *victim = t[LZ_FAIL_TABLE];
++    /* the level set's reference and the one taken here are the only ones held */
++    if (sstable_klog_resident(victim))
++        ASSERT_EQ(sstable_evict_klog(victim, SSTABLE_IDLE_BASELINE + 1), 1);
++    ASSERT_FALSE(sstable_klog_resident(victim));
++    char moved[1024];
++    snprintf(moved, sizeof(moved), "%s.moved", victim->klog_path);
++    ASSERT_EQ(rename(victim->klog_path, moved), 0);
++    /* a directory in its place, so the reopen fails rather than creating an empty klog */
++    ASSERT_EQ(mkdir(victim->klog_path, 0755), 0);
++
++    cf_iter_t *it = NULL;
++    const int built = cf_iter_new(db.cf, db.l0, UINT64_MAX, NULL, &it);
++    printf("(io %s) ", built == TDB_SUCCESS ? "where reached" : "when built");
++    if (built == TDB_SUCCESS)
++    {
++        /* a table before the broken one reads */
++        ASSERT_EQ(lz_seek(it, 2 * LZ_FAIL_PER + 3), TDB_SUCCESS);
++        ASSERT_EQ(lz_current(it), 2 * LZ_FAIL_PER + 3);
++        /* a seek onto the broken one fails as io, and leaves the iterator invalid */
++        ASSERT_EQ(lz_seek(it, LZ_FAIL_TABLE * LZ_FAIL_PER + 3), TDB_ERR_IO);
++        ASSERT_FALSE(cf_iter_valid(it));
++        /* so does a backward seek and a walk that steps onto it */
++        ASSERT_EQ(lz_seek_for_prev(it, LZ_FAIL_TABLE * LZ_FAIL_PER + 3), TDB_ERR_IO);
++        /* the merge reads one entry ahead of where it stands, so the step onto a table's last key
++         * is the one that reaches into the next table */
++        ASSERT_EQ(lz_seek(it, LZ_FAIL_TABLE * LZ_FAIL_PER - 3), TDB_SUCCESS);
++        ASSERT_EQ(cf_iter_next(it), TDB_SUCCESS);
++        ASSERT_EQ(lz_current(it), LZ_FAIL_TABLE * LZ_FAIL_PER - 2);
++        ASSERT_EQ(cf_iter_next(it), TDB_ERR_IO);
++        ASSERT_FALSE(cf_iter_valid(it));
++        ASSERT_EQ(lz_seek_for_prev(it, (LZ_FAIL_TABLE + 1) * LZ_FAIL_PER + 2), TDB_SUCCESS);
++        ASSERT_EQ(cf_iter_prev(it), TDB_SUCCESS);
++        ASSERT_EQ(lz_current(it), (LZ_FAIL_TABLE + 1) * LZ_FAIL_PER + 1);
++        ASSERT_EQ(cf_iter_prev(it), TDB_ERR_IO);
++        ASSERT_FALSE(cf_iter_valid(it));
++        /* a whole walk cannot pass it either way */
++        int rc = cf_iter_seek_first(it);
++        while (rc == TDB_SUCCESS) rc = cf_iter_next(it);
++        ASSERT_EQ(rc, TDB_ERR_IO);
++        rc = cf_iter_seek_last(it);
++        while (rc == TDB_SUCCESS) rc = cf_iter_prev(it);
++        ASSERT_EQ(rc, TDB_ERR_IO);
++        /* and a seek elsewhere afterwards reads again */
++        ASSERT_EQ(lz_seek(it, 9 * LZ_FAIL_PER), TDB_SUCCESS);
++        ASSERT_EQ(lz_current(it), 9 * LZ_FAIL_PER);
++        cf_iter_free(it);
++    }
++    else
++    {
++        ASSERT_EQ(built, TDB_ERR_IO);
++        ASSERT_TRUE(it == NULL);
++    }
++
++    ASSERT_EQ(rmdir(victim->klog_path), 0);
++    ASSERT_EQ(rename(moved, victim->klog_path), 0);
++    lz_unref_all(t, LZ_FAIL_TABLES);
++    lz_db_close(&db);
++}
++
++static void test_lazy_open_failure_is_io(void)
++{
++    lz_open_failure_is_io(0);
++}
++
++static void test_lazy_open_failure_is_io_lz4(void)
++{
++    if (!lz4_available()) return;
++    lz_open_failure_is_io(1);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_cursors_open_only_touched_tables, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_cursors_open_only_touched_tables_lz4, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_matches_model, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_matches_model_lz4, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_covers_without_cursor, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_covers_without_cursor_lz4, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_tombstone_only_table_in_run, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_tombstone_only_table_in_run_lz4, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_open_failure_is_io, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_lazy_open_failure_is_io_lz4, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

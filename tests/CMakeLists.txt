@@ -57,7 +57,7 @@ endforeach()
 # and the upstream sstable suite that guards the builder it changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
-foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable lazy_level_cursors)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   # the btree internals include xxhash.h, which TidesDB keeps under external/
@@ -108,6 +108,8 @@ add_test(NAME TidesDbCommitGate COMMAND tidesdb_commit_gate_tests WORKING_DIRECT
 add_test(NAME TidesDbFlushWait COMMAND tidesdb_flush_wait_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the upstream sstable suite writes its scratch files under the working directory
 add_test(NAME TidesDbSstable COMMAND tidesdb_sstable_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the lazy level cursor suite writes its scratch database under the working directory
+add_test(NAME TidesDbLazyLevelCursors COMMAND tidesdb_lazy_level_cursors_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)
