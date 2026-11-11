@@ -88,6 +88,11 @@ std::string RenderSection(const std::string& name, const ServerStats& s) {
     return Section("Stats", {{"total_connections_received", std::to_string(s.total_connections)},
                              {"total_commands_processed", std::to_string(s.total_commands)},
                              {"expired_keys", std::to_string(s.expired_keys)},
+                             {"blind_set_filter_state", s.blind_set_filter_state},
+                             {"blind_set_filter_keys", std::to_string(s.blind_set_filter_keys)},
+                             {"blind_set_filter_bytes", std::to_string(s.blind_set_filter_bytes)},
+                             {"blind_set_filter_rebuilds", std::to_string(s.blind_set_filter_rebuilds)},
+                             {"blind_set_skipped_reads", std::to_string(s.blind_set_skipped_reads)},
                              {"sync_full", std::to_string(s.repl.sync_full)},
                              {"sync_partial_ok", std::to_string(s.repl.sync_partial_ok)},
                              {"sync_partial_err", std::to_string(s.repl.sync_partial_err)}});

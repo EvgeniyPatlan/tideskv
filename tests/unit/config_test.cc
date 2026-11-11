@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "support/fake_server_services.h"
 #include "support/temp_dir.h"
 
 namespace tideskv {
@@ -37,6 +38,26 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(v.l0_stall_threshold, 64);
   EXPECT_EQ(v.btree_block_size, 4096u);
   EXPECT_EQ(v.compression_start_level, 0);
+}
+
+TEST(Config, BlindSetDefaultsYes) {
+  EXPECT_TRUE(Config().Snapshot().blind_set);
+  const auto got = Config().Get("blind-set");
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].second, "yes");
+}
+
+TEST(Config, BlindSetRuntimeToggle) {
+  test::FakeServerServices s;
+  EXPECT_TRUE(s.special_keys_.enabled());
+  ASSERT_TRUE(s.config_.Set("blind-set", "no", /*at_runtime=*/true).ok());
+  EXPECT_FALSE(s.config_.Snapshot().blind_set);
+  EXPECT_FALSE(s.special_keys_.enabled());
+  EXPECT_EQ(s.special_keys_.state_name(), "disabled");
+  EXPECT_FALSE(s.config_.Set("blind-set", "maybe", true).ok());
+  EXPECT_FALSE(s.special_keys_.enabled());
+  ASSERT_TRUE(s.config_.Set("blind-set", "YES", true).ok());
+  EXPECT_TRUE(s.special_keys_.enabled());
 }
 
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
@@ -149,7 +170,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 48u);
+  EXPECT_EQ(c.Get("*").size(), 49u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {

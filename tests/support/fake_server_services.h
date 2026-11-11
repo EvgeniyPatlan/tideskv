@@ -26,6 +26,7 @@
 #include "support/faulty_storage.h"
 #include "types/cursor_store.h"
 #include "types/oid_allocator.h"
+#include "types/special_key_filter.h"
 
 namespace tideskv::test {
 
@@ -117,6 +118,10 @@ class FakeReplication final : public Replication {
 class FakeServerServices final : public ServerServices {
  public:
   FakeServerServices() {
+    // B1: every meta Put of the (empty) storage feeds the filter, so it is complete from the start.
+    storage_.SetMetaPutHook(&special_keys_);
+    special_keys_.MarkReady();
+    config_.SetOnChange([this](const ConfigValues& v) { special_keys_.set_enabled(v.blind_set); });
     replication_.log = &repl_log_;
     if (Status st = repl_log_.Recover(); !st.ok())
       throw std::runtime_error("ReplLog::Recover: " + st.ToString());
@@ -141,6 +146,7 @@ class FakeServerServices final : public ServerServices {
   ClientPause& pause() override { return pause_; }
   cluster::ClusterManager* cluster() override { return cluster_manager; }
   migrate::MigrationService* migration() override { return migration_service; }
+  SpecialKeyFilter& special_keys() override { return special_keys_; }
 
   CommandRegistry registry_;
   Config config_;
@@ -154,6 +160,7 @@ class FakeServerServices final : public ServerServices {
   ClientPause pause_;
   cluster::ClusterManager* cluster_manager = nullptr;      // set by ClusterHarness
   migrate::MigrationService* migration_service = nullptr;  // set by ClusterHarness
+  SpecialKeyFilter special_keys_;  // before storage_: its write txns hold the hook pointer
   FaultyStorage storage_;
   LockManager locks_;
   FakeClock clock_;

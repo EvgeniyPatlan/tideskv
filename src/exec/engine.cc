@@ -105,6 +105,14 @@ Status Engine::WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flu
   return RunTxn(fn, WriteScope{0, nullptr, nullptr, &flushed_dbs});
 }
 
+Status Engine::Quiesce(const std::function<void()>& fn) {
+  if (ActiveBatch() != nullptr) return Status::Internal("quiesce inside a batch");
+  [[maybe_unused]] const ReentryCheck reentry;
+  std::lock_guard barrier(gate_);  // every call holding the gate finishes first, busy or not
+  fn();
+  return Status::Ok();
+}
+
 Status Engine::CollectFlushed(ReadView& view, const WriteScope& scope, std::vector<DbKey>* out) {
   out->clear();
   if (scope.flushed_dbs == nullptr || observer_ == nullptr || observer_->Idle()) return Status::Ok();

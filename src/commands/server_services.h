@@ -22,6 +22,7 @@ class Engine;
 class OidAllocator;
 class Replication;
 class ScriptEngine;
+class SpecialKeyFilter;
 class WatchRegistry;
 
 // One attached replica as INFO lists it: "send_bulk" while a full sync transfers its snapshot, then "online".
@@ -106,6 +107,12 @@ struct ServerStats {
   uint64_t loading_loaded_bytes = 0;  // LOAD payload bytes applied
   int64_t loading_eta_seconds = 0;    // Redis's formula (server.c:5850), computed in App::Stats
   bool cluster_enabled = false;       // INFO # Cluster and redis_mode (M7a D25)
+  // B1: the special-key filter behind blind SET (SpecialKeyFilter::state_name and counters).
+  std::string blind_set_filter_state = "building";
+  uint64_t blind_set_filter_keys = 0;
+  uint64_t blind_set_filter_bytes = 0;
+  uint64_t blind_set_filter_rebuilds = 0;  // completed SpecialKeyService rebuilds
+  uint64_t blind_set_skipped_reads = 0;    // SET keys written without a pre-write read
 };
 
 // What command handlers may ask of the server. Implemented by App (Task 19) and
@@ -128,6 +135,7 @@ class ServerServices {
   virtual ClientPause& pause() = 0;                // CLIENT PAUSE (M7a D21)
   virtual cluster::ClusterManager* cluster() = 0;  // null unless cluster-enabled (M7a)
   virtual migrate::MigrationService* migration() = 0;  // null unless cluster-enabled (M7b)
+  virtual SpecialKeyFilter& special_keys() = 0;        // blind SET (B1); fed by the storage hook
 };
 
 }  // namespace tideskv

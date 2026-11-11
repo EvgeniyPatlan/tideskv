@@ -160,13 +160,14 @@ TEST_F(CmdDebugTest, CorruptZsetScoreIsAnErrorReply) {
 
 TEST_F(CmdDebugTest, HelpNamesTheSupportedSubcommands) {
   const std::string reply = Run({"DEBUG", "HELP"});
-  EXPECT_EQ(reply.substr(0, 5), "*11\r\n");
+  EXPECT_EQ(reply.substr(0, 5), "*13\r\n");
   EXPECT_NE(reply.find("+DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"),
             std::string::npos);
   EXPECT_NE(reply.find("+DIGEST\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-VALUE <key> [<key> ...]\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-INDEX\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+DIGEST-SLOTS <slot|from-to> [TTL]\r\n"), std::string::npos);
+  EXPECT_NE(reply.find("+SPECIAL-KEYS\r\n"), std::string::npos);
   EXPECT_NE(reply.find("+HELP\r\n"), std::string::npos);
 }
 
@@ -182,6 +183,18 @@ TEST_F(CmdDebugTest, DigestSlotsTakesOneRangeAndAnOptionalTtl) {  // M7b D23
   EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "3300", "NOPE"}), Err(kErrSyntax));
   EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "1 2"}), Err(kErrSyntax));  // one range only
   EXPECT_EQ(h.Run({"DEBUG", "DIGEST-SLOTS", "16384"}), Err("ERR Invalid slot id: out of numeric range"));
+}
+
+// B1: the special-key filter against the meta CF; a meta Put that bypassed the hook shows as missing.
+TEST_F(CmdDebugTest, DebugSpecialKeysReportsMissing) {
+  Run({"SET", "plain", "v"});
+  Run({"HSET", "h", "f", "v"});
+  EXPECT_EQ(Run({"DEBUG", "SPECIAL-KEYS"}), Arr({"+ready\r\n", Int(1), Int(0)}));
+  h.services.storage_.SetMetaPutHook(nullptr);
+  h.SeedHash(0, "h2", 9, false);
+  h.services.storage_.SetMetaPutHook(&h.services.special_keys_);
+  EXPECT_EQ(Run({"DEBUG", "SPECIAL-KEYS"}), Arr({"+ready\r\n", Int(2), Int(1)}));
+  EXPECT_EQ(Run({"DEBUG", "SPECIAL-KEYS", "x"}).rfind("-ERR", 0), 0u);
 }
 
 }  // namespace

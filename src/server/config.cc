@@ -99,6 +99,13 @@ Status ValidateNoControlChars(std::string_view v) {
   return Status::Ok();
 }
 
+Status YesNo(std::string_view v, bool* out) {
+  const std::string lower = ToLower(v);
+  if (lower != "yes" && lower != "no") return Status::InvalidArgument("argument must be 'yes' or 'no'");
+  *out = lower == "yes";
+  return Status::Ok();
+}
+
 template <typename T>
 Status SetInt(std::string_view v, int64_t lo, int64_t hi, T* out) {
   int64_t n = 0;
@@ -115,6 +122,8 @@ std::vector<Option> BaseOptions() {
          return NonEmpty(v, &c.bind);
        },
        [](const ConfigValues& c) { return c.bind; }},
+      {"blind-set", true, [](ConfigValues& c, std::string_view v) { return YesNo(v, &c.blind_set); },
+       [](const ConfigValues& c) { return std::string(c.blind_set ? "yes" : "no"); }},
       {"block-cache-size", false,
        [](ConfigValues& c, std::string_view v) { return Memory(v, 0, &c.block_cache_size); },
        [](const ConfigValues& c) { return std::to_string(c.block_cache_size); }},

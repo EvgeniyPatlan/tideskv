@@ -223,6 +223,53 @@ TEST_F(EngineFixture, WriteExclusiveWaitsForInflightWrites) {
   EXPECT_TRUE(exclusive_ran.load());
 }
 
+// B1: the special-key filter's Reset runs under Quiesce, so a write that already buffered its meta Put
+// (and told the hook) must commit before fn runs.
+TEST_F(EngineFixture, QuiesceWaitsForWriters) {
+  std::atomic<bool> in_write{false}, release{false}, quiesced{false};
+  std::thread writer([&] {
+    EXPECT_TRUE(engine
+                    .Write(0, {"k"},
+                           [&](WriteTxn& t, int64_t) {
+                             EXPECT_TRUE(t.Put(ColumnFamily::kMeta, "k", "v").ok());
+                             in_write = true;
+                             while (!release) std::this_thread::yield();
+                             EXPECT_FALSE(quiesced.load());
+                             return Status::Ok();
+                           })
+                    .ok());
+  });
+  while (!in_write) std::this_thread::yield();
+  std::string seen;
+  std::thread quiescer([&] {
+    EXPECT_TRUE(engine
+                    .Quiesce([&] {
+                      quiesced = true;
+                      auto view = storage.BeginRead();  // fn may use the storage, not the Engine
+                      ASSERT_TRUE(view.ok());
+                      auto r = (*view)->Get(ColumnFamily::kMeta, "k");
+                      if (r.ok()) seen = *r;
+                    })
+                    .ok());
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(quiesced.load());
+  release = true;
+  writer.join();
+  quiescer.join();
+  EXPECT_TRUE(quiesced.load());
+  EXPECT_EQ(seen, "v");  // the writer committed before fn ran
+}
+
+TEST_F(EngineFixture, QuiesceRefusedInBatch) {
+  auto batch = engine.BeginBatch();
+  ASSERT_TRUE(batch.ok());
+  bool ran = false;
+  const Status st = engine.Quiesce([&] { ran = true; });
+  EXPECT_EQ(st.code(), StatusCode::kInternal);
+  EXPECT_FALSE(ran);
+}
+
 class RecordingListener final : public CommitListener {
  public:
   void OnCommitted(const std::vector<RangeDelete>& d) override { batches.push_back(d); }

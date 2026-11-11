@@ -103,7 +103,19 @@ TEST(SpecialKeyFilter, GrowthAndSaturation) {
   EXPECT_FALSE(f.SkipReadAllowed("k0"));
 }
 
+// ASan and TSan abort on an allocation this large instead of throwing std::bad_alloc.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define TIDESKV_FILTER_TEST_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define TIDESKV_FILTER_TEST_SANITIZED 1
+#endif
+#endif
+
 TEST(SpecialKeyFilter, FailedResetKeepsTheOldFilterIntact) {
+#ifdef TIDESKV_FILTER_TEST_SANITIZED
+  GTEST_SKIP() << "sanitizer allocators abort on oversized requests";
+#endif
   SpecialKeyFilter f(1000, size_t{1} << 58);
   for (int i = 0; i < 100; ++i) f.Insert("k" + std::to_string(i));
   const size_t bytes = f.Bytes(), count = f.Count(), cap = f.Capacity();

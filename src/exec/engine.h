@@ -92,6 +92,12 @@ class Engine {
   // `flushed_dbs`: the dbs fn empties; their watched keys that exist before fn runs are reported.
   Status WriteExclusive(const WriteFn& fn, const std::vector<uint8_t>& flushed_dbs = {});
 
+  // B1: runs fn while holding the gate exclusively, the barrier BeginLoad uses: every call already holding
+  // the gate (a Write, a batch, a replica apply, a load txn) finishes first, busy script or not, and none
+  // starts until fn returns. For work that must not overlap any meta write (SpecialKeyFilter::Reset).
+  // kInternal inside a batch (it would deadlock on the gate); fn must not call the Engine.
+  Status Quiesce(const std::function<void()>& fn);
+
   // An atomic batch (EXEC; M5a plan G1). Holds the gate exclusively and one transaction; the
   // clock is frozen. Until it is destroyed or committed, every Engine call on the creating
   // thread runs inside that transaction without locking, each Write under its own savepoint

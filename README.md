@@ -96,6 +96,7 @@ These are the most used settings. `CONFIG GET *` lists all of them with their cu
 | `l1-file-count-trigger` | `8` | Flush-tier tables per column family that start a merge |
 | `l0-stall-threshold` | `64` | Write backpressure: throttle from half this backlog, block at it |
 | `compression` | `lz4` | `no`, `lz4` or `zstd` |
+| `blind-set` | `yes` | Let a plain `SET` skip its pre-write read of a key that never was a collection or had a TTL (an in-memory filter built at start; `INFO stats` shows it as `blind_set_*`) |
 | `requirepass` | empty | Password for `AUTH` |
 | `maxclients` | `10000` | Connection limit |
 | `lua-time-limit` | `5000` ms | When a long script starts answering `BUSY` |

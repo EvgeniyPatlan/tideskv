@@ -22,10 +22,12 @@
 #include "server/client_pause.h"
 #include "server/compaction_scheduler.h"
 #include "server/config.h"
+#include "server/special_key_service.h"
 #include "server/watch.h"
 #include "storage/tides_storage.h"
 #include "types/cursor_store.h"
 #include "types/oid_allocator.h"
+#include "types/special_key_filter.h"
 
 namespace tideskv {
 
@@ -57,6 +59,7 @@ class App final : public ServerServices {
   ClientPause& pause() override { return pause_; }
   cluster::ClusterManager* cluster() override { return cluster_.get(); }
   migrate::MigrationService* migration() override { return migration_.get(); }
+  SpecialKeyFilter& special_keys() override { return special_keys_; }
 
  private:
   App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage);
@@ -73,6 +76,9 @@ class App final : public ServerServices {
   Status StartRole();  // the reaper on a master, the replica client when replicaof (or the topology) says so
 
   std::unique_ptr<Config> config_;
+  // B1: before storage_, which holds it as its meta-put hook (and so do its open write txns): it outlives
+  // the storage and every transaction.
+  SpecialKeyFilter special_keys_;
   std::unique_ptr<TidesStorage> storage_;
   std::unique_ptr<ReplLog> repl_log_;  // before oids_ and engine_: both commit through it
   std::unique_ptr<OidAllocator> oids_;
@@ -94,6 +100,9 @@ class App final : public ServerServices {
   WatchRegistry watches_;                           // before engine_ and the reaper: it must outlive them
   std::unique_ptr<CompactionScheduler> scheduler_;  // compacts storage_; the engine feeds it
   std::unique_ptr<Engine> engine_;
+  // B1: builds and rebuilds special_keys_ through engine_ and storage_; after engine_ (destroyed first) and
+  // stopped in Stop() before engine_.reset(). Started in Start().
+  std::unique_ptr<SpecialKeyService> special_key_service_;
   ClientPause pause_;  // before reaper_ (its paused hook reads it) and server_ (connections park in it)
   std::unique_ptr<ExpireReaper> reaper_;  // uses engine_; destroyed in Stop() before it; started by role
   // M7b: refers to engine_, repl_log_, storage_, oids_ and cluster_; shut down in Stop() before replication_,

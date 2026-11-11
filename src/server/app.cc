@@ -110,6 +110,10 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
 
 App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
     : config_(std::move(config)), storage_(std::move(storage)) {
+  // B1: before the first commit (Recover, AbortLoad, the oid lease): every meta Put from here on feeds the
+  // filter; what was committed before is found by the startup scan.
+  storage_->SetMetaPutHook(&special_keys_);
+  special_keys_.set_enabled(config_->Snapshot().blind_set);
   repl_log_ = std::make_unique<ReplLog>(*storage_, clock_, config_->Snapshot().repl_backlog_lazy);
   oids_ = std::make_unique<OidAllocator>(
       *storage_, [this] { return storage_->Checkpoint(); },
@@ -124,6 +128,7 @@ App::App(std::unique_ptr<Config> config, std::unique_ptr<TidesStorage> storage)
   scheduler_ = std::make_unique<CompactionScheduler>(*storage_, std::move(co));
   engine_ =
       std::make_unique<Engine>(*storage_, *locks_, clock_, scheduler_.get(), &watches_, repl_log_.get());
+  special_key_service_ = std::make_unique<SpecialKeyService>(special_keys_, *storage_, *engine_);
   engine_->SetBusyGuard([this] { return scripts_.TimedOut(); }, std::string(kErrBusyScript));  // H6
   scripts_.SetOnTimeout([this] { engine_->WakeWaiters(); });  // the script thread holds the gate: no lock
   ExpireReaper::Options reaper_options;
@@ -279,8 +284,10 @@ Status App::CreateReplication() {
   // Hook calls from concurrent SetMany are not ordered (CF-M6b-1): RefreshConfig snapshots and stores
   // under one mutex. replication_ outlives every CONFIG SET: it is destroyed with the App, after
   // server_ stopped.
-  config_->SetOnChange(
-      [this](const ConfigValues&) { replication_->RefreshConfig([this] { return config_->Snapshot(); }); });
+  config_->SetOnChange([this](const ConfigValues& v) {
+    special_keys_.set_enabled(v.blind_set);
+    replication_->RefreshConfig([this] { return config_->Snapshot(); });
+  });
   return Status::Ok();
 }
 
@@ -333,6 +340,7 @@ Status App::Start() {
   signals_.emplace(main_ctx_, SIGINT, SIGTERM);
   // A configured replica is fenced before the first client connects, so no write lands as a master.
   if (Status st = StartRole(); !st.ok()) return st;
+  special_key_service_->Start();  // SETs read until its startup scan marks the filter ready
   if (Status st = server_->Start(); !st.ok()) return st;
   scheduler_->Start();
   replication_->Start();
@@ -369,6 +377,7 @@ void App::Stop() {
   server_->Stop();                             // no command can touch storage after this
   reaper_.reset();                             // joins the reaper thread; it writes through engine_
   migration_.reset();                          // the connections' close hooks used it until server_->Stop()
+  special_key_service_.reset();                // joins its thread; it quiesces engine_ and scans storage_
   engine_.reset();                             // references storage_, so it goes first
   scheduler_.reset();  // compacts storage_; nothing commits (feeds it) once the engine is gone
   oids_.reset();       // likewise (its persist hook checkpoints storage_)
@@ -414,6 +423,11 @@ ServerStats App::Stats() const {
   s.background_compactions = scheduler_ ? scheduler_->completed() : 0;
   s.background_compaction_failures = scheduler_ ? scheduler_->failed() : 0;
   s.expired_keys = reaper_ ? reaper_->expired_total() : 0;
+  s.blind_set_filter_state = std::string(special_keys_.state_name());
+  s.blind_set_filter_keys = special_keys_.Count();
+  s.blind_set_filter_bytes = special_keys_.Bytes();
+  s.blind_set_filter_rebuilds = special_key_service_ ? special_key_service_->rebuilds() : 0;
+  s.blind_set_skipped_reads = special_keys_.skipped_reads();
   s.blocked_clients = blocking_.blocked_clients() + pause_.parked();  // Redis counts postponed clients
   s.blocking_keys = blocking_.blocking_keys();
   s.lua_memory = scripts_.lua_memory();

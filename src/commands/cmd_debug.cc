@@ -12,14 +12,15 @@
 #include "exec/engine.h"
 #include "types/digest.h"
 #include "types/index_digest.h"
+#include "types/special_key_filter.h"
 
 // DEBUG: only the DIGEST / DIGEST-VALUE subcommands (debug.c), with Redis's exact algorithm, plus the
-// TidesKV-only DIGEST-INDEX (M7a D23).
+// TidesKV-only DIGEST-INDEX (M7a D23) and SPECIAL-KEYS (B1).
 namespace tideskv {
 namespace {
 
 void DebugHelp(ExecContext& ctx) {
-  static constexpr std::array<std::string_view, 10> kLines = {
+  static constexpr std::array<std::string_view, 12> kLines = {
       "DIGEST",
       "    Output a hex signature representing the current DB content.",
       "DIGEST-VALUE <key> [<key> ...]",
@@ -29,6 +30,8 @@ void DebugHelp(ExecContext& ctx) {
       "counts.",
       "DIGEST-SLOTS <slot|from-to> [TTL]",
       "    Output a hex signature of the keys in the slot range (TTL: with their exact deadlines).",
+      "SPECIAL-KEYS",
+      "    Output the blind-SET filter state, then its special and missing key counts.",
       "HELP",
       "    Print this help."};
   ctx.reply.ArrayHeader(kLines.size() + 1);
@@ -75,6 +78,21 @@ void DebugDigestIndex(ExecContext& ctx) {
   ctx.reply.Integer(static_cast<int64_t>(d.orphans));
 }
 
+// B1: TidesKV only. Every meta record that is a collection or has a TTL, and how many of them the
+// special-key filter lacks (any is a bug: a blind SET could then overwrite a live collection or TTL).
+void DebugSpecialKeys(ExecContext& ctx) {
+  SpecialKeyCheck c;
+  const SpecialKeyFilter& filter = ctx.server.special_keys();
+  const Engine::LoadingReadScope during_load;  // CF6: DEBUG works while a full sync loads
+  const Status st = ctx.server.engine().Snapshot(
+      [&](ReadView& v, int64_t) { return MoveInto(CheckSpecialKeys(v, filter), &c); });
+  if (!st.ok()) return ReplyError(ctx, st);
+  ctx.reply.ArrayHeader(3);
+  ctx.reply.SimpleString(filter.state_name());
+  ctx.reply.Integer(static_cast<int64_t>(c.specials));
+  ctx.reply.Integer(static_cast<int64_t>(c.missing));
+}
+
 // M7b D23: TidesKV only. One slot range of db 0; TTL mixes each key's exact deadline.
 void DebugDigestSlots(ExecContext& ctx, const ArgList& argv) {
   if (argv.size() > 4 || (argv.size() == 4 && !EqualsIgnoreCase(argv[3], "ttl"))) {
@@ -99,6 +117,7 @@ void Debug(ExecContext& ctx, const ArgList& argv) {
   if (sub == "digest-value") return DebugDigestValue(ctx, argv);
   if (sub == "digest-index" && argv.size() == 2) return DebugDigestIndex(ctx);
   if (sub == "digest-slots" && argv.size() >= 3) return DebugDigestSlots(ctx, argv);
+  if (sub == "special-keys" && argv.size() == 2) return DebugSpecialKeys(ctx);
   ctx.reply.Error(SubcommandSyntaxError(argv[1], "DEBUG"));
 }
 

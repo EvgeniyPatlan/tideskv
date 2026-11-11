@@ -448,6 +448,7 @@ Settings are read in this order, and later sources win:
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |
 | `compression-start-level` | `0` | no | First level whose tables are compressed, 0 to 2 (a higher one could leave the largest level uncompressed: a deepening compaction moves files down without rewriting them); `0` compresses every level, `2` leaves the flush tier (level 1) uncompressed so a merge pays for the codec once. Tables of both kinds stay readable |
 | `btree-block-size` | `4kb` | no | Size of a TidesDB btree node, 4kb to 64kb in multiples of 4kb; larger nodes mean fewer, bigger reads per lookup and more bytes read per miss |
+| `blind-set` | `yes` | yes | Let a plain `SET` skip its pre-write read of a key that never was a collection or had a TTL. An in-memory filter of such keys (at most 64 MB) is built by a scan at start and rebuilt when it fills up or a full sync ends; until it is ready every `SET` reads. `INFO stats` shows it (`blind_set_filter_state`, `_keys`, `_bytes`, `_rebuilds`, `blind_set_skipped_reads`); `DEBUG SPECIAL-KEYS` checks it against the data |
 | `requirepass` | empty | yes | Password for `AUTH` |
 | `maxclients` | `10000` | yes | Connection limit |
 | `lua-time-limit` | `5000` ms | yes | When a long script starts answering `BUSY` |

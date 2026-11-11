@@ -64,6 +64,21 @@ TEST(FormatInfo, AllSectionsByDefault) {
   EXPECT_EQ(FormatInfo(SampleStats(), {"everything"}), info);
 }
 
+TEST(FormatInfo, InfoShowsBlindSetFields) {
+  ServerStats s = SampleStats();
+  s.blind_set_filter_state = "ready";
+  s.blind_set_filter_keys = 5;
+  s.blind_set_filter_bytes = 4096;
+  s.blind_set_filter_rebuilds = 2;
+  s.blind_set_skipped_reads = 17;
+  const std::string info = FormatInfo(s, {"stats"});
+  for (const char* needle :
+       {"blind_set_filter_state:ready\r\n", "blind_set_filter_keys:5\r\n", "blind_set_filter_bytes:4096\r\n",
+        "blind_set_filter_rebuilds:2\r\n", "blind_set_skipped_reads:17\r\n"}) {
+    EXPECT_NE(info.find(needle), std::string::npos) << needle;
+  }
+}
+
 TEST(FormatInfo, SelectedSectionsOnly) {
   const std::string info = FormatInfo(SampleStats(), {"CLIENTS"});
   EXPECT_NE(info.find("# Clients"), std::string::npos);

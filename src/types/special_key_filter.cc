@@ -21,6 +21,10 @@ struct Probe {
   uint64_t h2;  // 7 probes of 9 bits each
 };
 
+size_t BlocksFor(size_t capacity, int bits_per_key) {
+  return std::max<size_t>(1, (capacity * static_cast<size_t>(bits_per_key) + 511) / 512);
+}
+
 Probe Locate(std::string_view key, size_t blocks) {
   const uint64_t h1 = std::hash<std::string_view>{}(key);
   const uint64_t high = h1 >> 32;
@@ -38,7 +42,7 @@ SpecialKeyFilter::SpecialKeyFilter(size_t initial_capacity, size_t max_bytes)
 // were.
 void SpecialKeyFilter::Allocate(size_t capacity) {
   capacity = std::max<size_t>(1, std::min(capacity, max_capacity_));
-  const size_t blocks = std::max<size_t>(1, (capacity * kBitsPerKey + 511) / 512);
+  const size_t blocks = BlocksFor(capacity, kBitsPerKey);
   std::unique_ptr<std::atomic<uint64_t>[]> words(new std::atomic<uint64_t>[blocks * kWordsPerBlock]());
   words_ = std::move(words);
   blocks_ = blocks;
@@ -115,7 +119,10 @@ std::string_view SpecialKeyFilter::state_name() const noexcept {
 size_t SpecialKeyFilter::Count() const noexcept { return count_.load(std::memory_order_relaxed); }
 size_t SpecialKeyFilter::Capacity() const noexcept { return capacity_.load(std::memory_order_relaxed); }
 size_t SpecialKeyFilter::MaxCapacity() const noexcept { return max_capacity_; }
-size_t SpecialKeyFilter::Bytes() const noexcept { return blocks_ * kWordsPerBlock * sizeof(uint64_t); }
+// From the atomic capacity, not blocks_: INFO reads it while a rebuild may be resetting the filter.
+size_t SpecialKeyFilter::Bytes() const noexcept {
+  return BlocksFor(Capacity(), kBitsPerKey) * kWordsPerBlock * sizeof(uint64_t);
+}
 void SpecialKeyFilter::NoteSkippedRead() noexcept { skipped_.fetch_add(1, std::memory_order_relaxed); }
 uint64_t SpecialKeyFilter::skipped_reads() const noexcept { return skipped_.load(std::memory_order_relaxed); }
 

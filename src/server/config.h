@@ -43,6 +43,9 @@ struct ConfigValues {
   // applied to every column family at open.
   uint64_t btree_block_size = 4096;
   int compression_start_level = 0;
+  // B1: a plain SET may skip its pre-write read of a key the special-key filter says never was a
+  // collection or had a TTL (runtime; "no" makes every SET read, as before).
+  bool blind_set = true;
   std::string requirepass;  // empty = no AUTH required
   int maxclients = 10000;
   int64_t busy_reply_threshold_ms = 5000;  // busy-reply-threshold / lua-time-limit (M5b)
