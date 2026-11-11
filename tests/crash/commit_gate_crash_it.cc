@@ -217,9 +217,16 @@ int CheckAfterCrash(const std::string& db_path, const std::vector<std::string>& 
   return bad_writers;
 }
 
+uint64_t SumAcks(const std::vector<std::string>& ack_paths) {
+  uint64_t sum = 0;
+  for (const std::string& path : ack_paths) sum += ReadAck(path);
+  return sum;
+}
+
 void RunScenario(const Scenario& sc) {
   const int iters = Iterations();
-  srand(static_cast<unsigned>(getpid()));
+  const unsigned seed = static_cast<unsigned>(getpid());
+  srand(seed);
   for (int it = 0; it < iters; ++it) {
     TempDir dir("tideskv-gate-crash");
     const std::string db_path = dir.str() + "/db";
@@ -227,16 +234,23 @@ void RunScenario(const Scenario& sc) {
     for (int w = 0; w < sc.writers; ++w) ack_paths.push_back(dir.str() + "/ack" + std::to_string(w));
 
     const int kill_after_ms = kKillBaseMs + rand() % kKillJitterMs;
+    // every failure below names what reproduces the round
+    SCOPED_TRACE("seed " + std::to_string(seed) + ", iter " + std::to_string(it) + ", kill after " +
+                 std::to_string(kill_after_ms) + " ms");
     const pid_t pid = fork();
     ASSERT_GE(pid, 0) << "fork failed";
     if (pid == 0) RunChild(db_path, ack_paths, sc);
     std::this_thread::sleep_for(std::chrono::milliseconds(kill_after_ms));
+    // read before the kill: a child that never got past open would pass every check below with
+    // nothing acknowledged, so the round has to show it was killed mid-commit, not before one
+    const uint64_t acked_before_kill = SumAcks(ack_paths);
     kill(pid, SIGKILL);
     int status = 0;
     ASSERT_EQ(waitpid(pid, &status, 0), pid);
     ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
         << "iter " << it << ": child ended on its own, exit status "
         << (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    ASSERT_GT(acked_before_kill, 0u) << "iter " << it << ": child acknowledged no commit before the kill";
 
     ASSERT_NE(CheckAfterCrash(db_path, ack_paths, sc, it), -1);
   }
