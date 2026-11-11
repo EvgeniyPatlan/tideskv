@@ -24,6 +24,12 @@ Environment:
 - `WARMUP` and `DURATION` are in seconds (defaults 60 and 180, quick 10 and 30, medium as full).
 - `THREADS` and `CLIENTS` are memtier's settings (defaults 4 and 50).
 - `QUIESCE_MAX` caps each wait for the server to go quiet, in seconds (default 600, quick 60).
+- `TIDESKV_EXTRA_CONF` (experiments) appends config lines, separated by `;`, to the TidesKV conf, for example
+  `TIDESKV_EXTRA_CONF='btree-block-size 16kb;l0-stall-threshold 32'`. The lines come last, so they win. A value that
+  changes a key the parity check reads back makes `run.sh`'s parity check fail and its cells show `ERR`; use it with
+  `profile.sh` or accept that the run is not a comparison.
+- `ALLOCATOR` (`profile.sh` only; `mimalloc`, the default, or `system`) sets `TIDESKV_ALLOCATOR` for the profiling
+  server image. A value other than `mimalloc` is added to the image tag, so each allocator gets its own image.
 
 The TidesKV image is tagged by the content of `src`, `cmake`, `CMakeLists.txt`, `CMakePresets.json`,
 `third_party` and the Dockerfile, and is built only when that tag is missing. A commit that changes
