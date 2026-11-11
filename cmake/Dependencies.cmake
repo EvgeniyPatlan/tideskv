@@ -37,7 +37,10 @@ set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-compression-start-level.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-wal-flusher-wake.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-vlog-full-codec.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-commit-gate.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-commit-gate.patch"
+  # a synchronous flush and a checkpoint wait for the memtables queued when they were called, not for
+  # an empty queue that writers outrunning flush never leave
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-flush-wait-called-generations.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

@@ -1,0 +1,479 @@
+diff --git a/include/db.h b/include/db.h
+--- a/include/db.h
++++ b/include/db.h
+@@ -1483,8 +1483,8 @@ void tidesdb_iter_free(tidesdb_iter_t *iter);
+  * merge that can run for minutes -- and in that case the work asked for is usually already under
+  * way. tidesdb_backup claims every family the same way, and reports locked if any one of them will
+  * not come free. tidesdb_flush_memtable, and tidesdb_checkpoint through it, instead wait a bounded
+- * time for the immutable queue to drain and report locked only if it has not, which says flush is
+- * not keeping up rather than that anything is wrong with the call. */
++ * time for every memtable queued when they were called to be flushed and report locked only if one
++ * has not, which says flush is not keeping up rather than that anything is wrong with the call. */
+ 
+ /**
+  * tidesdb_compact
+@@ -1518,11 +1518,12 @@ int tidesdb_compact_range(tidesdb_t *db, tidesdb_column_family_t *cf, const uint
+ 
+ /**
+  * tidesdb_flush_memtable
+- * synchronously rotate and flush the memtable to sstables, waiting a bounded time for the
+- * immutable queue to drain
++ * synchronously rotate and flush the memtable to sstables, waiting a bounded time for every
++ * memtable queued when it was called, the one it sealed included, to be flushed. memtables sealed
++ * by commits that race the call are not waited on, so a queue writers keep full does not hold it
+  * @param db database handle
+- * @return TDB_SUCCESS, TDB_ERR_LOCKED if the queue had not drained when the wait expired, or an
+- * error code
++ * @return TDB_SUCCESS, TDB_ERR_LOCKED if a memtable queued at the call was still unflushed when the
++ * wait expired, or an error code
+  */
+ int tidesdb_flush_memtable(tidesdb_t *db);
+ 
+diff --git a/src/engine/engine.h b/src/engine/engine.h
+--- a/src/engine/engine.h
++++ b/src/engine/engine.h
+@@ -722,11 +722,11 @@ int engine_sync_wal(tidesdb_t *db);
+ 
+ /**
+  * engine_flush_memtable
+- * synchronously seal the active memtable and wait for the flush pool to drive every queued
+- * immutable to L1; a no-op when the active memtable is empty
++ * synchronously seal the active memtable and wait for the flush pool to drive every immutable
++ * queued at the call, the sealed one included, to L1; immutables queued after it are not waited on
+  * @param db the engine
+- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY when the flush does not drain in time, or
+- * an io or allocation error
++ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_LOCKED when the flush does not land them in
++ * time, or an io or allocation error
+  */
+ int engine_flush_memtable(tidesdb_t *db);
+ 
+diff --git a/src/engine/engine_ops.c b/src/engine/engine_ops.c
+--- a/src/engine/engine_ops.c
++++ b/src/engine/engine_ops.c
+@@ -16,8 +16,9 @@
+ #include "sstable/sstable.h"
+ #include "txn/mvcc.h"
+ 
+-/* how long a synchronous flush waits for the immutable queue to drain, and how often it looks; the
+- * bound caps the wait so a stuck flush pool surfaces as busy rather than hanging the caller */
++/* how long a synchronous flush waits for the generations queued when it was called to be flushed,
++ * and how often it looks; the bound caps the wait so a stuck flush pool surfaces as busy rather
++ * than hanging the caller */
+ #define ENGINE_FLUSH_WAIT_TIMEOUT_US (60ull * 1000 * 1000)
+ #define ENGINE_FLUSH_WAIT_POLL_US    1000
+ 
+@@ -43,7 +44,9 @@ int engine_flush_memtable(tidesdb_t *db)
+     const int rc = engine_force_rotate(db);
+     if (rc != TDB_SUCCESS) return rc;
+ 
+-    /* wait for the immutable queue to drain, not merely for the generation this call sealed.
++    /* wait for every generation sealed before the read below to be flushed -- the one this call
++     * sealed, and every one an earlier rotation queued. those are all of a lower generation than
++     * the memtable active after the rotation, since a rotation only ever queues a younger one.
+      *
+      * waiting on the sealed generation alone is wrong for the callers that matter here. backup and
+      * clone copy files, so everything they should capture has to be in a file before they start --
+@@ -51,15 +54,18 @@ int engine_flush_memtable(tidesdb_t *db)
+      * this call would then return at once while generations from earlier rotations were still
+      * queued and still only in memory, and the copy would quietly miss their data.
+      *
+-     * the cost is that a database under sustained writes may never show an empty queue, so this can
+-     * report contention when the caller's own data has in fact landed. that is the safe direction
+-     * to be wrong in, and it is the behaviour every caller here was written against */
++     * waiting for an empty queue is wrong the other way. writers that outrun flush keep the queue
++     * from ever emptying, and the wait would run out its whole bound and report contention when
++     * the caller's data had in fact landed. generations queued after the read hold only commits
++     * that raced this call, which it never promised to capture. the bound stays as the backstop
++     * that surfaces a stuck flush pool as busy rather than hanging the caller */
++    const uint64_t called = tidesdb_l0_active_generation(db->l0);
+     for (uint64_t tick = 0; tick < ENGINE_FLUSH_WAIT_TIMEOUT_US / ENGINE_FLUSH_WAIT_POLL_US; tick++)
+     {
+-        if (tidesdb_l0_queue_depth(db->l0) == 0) return TDB_SUCCESS;
++        if (!tidesdb_l0_queue_holds_older(db->l0, called)) return TDB_SUCCESS;
+         usleep(ENGINE_FLUSH_WAIT_POLL_US);
+     }
+-    return tidesdb_l0_queue_depth(db->l0) == 0 ? TDB_SUCCESS : TDB_ERR_LOCKED;
++    return tidesdb_l0_queue_holds_older(db->l0, called) ? TDB_ERR_LOCKED : TDB_SUCCESS;
+ }
+ 
+ /* fsync every resident klog across all families, so a checkpoint lands the just-flushed L1 data
+diff --git a/src/memtable/l0_immutable.c b/src/memtable/l0_immutable.c
+--- a/src/memtable/l0_immutable.c
++++ b/src/memtable/l0_immutable.c
+@@ -140,6 +140,39 @@ size_t tidesdb_l0_queue_depth(const tidesdb_l0_t *l0)
+     return queue_size(l0->queue);
+ }
+ 
++int tidesdb_l0_queue_holds_older(tidesdb_l0_t *l0, const uint64_t generation)
++{
++    if (!l0) return 0;
++
++    /* under the reader epoch, exactly as a read does, so a concurrent retire cannot free a queued
++     * immutable while its generation is read */
++    tdb_epoch_enter(&l0->active_readers);
++    const size_t depth = queue_size(l0->queue);
++    if (depth == 0)
++    {
++        tdb_epoch_exit(&l0->active_readers);
++        return 0;
++    }
++    tidesdb_memtable_t *stack_snap[TDB_L0_IMMUTABLE_SNAP_STACK];
++    void **snap =
++        depth <= TDB_L0_IMMUTABLE_SNAP_STACK ? (void **)stack_snap : malloc(depth * sizeof(void *));
++    if (!snap)
++    {
++        tdb_epoch_exit(&l0->active_readers);
++        return 1; /* unknown, so the answer that keeps a waiter waiting */
++    }
++    const size_t got = queue_snapshot(l0->queue, snap, depth);
++    int holds = 0;
++    for (size_t i = 0; i < got && !holds; i++)
++    {
++        const tidesdb_memtable_t *mt = (const tidesdb_memtable_t *)snap[i];
++        if (mt && mt->generation < generation) holds = 1;
++    }
++    if (snap != (void **)stack_snap) free(snap);
++    tdb_epoch_exit(&l0->active_readers);
++    return holds;
++}
++
+ void tidesdb_memtable_mark_flushed(tidesdb_memtable_t *mt)
+ {
+     if (!mt) return;
+diff --git a/src/memtable/memtable.c b/src/memtable/memtable.c
+--- a/src/memtable/memtable.c
++++ b/src/memtable/memtable.c
+@@ -701,9 +701,7 @@ int tidesdb_l0_wal_append_one(tidesdb_l0_t *l0, const uint8_t *batch, size_t siz
+     return rc;
+ }
+ 
+-/* the generation of the memtable active now, the youngest that can hold an abandoned batch's
+- * entries; with no active memtable nothing can, and the record is kept for good */
+-static uint64_t l0_active_generation(tidesdb_l0_t *l0)
++uint64_t tidesdb_l0_active_generation(tidesdb_l0_t *l0)
+ {
+     uint64_t generation = UINT64_MAX;
+     tidesdb_memtable_t *mt = l0_pin_active_read(l0);
+@@ -718,7 +716,9 @@ static uint64_t l0_active_generation(tidesdb_l0_t *l0)
+ int tidesdb_l0_mark_aborted(tidesdb_l0_t *l0, const uint64_t seq)
+ {
+     if (!l0 || seq == 0) return TDB_ERR_INVALID_ARGS;
+-    const uint64_t generation = l0_active_generation(l0);
++    /* the active memtable is the youngest that can hold an abandoned batch's entries; with none
++     * pinnable nothing can, and the record is kept for good */
++    const uint64_t generation = tidesdb_l0_active_generation(l0);
+ 
+     pthread_mutex_lock(&l0->aborted_lock);
+     const int n = atomic_load_explicit(&l0->aborted_count, memory_order_relaxed);
+diff --git a/src/memtable/memtable.h b/src/memtable/memtable.h
+--- a/src/memtable/memtable.h
++++ b/src/memtable/memtable.h
+@@ -614,6 +614,26 @@ void tidesdb_l0_release_immutable(tidesdb_l0_t *l0, tidesdb_memtable_t *mt);
+  */
+ size_t tidesdb_l0_queue_depth(const tidesdb_l0_t *l0);
+ 
++/**
++ * tidesdb_l0_queue_holds_older
++ * whether an immutable older than the given generation is still queued, that is not yet flushed
++ * and retired. the queue is ordered by generation and a rotation only ever queues a younger one,
++ * so once this reads false for a generation it stays false
++ * @param l0 the subsystem
++ * @param generation the generation to compare against
++ * @return 1 if an immutable of a lower generation is queued, 0 otherwise
++ */
++int tidesdb_l0_queue_holds_older(tidesdb_l0_t *l0, uint64_t generation);
++
++/**
++ * tidesdb_l0_active_generation
++ * the generation of the memtable active now. every memtable a rotation sealed before this read is
++ * of a lower generation, including one a concurrent rotation has queued but not yet swapped out
++ * @param l0 the subsystem
++ * @return the active generation, or UINT64_MAX when no active memtable is pinnable
++ */
++uint64_t tidesdb_l0_active_generation(tidesdb_l0_t *l0);
++
+ /**
+  * tidesdb_l0_active_bytes
+  * the memory the active memtable occupies, the figure the rotation threshold is compared against,
+diff --git a/test/flush_wait__tests.c b/test/flush_wait__tests.c
+new file mode 100644
+--- /dev/null
++++ b/test/flush_wait__tests.c
+@@ -0,0 +1,276 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the wait a synchronous flush (and a checkpoint through it) does after its rotation. it waits for
++ * every generation queued when it was called, the one it sealed included, and not for an empty
++ * queue: writers that outrun flush keep the queue from ever emptying, and a wait for empty would
++ * then run out its whole bound and report locked although the caller's data had landed */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "../src/engine/engine.h"       /* engine_force_rotate */
++#include "../src/engine/engine_types.h" /* db->l0, db->flush_lock, db->active_wal_gen */
++#include "../src/memtable/l0_internal.h"
++#include "../src/memtable/memtable.h"
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define FW_DB_DIR     "." PATH_SEPARATOR "test_flush_wait_db"
++#define FW_WRITERS    8
++#define FW_PUTS       16
++#define FW_KEY_SIZE   12
++#define FW_VALUE_SIZE 100
++#define FW_BUFFER     (64u * 1024u)
++/* a small queue limit, so writers block and refill it long before flush can empty it */
++#define FW_QUEUE_LIMIT 8
++/* the throttle holds the claim lock this long, then lets one claim through */
++#define FW_THROTTLE_HOLD_US 50000
++#define FW_THROTTLE_GAP_US  200
++/* how deep the queue must be before the call, so the test is in the regime it is about */
++#define FW_MIN_DEPTH     2
++#define FW_SETTLE_US     500000
++#define FW_DEPTH_WAIT_US 10000000
++#define FW_POLL_US       1000
++/* far below the 60 s backstop a wait for an empty queue runs out */
++#define FW_BOUND_US   (10ull * 1000 * 1000)
++#define FW_MAX_PINNED 4096
++
++typedef struct
++{
++    tidesdb_t *db;
++    tidesdb_column_family_t *cf;
++    int id;
++    _Atomic(int) *stop;
++    _Atomic(uint64_t) acked;
++} fw_arg_t;
++
++static uint64_t fw_now_us(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
++}
++
++static void *fw_writer(void *arg)
++{
++    fw_arg_t *a = (fw_arg_t *)arg;
++    uint8_t value[FW_VALUE_SIZE];
++    memset(value, 'v', sizeof(value));
++    for (uint64_t i = 0; !atomic_load(a->stop); i++)
++    {
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin_with_isolation(a->db, TDB_ISOLATION_READ_COMMITTED, &txn),
++                  TDB_SUCCESS);
++        for (int j = 0; j < FW_PUTS; j++)
++        {
++            char key[FW_KEY_SIZE + 1];
++            snprintf(key, sizeof(key), "%02d%010llu", a->id,
++                     (unsigned long long)(i * FW_PUTS + (uint64_t)j));
++            ASSERT_EQ(tidesdb_txn_put(txn, a->cf, (const uint8_t *)key, FW_KEY_SIZE, value,
++                                      sizeof(value), -1),
++                      TDB_SUCCESS);
++        }
++        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++        tidesdb_txn_free(txn);
++        atomic_fetch_add(&a->acked, 1);
++    }
++    return NULL;
++}
++
++/* slow flush down by holding the lock a flush worker claims an immutable under, so rotations
++ * outrun it and the queue stays near its limit */
++static void *fw_throttle(void *arg)
++{
++    fw_arg_t *a = (fw_arg_t *)arg;
++    while (!atomic_load(a->stop))
++    {
++        pthread_mutex_lock(&a->db->flush_lock);
++        usleep(FW_THROTTLE_HOLD_US);
++        pthread_mutex_unlock(&a->db->flush_lock);
++        usleep(FW_THROTTLE_GAP_US);
++    }
++    return NULL;
++}
++
++/* whether any immutable still queued is of the given generation or older; the active memtable,
++ * which sits in the queue for a moment mid rotation, is not an immutable */
++static int fw_queue_holds_through(tidesdb_t *db, const uint64_t generation, int *depth)
++{
++    tidesdb_memtable_t **pinned = malloc(FW_MAX_PINNED * sizeof(*pinned));
++    ASSERT_TRUE(pinned != NULL);
++    int n = 0;
++    ASSERT_EQ(tidesdb_l0_pin_memtables(db->l0, pinned, FW_MAX_PINNED, &n), TDB_SUCCESS);
++    const tidesdb_memtable_t *active = atomic_load(&db->l0->active);
++    int holds = 0;
++    *depth = 0;
++    for (int i = 0; i < n; i++)
++    {
++        if (pinned[i] == active) continue;
++        (*depth)++;
++        if (pinned[i]->generation <= generation) holds = 1;
++    }
++    tidesdb_l0_unpin_memtables(pinned, n);
++    free(pinned);
++    return holds;
++}
++
++/* writers outrun a throttled flush, so the queue never empties. a checkpoint still returns
++ * promptly, and when it does no generation that was active or queued when it was called is left
++ * unflushed */
++void test_checkpoint_under_flush_bound_writers(void)
++{
++    (void)remove_directory(FW_DB_DIR);
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = FW_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_write_buffer_size = FW_BUFFER;
++    cfg.memtable_idle_flush_seconds = 0;
++    cfg.memtable_l0_queue_stall_threshold = FW_QUEUE_LIMIT;
++    cfg.num_flush_threads = 1;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    ASSERT_EQ(tidesdb_create_column_family(db, "cf0", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cf0");
++    ASSERT_TRUE(cf != NULL);
++
++    _Atomic(int) stop;
++    atomic_init(&stop, 0);
++    fw_arg_t args[FW_WRITERS + 1];
++    pthread_t threads[FW_WRITERS + 1];
++    for (int i = 0; i <= FW_WRITERS; i++)
++    {
++        args[i] = (fw_arg_t){.db = db, .cf = cf, .id = i, .stop = &stop};
++        atomic_init(&args[i].acked, 0);
++        ASSERT_EQ(
++            pthread_create(&threads[i], NULL, i < FW_WRITERS ? fw_writer : fw_throttle, &args[i]),
++            0);
++    }
++
++    /* into the regime: the queue is deep and has stayed fed for a while */
++    usleep(FW_SETTLE_US);
++    uint64_t waited = 0;
++    while (tidesdb_l0_queue_depth(db->l0) < FW_MIN_DEPTH && waited < FW_DEPTH_WAIT_US)
++    {
++        usleep(FW_POLL_US);
++        waited += FW_POLL_US;
++    }
++    const size_t depth_before = tidesdb_l0_queue_depth(db->l0);
++    ASSERT_TRUE(depth_before >= FW_MIN_DEPTH);
++
++    /* the active memtable's generation when the call is made; anything at or below it is what the
++     * call must see flushed. the published figure trails a swap by an instant, which only makes
++     * this a lower bound */
++    const uint64_t called_gen = atomic_load_explicit(&db->active_wal_gen, memory_order_acquire);
++    const uint64_t t0 = fw_now_us();
++    const int rc = tidesdb_checkpoint(db);
++    const uint64_t elapsed_us = fw_now_us() - t0;
++    int depth_after = 0;
++    const int holds = fw_queue_holds_through(db, called_gen, &depth_after);
++
++    atomic_store(&stop, 1);
++    uint64_t acked = 0;
++    for (int i = 0; i <= FW_WRITERS; i++)
++    {
++        ASSERT_EQ(pthread_join(threads[i], NULL), 0);
++        acked += atomic_load(&args[i].acked);
++    }
++    printf("(rc %d in %llu us, depth %zu before and %d after, called gen %llu, acked %llu) ", rc,
++           (unsigned long long)elapsed_us, depth_before, depth_after,
++           (unsigned long long)called_gen, (unsigned long long)acked);
++    fflush(stdout); /* the figures are the diagnosis when an assertion below aborts */
++    ASSERT_EQ(rc, TDB_SUCCESS);
++    ASSERT_TRUE(elapsed_us < FW_BOUND_US);
++    ASSERT_FALSE(holds);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(FW_DB_DIR);
++}
++
++typedef struct
++{
++    tidesdb_t *db;
++    _Atomic(int) done;
++    int rc;
++} fw_flush_arg_t;
++
++static void *fw_flush_thread(void *arg)
++{
++    fw_flush_arg_t *a = (fw_flush_arg_t *)arg;
++    a->rc = tidesdb_flush_memtable(a->db);
++    atomic_store(&a->done, 1);
++    return NULL;
++}
++
++/* the sealed generation is not the only one to wait on: one queued by an earlier rotation is still
++ * only in memory, and a flush that finds the active memtable empty seals nothing at all. with the
++ * flush workers held off, a call must not return while such a generation is queued */
++void test_flush_waits_for_generations_queued_before_it(void)
++{
++    (void)remove_directory(FW_DB_DIR);
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = FW_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_idle_flush_seconds = 0;
++    cfg.num_flush_threads = 1;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    ASSERT_EQ(tidesdb_create_column_family(db, "cf0", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cf0");
++    ASSERT_TRUE(cf != NULL);
++
++    /* hold off every claim, then queue one generation behind an empty active memtable */
++    pthread_mutex_lock(&db->flush_lock);
++    tidesdb_txn_t *txn = NULL;
++    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)"k", 1, (const uint8_t *)"v", 1, -1),
++              TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++    tidesdb_txn_free(txn);
++    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_l0_active_bytes(db->l0), 0);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), 1);
++
++    fw_flush_arg_t fa = {.db = db, .rc = -1};
++    atomic_init(&fa.done, 0);
++    pthread_t t;
++    ASSERT_EQ(pthread_create(&t, NULL, fw_flush_thread, &fa), 0);
++    usleep(FW_SETTLE_US / 5);
++    ASSERT_EQ(atomic_load(&fa.done), 0); /* the queued generation is not flushed yet */
++
++    pthread_mutex_unlock(&db->flush_lock);
++    ASSERT_EQ(pthread_join(t, NULL), 0);
++    ASSERT_EQ(fa.rc, TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), 0);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(FW_DB_DIR);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_flush_waits_for_generations_queued_before_it, tests_passed);
++    RUN_TEST(test_checkpoint_under_flush_bound_writers, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

@@ -204,6 +204,77 @@ TEST(TidesStorage, CheckpointSucceedsUnderConcurrentCommits) {
   EXPECT_GT(commits.load(), 0);
 }
 
+// Checkpoints against sustained writers into every family, a 64 KiB memtable and a single flush
+// thread, so rotations queue memtables throughout. A checkpoint waits for what was queued when it was
+// called, not for an empty queue, so it returns ok well inside TidesDB's 60 s backstop. In process
+// the flush thread still keeps up, so the queue does empty now and then; the regime where it never
+// does is pinned down by TidesDB's own flush wait suite (tidesdb-flush-wait-called-generations.patch),
+// which throttles flush directly.
+TEST(TidesStorage, CheckpointReturnsPromptlyUnderSustainedCommits) {
+  constexpr int kThreads = 8;
+  constexpr auto kCheckpointFor = std::chrono::seconds(1);
+  constexpr auto kBound = std::chrono::seconds(10);
+  TempDir dir;
+  StorageOptions o = OptionsFor(dir);
+  o.memtable_size = 64 * 1024;
+  o.flush_threads = 1;
+  o.l0_stall_threshold = 64;  // TidesKV's own limit
+  auto s = MustOpen(o);
+  ASSERT_NE(s, nullptr);
+  std::atomic<bool> stop{false};
+  std::atomic<int> commits{0};
+  std::vector<std::string> failures(kThreads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      const std::string value(1024, 'v');
+      for (int i = 0; !stop.load(); ++i) {
+        auto txn = s->BeginWrite();
+        if (!txn.ok()) {
+          failures[t] = txn.status().ToString();
+          return;
+        }
+        for (ColumnFamily cf : kAllColumnFamilies) {
+          if (Status st = (*txn)->Put(cf, std::to_string(t) + ":" + std::to_string(i), value); !st.ok()) {
+            failures[t] = st.ToString();
+            return;
+          }
+        }
+        if (Status st = (*txn)->Commit(); !st.ok()) {
+          failures[t] = "commit " + std::to_string(i) + ": " + st.ToString();
+          return;
+        }
+        commits.fetch_add(1);
+      }
+    });
+  }
+  // writers first, so the checkpoints meet a queue that is being refilled
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (commits.load() < 1000 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::vector<std::string> checkpoint_failures;
+  int checkpoints = 0;
+  const auto until = std::chrono::steady_clock::now() + kCheckpointFor;
+  while (std::chrono::steady_clock::now() < until) {
+    const auto start = std::chrono::steady_clock::now();
+    const Status st = s->Checkpoint();
+    const auto took = std::chrono::steady_clock::now() - start;
+    if (!st.ok() || took >= kBound) {
+      checkpoint_failures.push_back(
+          std::to_string(checkpoints) + ": " + st.ToString() + " after " +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()) + " ms");
+    }
+    ++checkpoints;
+  }
+  stop.store(true);
+  for (auto& th : threads) th.join();
+  EXPECT_GT(checkpoints, 0);
+  EXPECT_TRUE(checkpoint_failures.empty()) << checkpoint_failures.front();
+  for (int t = 0; t < kThreads; ++t) EXPECT_EQ(failures[t], "") << "thread " << t;
+  EXPECT_GE(commits.load(), 1000);
+}
+
 StorageOptions OptionsWith(const TempDir& dir, Compression c) {
   StorageOptions o = OptionsFor(dir);
   o.compression = c;
