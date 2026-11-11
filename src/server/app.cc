@@ -90,6 +90,7 @@ Result<std::unique_ptr<App>> App::Create(std::unique_ptr<Config> config) {
   so.btree_block_size = v.btree_block_size;
   so.compression_start_level = v.compression_start_level;
   so.memtable_bloom = v.memtable_bloom;
+  so.memtable_queue_max_bytes = v.memtable_queue_max_memory;
   so.compression = v.compression == "zstd" ? Compression::kZstd
                    : v.compression == "no" ? Compression::kNone
                                            : Compression::kLz4;
@@ -466,6 +467,10 @@ void App::FillStorageStats(ServerStats& s) const {
     }
     s.storage_flushes = st->flush_count;
     s.storage_compactions = st->compaction_count;
+    s.storage_memtable_queue_bytes = st->immutable_memtable_bytes;
+    s.storage_writes_throttled = st->writes_throttled;
+    s.storage_writes_blocked = st->writes_blocked;
+    s.storage_write_stall_us = st->write_stall_us;
   }
 }
 

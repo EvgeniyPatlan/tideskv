@@ -52,7 +52,10 @@ set(TIDESDB_PATCHES
   # a decoded btree node is built in one arena sized exactly to what it keeps, so the node cache is
   # charged about the node instead of a pooled chunk twice its size, and a compressed node decodes
   # into a thread buffer rather than a fresh allocation per cache miss
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-node-arena-exact.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-node-arena-exact.patch"
+  # memtable_l0_queue_max_bytes: a byte budget for the queued immutables beside the count limit, so a large
+  # write buffer does not turn the count writers need through a merge into more memory than the host has
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-l0-queue-byte-budget.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

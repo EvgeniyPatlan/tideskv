@@ -333,7 +333,7 @@ TidesDB is a log-structured merge-tree (LSM-tree) engine, the same family as Roc
 **How a write reaches disk:**
 
 1. The engine hands TidesDB one batch per command, or per `EXEC` or script.
-2. TidesDB appends the batch to its write-ahead log (WAL) and inserts it into the memtable, a sorted structure in memory (`memtable-size`, 64 MB by default; up to 64 x that, 4 GB by default, can queue in memory when flushing falls behind). The write is acknowledged.
+2. TidesDB appends the batch to its write-ahead log (WAL) and inserts it into the memtable, a sorted structure in memory (`memtable-size`, 256 MB by default; when flushing falls behind, full memtables queue in memory up to `memtable-queue-max-memory`, 2 GB by default, or `l0-stall-threshold` memtables, whichever comes first). The write is acknowledged.
 3. A full memtable is flushed to disk as an immutable sorted file, an SSTable.
 4. Background compaction merges SSTables into fewer, larger ones and drops overwritten or deleted entries.
 
@@ -442,10 +442,11 @@ Settings are read in this order, and later sources win:
 | `sync-mode` | `interval` | no | `none`, `interval` or `full` |
 | `sync-interval-us` | `1000000` | no | fsync period for `interval` |
 | `block-cache-size` | `4gb` | no | TidesDB read cache |
-| `memtable-size` | `64mb` | no | TidesDB write buffer; queued memtables can reach 64 x this (4 GB by default) before writes block |
-| `memtable-bloom` | `yes` | no | Give each memtable a whole-key bloom filter, so a point read (`GET`, the read before a write) skips the memtables that cannot hold its key instead of searching each one. Each filter takes 1/64 of `memtable-size` (1 MB at the default), at least 64 KB, on top of it; `no` searches every memtable |
+| `memtable-size` | `256mb` | no | TidesDB write buffer |
+| `memtable-queue-max-memory` | `2gb` | no | Memory the queued (sealed, not yet flushed) memtables may hold: queued memtables throttle writes from 3/4 of either `l0-stall-threshold` memtables or `memtable-queue-max-memory` bytes and hold a commit up to 2 s at either. `0` = the count alone; a non-zero value below 2 x `memtable-size` is raised to that, so one sealed memtable never blocks writes on its own. The queue's bytes and the paced commits show in `INFO persistence` (`storage_memtable_queue_bytes`, `storage_writes_throttled`, `storage_writes_blocked`, `storage_write_stall_us`) |
+| `memtable-bloom` | `yes` | no | Give each memtable a whole-key bloom filter, so a point read (`GET`, the read before a write) skips the memtables that cannot hold its key instead of searching each one. Each filter takes 1/64 of `memtable-size` (4 MB at the default), at least 64 KB, on top of it; `no` searches every memtable |
 | `l1-file-count-trigger` | `8` | no | Flush-tier tables per column family that start a merge |
-| `l0-stall-threshold` | `64` | no | Write backpressure: throttle from half this backlog (unflushed memtables or flush-tier tables), block at it |
+| `l0-stall-threshold` | `64` | no | Write backpressure: queued (unflushed) memtables throttle writes from 3/4 of this count and block at it; flush-tier tables throttle from 1/2 and block at it. A held commit is admitted anyway after 2 s |
 | `compression` | `lz4` | no | `no`, `lz4` or `zstd` |
 | `compression-start-level` | `0` | no | First level whose tables are compressed, 0 to 2 (a higher one could leave the largest level uncompressed: a deepening compaction moves files down without rewriting them); `0` compresses every level, `2` leaves the flush tier (level 1) uncompressed so a merge pays for the codec once. Tables of both kinds stay readable |
 | `btree-block-size` | `4kb` | no | Size of a TidesDB btree node, 4kb to 64kb in multiples of 4kb; larger nodes mean fewer, bigger reads per lookup and more bytes read per miss |
@@ -500,7 +501,7 @@ For cluster mode, use your client's cluster mode, such as `redis.RedisCluster` o
 - **Not supported yet** (planned for v1.x): Streams, Bitmaps, HyperLogLog, Geo, Pub/Sub, JSON, Search, TLS, ACLs, and the commands `MOVE`, `COPY`, `SWAPDB`, `OBJECT` and `CLIENT LIST`.
 - **On-disk format:** TidesKV cannot read Redis RDB files or a Kvrocks data directory, and won't. Move data through a client instead. The project is pre-1.0, so the on-disk format may still change between versions.
 - **Default port** is 6666, not 6379.
-- **Memory:** there is no `maxmemory` or eviction, because data lives on disk. Memory use is governed by `block-cache-size` and `memtable-size`.
+- **Memory:** there is no `maxmemory` or eviction, because data lives on disk. Memory use is governed by `block-cache-size`, `memtable-size` and `memtable-queue-max-memory`.
 
 ### Troubleshooting
 

@@ -38,7 +38,11 @@ struct StorageStats {
   uint64_t flush_count = 0;
   uint64_t compaction_count = 0;
   int immutable_memtables = 0;
-  uint64_t family_config_updates = 0;  // config updates Open issued to existing families
+  size_t immutable_memtable_bytes = 0;  // what the queued memtables held when sealed
+  uint64_t writes_throttled = 0;        // commits L0 admission made dwell
+  uint64_t writes_blocked = 0;          // commits L0 admission made wait for the queue to drain
+  uint64_t write_stall_us = 0;          // total time commits were held in L0 admission
+  uint64_t family_config_updates = 0;   // config updates Open issued to existing families
 };
 
 struct StorageOptions {
@@ -62,6 +66,10 @@ struct StorageOptions {
   // A whole-key bloom in front of each memtable's skip list (TidesDB memtable_whole_key_bloom): point reads
   // skip the memtables that cannot hold the key. Costs 1/64 of memtable_size per memtable, at least 64 KB.
   bool memtable_bloom = false;
+  // B10: byte budget for the queued (sealed, unflushed) memtables (TidesDB memtable_l0_queue_max_bytes):
+  // commits throttle from 3/4 of it and block at it. 0 = the count limit alone. A non-zero value under
+  // 2 x memtable_size is raised to that, so one sealed memtable never blocks writers on its own.
+  size_t memtable_queue_max_bytes = 0;
 };
 
 // Storage backed by TidesDB. The only module that touches the TidesDB C API.
@@ -93,6 +101,7 @@ class TidesStorage final : public Storage, public Compactor {
   // compaction already holds the CF.
   Status Compact(ColumnFamily cf) override;
   Result<StorageStats> Stats();
+  size_t memtable_queue_max_bytes() const;  // the byte budget Open applied, after the clamp (0 = none)
 
  private:
   struct Impl;

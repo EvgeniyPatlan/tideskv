@@ -1,0 +1,926 @@
+diff --git a/include/db.h b/include/db.h
+index bc97753..86b1cea 100644
+--- a/include/db.h
++++ b/include/db.h
+@@ -375,6 +375,12 @@ typedef struct tidesdb_column_family_config_t
+  * searching it. each memtable's filter takes a sixty-fourth of memtable_write_buffer_size, at least
+  * 64 KiB, on top of that budget; it pays off where most point reads miss the memtables. 0, the
+  * default, searches every memtable as before
++ * @param memtable_l0_queue_max_bytes the most memory the immutables waiting for flush may hold
++ * together, or 0 for no byte limit, the default. the stall threshold counts those immutables, and
++ * at a large write buffer a count that keeps writers moving through a merge is far more memory than
++ * a host may have; this bounds the bytes beside it. writers dwell from three quarters of it and
++ * wait at it, as they do at the count, and a wait is bounded the same way. an immutable is weighed
++ * as it was sealed, skip list and range deletes; its whole-key bloom is not counted
+  */
+ typedef struct tidesdb_config_t
+ {
+@@ -397,6 +403,7 @@ typedef struct tidesdb_config_t
+     int memtable_idle_flush_seconds;
+     int64_t txn_timeout_seconds;
+     int memtable_whole_key_bloom;
++    size_t memtable_l0_queue_max_bytes;
+ } tidesdb_config_t;
+ 
+ /* ===== statistics ===== */
+@@ -604,6 +611,8 @@ typedef struct
+  * @param write_stall_us total microseconds commits were held in L0 admission, dwell plus wait
+  * @param write_stall_ceiling_hits commits admitted only because the admission wait ceiling expired;
+  * any of these means flush did not keep up with ingestion
++ * @param immutable_memtable_bytes memory the immutables awaiting flush held when they were sealed,
++ * the figure memtable_l0_queue_max_bytes is compared against
+  */
+ typedef struct tidesdb_db_stats_t
+ {
+@@ -646,6 +655,7 @@ typedef struct tidesdb_db_stats_t
+     uint64_t writes_blocked;
+     uint64_t write_stall_us;
+     uint64_t write_stall_ceiling_hits;
++    size_t immutable_memtable_bytes;
+ } tidesdb_db_stats_t;
+ 
+ /* ===== defaults ===== */
+diff --git a/src/db.c b/src/db.c
+index 3602c0e..980d44e 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -82,6 +82,7 @@ tidesdb_config_t tidesdb_default_config(void)
+     c.memtable_l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL;
+     c.memtable_idle_flush_seconds = TDB_DEFAULT_IDLE_FLUSH_SECONDS;
+     c.memtable_whole_key_bloom = 0;
++    c.memtable_l0_queue_max_bytes = 0; /* no byte limit: the count alone bounds the queue */
+     return c;
+ }
+ 
+diff --git a/src/engine/engine.c b/src/engine/engine.c
+index 50c9067..fb3ae26 100644
+--- a/src/engine/engine.c
++++ b/src/engine/engine.c
+@@ -293,6 +293,7 @@ static int engine_create_l0(tidesdb_t *db)
+                                db->config.memtable_skip_list_max_level,
+                                db->config.memtable_skip_list_probability, NULL, NULL);
+     if (!db->l0) return TDB_ERR_MEMORY;
++    tidesdb_l0_set_queue_max_bytes(db->l0, db->config.memtable_l0_queue_max_bytes);
+ 
+     /* none is the mode that asks for nothing at commit, so its appends stop at the ring. interval
+      * and full both promise an acknowledged commit has left this process, so they wait for it */
+diff --git a/src/engine/engine.h b/src/engine/engine.h
+index f39fb35..35e58c1 100644
+--- a/src/engine/engine.h
++++ b/src/engine/engine.h
+@@ -677,6 +677,14 @@ int engine_range_stats(tidesdb_t *db, cf_t *cf, const uint8_t *key_a, size_t key
+ 
+ /* ===== maintenance operations (src/engine/engine_ops.c) ===== */
+ 
++/**
++ * tdb_test_flush_hold
++ * a test's hand on the flush pool: while non-zero a flush worker waits at its top before claiming
++ * anything, so a test can fill the L0 queue with flush stopped and watch what writers do. nothing
++ * in the engine sets it and its zero costs a worker one relaxed load. defined in engine_l0.c
++ */
++extern _Atomic(int) tdb_test_flush_hold;
++
+ /**
+  * engine_force_rotate
+  * seal the active memtable into the immutable queue regardless of its fill level and install a
+diff --git a/src/engine/engine_l0.c b/src/engine/engine_l0.c
+index 2d390ce..b4b75de 100644
+--- a/src/engine/engine_l0.c
++++ b/src/engine/engine_l0.c
+@@ -203,11 +203,19 @@ static void engine_flush_one(tidesdb_t *db, tidesdb_memtable_t *imm, uint64_t ti
+     if (install_rc != TDB_SUCCESS) tidesdb_l0_release_immutable(db->l0, imm);
+ }
+ 
++/* how often a held flush worker looks at the hold again */
++#define ENGINE_TEST_FLUSH_HOLD_POLL_US 1000
++
++_Atomic(int) tdb_test_flush_hold = 0;
++
+ void engine_flush_worker(void *item, void *ctx)
+ {
+     (void)item; /* a wake signal; the immutable comes from the shared L0 queue */
+     tidesdb_t *db = (tidesdb_t *)ctx;
+ 
++    while (atomic_load_explicit(&tdb_test_flush_hold, memory_order_relaxed))
++        usleep(ENGINE_TEST_FLUSH_HOLD_POLL_US);
++
+     /* the next rotation's log is prepared here, on a flush worker, rather than by the committer
+      * whose commit rotated, so creating the file is device work no commit waits on. a rotation that
+      * arrives first opens its own log */
+diff --git a/src/engine/engine_stats.c b/src/engine/engine_stats.c
+index 328301f..62575c5 100644
+--- a/src/engine/engine_stats.c
++++ b/src/engine/engine_stats.c
+@@ -389,6 +389,7 @@ int engine_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *out)
+     const size_t queued = tidesdb_l0_queue_depth(db->l0);
+     out->immutable_memtable_count = (int)queued;
+     out->is_flushing = queued > 0 ? 1 : 0;
++    out->immutable_memtable_bytes = tidesdb_l0_queued_bytes(db->l0);
+     out->memtable_bytes = tidesdb_l0_active_bytes(db->l0);
+     out->wal_bytes_written = tidesdb_l0_wal_bytes_written(db->l0);
+     out->compaction_pending_count = (int)queue_size(db->compaction_queue);
+diff --git a/src/internal/types.h b/src/internal/types.h
+index e765076..2112a98 100644
+--- a/src/internal/types.h
++++ b/src/internal/types.h
+@@ -73,6 +73,10 @@
+  * one (memtable/memtable_bloom.h). fixed at create, before the memtable is reachable
+  * @param bloom_blocks how many 64-byte blocks bloom holds, 0 with no bloom
+  * @param bloom_mem the allocation bloom is aligned within, which the free releases
++ * @param queued_bytes what this memtable held when a rotation sealed it into the L0 queue, skip
++ * list and range tombstones, the figure the queue's byte budget is kept in. set before the enqueue
++ * publishes the memtable and never changed after, so the removal that takes the memtable off the
++ * queue gives back exactly what its rotation added; 0 until then
+  */
+ typedef struct tidesdb_memtable_t
+ {
+@@ -93,6 +97,7 @@ typedef struct tidesdb_memtable_t
+     _Atomic(uint64_t) *bloom;
+     uint32_t bloom_blocks;
+     void *bloom_mem;
++    size_t queued_bytes;
+ } tidesdb_memtable_t;
+ 
+ #endif /* __TIDESDB_INTERNAL_TYPES_H__ */
+diff --git a/src/memtable/backpressure.c b/src/memtable/backpressure.c
+index ccdc95a..0a4ad71 100644
+--- a/src/memtable/backpressure.c
++++ b/src/memtable/backpressure.c
+@@ -75,6 +75,42 @@ static void tidesdb_backpressure_tier_throttle(const tidesdb_l0_pressure_t *pres
+     }
+ }
+ 
++/**
++ * tidesdb_backpressure_bytes_throttle
++ * tighten a verdict for the queued immutables' bytes, which the count cannot show: at a large write
++ * buffer a count that leaves writers room through a merge is more memory than the host has
++ * @param pressure the snapshot, whose byte budget is 0 when the producer sets none
++ * @param decision the verdict so far, raised in place and never lowered
++ */
++static void tidesdb_backpressure_bytes_throttle(const tidesdb_l0_pressure_t *pressure,
++                                                tidesdb_backpressure_decision_t *decision)
++{
++    const size_t limit = pressure->queued_bytes_limit;
++    if (limit == 0 || decision->action == TDB_BACKPRESSURE_BLOCK) return;
++
++    if (pressure->queued_bytes >= limit)
++    {
++        decision->action = TDB_BACKPRESSURE_BLOCK;
++        decision->throttle_us = 0;
++        return;
++    }
++    const size_t high = limit / TDB_BACKPRESSURE_HIGHWATER_DEN * TDB_BACKPRESSURE_HIGHWATER_NUM +
++                        limit % TDB_BACKPRESSURE_HIGHWATER_DEN * TDB_BACKPRESSURE_HIGHWATER_NUM /
++                            TDB_BACKPRESSURE_HIGHWATER_DEN;
++    if (pressure->queued_bytes < high) return;
++
++    /* a step for the band's first write buffer and one more for each after it, the count band's
++     * slot measured in the bytes a slot holds */
++    const size_t over = pressure->queued_bytes - high;
++    const uint64_t steps = pressure->buffer_size > 0 ? over / pressure->buffer_size + 1 : 1;
++    const uint64_t dwell = steps * TDB_BACKPRESSURE_THROTTLE_STEP_US;
++    if (dwell > decision->throttle_us)
++    {
++        decision->action = TDB_BACKPRESSURE_THROTTLE;
++        decision->throttle_us = dwell;
++    }
++}
++
+ /**
+  * tidesdb_backpressure_ring_throttle
+  * raise a verdict's dwell for staging-ring pressure, which the queue depth cannot show
+@@ -117,6 +153,7 @@ tidesdb_backpressure_decision_t tidesdb_backpressure_default_policy(
+      * the queue is, so its band is evaluated either way rather than skipped with the queue's */
+     if (pressure->queue_limit <= 0)
+     {
++        tidesdb_backpressure_bytes_throttle(pressure, &decision);
+         tidesdb_backpressure_ring_throttle(pressure, &decision);
+         tidesdb_backpressure_tier_throttle(pressure, &decision);
+         return decision;
+@@ -140,6 +177,7 @@ tidesdb_backpressure_decision_t tidesdb_backpressure_default_policy(
+         decision.throttle_us = (uint64_t)over * TDB_BACKPRESSURE_THROTTLE_STEP_US;
+     }
+ 
++    tidesdb_backpressure_bytes_throttle(pressure, &decision);
+     tidesdb_backpressure_ring_throttle(pressure, &decision);
+     tidesdb_backpressure_tier_throttle(pressure, &decision);
+     return decision;
+diff --git a/src/memtable/backpressure.h b/src/memtable/backpressure.h
+index c658270..3b15ad7 100644
+--- a/src/memtable/backpressure.h
++++ b/src/memtable/backpressure.h
+@@ -37,6 +37,11 @@
+  * out of memory promptly and still leave a tier of runs every later read has to merge across
+  * @param tier_slow runs at which a writer starts dwelling, or 0 to weigh the tier not at all
+  * @param tier_stall runs at which a writer waits for the tier to drain
++ * @param queued_bytes what the immutables in the L0 queue held when each was sealed, summed
++ * @param queued_bytes_limit the byte budget for them, or 0 to weigh their bytes not at all. the
++ * count limit says how many may wait for flush and this how much memory they may hold, which at a
++ * large write buffer is the bound that matters; a writer dwells from three quarters of it and waits
++ * at it, whichever of the two is reached first
+  */
+ typedef struct
+ {
+@@ -49,6 +54,8 @@ typedef struct
+     int tier_depth;
+     int tier_slow;
+     int tier_stall;
++    size_t queued_bytes;
++    size_t queued_bytes_limit;
+ } tidesdb_l0_pressure_t;
+ 
+ /**
+@@ -121,8 +128,9 @@ tidesdb_backpressure_decision_t tidesdb_backpressure_decide(const tidesdb_backpr
+  * tidesdb_backpressure_default_policy
+  * the built-in policy: admit below the high-water fraction of the queue limit, throttle with a
+  * dwell that rises as depth climbs through the band, and block at or above the peak; an unbounded
+- * limit
+- * (<= 0) always admits
++ * limit (<= 0) never paces on the count. the queued bytes are paced the same way against their
++ * budget when one is set, a step of dwell for each write buffer past the high-water mark, and the
++ * larger of the two verdicts wins
+  * @param pressure the current L0 pressure snapshot
+  * @param ctx unused
+  * @return the verdict for a writer under this pressure
+diff --git a/src/memtable/l0_admission.c b/src/memtable/l0_admission.c
+index c7e4623..0141a5b 100644
+--- a/src/memtable/l0_admission.c
++++ b/src/memtable/l0_admission.c
+@@ -59,6 +59,8 @@ static void l0_admission_snapshot(const tidesdb_l0_t *l0, tidesdb_l0_pressure_t
+     memset(out, 0, sizeof(*out));
+     out->queue_depth = (int)queue_size(l0->queue);
+     out->queue_limit = l0->l0_queue_size;
++    out->queued_bytes = tidesdb_l0_queued_bytes(l0);
++    out->queued_bytes_limit = l0->queue_max_bytes;
+     /* the active memtable's fill is deliberately not among the fields a policy decides on. reading
+      * it here would cost a pinned load of the shared active slot -- three contended atomics and a
+      * full barrier -- on every commit, which is more than the pacing it would buy, so admission
+@@ -92,8 +94,10 @@ static void l0_admission_note_block(tidesdb_l0_t *l0, const tidesdb_l0_pressure_
+     const uint64_t blocked =
+         atomic_fetch_add_explicit(&l0->admits_blocked, 1, memory_order_relaxed) + 1;
+     if (blocked % TDB_L0_BACKPRESSURE_LOG_EVERY == 1)
+-        TDB_DEBUG_LOG(TDB_LOG_TRACE, "l0 admission blocked at depth %d of %d, %d flushing",
+-                      pressure->queue_depth, pressure->queue_limit, pressure->flush_in_progress);
++        TDB_DEBUG_LOG(TDB_LOG_TRACE,
++                      "l0 admission blocked at depth %d of %d, %zu of %zu bytes, %d flushing",
++                      pressure->queue_depth, pressure->queue_limit, pressure->queued_bytes,
++                      pressure->queued_bytes_limit, pressure->flush_in_progress);
+ }
+ 
+ /**
+@@ -137,7 +141,8 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
+      * empty queue is only a free admit while the tier is also shallow */
+     const int tier = atomic_load_explicit(&l0->tier_depth, memory_order_relaxed);
+     const int tier_slow = l0_tier_slow_runs(l0);
+-    const int no_queue_pressure = l0->l0_queue_size <= 0 || queue_size(l0->queue) == 0;
++    const int queue_bounded = l0->l0_queue_size > 0 || l0->queue_max_bytes > 0;
++    const int no_queue_pressure = !queue_bounded || queue_size(l0->queue) == 0;
+     if (no_queue_pressure && (tier_slow <= 0 || tier < tier_slow)) return TDB_SUCCESS;
+ 
+     uint64_t stalled_us = 0;
+@@ -179,9 +184,10 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
+         {
+             atomic_fetch_add_explicit(&l0->admit_ceiling_hits, 1, memory_order_relaxed);
+             TDB_DEBUG_LOG(TDB_LOG_WARN,
+-                          "l0 admission ceiling reached after %llu us at depth %d, flush is not "
+-                          "keeping up",
+-                          (unsigned long long)stalled_us, pressure.queue_depth);
++                          "l0 admission ceiling reached after %llu us at depth %d (%zu bytes), "
++                          "flush is not keeping up",
++                          (unsigned long long)stalled_us, pressure.queue_depth,
++                          pressure.queued_bytes);
+             break;
+         }
+     }
+diff --git a/src/memtable/l0_immutable.c b/src/memtable/l0_immutable.c
+index 7970b04..b01e2e4 100644
+--- a/src/memtable/l0_immutable.c
++++ b/src/memtable/l0_immutable.c
+@@ -41,8 +41,10 @@ tidesdb_memtable_t *tidesdb_l0_dequeue_immutable(tidesdb_l0_t *l0)
+ {
+     if (!l0) return NULL;
+     tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_dequeue(l0->queue);
++    if (!mt) return NULL;
++    l0_queue_bytes_release(l0, mt);
+     /* the queue just got shallower, which is the thing a blocked writer is waiting on */
+-    if (mt) tidesdb_l0_admit_wake(l0);
++    tidesdb_l0_admit_wake(l0);
+     return mt;
+ }
+ 
+@@ -104,7 +106,14 @@ void tidesdb_l0_retire_immutable(tidesdb_l0_t *l0, tidesdb_memtable_t *mt)
+      * as a rotation does, so it is published the same way -- a reader that missed the active and
+      * then found this immutable already gone would otherwise report an absence it cannot stand
+      * behind */
+-    (void)queue_remove_if(l0->queue, l0_match_memtable, mt, NULL);
++    /* a memtable the close drain dequeued is no longer queued and gave its bytes back then, so they
++     * are given back here only when this call is the one that removed it */
++    if (queue_remove_if(l0->queue, l0_match_memtable, mt, NULL) > 0)
++    {
++        l0_queue_bytes_release(l0, mt);
++        /* shallower in bytes as well as depth, which a writer blocked on either is waiting for */
++        tidesdb_l0_admit_wake(l0);
++    }
+     atomic_fetch_add_explicit(&l0->visible_changes, 1, memory_order_release);
+     atomic_fetch_sub_explicit(&l0->flushes_in_flight, 1, memory_order_relaxed);
+     l0_forget_aborted_through(l0, mt->generation);
+diff --git a/src/memtable/l0_internal.h b/src/memtable/l0_internal.h
+index b198f0d..b9c9e84 100644
+--- a/src/memtable/l0_internal.h
++++ b/src/memtable/l0_internal.h
+@@ -58,6 +58,18 @@ void l0_unpin_read(tidesdb_memtable_t *mt);
+  */
+ uint64_t tidesdb_l0_skiplist_probes(void);
+ 
++/**
++ * l0_queue_bytes_release
++ * give back what an immutable's rotation added to the queue's byte count, called by every path that
++ * takes the immutable off the queue and only by those, so the count holds exactly the queued ones
++ * @param l0 the subsystem
++ * @param mt the memtable just removed from the queue
++ */
++static inline void l0_queue_bytes_release(tidesdb_l0_t *l0, const tidesdb_memtable_t *mt)
++{
++    atomic_fetch_sub_explicit(&l0->queued_bytes, mt->queued_bytes, memory_order_relaxed);
++}
++
+ /**
+  * l0_pending_node_t
+  * one immutable awaiting a quiet moment to be freed
+diff --git a/src/memtable/memtable.c b/src/memtable/memtable.c
+index 083783a..82bbca4 100644
+--- a/src/memtable/memtable.c
++++ b/src/memtable/memtable.c
+@@ -106,6 +106,7 @@ tidesdb_memtable_t *tidesdb_memtable_create_with_bloom(block_manager_t *wal, uin
+     atomic_init(&mt->vlog_token, VLOG_BUILD_TOKEN_NONE);
+     atomic_init(&mt->high_seq, 0);
+     atomic_init(&mt->seq_floor, 0);
++    mt->queued_bytes = 0; /* weighed by the rotation that seals it */
+ 
+     /* the set itself waits for the first range delete, so a database that never issues one carries
+      * nothing but the empty count and the lock */
+@@ -183,6 +184,8 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
+     atomic_init(&l0->admit_stall_us, 0);
+     atomic_init(&l0->admit_ceiling_hits, 0);
+     atomic_init(&l0->admit_max_us, 0);
++    l0->queue_max_bytes = 0;
++    atomic_init(&l0->queued_bytes, 0);
+     atomic_init(&l0->aborted_count, 0);
+     for (int i = 0; i < TDB_L0_MAX_ABORTED_SEQS; i++)
+     {
+@@ -242,7 +245,10 @@ void tidesdb_l0_destroy(tidesdb_l0_t *l0)
+     {
+         tidesdb_memtable_t *queued;
+         while ((queued = (tidesdb_memtable_t *)queue_dequeue(l0->queue)) != NULL)
++        {
++            l0_queue_bytes_release(l0, queued);
+             tidesdb_memtable_free(queued);
++        }
+         queue_free(l0->queue);
+     }
+     tidesdb_backpressure_free(l0->backpressure);
+@@ -832,11 +838,20 @@ int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
+      * sequence drawn after the swap is above every one the sealed memtable holds (G2). the caller
+      * holds rotate_lock, so this is the only closer */
+     tdb_commit_gate_close(&l0->commit_gate);
++    /* weighed with the gate closed, so no commit is still applying into it and the figure is what
++     * the memtable holds for as long as it is queued. the same measure the rotation threshold is
++     * compared against; the bloom is fixed at create and is not counted */
++    sealed->queued_bytes =
++        skip_list_get_memory_bytes(sealed->skip_list) + l0_range_tombstone_bytes(sealed);
+     if (queue_enqueue(l0->queue, sealed) != 0)
+     {
++        sealed->queued_bytes = 0;
+         tdb_commit_gate_open(&l0->commit_gate);
+         return TDB_ERR_MEMORY;
+     }
++    /* counted before the swap: a flush skips a queued memtable while it is still the active one, so
++     * nothing can retire it, and give its bytes back, before they were added */
++    atomic_fetch_add_explicit(&l0->queued_bytes, sealed->queued_bytes, memory_order_relaxed);
+     /* nothing applies into the sealed memtable from here, so its high sequence is final, and every
+      * sequence the new one takes must be above it */
+     atomic_store_explicit(&new_mt->seq_floor,
+@@ -850,6 +865,17 @@ int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
+     return TDB_SUCCESS;
+ }
+ 
++void tidesdb_l0_set_queue_max_bytes(tidesdb_l0_t *l0, const size_t bytes)
++{
++    if (!l0) return;
++    l0->queue_max_bytes = bytes;
++}
++
++size_t tidesdb_l0_queued_bytes(const tidesdb_l0_t *l0)
++{
++    return l0 ? atomic_load_explicit(&l0->queued_bytes, memory_order_relaxed) : 0;
++}
++
+ uint64_t tidesdb_l0_rotation_mark(const tidesdb_l0_t *l0)
+ {
+     return l0 ? atomic_load_explicit(&l0->visible_changes, memory_order_acquire) : 0;
+diff --git a/src/memtable/memtable.h b/src/memtable/memtable.h
+index e2d6c02..a7a2966 100644
+--- a/src/memtable/memtable.h
++++ b/src/memtable/memtable.h
+@@ -190,6 +190,10 @@ int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size
+  * whose log took the same commit's record (G1 broken); zero while the gate holds
+  * @param gate_seq_inversions entries applied at a sequence at or below the memtable's seq_floor
+  * (G2 broken); zero while the gate holds
++ * @param queue_max_bytes the byte budget for the queued immutables, or 0 for none; set once at open
++ * before any writer, so read without ordering
++ * @param queued_bytes the sum of every queued immutable's queued_bytes, added by the rotation that
++ * enqueues one and taken back by whichever removal takes it off the queue
+  */
+ typedef struct
+ {
+@@ -225,6 +229,8 @@ typedef struct
+     tdb_commit_gate_t commit_gate;
+     _Atomic(uint64_t) gate_split_applies;
+     _Atomic(uint64_t) gate_seq_inversions;
++    size_t queue_max_bytes;
++    _Atomic(size_t) queued_bytes;
+ } tidesdb_l0_t;
+ 
+ /**
+@@ -634,6 +640,25 @@ void tidesdb_l0_retire_immutable(tidesdb_l0_t *l0, tidesdb_memtable_t *mt);
+  */
+ void tidesdb_l0_release_immutable(tidesdb_l0_t *l0, tidesdb_memtable_t *mt);
+ 
++/**
++ * tidesdb_l0_set_queue_max_bytes
++ * set the byte budget for the queued immutables, beside the count limit the subsystem was created
++ * with; writers dwell from three quarters of it and wait at it. called once at open, before any
++ * writer
++ * @param l0 the subsystem
++ * @param bytes the budget, or 0 for no byte limit
++ */
++void tidesdb_l0_set_queue_max_bytes(tidesdb_l0_t *l0, size_t bytes);
++
++/**
++ * tidesdb_l0_queued_bytes
++ * what the immutables awaiting flush held when each was sealed, summed; the figure the byte budget
++ * is compared against. a memtable claimed by a flush still counts until its install retires it
++ * @param l0 the subsystem
++ * @return the queued bytes, 0 for a NULL subsystem
++ */
++size_t tidesdb_l0_queued_bytes(const tidesdb_l0_t *l0);
++
+ /**
+  * tidesdb_l0_queue_depth
+  * the current number of immutable memtables awaiting flush; the write path paces on this, not the
+@@ -698,12 +723,13 @@ int tidesdb_l0_seq_aborted(const tidesdb_l0_t *l0, uint64_t seq);
+ /**
+  * tidesdb_l0_admit_write
+  * pace one writer against current L0 fill before its write is made durable -- snapshot the
+- * pressure, ask the backpressure policy, and dwell or wait out a full queue as it decides. an
+- * unbounded queue limit admits immediately, so the whole mechanism is opt-in through configuration.
+- * a writer that waits out the ceiling without the queue draining is admitted anyway, so a wedged
+- * flush degrades ingestion instead of hanging it. an empty immutable queue also admits without
+- * consulting the policy, since this paces against the unflushed backlog and there is none -- a
+- * policy pacing on active memtable fill alone is therefore not driven from here
++ * pressure, ask the backpressure policy, and dwell or wait out a full queue as it decides. a queue
++ * with neither a count limit nor a byte budget is not paced on its backlog, so that pacing is
++ * opt-in through configuration. a writer that waits out the ceiling without the queue draining is
++ * admitted anyway, so a wedged flush degrades ingestion instead of hanging it. an empty immutable
++ * queue also admits without consulting the policy, since this paces against the unflushed backlog
++ * and there is none -- a policy pacing on active memtable fill alone is therefore not driven from
++ * here
+  * @param l0 the subsystem
+  * @return TDB_SUCCESS once the writer may proceed, or TDB_ERR_INVALID_ARGS if l0 is NULL
+  */
+diff --git a/test/l0_queue_bytes__tests.c b/test/l0_queue_bytes__tests.c
+new file mode 100644
+index 0000000..7251395
+--- /dev/null
++++ b/test/l0_queue_bytes__tests.c
+@@ -0,0 +1,430 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the byte budget beside the queue's count limit (memtable_l0_queue_max_bytes). the count bounds
++ * how many immutables may wait for flush, which at a large write buffer is a great deal of memory;
++ * the budget bounds what they hold. the policy blocks at the budget and throttles from three
++ * quarters of it, the L0 keeps the bytes of every queued immutable as it was sealed, and a writer
++ * outrunning a flush that has stopped waits at the budget rather than filling memory */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/engine/engine.h"       /* tdb_test_flush_hold */
++#include "../src/engine/engine_types.h" /* db->l0 */
++#include "../src/memtable/backpressure.h"
++#include "../src/memtable/l0_internal.h"
++#include "../src/memtable/memtable.h"
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++static const char *qb_exe = NULL;
++
++#define QB_STEP_US 200 /* the policy's per-step dwell, TDB_BACKPRESSURE_THROTTLE_STEP_US */
++#define QB_LIMIT   (64u << 20)
++#define QB_BUFFER  (4u << 20)
++
++#define QB_DB_DIR     "." PATH_SEPARATOR "test_l0_queue_bytes_db"
++#define QB_CF         "cf0"
++#define QB_CHILD_FLAG "--l0-queue-bytes-child"
++#define QB_PHASE_FILL "fill"
++
++#define QB_VALUE_SIZE 256
++#define QB_PER_TXN    100
++/* waits a test makes on a background effect, in 10 ms polls */
++#define QB_POLL_US    10000
++#define QB_POLL_LIMIT 3000
++
++/* the policy alone: a snapshot with the count well under its band and the bytes where the case puts
++ * them */
++static tidesdb_l0_pressure_t qb_bytes_at(const size_t bytes, const size_t limit)
++{
++    tidesdb_l0_pressure_t p = {.queue_depth = 2,
++                               .queue_limit = 64,
++                               .buffer_size = QB_BUFFER,
++                               .queued_bytes = bytes,
++                               .queued_bytes_limit = limit};
++    return p;
++}
++
++/* at the budget a writer waits, however few immutables hold it */
++void test_byte_limit_blocks_at_limit(void)
++{
++    tidesdb_l0_pressure_t p = qb_bytes_at(QB_LIMIT, QB_LIMIT);
++    tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_BLOCK);
++    p = qb_bytes_at(QB_LIMIT + 1, QB_LIMIT);
++    d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_BLOCK);
++}
++
++/* from three quarters of the budget a writer dwells one step, and one more for each write buffer
++ * the queue holds past that mark */
++void test_byte_limit_throttles_from_three_quarters(void)
++{
++    const size_t high = (size_t)QB_LIMIT * 3 / 4;
++    tidesdb_l0_pressure_t p = qb_bytes_at(high, QB_LIMIT);
++    tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_THROTTLE);
++    ASSERT_EQ(d.throttle_us, (uint64_t)QB_STEP_US);
++
++    p = qb_bytes_at(high + 2 * (size_t)QB_BUFFER, QB_LIMIT);
++    d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_THROTTLE);
++    ASSERT_EQ(d.throttle_us, (uint64_t)(3 * QB_STEP_US));
++
++    p = qb_bytes_at(high - 1, QB_LIMIT);
++    d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_ADMIT);
++    ASSERT_EQ(d.throttle_us, (uint64_t)0);
++}
++
++/* a count-band dwell larger than the bytes band's is kept, never traded down */
++void test_byte_band_never_lowers_a_larger_dwell(void)
++{
++    const size_t high = (size_t)QB_LIMIT * 3 / 4;
++    tidesdb_l0_pressure_t p = qb_bytes_at(high, QB_LIMIT);
++    p.queue_depth = 60; /* (60 - 48 + 1) steps from the count band */
++    const tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_THROTTLE);
++    ASSERT_EQ(d.throttle_us, (uint64_t)(13 * QB_STEP_US));
++}
++
++/* a budget of zero leaves the count band deciding exactly as it did before the budget existed:
++ * admit below 3/4 of the count, a step per slot from there, block at the count */
++void test_zero_byte_limit_is_count_only(void)
++{
++    const struct
++    {
++        int depth;
++        tidesdb_backpressure_action_t action;
++        uint64_t dwell;
++    } cases[] = {{0, TDB_BACKPRESSURE_ADMIT, 0},
++                 {47, TDB_BACKPRESSURE_ADMIT, 0},
++                 {48, TDB_BACKPRESSURE_THROTTLE, QB_STEP_US},
++                 {63, TDB_BACKPRESSURE_THROTTLE, 16 * QB_STEP_US},
++                 {64, TDB_BACKPRESSURE_BLOCK, 0}};
++    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
++    {
++        /* whatever the bytes read, a zero budget does not weigh them */
++        tidesdb_l0_pressure_t p = qb_bytes_at((size_t)1 << 40, 0);
++        p.queue_depth = cases[i].depth;
++        const tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++        ASSERT_EQ(d.action, cases[i].action);
++        ASSERT_EQ(d.throttle_us, cases[i].dwell);
++    }
++}
++
++/* the flush tier's band stays on runs: a budget the bytes are under changes nothing about it */
++void test_tier_band_ignores_byte_limit(void)
++{
++    tidesdb_l0_pressure_t p = qb_bytes_at((size_t)QB_LIMIT / 2, QB_LIMIT);
++    p.tier_depth = 40;
++    p.tier_slow = 32;
++    p.tier_stall = 64;
++    const tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_THROTTLE);
++    ASSERT_EQ(d.throttle_us, (uint64_t)(9 * QB_STEP_US));
++}
++
++/* the bytes band holds with the count unbounded too, since the two bound different things */
++void test_byte_limit_applies_with_unbounded_count(void)
++{
++    tidesdb_l0_pressure_t p = qb_bytes_at(QB_LIMIT, QB_LIMIT);
++    p.queue_limit = 0;
++    const tidesdb_backpressure_decision_t d = tidesdb_backpressure_default_policy(&p, NULL);
++    ASSERT_EQ(d.action, TDB_BACKPRESSURE_BLOCK);
++}
++
++/* an in-memory memtable holding about a mebibyte of entries */
++static void qb_fill_active(tidesdb_l0_t *l0, const uint64_t seq_base)
++{
++    char value[QB_VALUE_SIZE];
++    memset(value, 'v', sizeof(value));
++    for (int i = 0; i < 3000; i++)
++    {
++        char key[32];
++        snprintf(key, sizeof(key), "k%08llu", (unsigned long long)(seq_base + (uint64_t)i));
++        ASSERT_EQ(tidesdb_l0_put(l0, 0, (const uint8_t *)key, strlen(key), (const uint8_t *)value,
++                                 sizeof(value), -1, seq_base + (uint64_t)i + 1, 0),
++                  TDB_SUCCESS);
++    }
++}
++
++static tidesdb_memtable_t *qb_fresh_mt(const uint64_t id)
++{
++    return tidesdb_memtable_create(NULL, id, id, 12, 0.25f, NULL, NULL);
++}
++
++/* every immutable's bytes are counted from its rotation until it leaves the queue -- by a flush
++ * that retires it, or by the drain a close makes -- and only then */
++void test_queued_bytes_track_rotate_and_retire(void)
++{
++    tidesdb_l0_t *l0 = tidesdb_l0_create(QB_BUFFER, 64, 12, 0.25f, NULL, NULL);
++    ASSERT_TRUE(l0 != NULL);
++    ASSERT_TRUE(tidesdb_l0_set_active(l0, qb_fresh_mt(0)) == NULL);
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), (size_t)0);
++
++    size_t recorded[3];
++    for (int r = 0; r < 3; r++)
++    {
++        tidesdb_memtable_t *sealing = atomic_load(&l0->active);
++        qb_fill_active(l0, (uint64_t)r * 10000);
++        const size_t held = tidesdb_l0_active_bytes(l0);
++        ASSERT_TRUE(held >= (size_t)(1u << 20));
++        ASSERT_EQ(tidesdb_l0_rotate(l0, qb_fresh_mt((uint64_t)r + 1)), TDB_SUCCESS);
++        recorded[r] = sealing->queued_bytes;
++        ASSERT_EQ(recorded[r], held);
++    }
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), recorded[0] + recorded[1] + recorded[2]);
++
++    /* a flush claims and retires the two oldest */
++    for (int r = 0; r < 2; r++)
++    {
++        tidesdb_memtable_t *imm = tidesdb_l0_claim_immutable(l0);
++        ASSERT_TRUE(imm != NULL);
++        tidesdb_l0_retire_immutable(l0, imm);
++    }
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), recorded[2]);
++
++    /* a claim that fails to install releases without leaving the queue, so its bytes stay */
++    tidesdb_memtable_t *imm = tidesdb_l0_claim_immutable(l0);
++    ASSERT_TRUE(imm != NULL);
++    tidesdb_l0_release_immutable(l0, imm);
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), recorded[2]);
++
++    /* the close drain dequeues; the flush it then runs retires the dequeued memtable, which must
++     * not take its bytes a second time */
++    imm = tidesdb_l0_dequeue_immutable(l0);
++    ASSERT_TRUE(imm != NULL);
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), (size_t)0);
++    atomic_fetch_add(&l0->flushes_in_flight, 1); /* as a claim would have */
++    tidesdb_l0_retire_immutable(l0, imm);
++    ASSERT_EQ(tidesdb_l0_queued_bytes(l0), (size_t)0);
++    ASSERT_TRUE(tidesdb_l0_dequeue_immutable(l0) == NULL);
++
++    tidesdb_l0_destroy(l0);
++}
++
++/* the budget is set on the L0 the engine opens, and reported */
++void test_budget_reaches_the_l0(void)
++{
++    tidesdb_l0_t *l0 = tidesdb_l0_create(QB_BUFFER, 64, 12, 0.25f, NULL, NULL);
++    ASSERT_TRUE(l0 != NULL);
++    ASSERT_EQ(l0->queue_max_bytes, (size_t)0);
++    tidesdb_l0_set_queue_max_bytes(l0, 12u << 20);
++    ASSERT_EQ(l0->queue_max_bytes, (size_t)(12u << 20));
++    tidesdb_l0_destroy(l0);
++    ASSERT_EQ(tidesdb_default_config().memtable_l0_queue_max_bytes, (size_t)0);
++}
++
++static tidesdb_config_t qb_config(void)
++{
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = QB_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_write_buffer_size = QB_BUFFER;
++    cfg.memtable_l0_queue_stall_threshold = 64;
++    cfg.memtable_idle_flush_seconds = 0;
++    cfg.num_flush_threads = 2;
++    return cfg;
++}
++
++static void qb_wait_drained(tidesdb_t *db)
++{
++    for (int i = 0; i < QB_POLL_LIMIT && tidesdb_l0_queue_depth(db->l0) > 0; i++)
++        usleep(QB_POLL_US);
++    ASSERT_EQ(tidesdb_l0_queue_depth(db->l0), (size_t)0);
++}
++
++typedef struct
++{
++    tidesdb_t *db;
++    tidesdb_column_family_t *cf;
++    int from;
++    int to;
++    _Atomic(int) done;
++} qb_writer_t;
++
++/* commit keys [from, to) QB_PER_TXN a transaction */
++static void qb_fill(tidesdb_t *db, tidesdb_column_family_t *cf, const int from, const int to)
++{
++    char value[QB_VALUE_SIZE];
++    memset(value, 'v', sizeof(value));
++    for (int i = from; i < to;)
++    {
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
++        for (int j = 0; j < QB_PER_TXN && i < to; j++, i++)
++        {
++            char key[32];
++            snprintf(key, sizeof(key), "k%08d", i);
++            ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key),
++                                      (const uint8_t *)value, sizeof(value), -1),
++                      TDB_SUCCESS);
++        }
++        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++        tidesdb_txn_free(txn);
++    }
++}
++
++static void *qb_writer_main(void *arg)
++{
++    qb_writer_t *w = (qb_writer_t *)arg;
++    qb_fill(w->db, w->cf, w->from, w->to);
++    atomic_store(&w->done, 1);
++    return NULL;
++}
++
++static tidesdb_t *qb_open(const tidesdb_config_t *cfg, const int create_cf,
++                          tidesdb_column_family_t **cf)
++{
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(cfg, &db), TDB_SUCCESS);
++    if (create_cf)
++    {
++        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++        ASSERT_EQ(tidesdb_create_column_family(db, QB_CF, &cc), TDB_SUCCESS);
++    }
++    *cf = tidesdb_get_column_family(db, QB_CF);
++    ASSERT_TRUE(*cf != NULL);
++    return db;
++}
++
++/* with flush stopped, a writer fills the queue up to the budget and waits there instead of going on
++ * to the count limit; once flush resumes the queue drains, the writer finishes, and the bytes
++ * return to zero */
++void test_writes_wait_at_byte_budget(void)
++{
++    (void)remove_directory(QB_DB_DIR);
++    tidesdb_config_t cfg = qb_config();
++    cfg.memtable_l0_queue_max_bytes = 12u << 20;
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = qb_open(&cfg, 1, &cf);
++
++    atomic_store(&tdb_test_flush_hold, 1);
++    /* about 40 MiB of entries: ten write buffers, far past the 12 MiB the queue may hold */
++    qb_writer_t w = {.db = db, .cf = cf, .from = 0, .to = 60000};
++    atomic_init(&w.done, 0);
++    pthread_t th;
++    ASSERT_EQ(pthread_create(&th, NULL, qb_writer_main, &w), 0);
++
++    tidesdb_db_stats_t st;
++    memset(&st, 0, sizeof(st));
++    for (int i = 0; i < QB_POLL_LIMIT; i++)
++    {
++        ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++        if (st.writes_blocked > 0) break;
++        usleep(QB_POLL_US);
++    }
++    printf("(blocked %llu, queued %zu bytes in %d memtables) ",
++           (unsigned long long)st.writes_blocked, st.immutable_memtable_bytes,
++           st.immutable_memtable_count);
++    fflush(stdout);
++    ASSERT_TRUE(st.writes_blocked > 0);
++    ASSERT_TRUE(st.immutable_memtable_bytes >= (size_t)(12u << 20));
++    ASSERT_TRUE(st.immutable_memtable_bytes <= (size_t)(16u << 20));
++    ASSERT_EQ(atomic_load(&w.done), 0);
++
++    atomic_store(&tdb_test_flush_hold, 0);
++    ASSERT_EQ(pthread_join(th, NULL), 0);
++    ASSERT_EQ(atomic_load(&w.done), 1);
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++    qb_wait_drained(db);
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    ASSERT_EQ(st.immutable_memtable_bytes, (size_t)0);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(QB_DB_DIR);
++}
++
++/* the child of the recovery case: rotate several memtables with flush stopped and die without a
++ * close, so every one of them comes back from its log on the next open */
++static void qb_child_fill(void)
++{
++    atomic_store(&tdb_test_flush_hold, 1);
++    const tidesdb_config_t cfg = qb_config();
++    tidesdb_t *db = NULL;
++    if (tidesdb_open(&cfg, &db) != TDB_SUCCESS) _exit(1);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    if (tidesdb_create_column_family(db, QB_CF, &cc) != TDB_SUCCESS) _exit(1);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, QB_CF);
++    if (!cf) _exit(1);
++    qb_fill(db, cf, 0, 30000);
++    if (tidesdb_l0_queue_depth(db->l0) < 2) _exit(3);
++    _exit(0);
++}
++
++/* the generations a reopen replays are queued through the same rotation a live write takes, so
++ * their bytes are counted, and the flush that retires them takes them back to zero rather than
++ * below */
++void test_recovered_generations_are_counted(void)
++{
++    (void)remove_directory(QB_DB_DIR);
++    int exit_code = -1;
++    ASSERT_EQ(test_spawn_self(qb_exe, QB_CHILD_FLAG, QB_PHASE_FILL, "0", &exit_code), 0);
++    ASSERT_EQ(exit_code, 0);
++
++    atomic_store(&tdb_test_flush_hold, 1);
++    const tidesdb_config_t cfg = qb_config();
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = qb_open(&cfg, 0, &cf);
++
++    tidesdb_memtable_t *pinned[64];
++    int n = 0;
++    ASSERT_EQ(tidesdb_l0_pin_memtables(db->l0, pinned, 64, &n), TDB_SUCCESS);
++    size_t sum = 0;
++    for (int i = 1; i < n; i++) sum += pinned[i]->queued_bytes; /* pinned[0] is the active */
++    tidesdb_l0_unpin_memtables(pinned, n);
++    const size_t queued = tidesdb_l0_queued_bytes(db->l0);
++    printf("(%zu recovered generations, %zu bytes) ", tidesdb_l0_queue_depth(db->l0), queued);
++    fflush(stdout);
++    ASSERT_TRUE(tidesdb_l0_queue_depth(db->l0) >= 2);
++    ASSERT_TRUE(queued > (size_t)(4u << 20));
++    ASSERT_EQ(queued, sum);
++
++    atomic_store(&tdb_test_flush_hold, 0);
++    qb_wait_drained(db);
++    ASSERT_EQ(tidesdb_l0_queued_bytes(db->l0), (size_t)0);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(QB_DB_DIR);
++}
++
++int main(int argc, char **argv)
++{
++    qb_exe = argv[0];
++    if (argc >= 3 && strcmp(argv[1], QB_CHILD_FLAG) == 0)
++    {
++        if (strcmp(argv[2], QB_PHASE_FILL) == 0) qb_child_fill();
++        return 2;
++    }
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_byte_limit_blocks_at_limit, tests_passed);
++    RUN_TEST(test_byte_limit_throttles_from_three_quarters, tests_passed);
++    RUN_TEST(test_byte_band_never_lowers_a_larger_dwell, tests_passed);
++    RUN_TEST(test_zero_byte_limit_is_count_only, tests_passed);
++    RUN_TEST(test_tier_band_ignores_byte_limit, tests_passed);
++    RUN_TEST(test_byte_limit_applies_with_unbounded_count, tests_passed);
++    RUN_TEST(test_queued_bytes_track_rotate_and_retire, tests_passed);
++    RUN_TEST(test_budget_reaches_the_l0, tests_passed);
++    RUN_TEST(test_writes_wait_at_byte_budget, tests_passed);
++    RUN_TEST(test_recovered_generations_are_counted, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

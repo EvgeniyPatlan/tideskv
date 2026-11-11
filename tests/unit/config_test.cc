@@ -30,7 +30,8 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(v.port, 6666);
   EXPECT_EQ(v.sync_mode, "interval");
   EXPECT_EQ(v.block_cache_size, 4ULL << 30);
-  EXPECT_EQ(v.memtable_size, 64ULL << 20);
+  EXPECT_EQ(v.memtable_size, 256ULL << 20);
+  EXPECT_EQ(v.memtable_queue_max_memory, 2ULL << 30);
   EXPECT_EQ(v.maxclients, 10000);
   EXPECT_EQ(v.client_query_buffer_limit, 1ULL << 30);
   EXPECT_TRUE(v.requirepass.empty());
@@ -72,6 +73,21 @@ TEST(Config, MemtableBloomDefaultsYesStartupOnly) {
   EXPECT_FALSE(c.Set("memtable-bloom", "maybe", false).ok());
   EXPECT_FALSE(c.Set("memtable-bloom", "yes", /*at_runtime=*/true).ok());  // startup only
   EXPECT_FALSE(c.Snapshot().memtable_bloom);
+}
+
+TEST(Config, MemtableQueueMaxMemoryStartupOnly) {
+  EXPECT_EQ(Config().Get("memtable-queue-max-memory")[0].second, std::to_string(2ULL << 30));
+  Config c;
+  ASSERT_TRUE(c.Set("memtable-queue-max-memory", "0", /*at_runtime=*/false).ok());  // no byte limit
+  EXPECT_EQ(c.Snapshot().memtable_queue_max_memory, 0u);
+  ASSERT_TRUE(c.Set("memtable-queue-max-memory", "1mb", false).ok());
+  EXPECT_EQ(c.Snapshot().memtable_queue_max_memory, 1ULL << 20);
+  ASSERT_TRUE(c.Set("memtable-queue-max-memory", "4gb", false).ok());
+  EXPECT_EQ(c.Snapshot().memtable_queue_max_memory, 4ULL << 30);
+  EXPECT_FALSE(c.Set("memtable-queue-max-memory", "512kb", false).ok());  // under 1mb and not 0
+  EXPECT_FALSE(c.Set("memtable-queue-max-memory", "lots", false).ok());
+  EXPECT_FALSE(c.Set("memtable-queue-max-memory", "8gb", /*at_runtime=*/true).ok());  // startup only
+  EXPECT_EQ(c.Snapshot().memtable_queue_max_memory, 4ULL << 30);
 }
 
 TEST(Config, LoadFileParsesCommentsQuotesAndUnits) {
@@ -184,7 +200,7 @@ TEST(Config, GetUsesCaseInsensitiveGlob) {
   EXPECT_EQ(c.Get("port"), (std::vector<std::pair<std::string, std::string>>{{"port", "6666"}}));
   EXPECT_EQ(c.Get("PORT").size(), 1u);
   EXPECT_EQ(c.Get("max*"), (std::vector<std::pair<std::string, std::string>>{{"maxclients", "10000"}}));
-  EXPECT_EQ(c.Get("*").size(), 50u);
+  EXPECT_EQ(c.Get("*").size(), 51u);
 }
 
 TEST(Config, RewritePersistsRuntimeChanges) {

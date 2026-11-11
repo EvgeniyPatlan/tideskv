@@ -459,13 +459,22 @@ Status EnsureColumnFamily(tidesdb_t* db, ColumnFamily cf, const FamilySettings& 
   return *out != nullptr ? Status::Ok() : Status::Internal("column family missing after create: " + name);
 }
 
+// The queued-memtable byte budget TidesDB gets: below two memtables one sealed memtable waiting for its
+// flush would already block writers, so a smaller non-zero budget is raised to two.
+size_t QueueBudget(size_t requested, size_t memtable_size) {
+  if (requested == 0 || requested >= 2 * memtable_size) return requested;
+  spdlog::info("memtable-queue-max-memory {} is below two memtables; using {}", requested, 2 * memtable_size);
+  return 2 * memtable_size;
+}
+
 }  // namespace
 
 struct TidesStorage::Impl {
   tidesdb_t* db = nullptr;
   CfHandles cfs{};
   Compression compression = Compression::kNone;
-  uint64_t family_config_updates = 0;  // issued by Open to families that already existed
+  size_t memtable_queue_max_bytes = 0;  // as applied
+  uint64_t family_config_updates = 0;   // issued by Open to families that already existed
   // Per database: the engine's range-hold table belongs to one tidesdb_t, and a process may open several.
   RangeHoldBudget range_holds{kTidesRangeHoldSlots};
   std::atomic<MetaPutHook*> meta_hook{nullptr};
@@ -491,6 +500,8 @@ Result<std::unique_ptr<TidesStorage>> TidesStorage::Open(const StorageOptions& o
   if (o.compaction_threads != 0) cfg.num_compaction_threads = o.compaction_threads;
   if (o.l0_stall_threshold != 0) cfg.memtable_l0_queue_stall_threshold = o.l0_stall_threshold;
   cfg.memtable_whole_key_bloom = o.memtable_bloom ? 1 : 0;
+  cfg.memtable_l0_queue_max_bytes = QueueBudget(o.memtable_queue_max_bytes, cfg.memtable_write_buffer_size);
+  impl->memtable_queue_max_bytes = cfg.memtable_l0_queue_max_bytes;
 
   const int rc = tidesdb_open(&cfg, &impl->db);
   if (rc == TDB_ERR_LOCKED) {
@@ -559,6 +570,8 @@ std::string_view CompressionName(Compression c) {
 
 Compression TidesStorage::compression() const { return impl_->compression; }
 
+size_t TidesStorage::memtable_queue_max_bytes() const { return impl_->memtable_queue_max_bytes; }
+
 // Whole-CF only. tidesdb_compact_range (v10.1.1) picks its inputs by each sstable's point-key
 // min/max. The flush of a memtable that held only a range delete (the usual FLUSHDB) writes an
 // sstable with the tombstone and no keys, whose empty min/max never meets a range starting at a
@@ -574,6 +587,10 @@ Result<StorageStats> TidesStorage::Stats() {
   out.flush_count = db.flush_count;
   out.compaction_count = db.compaction_count;
   out.immutable_memtables = db.immutable_memtable_count;
+  out.immutable_memtable_bytes = db.immutable_memtable_bytes;
+  out.writes_throttled = db.writes_throttled;
+  out.writes_blocked = db.writes_blocked;
+  out.write_stall_us = db.write_stall_us;
   out.family_config_updates = impl_->family_config_updates;
   for (ColumnFamily cf : kAllColumnFamilies) {
     tidesdb_cf_stats_t st{};

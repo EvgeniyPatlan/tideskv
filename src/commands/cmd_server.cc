@@ -41,6 +41,10 @@ Fields PersistenceFields(const ServerStats& s) {
               {"tombstones", std::to_string(s.storage_tombstones)},
               {"flushes", std::to_string(s.storage_flushes)},
               {"compactions", std::to_string(s.storage_compactions)},
+              {"storage_memtable_queue_bytes", std::to_string(s.storage_memtable_queue_bytes)},
+              {"storage_writes_throttled", std::to_string(s.storage_writes_throttled)},
+              {"storage_writes_blocked", std::to_string(s.storage_writes_blocked)},
+              {"storage_write_stall_us", std::to_string(s.storage_write_stall_us)},
               {"background_compactions", std::to_string(s.background_compactions)},
               {"background_compaction_failures", std::to_string(s.background_compaction_failures)}};
   for (const auto& io : s.storage_cf_io) {

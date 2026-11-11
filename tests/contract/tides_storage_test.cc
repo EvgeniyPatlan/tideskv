@@ -395,6 +395,42 @@ TEST(TidesStorageMaint, L1FileCountTriggerAppliesToNewAndExistingFamilies) {
   for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 4);
 }
 
+// B10: the queued-memtable byte budget is raised to two memtables when set smaller, so a lone sealed
+// memtable never blocks writers by itself; 0 leaves only the count limit. The stats carry the queue's bytes.
+TEST(TidesStorageMaint, QueueBudgetIsClamped) {
+  {
+    TempDir dir;
+    StorageOptions o = OptionsFor(dir);
+    o.memtable_size = 8ULL << 20;
+    o.memtable_queue_max_bytes = 4ULL << 20;
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->memtable_queue_max_bytes(), 16ULL << 20);
+    auto st = s->Stats();
+    ASSERT_TRUE(st.ok());
+    EXPECT_EQ(st->immutable_memtable_bytes, 0u);
+    EXPECT_EQ(st->writes_blocked, 0u);
+  }
+  {
+    TempDir dir;
+    StorageOptions o = OptionsFor(dir);
+    o.memtable_size = 8ULL << 20;
+    o.memtable_queue_max_bytes = 0;
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->memtable_queue_max_bytes(), 0u);
+  }
+  {
+    TempDir dir;
+    StorageOptions o = OptionsFor(dir);
+    o.memtable_size = 8ULL << 20;
+    o.memtable_queue_max_bytes = 64ULL << 20;  // already above two memtables: kept as given
+    auto s = MustOpen(o);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->memtable_queue_max_bytes(), 64ULL << 20);
+  }
+}
+
 // The block size and the compression start level reach every family, on creation and on reopen, and a
 // reopen with the settings the families already carry issues no config update.
 TEST(TidesStorageMaint, BlockSizeAndCompressionStartLevelApplyAndSkipUnchangedUpdates) {

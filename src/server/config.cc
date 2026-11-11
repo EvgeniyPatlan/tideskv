@@ -195,6 +195,16 @@ std::vector<Option> BaseOptions() {
       {"memtable-bloom", false,
        [](ConfigValues& c, std::string_view v) { return YesNo(v, &c.memtable_bloom); },
        [](const ConfigValues& c) { return std::string(c.memtable_bloom ? "yes" : "no"); }},
+      {"memtable-queue-max-memory", false,
+       [](ConfigValues& c, std::string_view v) {
+         uint64_t parsed = 0;
+         if (!ParseMemory(v, &parsed) || (parsed != 0 && parsed < (1ULL << 20))) {
+           return Status::InvalidArgument("argument must be 0 or a memory value of at least 1048576 bytes");
+         }
+         c.memtable_queue_max_memory = parsed;
+         return Status::Ok();
+       },
+       [](const ConfigValues& c) { return std::to_string(c.memtable_queue_max_memory); }},
       {"memtable-size", false,
        [](ConfigValues& c, std::string_view v) { return Memory(v, 1ULL << 20, &c.memtable_size); },
        [](const ConfigValues& c) { return std::to_string(c.memtable_size); }},

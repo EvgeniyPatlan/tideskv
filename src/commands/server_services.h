@@ -85,6 +85,11 @@ struct ServerStats {
   uint64_t storage_tombstones = 0;
   uint64_t storage_flushes = 0;
   uint64_t storage_compactions = 0;
+  // L0 write admission: bytes the queued memtables hold, and how often (and how long) commits were paced.
+  uint64_t storage_memtable_queue_bytes = 0;
+  uint64_t storage_writes_throttled = 0;
+  uint64_t storage_writes_blocked = 0;
+  uint64_t storage_write_stall_us = 0;
   // Per-column-family flush/compaction byte counters and level layout, in ColumnFamily order.
   struct CfIo {
     std::string name;
