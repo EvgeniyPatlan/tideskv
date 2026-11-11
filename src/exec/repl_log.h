@@ -123,11 +123,12 @@ class ReplLog {
   // writes, so it cannot conflict with one. Not fence-checked: a demoted node may be promoted later.
   Status Activate();
   bool active() const { return active_.load(std::memory_order_acquire); }
-  // Dormant with unlogged commits: puts sys/repl_head = (last, cum) unless it already holds last. Under
-  // mu_, so an older head never overwrites a newer one. No drain: it writes the published pair, which never
-  // covers a seq still in flight. The trimmer thread calls it every tick, and the
-  // app at a clean shutdown; a crash loses at most the commits since (the replid rotates at the next
-  // master start, and a replica beyond the history's end gets a full resync).
+  // Dormant with unlogged commits: puts sys/repl_head = (last, cum) unless it already holds last. The pair
+  // is read under mu_ and committed without it, so commits run meanwhile; persists run one at a time and
+  // drainers wait for one in flight, so an older head never overwrites a newer one or an activation's
+  // delete. No drain: it writes the published pair, which never covers a seq still in flight. The trimmer
+  // thread calls it every tick, and the app at a clean shutdown; a crash loses at most the commits since (the
+  // replid rotates at the next master start, and a replica beyond the history's end gets a full resync).
   Status PersistHead();
   bool load_incomplete() const { return load_incomplete_.load(std::memory_order_acquire); }
   // A replica's full-sync load (M6b D5). Each drains the window, then commits `txn` (already holding that
@@ -188,12 +189,13 @@ class ReplLog {
   std::atomic<bool> active_{true};
   bool unlogged_ = false;  // guarded by mu_: last_ is in no record; sys/repl_head is on disk, past them
   uint64_t head_seq_ = 0;  // guarded by mu_: the seq sys/repl_head holds (meaningful while unlogged_)
+  bool head_persisting_ = false;  // guarded by mu_: PersistHead's commit is in flight (drainers wait)
   // The publication window, all guarded by mu_. Invariant: next_ == last_ + 1 + window_.size(); the window
   // is non-empty only while dormant and unlogged_.
   std::deque<Slot> window_;            // seqs last_+1 .. next_-1, in order
   uint64_t next_ = 1;                  // the next seq to draw
   int drainers_ = 0;                   // threads in DrainLocked; draws wait while > 0
-  std::condition_variable window_cv_;  // the window emptied, or a drainer left
+  std::condition_variable window_cv_;  // the window emptied, a drainer left, or a head persist ended
 };
 
 }  // namespace tideskv

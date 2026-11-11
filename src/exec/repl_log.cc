@@ -1,5 +1,6 @@
 #include "exec/repl_log.h"
 
+#include <algorithm>
 #include <cassert>
 #include <string>
 #include <utility>
@@ -223,7 +224,9 @@ void ReplLog::FinishLocked(uint64_t seq, bool ok) {
 
 void ReplLog::DrainLocked(std::unique_lock<std::mutex>& lock) {
   ++drainers_;
-  window_cv_.wait(lock, [&] { return window_.empty(); });
+  // A head persist in flight is waited out too: every drainer that changes sys/repl_head (activation, the
+  // load steps) must not have the persist's Put land after its own write.
+  window_cv_.wait(lock, [&] { return window_.empty() && !head_persisting_; });
   --drainers_;
   window_cv_.notify_all();  // draws waiting for drainers_ == 0
 }
@@ -390,17 +393,32 @@ Status ReplLog::Activate() {
 }
 
 // No drain: (last_, cum_) is the published pair, which never includes an unfinished seq, so the head
-// is exact even while later commits are in flight (they reach the next PersistHead).
+// is exact even while later commits are in flight (they reach the next PersistHead). The pair is copied
+// under mu_ and committed without it, so dormant commits are not held for the length of a strict-mode
+// fsync. head_persisting_ makes persists one at a time, each copying the pair after the one before it
+// finished, so an older head never lands after a newer one; and drainers (activation, the load steps,
+// which delete sys/repl_head) wait for it, so it never lands after their delete either. While it is set
+// unlogged_ cannot change: only those drainers clear it, and the head-carrying commit runs only before it.
 Status ReplLog::PersistHead() {
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
+  window_cv_.wait(lock, [&] { return drainers_ == 0 && !head_persisting_; });
   const uint64_t seq = last_.load(std::memory_order_relaxed);
-  if (active() || !unlogged_ || head_seq_ == seq) return Status::Ok();
+  if (active() || !unlogged_ || head_seq_ >= seq) return Status::Ok();
+  const std::string head = EncodeHead(seq, cum_);
+  head_persisting_ = true;
+  lock.unlock();
+  Status st = Status::Ok();
   auto txn = storage_.BeginWrite();
-  if (!txn.ok()) return txn.status();
-  if (Status st = (*txn)->Put(ColumnFamily::kSys, kSysReplHead, EncodeHead(seq, cum_)); !st.ok()) return st;
-  if (Status st = (*txn)->Commit(); !st.ok()) return st;
-  head_seq_ = seq;
-  return Status::Ok();
+  if (!txn.ok()) {
+    st = txn.status();
+  } else if (st = (*txn)->Put(ColumnFamily::kSys, kSysReplHead, head); st.ok()) {
+    st = (*txn)->Commit();
+  }
+  lock.lock();
+  head_persisting_ = false;
+  if (st.ok()) head_seq_ = std::max(head_seq_, seq);
+  window_cv_.notify_all();  // drainers and the next persist
+  return st;
 }
 
 Result<SyncSnapshot> ReplLog::ActivateAndSnapshot() {

@@ -156,14 +156,103 @@ TEST_F(ParkedSecondCommit, ActivateAndSnapshotWaitsForInFlightCommits) {
   EXPECT_EQ(ReplogSeqs(s_), (std::vector<uint64_t>{2}));  // the baseline
 }
 
-TEST_F(ParkedSecondCommit, PersistHeadDoesNotWaitForInFlightCommits) {
-  auto persist = std::async(std::launch::async, [&] { return log_.PersistHead(); });
-  if (persist.wait_for(kShort) != std::future_status::ready) {
-    s_.Release(2);
-    FAIL() << "PersistHead waited for A";
-  }
+// The head persisted is the published pair, past the commits already finished, while a later one is in
+// flight: #2 and #3 are done, #4 is parked, and the persist writes (3, cum after #3) without waiting.
+TEST(ReplLogConcurrentTest, PersistHeadWritesThePublishedHeadPastAnInFlightCommit) {
+  LatchedStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(CommitKey(s, log, "k1").ok());
+  ASSERT_TRUE(CommitKey(s, log, "k2").ok());
+  ASSERT_TRUE(CommitKey(s, log, "k3").ok());
+  const uint64_t cum_after_3 = log.cum_bytes();
+  ASSERT_EQ(HeadOnDisk(s).first, 1u);  // only the head-carrying commit wrote one so far
+  s.Hold(4);
+  auto a = CommitKeyAsync(s, log, "a");
+  ASSERT_TRUE(s.WaitParkedFor(4, kLong));
+  auto persist = std::async(std::launch::async, [&] { return log.PersistHead(); });
+  const bool persisted = Ready(persist, kLong);
+  s.Release(4);
+  ASSERT_TRUE(persisted) << "PersistHead waited for the parked commit";
   EXPECT_TRUE(persist.get().ok());
-  EXPECT_EQ(HeadOnDisk(s_), (std::pair<uint64_t, uint64_t>{1, cum_after_1_}));
+  EXPECT_EQ(HeadOnDisk(s), (std::pair<uint64_t, uint64_t>{3, cum_after_3}));
+  EXPECT_TRUE(a.get().ok());
+}
+
+// PersistHead commits outside the log's lock: while its storage commit is parked (an fsync, in strict
+// mode), dormant commits draw, commit and publish.
+TEST(ReplLogConcurrentTest, CommitsProceedWhilePersistHeadIsInStorage) {
+  LatchedStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(CommitKey(s, log, "k1").ok());
+  ASSERT_TRUE(CommitKey(s, log, "k2").ok());
+  const uint64_t cum_after_2 = log.cum_bytes();
+  s.Hold(3);
+  auto persist = std::async(std::launch::async, [&] { return log.PersistHead(); });
+  ASSERT_TRUE(s.WaitParkedFor(3, kLong));
+  auto b = CommitKeyAsync(s, log, "b");
+  const bool b_done = Ready(b, kLong);
+  s.Release(3);
+  ASSERT_TRUE(b_done) << "a commit waited for the parked head persist";
+  EXPECT_TRUE(b.get().ok());
+  EXPECT_EQ(log.last(), 3u);
+  ASSERT_EQ(persist.wait_for(kLong), std::future_status::ready);
+  EXPECT_TRUE(persist.get().ok());
+  EXPECT_EQ(HeadOnDisk(s), (std::pair<uint64_t, uint64_t>{2, cum_after_2}));
+}
+
+// Persists are serialized, so a stale one can never land after a newer one: a second persist waits for
+// the parked first, then writes the newer head.
+TEST(ReplLogConcurrentTest, ASecondPersistWaitsAndWritesTheNewerHead) {
+  LatchedStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(CommitKey(s, log, "k1").ok());
+  ASSERT_TRUE(CommitKey(s, log, "k2").ok());
+  s.Hold(3);
+  auto first = std::async(std::launch::async, [&] { return log.PersistHead(); });
+  ASSERT_TRUE(s.WaitParkedFor(3, kLong));
+  auto c = CommitKeyAsync(s, log, "k3");
+  const bool c_done = Ready(c, kLong);
+  if (!c_done) s.Release(3);
+  ASSERT_TRUE(c_done) << "a commit waited for the parked head persist";
+  EXPECT_TRUE(c.get().ok());
+  const uint64_t cum_after_3 = log.cum_bytes();
+  auto second = std::async(std::launch::async, [&] { return log.PersistHead(); });
+  EXPECT_EQ(second.wait_for(kShort), std::future_status::timeout);
+  EXPECT_EQ(s.reached(), 4);  // the second has not reached storage
+  s.Release(3);
+  ASSERT_EQ(first.wait_for(kLong), std::future_status::ready);
+  ASSERT_EQ(second.wait_for(kLong), std::future_status::ready);
+  EXPECT_TRUE(first.get().ok());
+  EXPECT_TRUE(second.get().ok());
+  EXPECT_EQ(HeadOnDisk(s), (std::pair<uint64_t, uint64_t>{3, cum_after_3}));
+}
+
+// Activation deletes sys/repl_head, so it waits for a persist in flight rather than let the persist's Put
+// land after its Delete.
+TEST(ReplLogConcurrentTest, ActivationWaitsForAnInFlightPersist) {
+  LatchedStorage s;
+  FakeClock clock;
+  ReplLog log(s, clock, kLazy);
+  ASSERT_TRUE(log.Recover().ok());
+  ASSERT_TRUE(CommitKey(s, log, "k1").ok());
+  ASSERT_TRUE(CommitKey(s, log, "k2").ok());
+  s.Hold(3);
+  auto persist = std::async(std::launch::async, [&] { return log.PersistHead(); });
+  ASSERT_TRUE(s.WaitParkedFor(3, kLong));
+  auto activate = std::async(std::launch::async, [&] { return log.Activate(); });
+  EXPECT_EQ(activate.wait_for(kShort), std::future_status::timeout);
+  s.Release(3);
+  ASSERT_EQ(activate.wait_for(kLong), std::future_status::ready);
+  EXPECT_TRUE(persist.get().ok());
+  EXPECT_TRUE(activate.get().ok());
+  EXPECT_EQ(HeadOnDisk(s), (std::pair<uint64_t, uint64_t>{0, 0}));
+  EXPECT_EQ(ReplogSeqs(s), (std::vector<uint64_t>{2}));
 }
 
 TEST(ReplLogConcurrentTest, AFailedMiddleCommitIsSkipped) {
