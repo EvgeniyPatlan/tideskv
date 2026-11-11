@@ -1,0 +1,1212 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -192,7 +192,7 @@ set(TIDESDB_SOURCES
+     src/sstable/vlog.c src/sstable/vlog_reclaim.c src/sstable/vlog_segment.c src/sstable/sstable.c
+     src/sstable/sstable_footer.c
+     src/sstable/sstable_read.c src/sstable/sstable_builder.c
+-    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_immutable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/mvcc_orphan.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
++    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/commit_gate.c src/memtable/l0_immutable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/mvcc_orphan.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
+     external/xxhash.c)
+ 
+ # vendored sources are compiled as-is; their diagnostics belong upstream, and letting them into this
+diff --git a/include/db.h b/include/db.h
+--- a/include/db.h
++++ b/include/db.h
+@@ -1654,6 +1654,7 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
+  * @param TDB_STALL_MANIFEST_COMMIT inside a manifest commit, which every flush install, every
+  *                                  compaction install and every ddl serialises through, so a
+  *                                  database making no progress is often waiting here
++ * @param TDB_STALL_COMMIT_GATE held off by the commit gate while a rotation swapped the memtable
+  * @param TDB_STALL_COUNT the number of reasons, not itself a reason
+  */
+ typedef enum
+@@ -1663,6 +1664,7 @@ typedef enum
+     TDB_STALL_ROTATE_WORK,
+     TDB_STALL_ADMISSION,
+     TDB_STALL_MANIFEST_COMMIT,
++    TDB_STALL_COMMIT_GATE,
+     TDB_STALL_COUNT
+ } tidesdb_stall_reason_t;
+ 
+diff --git a/src/engine/engine_stats.c b/src/engine/engine_stats.c
+--- a/src/engine/engine_stats.c
++++ b/src/engine/engine_stats.c
+@@ -448,6 +448,8 @@ const char *tidesdb_stall_reason_name(const tidesdb_stall_reason_t reason)
+             return "admission";
+         case TDB_STALL_MANIFEST_COMMIT:
+             return "manifest_commit";
++        case TDB_STALL_COMMIT_GATE:
++            return "commit_gate";
+         case TDB_STALL_COUNT:
+         default:
+             return "unknown";
+@@ -481,6 +483,11 @@ int engine_get_stall_stats(tidesdb_t *db, tidesdb_stall_stats_t *out)
+     tdb_wait_read(&db->manifest->commit_wait, &out->reasons[TDB_STALL_MANIFEST_COMMIT].count,
+                   &out->reasons[TDB_STALL_MANIFEST_COMMIT].total_us,
+                   &out->reasons[TDB_STALL_MANIFEST_COMMIT].max_us);
++
++    if (db->l0)
++        tdb_wait_read(&db->l0->commit_gate.enter_wait, &out->reasons[TDB_STALL_COMMIT_GATE].count,
++                      &out->reasons[TDB_STALL_COMMIT_GATE].total_us,
++                      &out->reasons[TDB_STALL_COMMIT_GATE].max_us);
+     return TDB_SUCCESS;
+ }
+ 
+diff --git a/src/internal/types.h b/src/internal/types.h
+--- a/src/internal/types.h
++++ b/src/internal/types.h
+@@ -65,6 +65,9 @@
+  * @param high_seq the highest sequence applied into this memtable, keys and intervals alike. a
+  * flush waits for the clock's watermark to pass it before building, so every version it writes is
+  * decided and the abandoned ones can be dropped rather than made permanent
++ * @param seq_floor the high sequence of the memtable this one replaced, set by the rotation while
++ * the commit gate is closed. every sequence applied here must be above it (G2 in
++ * memtable/commit_gate.h); one that is not is counted, never refused. in memory only
+  */
+ typedef struct tidesdb_memtable_t
+ {
+@@ -81,6 +84,7 @@ typedef struct tidesdb_memtable_t
+     _Atomic(size_t) range_tombstone_frags;
+     tdb_wprwlock_t range_tombstone_lock;
+     _Atomic(uint64_t) high_seq;
++    _Atomic(uint64_t) seq_floor;
+ } tidesdb_memtable_t;
+ 
+ #endif /* __TIDESDB_INTERNAL_TYPES_H__ */
+diff --git a/src/memtable/commit_gate.c b/src/memtable/commit_gate.c
+new file mode 100644
+--- /dev/null
++++ b/src/memtable/commit_gate.c
+@@ -0,0 +1,97 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++#include "commit_gate.h"
++
++/* the closer re-reads inflight on this cadence even unwoken, a net under a wake the slow path
++ * could miss; the leaver's wake is what normally ends the wait */
++#define TDB_COMMIT_GATE_CLOSE_RECHECK_US 200
++
++int tdb_commit_gate_init(tdb_commit_gate_t *g)
++{
++    atomic_init(&g->inflight, 0);
++    atomic_init(&g->closed, 0);
++    tdb_wait_init(&g->enter_wait);
++    if (pthread_mutex_init(&g->mtx, NULL) != 0) return -1;
++    /* on the clock the closer's deadline is built from, so a wall clock step cannot stretch the
++     * recheck */
++    if (tdb_cond_init_monotonic(&g->cv) != 0)
++    {
++        pthread_mutex_destroy(&g->mtx);
++        return -1;
++    }
++    return 0;
++}
++
++void tdb_commit_gate_destroy(tdb_commit_gate_t *g)
++{
++    pthread_cond_destroy(&g->cv);
++    pthread_mutex_destroy(&g->mtx);
++}
++
++void tdb_commit_gate_enter(tdb_commit_gate_t *g)
++{
++    uint64_t held_from = 0;
++    for (;;)
++    {
++        /* seq_cst both, against the closer's seq_cst store of closed and load of inflight: either
++         * the closer sees this add and waits for it, or this load sees closed and backs out */
++        atomic_fetch_add_explicit(&g->inflight, 1, memory_order_seq_cst);
++        if (!atomic_load_explicit(&g->closed, memory_order_seq_cst)) break;
++
++        if (held_from == 0) held_from = tdb_monotonic_us();
++        pthread_mutex_lock(&g->mtx);
++        /* undone under the lock, so the closer, which reads inflight under it, cannot read the
++         * add and then miss the wake that follows its removal */
++        if (atomic_fetch_sub_explicit(&g->inflight, 1, memory_order_seq_cst) == 1)
++            pthread_cond_broadcast(&g->cv);
++        while (atomic_load_explicit(&g->closed, memory_order_seq_cst))
++            pthread_cond_wait(&g->cv, &g->mtx);
++        pthread_mutex_unlock(&g->mtx);
++    }
++    if (held_from != 0) tdb_wait_note(&g->enter_wait, tdb_monotonic_us() - held_from);
++}
++
++void tdb_commit_gate_leave(tdb_commit_gate_t *g)
++{
++    /* the last one out of a closing gate wakes the closer. an open gate costs the one subtract and
++     * one load, since no one is waiting */
++    if (atomic_fetch_sub_explicit(&g->inflight, 1, memory_order_seq_cst) == 1 &&
++        atomic_load_explicit(&g->closed, memory_order_seq_cst))
++    {
++        pthread_mutex_lock(&g->mtx);
++        pthread_cond_broadcast(&g->cv);
++        pthread_mutex_unlock(&g->mtx);
++    }
++}
++
++void tdb_commit_gate_close(tdb_commit_gate_t *g)
++{
++    pthread_mutex_lock(&g->mtx);
++    atomic_store_explicit(&g->closed, 1, memory_order_seq_cst);
++    while (atomic_load_explicit(&g->inflight, memory_order_seq_cst) != 0)
++    {
++        struct timespec deadline;
++        tdb_wait_deadline(&deadline, TDB_COMMIT_GATE_CLOSE_RECHECK_US);
++        (void)pthread_cond_timedwait(&g->cv, &g->mtx, &deadline);
++    }
++    pthread_mutex_unlock(&g->mtx);
++}
++
++void tdb_commit_gate_open(tdb_commit_gate_t *g)
++{
++    pthread_mutex_lock(&g->mtx);
++    atomic_store_explicit(&g->closed, 0, memory_order_seq_cst);
++    pthread_cond_broadcast(&g->cv);
++    pthread_mutex_unlock(&g->mtx);
++}
++
++int64_t tdb_commit_gate_inflight(tdb_commit_gate_t *g)
++{
++    return atomic_load_explicit(&g->inflight, memory_order_seq_cst);
++}
+diff --git a/src/memtable/commit_gate.h b/src/memtable/commit_gate.h
+new file mode 100644
+--- /dev/null
++++ b/src/memtable/commit_gate.h
+@@ -0,0 +1,119 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++#ifndef __TIDESDB_COMMIT_GATE_H__
++#define __TIDESDB_COMMIT_GATE_H__
++
++#include "../compat.h"
++#include "base/waitstat.h" /* tdb_wait_stat_t for the time arrivals spend held off */
++
++/* the commit gate. a commit enters before it draws its sequence and leaves once its entries are
++ * applied; a rotation closes the gate around the swap of the active memtable. without it a
++ * rotation could land between a commit's log append and its apply, putting the record in WAL g and
++ * some or all of the entries in memtable g+1. the flush of g then drains only g's writers, builds
++ * an sstable without those entries and unlinks WAL g, and a kill before g+1 flushes loses or tears
++ * an acknowledged commit.
++ *
++ * invariants:
++ * G1 generation atomicity -- every WRITE_BATCH record in WAL g has all its entries in memtable g,
++ *    and memtable g holds no entry whose record is in another WAL (single-phase commits and 2PC
++ *    phase two alike: commit_prepared draws, appends COMMIT and applies inside the gate).
++ * G2 sequence separation -- every sequence in memtable g is below every sequence in memtable g+1.
++ *    the draw and the apply are both inside the gate and the swap is exclusive, so once a close
++ *    returns every drawn sequence is applied (or decided aborted), and every later draw is higher.
++ * G3 no wait cycle -- a holder waits only on the WAL flush thread (ring space, durability), the
++ *    value log and the skip list; never on rotate_lock, a flush, admission pacing or the visibility
++ *    watermark. admission pacing and the claims come before enter, wait_visible after leave, and
++ *    nothing inside the gate takes rotate_lock (the commit-path rotation runs after the commit
++ *    returns). the rotator holds rotate_lock and then closes the gate, so there is one closer.
++ * G4 unchanged contract -- a commit still returns only once durable per the sync mode and visible.
++ *
++ * caveats:
++ * - ring pacing (l0_pace_against_ring, a usleep inside the WAL append) runs inside the gate. it is
++ *   not a cycle, since the ring drains on its own thread, but a rotation can wait out a paced
++ *   commit.
++ * - a prepare leaves right after its PREPARE record (and the reads record ahead of it), since no
++ *   apply follows in that call. its sequence never carries a version, so G2 is not at stake.
++ *
++ * the fast path is one seq_cst add on inflight and one seq_cst load of closed, a Dekker pairing
++ * with the closer's seq_cst store of closed and load of inflight. an arrival that finds the gate
++ * closed undoes its add, wakes the closer if it was the last one in, and waits for the open. this
++ * is writer-preferring by construction: a plain pthread rwlock prefers readers and would starve the
++ * rotator under continuous commits, and tdb_wprwlock_t takes a mutex on every enter */
++
++/**
++ * tdb_commit_gate_t
++ * @param inflight commits between their sequence draw and their apply, plus arrivals still deciding
++ * whether the gate is open
++ * @param closed set while a rotation waits for the holders to leave and swaps the memtable
++ * @param mtx guards the slow path: the closer's wait, the arrivals' wait and their wakes
++ * @param cv where the closer waits for inflight to reach zero and arrivals wait for the open
++ * @param enter_wait how often and how long arrivals were held off by a closed gate
++ */
++typedef struct
++{
++    _Atomic(int64_t) inflight;
++    _Atomic(int) closed;
++    pthread_mutex_t mtx;
++    pthread_cond_t cv;
++    tdb_wait_stat_t enter_wait;
++} tdb_commit_gate_t;
++
++/**
++ * tdb_commit_gate_init
++ * initialise an open gate with nobody inside
++ * @param g the gate
++ * @return 0, or -1 when the mutex or condition variable could not be created
++ */
++int tdb_commit_gate_init(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_destroy
++ * release the gate's mutex and condition variable; nobody may be inside or waiting
++ * @param g the gate
++ */
++void tdb_commit_gate_destroy(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_enter
++ * enter the gate, waiting while a rotation holds it closed. not reentrant
++ * @param g the gate
++ */
++void tdb_commit_gate_enter(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_leave
++ * leave the gate, waking a waiting closer when this was the last holder
++ * @param g the gate
++ */
++void tdb_commit_gate_leave(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_close
++ * close the gate and wait until nobody is inside; returns with arrivals held off until
++ * tdb_commit_gate_open. one closer at a time (the caller serialises closers)
++ * @param g the gate
++ */
++void tdb_commit_gate_close(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_open
++ * reopen a closed gate and release every arrival waiting on it
++ * @param g the gate
++ */
++void tdb_commit_gate_open(tdb_commit_gate_t *g);
++
++/**
++ * tdb_commit_gate_inflight
++ * how many are inside the gate (or deciding whether to enter) right now
++ * @param g the gate
++ * @return the count
++ */
++int64_t tdb_commit_gate_inflight(tdb_commit_gate_t *g);
++
++#endif /* __TIDESDB_COMMIT_GATE_H__ */
+diff --git a/src/memtable/memtable.c b/src/memtable/memtable.c
+--- a/src/memtable/memtable.c
++++ b/src/memtable/memtable.c
+@@ -6,6 +6,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+  */
++#include <assert.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -57,6 +58,7 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
+     atomic_init(&mt->claimed, 0);
+     atomic_init(&mt->vlog_token, VLOG_BUILD_TOKEN_NONE);
+     atomic_init(&mt->high_seq, 0);
++    atomic_init(&mt->seq_floor, 0);
+ 
+     /* the set itself waits for the first range delete, so a database that never issues one carries
+      * nothing but the empty count and the lock */
+@@ -143,6 +145,18 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
+     /* on the clock the park's deadline is built from, so a wall clock step cannot hold a blocked
+      * writer past the backstop it asked for */
+     tdb_cond_init_monotonic(&l0->admit_cv);
++    atomic_init(&l0->gate_split_applies, 0);
++    atomic_init(&l0->gate_seq_inversions, 0);
++    if (tdb_commit_gate_init(&l0->commit_gate) != 0)
++    {
++        pthread_cond_destroy(&l0->admit_cv);
++        pthread_mutex_destroy(&l0->admit_mtx);
++        pthread_mutex_destroy(&l0->aborted_lock);
++        tidesdb_backpressure_free(l0->backpressure);
++        queue_free(l0->queue);
++        free(l0);
++        return NULL;
++    }
+     return l0;
+ }
+ 
+@@ -150,6 +164,10 @@ void tidesdb_l0_destroy(tidesdb_l0_t *l0)
+ {
+     if (!l0) return;
+ 
++    /* a commit still inside would be one that skipped its leave on some exit, and the next
++     * rotation would have waited on it forever */
++    assert(tdb_commit_gate_inflight(&l0->commit_gate) == 0);
++    tdb_commit_gate_destroy(&l0->commit_gate);
+     pthread_mutex_destroy(&l0->aborted_lock);
+     pthread_mutex_destroy(&l0->admit_mtx);
+     pthread_cond_destroy(&l0->admit_cv);
+@@ -299,6 +317,47 @@ static int l0_wal_append_kv(block_manager_t *wal, const uint8_t *pkey, size_t pk
+ 
+ static void l0_hold_vlog_floor(tidesdb_l0_t *l0, tidesdb_memtable_t *mt);
+ 
++/* one more than the generation of the memtable whose log this thread last appended a commit record
++ * to, or 0 when unknown (no record yet, or the commit has left the gate). generations start at 0,
++ * hence the offset. the apply that follows on the same thread checks its memtable against it */
++static _Thread_local uint64_t l0_appended_generation = 0;
++
++/* count an apply that breaks the commit gate's invariants: an entry landing in another generation
++ * than its record's (G1), or at a sequence the previous memtable already reached (G2). counted, not
++ * refused -- the entry is durable in some log already, and these exist to prove the gate holds */
++static void l0_check_commit_order(tidesdb_l0_t *l0, const tidesdb_memtable_t *mt,
++                                  const uint64_t seq)
++{
++    const uint64_t appended = l0_appended_generation;
++    if (appended != 0 && appended != mt->generation + 1)
++        atomic_fetch_add_explicit(&l0->gate_split_applies, 1, memory_order_relaxed);
++    const uint64_t floor = atomic_load_explicit(&mt->seq_floor, memory_order_acquire);
++    if (floor != 0 && seq <= floor)
++        atomic_fetch_add_explicit(&l0->gate_seq_inversions, 1, memory_order_relaxed);
++}
++
++void tidesdb_l0_commit_enter(tidesdb_l0_t *l0)
++{
++    if (l0) tdb_commit_gate_enter(&l0->commit_gate);
++}
++
++void tidesdb_l0_commit_leave(tidesdb_l0_t *l0)
++{
++    l0_appended_generation = 0;
++    if (l0) tdb_commit_gate_leave(&l0->commit_gate);
++}
++
++void tidesdb_l0_gate_stats(const tidesdb_l0_t *l0, tidesdb_l0_gate_stats_t *out)
++{
++    if (!out) return;
++    memset(out, 0, sizeof(*out));
++    if (!l0) return;
++    out->split_applies = atomic_load_explicit(&l0->gate_split_applies, memory_order_relaxed);
++    out->seq_inversions = atomic_load_explicit(&l0->gate_seq_inversions, memory_order_relaxed);
++    uint64_t max_us = 0;
++    tdb_wait_read(&l0->commit_gate.enter_wait, &out->enter_waits, &out->enter_wait_us, &max_us);
++}
++
+ /* raise the memtable's high sequence to seq if it is higher; a concurrent raise past it ends the
+  * loop just as a successful swap does */
+ static void l0_note_seq(tidesdb_memtable_t *mt, const uint64_t seq)
+@@ -394,6 +453,7 @@ static int l0_apply_entry(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *ke
+ 
+     tidesdb_memtable_t *mt = l0_pin_active_write(l0);
+     if (!mt) return TDB_ERR_BUSY;
++    l0_check_commit_order(l0, mt, seq);
+ 
+     const size_t pkey_size = TDB_CF_PREFIX_SIZE + key_size;
+     uint8_t stack_key[TDB_L0_KEY_STACK_BUF];
+@@ -466,6 +526,7 @@ int tidesdb_l0_apply_range_tombstone(tidesdb_l0_t *l0, const uint32_t cf_index,
+ 
+     tidesdb_memtable_t *mt = l0_pin_active_write(l0);
+     if (!mt) return TDB_ERR_BUSY;
++    l0_check_commit_order(l0, mt, seq);
+ 
+     /* the interval is stored over the prefixed keyspace the skip list is already sorted in, so one
+      * set covers every family. an upper bound left open ends where the next family begins, which is
+@@ -603,6 +664,8 @@ int tidesdb_l0_wal_append_one(tidesdb_l0_t *l0, const uint8_t *batch, size_t siz
+      * still be the one waited on */
+     block_manager_t *wal = atomic_load_explicit(&mt->wal, memory_order_acquire);
+     int rc = TDB_SUCCESS;
++    /* the generation this commit's entries must land in, which its apply checks */
++    l0_appended_generation = mt->generation + 1;
+     if (wal)
+     {
+         l0_pace_against_ring(l0, wal);
+@@ -713,11 +776,26 @@ int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
+      * new_mt also sees the enqueue. the queue takes over the sealed memtable's structural
+      * reference, so an enqueue OOM leaves it in the active slot untouched and the data stays
+      * durable in its WAL for recovery. */
+-    if (queue_enqueue(l0->queue, sealed) != 0) return TDB_ERR_MEMORY;
++    /* closed around the swap only, so no commit is between its sequence draw and its apply while
++     * the active slot changes: its record and its entries land in one generation (G1), and every
++     * sequence drawn after the swap is above every one the sealed memtable holds (G2). the caller
++     * holds rotate_lock, so this is the only closer */
++    tdb_commit_gate_close(&l0->commit_gate);
++    if (queue_enqueue(l0->queue, sealed) != 0)
++    {
++        tdb_commit_gate_open(&l0->commit_gate);
++        return TDB_ERR_MEMORY;
++    }
++    /* nothing applies into the sealed memtable from here, so its high sequence is final, and every
++     * sequence the new one takes must be above it */
++    atomic_store_explicit(&new_mt->seq_floor,
++                          atomic_load_explicit(&sealed->high_seq, memory_order_acquire),
++                          memory_order_relaxed);
+     atomic_exchange_explicit(&l0->active, new_mt, memory_order_acq_rel);
+     /* publish the boundary move so a reader that bracketed its active-then-queue read across this
+      * rotation observes the change and retries rather than reporting a false miss */
+     atomic_fetch_add_explicit(&l0->visible_changes, 1, memory_order_release);
++    tdb_commit_gate_open(&l0->commit_gate);
+     return TDB_SUCCESS;
+ }
+ 
+diff --git a/src/memtable/memtable.h b/src/memtable/memtable.h
+--- a/src/memtable/memtable.h
++++ b/src/memtable/memtable.h
+@@ -13,6 +13,7 @@
+ #include "backpressure.h"
+ #include "base/arena.h"           /* arena_pool_t the skip list draws node chunks from */
+ #include "base/waitstat.h"        /* tdb_wait_stat_t for the log-append wait */
++#include "commit_gate.h"          /* tdb_commit_gate_t a rotation closes around the swap */
+ #include "datastructures/queue.h" /* queue_t backs the l0 immutable queue */
+ #include "sstable/vlog.h" /* the build floor a memtable holds over values no sstable names yet */
+ 
+@@ -153,6 +154,13 @@ int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size
+  * polling instead costs a wakeup every couple of hundred microseconds per blocked writer, which on
+  * a machine with fewer cores than it has blocked writers is the scheduler's whole budget spent on
+  * threads discovering nothing has changed
++ * @param commit_gate held by a commit from before its sequence draw until its entries are applied,
++ * and closed by a rotation around the swap of the active memtable, so a commit never straddles two
++ * generations (see commit_gate.h)
++ * @param gate_split_applies entries applied into a memtable of another generation than the one
++ * whose log took the same commit's record (G1 broken); zero while the gate holds
++ * @param gate_seq_inversions entries applied at a sequence at or below the memtable's seq_floor
++ * (G2 broken); zero while the gate holds
+  */
+ typedef struct
+ {
+@@ -185,6 +193,9 @@ typedef struct
+     _Atomic(void *) pending_reclaim;
+     pthread_mutex_t admit_mtx;
+     pthread_cond_t admit_cv;
++    tdb_commit_gate_t commit_gate;
++    _Atomic(uint64_t) gate_split_applies;
++    _Atomic(uint64_t) gate_seq_inversions;
+ } tidesdb_l0_t;
+ 
+ /**
+@@ -699,6 +710,45 @@ typedef struct
+  */
+ void tidesdb_l0_wal_wait_stats(const tidesdb_l0_t *l0, tidesdb_l0_wal_wait_t *out);
+ 
++/**
++ * tidesdb_l0_commit_enter
++ * enter the commit gate ahead of drawing a commit sequence, waiting while a rotation holds it
++ * closed. a commit holds it until its entries are applied and its sequence is decided
++ * @param l0 the subsystem
++ */
++void tidesdb_l0_commit_enter(tidesdb_l0_t *l0);
++
++/**
++ * tidesdb_l0_commit_leave
++ * leave the commit gate, forgetting the generation this thread last appended a record to
++ * @param l0 the subsystem
++ */
++void tidesdb_l0_commit_leave(tidesdb_l0_t *l0);
++
++/**
++ * tidesdb_l0_gate_stats_t
++ * what the commit gate and the order checks behind it have seen
++ * @param split_applies entries applied into another generation than their record's (G1 broken)
++ * @param seq_inversions entries applied at or below their memtable's seq_floor (G2 broken)
++ * @param enter_waits commits held off by a closed gate
++ * @param enter_wait_us the summed time they were held
++ */
++typedef struct
++{
++    uint64_t split_applies;
++    uint64_t seq_inversions;
++    uint64_t enter_waits;
++    uint64_t enter_wait_us;
++} tidesdb_l0_gate_stats_t;
++
++/**
++ * tidesdb_l0_gate_stats
++ * read the commit gate counters
++ * @param l0 the subsystem, may be NULL
++ * @param out out -- the counters, zeroed when l0 is NULL
++ */
++void tidesdb_l0_gate_stats(const tidesdb_l0_t *l0, tidesdb_l0_gate_stats_t *out);
++
+ /**
+  * tidesdb_l0_wal_bytes_written
+  * framed bytes ever handed to the write-ahead log
+diff --git a/src/txn/l0_adapter.c b/src/txn/l0_adapter.c
+--- a/src/txn/l0_adapter.c
++++ b/src/txn/l0_adapter.c
+@@ -149,6 +149,16 @@ int tidesdb_l0_apply_entries(tidesdb_l0_t *l0, const tidesdb_wal_entry_t *entrie
+     return TDB_SUCCESS;
+ }
+ 
++static void l0_backend_commit_enter(void *ctx)
++{
++    tidesdb_l0_commit_enter(((tidesdb_l0_txn_ctx_t *)ctx)->l0);
++}
++
++static void l0_backend_commit_leave(void *ctx)
++{
++    tidesdb_l0_commit_leave(((tidesdb_l0_txn_ctx_t *)ctx)->l0);
++}
++
+ static void l0_backend_abandon(void *ctx, uint64_t seq)
+ {
+     tidesdb_l0_txn_ctx_t *actx = (tidesdb_l0_txn_ctx_t *)ctx;
+@@ -222,6 +232,8 @@ void tidesdb_l0_backend(tidesdb_l0_txn_ctx_t *ctx, tdb_txn_backend_t *out)
+     out->wal_append = l0_backend_wal_append;
+     out->apply = l0_backend_apply;
+     out->abandon = l0_backend_abandon;
++    out->commit_enter = l0_backend_commit_enter;
++    out->commit_leave = l0_backend_commit_leave;
+     out->ctx = ctx;
+ }
+ 
+diff --git a/src/txn/txn.h b/src/txn/txn.h
+--- a/src/txn/txn.h
++++ b/src/txn/txn.h
+@@ -243,6 +243,11 @@ typedef struct
+  *                entries it left behind are hidden from reads and dropped by the flush rather than
+  *                reaching L1; may be NULL for a backend with no such state
+  * @param separator the value-log separation policy this backend commits through
++ * @param commit_enter enter the backend's commit gate before a commit draws its sequence, after its
++ *                     pacing and claims; NULL for a backend with no gate
++ * @param commit_leave leave the gate once the drawn sequence is decided -- applied and marked
++ *                     committed, or marked aborted -- and before waiting on visibility; called
++ *                     exactly once for every enter, on every exit. NULL for a backend with no gate
+  * @param ctx opaque context passed to every backend call
+  */
+ typedef struct
+@@ -251,6 +256,8 @@ typedef struct
+     int (*wal_append)(void *ctx, const uint8_t *batch, size_t size);
+     int (*apply)(void *ctx, const tidesdb_wal_entry_t *entries, int count);
+     void (*abandon)(void *ctx, uint64_t seq);
++    void (*commit_enter)(void *ctx);
++    void (*commit_leave)(void *ctx);
+     tdb_value_separator_t separator;
+     void *ctx;
+ } tdb_txn_backend_t;
+diff --git a/src/txn/txn_commit.c b/src/txn/txn_commit.c
+--- a/src/txn/txn_commit.c
++++ b/src/txn/txn_commit.c
+@@ -748,6 +748,12 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+         return rc;
+     }
+ 
++    /* the gate is held from before the draw until the sequence is decided, so a rotation cannot
++     * fall between this commit's log record and its apply, nor between its draw and an apply of a
++     * lower sequence (memtable/commit_gate.h). entered after the pacing and claims, which may wait
++     */
++    txn_gate_enter(backend);
++
+     /* draw the commit sequence and mark it in progress -- invisible until marked committed. the
+      * validation follows, since it orders this commit against the claims it meets by that sequence
+      */
+@@ -780,6 +786,7 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+          * aborted is what lets the watermark pass it */
+         txn_release_claims(txn);
+         tidesdb_mvcc_mark_aborted(txn->clock, seq);
++        txn_gate_leave(backend);
+         txn->state = TDB_TXN_ABORTED;
+         txn_leave_registry(txn);
+         free(entries);
+@@ -828,6 +835,7 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+ 
+         txn_release_claims(txn);
+         tidesdb_mvcc_mark_aborted(txn->clock, seq);
++        txn_gate_leave(backend);
+         txn->state = TDB_TXN_ABORTED;
+         txn_leave_registry(txn);
+         free(entries);
+@@ -835,6 +843,9 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+     }
+ 
+     tidesdb_mvcc_mark(txn->clock, seq, 1);
++    /* decided and applied, so a rotation may go ahead. the wait for visibility stays outside the
++     * gate, which covers only the draw-to-apply window (G3 in memtable/commit_gate.h) */
++    txn_gate_leave(backend);
+     tidesdb_mvcc_wait_visible(txn->clock, seq);
+     txn->commit_seq = seq;
+ 
+diff --git a/src/txn/txn_internal.h b/src/txn/txn_internal.h
+--- a/src/txn/txn_internal.h
++++ b/src/txn/txn_internal.h
+@@ -141,9 +141,10 @@ void txn_release_claims(tdb_txn_t *txn);
+  * txn_write_phase
+  * the shared first phase of committing -- build the deduplicated entries, pace on backpressure,
+  * claim the write set and its intervals, draw and mark-in-progress a commit seq, validate, and
+- * durably append the WAL record of the given kind. on failure it drops the claims, marks a drawn
+- * seq aborted, aborts the transaction, leaves the registry, frees the entries, and returns the
+- * error
++ * durably append the WAL record of the given kind. it enters the backend's commit gate before the
++ * draw; on success the caller holds the gate and must leave it once the sequence is decided. on
++ * failure it drops the claims, marks a drawn seq aborted, leaves the gate, aborts the transaction,
++ * leaves the registry, frees the entries, and returns the error
+  * @param txn the transaction
+  * @param backend the injected commit backend
+  * @param sources the source stack conflict detection reads
+@@ -161,4 +162,17 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+                     const uint8_t *xid, size_t xid_size, tidesdb_wal_entry_t **out_entries,
+                     int *out_count, uint64_t *out_seq);
+ 
++/* enter and leave the backend's commit gate, when it has one. a commit enters after its pacing and
++ * claims and before its draw, and leaves once its sequence is decided -- on every exit, since a
++ * holder that never left would stall the next rotation for good */
++static inline void txn_gate_enter(const tdb_txn_backend_t *backend)
++{
++    if (backend->commit_enter) backend->commit_enter(backend->ctx);
++}
++
++static inline void txn_gate_leave(const tdb_txn_backend_t *backend)
++{
++    if (backend->commit_leave) backend->commit_leave(backend->ctx);
++}
++
+ #endif /* __TIDESDB_TXN_INTERNAL_H__ */
+diff --git a/src/txn/txn_two_phase.c b/src/txn/txn_two_phase.c
+--- a/src/txn/txn_two_phase.c
++++ b/src/txn/txn_two_phase.c
+@@ -51,6 +51,9 @@ int tdb_txn_prepare(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
+         free(xid_copy);
+         return rc; /* already aborted and left the registry */
+     }
++    /* no apply follows in this call, and the prepare's sequence never carries a version, so the
++     * gate is left as soon as the PREPARE record is in the log */
++    txn_gate_leave(backend);
+ 
+     /* stage for phase two -- durable but not applied. the txn keeps its registry membership and its
+      * claims until resolved, so its snapshot still pins the gc floor and its keys stay held. the
+@@ -111,6 +114,9 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
+      * a commit drawn above it validates before the batch is applied and must find the batch below
+      * itself in the claims, since the store cannot show it yet; a record still reading as prepared
+      * would place the batch above that commit, and a read of a key the batch writes would pass */
++    /* held from the draw through the apply, as a one-phase commit holds it, so the COMMIT record
++     * and the batch land in one generation above every sequence an older memtable holds */
++    txn_gate_enter(backend);
+     const uint64_t seq = tidesdb_mvcc_draw(txn->clock, &txn->commit);
+     for (int i = 0; i < txn->prepared_count; i++) txn->prepared_entries[i].seq = seq;
+ 
+@@ -126,6 +132,7 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
+          * it is */
+         tidesdb_mvcc_commit_prepared(&txn->commit);
+         tidesdb_mvcc_mark_aborted(txn->clock, seq);
++        txn_gate_leave(backend);
+         return wr;
+     }
+ 
+@@ -135,6 +142,7 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
+ 
+     txn->commit_seq = seq;
+     tidesdb_mvcc_mark(txn->clock, seq, 1);
++    txn_gate_leave(backend);
+     tidesdb_mvcc_wait_visible(txn->clock, seq);
+ 
+     /* the claims and the intervals go once the batch is visible, and not before: from here the
+diff --git a/test/commit_gate__tests.c b/test/commit_gate__tests.c
+new file mode 100644
+--- /dev/null
++++ b/test/commit_gate__tests.c
+@@ -0,0 +1,505 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* the commit gate. a commit holds the gate from before it draws its sequence until its entries are
++ * applied, and a rotation closes it around the swap of the active memtable, so a commit's log
++ * record and its entries always land in the same generation (G1) and every sequence in a younger
++ * memtable is above every one in an older memtable (G2). the primitive is checked on its own, then
++ * the l0 rotation against it, then every txn commit path for a balanced enter and leave, and last a
++ * database under concurrent commits and forced rotations, read through the l0's order counters */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/base/waitstat.h"
++#include "../src/engine/engine_types.h" /* db->l0 */
++#include "../src/memtable/commit_gate.h"
++#include "../src/memtable/memtable.h"
++#include "../src/txn/txn.h"
++#include "../src/txn/txn_internal.h"
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define CG_FAST_PATH_PAIRS 1000000
++/* how long a thread that should be held is given to show it is not */
++#define CG_HELD_US 50000
++/* how long a thread that should be released is given to show it is */
++#define CG_RELEASE_US 1000000
++#define CG_POLL_US    100
++
++#define CG_PREF_THREADS  8
++#define CG_PREF_HOLD_US  50
++#define CG_PREF_CLOSES   100
++#define CG_PREF_RUN_US   2000000
++#define CG_PREF_CLOSE_US 100000
++
++#define CG_SKIP_LEVEL 12
++#define CG_SKIP_PROB  0.25f
++
++#define CG_DB_DIR      "." PATH_SEPARATOR "test_commit_gate_db"
++#define CG_WRITERS     8
++#define CG_TXNS        2000
++#define CG_PUTS        16
++#define CG_KEY_SIZE    10
++#define CG_VALUE_SIZE  100
++#define CG_BUFFER      (64u * 1024u)
++#define CG_FLUSH_US    1000
++#define CG_MIN_FLUSHES 20
++
++/* wait for a flag to read non-zero, up to a bound; returns whether it did */
++static int cg_wait_flag(_Atomic(int) *flag, const uint64_t bound_us)
++{
++    for (uint64_t waited = 0; waited < bound_us; waited += CG_POLL_US)
++    {
++        if (atomic_load(flag)) return 1;
++        usleep(CG_POLL_US);
++    }
++    return atomic_load(flag) != 0;
++}
++
++static uint64_t cg_enter_waits(tdb_commit_gate_t *g)
++{
++    uint64_t count = 0, total = 0, max = 0;
++    tdb_wait_read(&g->enter_wait, &count, &total, &max);
++    return count;
++}
++
++/* an uncontended gate is one atomic add and one load each way, and never counts a wait */
++void test_gate_fast_path(void)
++{
++    tdb_commit_gate_t g;
++    ASSERT_EQ(tdb_commit_gate_init(&g), 0);
++    for (int i = 0; i < CG_FAST_PATH_PAIRS; i++)
++    {
++        tdb_commit_gate_enter(&g);
++        tdb_commit_gate_leave(&g);
++    }
++    ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++    ASSERT_EQ(cg_enter_waits(&g), 0);
++    tdb_commit_gate_destroy(&g);
++}
++
++typedef struct
++{
++    tdb_commit_gate_t *gate;
++    _Atomic(int) done;
++} cg_thread_arg_t;
++
++static void *cg_closer(void *arg)
++{
++    cg_thread_arg_t *a = (cg_thread_arg_t *)arg;
++    tdb_commit_gate_close(a->gate);
++    atomic_store(&a->done, 1);
++    return NULL;
++}
++
++static void *cg_arrival(void *arg)
++{
++    cg_thread_arg_t *a = (cg_thread_arg_t *)arg;
++    tdb_commit_gate_enter(a->gate);
++    atomic_store(&a->done, 1);
++    tdb_commit_gate_leave(a->gate);
++    return NULL;
++}
++
++/* a close does not return while a commit is inside, and returns promptly once it leaves */
++void test_close_waits_for_inflight(void)
++{
++    tdb_commit_gate_t g;
++    ASSERT_EQ(tdb_commit_gate_init(&g), 0);
++    tdb_commit_gate_enter(&g);
++
++    cg_thread_arg_t a = {.gate = &g};
++    atomic_init(&a.done, 0);
++    pthread_t t;
++    ASSERT_EQ(pthread_create(&t, NULL, cg_closer, &a), 0);
++    usleep(CG_HELD_US);
++    ASSERT_EQ(atomic_load(&a.done), 0);
++
++    tdb_commit_gate_leave(&g);
++    ASSERT_TRUE(cg_wait_flag(&a.done, CG_RELEASE_US));
++    ASSERT_EQ(pthread_join(t, NULL), 0);
++    ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++    tdb_commit_gate_open(&g);
++    tdb_commit_gate_destroy(&g);
++}
++
++/* a closed gate holds a new commit off until it opens, and the hold is counted as a wait */
++void test_closed_gate_turns_arrivals_away(void)
++{
++    tdb_commit_gate_t g;
++    ASSERT_EQ(tdb_commit_gate_init(&g), 0);
++    tdb_commit_gate_close(&g);
++
++    cg_thread_arg_t b = {.gate = &g};
++    atomic_init(&b.done, 0);
++    pthread_t t;
++    ASSERT_EQ(pthread_create(&t, NULL, cg_arrival, &b), 0);
++    usleep(CG_HELD_US);
++    ASSERT_EQ(atomic_load(&b.done), 0);
++
++    tdb_commit_gate_open(&g);
++    ASSERT_TRUE(cg_wait_flag(&b.done, CG_RELEASE_US));
++    ASSERT_EQ(pthread_join(t, NULL), 0);
++    ASSERT_EQ(cg_enter_waits(&g), 1);
++    ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++    tdb_commit_gate_destroy(&g);
++}
++
++typedef struct
++{
++    tdb_commit_gate_t *gate;
++    _Atomic(int) *stop;
++} cg_looper_arg_t;
++
++static void *cg_looper(void *arg)
++{
++    cg_looper_arg_t *a = (cg_looper_arg_t *)arg;
++    while (!atomic_load(a->stop))
++    {
++        tdb_commit_gate_enter(a->gate);
++        usleep(CG_PREF_HOLD_US);
++        tdb_commit_gate_leave(a->gate);
++    }
++    return NULL;
++}
++
++/* commits arriving without pause never starve a rotation: the closed flag turns them away, so a
++ * close waits only for the ones already inside */
++void test_writer_preference(void)
++{
++    tdb_commit_gate_t g;
++    ASSERT_EQ(tdb_commit_gate_init(&g), 0);
++    _Atomic(int) stop;
++    atomic_init(&stop, 0);
++    cg_looper_arg_t arg = {.gate = &g, .stop = &stop};
++    pthread_t t[CG_PREF_THREADS];
++    for (int i = 0; i < CG_PREF_THREADS; i++)
++        ASSERT_EQ(pthread_create(&t[i], NULL, cg_looper, &arg), 0);
++
++    uint64_t worst = 0;
++    for (int i = 0; i < CG_PREF_CLOSES; i++)
++    {
++        usleep(CG_PREF_RUN_US / CG_PREF_CLOSES);
++        const uint64_t from = tdb_monotonic_us();
++        tdb_commit_gate_close(&g);
++        const uint64_t took = tdb_monotonic_us() - from;
++        ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++        tdb_commit_gate_open(&g);
++        if (took > worst) worst = took;
++        ASSERT_TRUE(took < CG_PREF_CLOSE_US);
++    }
++    printf("(slowest close %llu us) ", (unsigned long long)worst);
++
++    atomic_store(&stop, 1);
++    for (int i = 0; i < CG_PREF_THREADS; i++) ASSERT_EQ(pthread_join(t[i], NULL), 0);
++    ASSERT_EQ(tdb_commit_gate_inflight(&g), 0);
++    tdb_commit_gate_destroy(&g);
++}
++
++typedef struct
++{
++    tidesdb_l0_t *l0;
++    tidesdb_memtable_t *mt;
++    _Atomic(int) done;
++    int rc;
++} cg_rotate_arg_t;
++
++static void *cg_rotator(void *arg)
++{
++    cg_rotate_arg_t *a = (cg_rotate_arg_t *)arg;
++    a->rc = tidesdb_l0_rotate(a->l0, a->mt);
++    atomic_store(&a->done, 1);
++    return NULL;
++}
++
++/* a rotation does not swap the active memtable while a commit is inside the gate */
++void test_rotation_waits_for_commit_inside_gate(void)
++{
++    tidesdb_l0_t *l0 = tidesdb_l0_create(CG_BUFFER, 0, CG_SKIP_LEVEL, CG_SKIP_PROB, NULL, NULL);
++    ASSERT_TRUE(l0 != NULL);
++    tidesdb_memtable_t *old_mt =
++        tidesdb_memtable_create(NULL, 1, 1, CG_SKIP_LEVEL, CG_SKIP_PROB, NULL, NULL);
++    ASSERT_TRUE(old_mt != NULL);
++    ASSERT_TRUE(tidesdb_l0_set_active(l0, old_mt) == NULL);
++    tidesdb_memtable_t *new_mt =
++        tidesdb_memtable_create(NULL, 2, 2, CG_SKIP_LEVEL, CG_SKIP_PROB, NULL, NULL);
++    ASSERT_TRUE(new_mt != NULL);
++
++    tidesdb_l0_commit_enter(l0);
++    cg_rotate_arg_t a = {.l0 = l0, .mt = new_mt, .rc = -1};
++    atomic_init(&a.done, 0);
++    pthread_t t;
++    ASSERT_EQ(pthread_create(&t, NULL, cg_rotator, &a), 0);
++    usleep(CG_HELD_US);
++    ASSERT_EQ(atomic_load(&a.done), 0);
++    ASSERT_TRUE(atomic_load(&l0->active) == old_mt);
++
++    tidesdb_l0_commit_leave(l0);
++    ASSERT_TRUE(cg_wait_flag(&a.done, CG_RELEASE_US));
++    ASSERT_EQ(pthread_join(t, NULL), 0);
++    ASSERT_EQ(a.rc, TDB_SUCCESS);
++    ASSERT_TRUE(atomic_load(&l0->active) == new_mt);
++    tidesdb_l0_destroy(l0); /* frees the active memtable and the sealed one in the queue */
++}
++
++/* a mock commit backend counting the gate calls and able to fail the log append or the apply */
++typedef struct
++{
++    int enters;
++    int leaves;
++    int fail_wal;
++    int fail_apply;
++} cg_backend_t;
++
++static int cg_be_wal(void *ctx, const uint8_t *batch, size_t size)
++{
++    (void)batch;
++    (void)size;
++    return ((cg_backend_t *)ctx)->fail_wal ? -1 : 0;
++}
++
++static int cg_be_apply(void *ctx, const tidesdb_wal_entry_t *entries, int count)
++{
++    (void)entries;
++    (void)count;
++    return ((cg_backend_t *)ctx)->fail_apply ? -1 : 0;
++}
++
++static void cg_be_enter(void *ctx)
++{
++    cg_backend_t *m = (cg_backend_t *)ctx;
++    /* the gate is not reentrant: a commit path entering twice would deadlock a rotation */
++    ASSERT_EQ(m->enters, m->leaves);
++    m->enters++;
++}
++
++static void cg_be_leave(void *ctx)
++{
++    cg_backend_t *m = (cg_backend_t *)ctx;
++    m->leaves++;
++    ASSERT_EQ(m->enters, m->leaves);
++}
++
++static tdb_txn_backend_t cg_backend(cg_backend_t *m)
++{
++    tdb_txn_backend_t b = {.wal_append = cg_be_wal,
++                           .apply = cg_be_apply,
++                           .commit_enter = cg_be_enter,
++                           .commit_leave = cg_be_leave,
++                           .ctx = m};
++    return b;
++}
++
++static tdb_txn_t *cg_writing_txn(tidesdb_mvcc_t *clock)
++{
++    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
++    ASSERT_TRUE(t != NULL);
++    ASSERT_EQ(tdb_txn_put(t, 0, (const uint8_t *)"k", 1, (const uint8_t *)"v", 1, -1), TDB_SUCCESS);
++    return t;
++}
++
++/* every way a commit ends leaves the gate it entered, once: a commit that did not would hang the
++ * next rotation for good */
++void test_every_commit_path_balances_the_gate(void)
++{
++    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
++    ASSERT_TRUE(clock != NULL);
++    const uint8_t xid[] = {7, 7};
++
++    /* (a) success */
++    cg_backend_t m = {0};
++    tdb_txn_backend_t be = cg_backend(&m);
++    tdb_txn_t *t = cg_writing_txn(clock);
++    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
++    ASSERT_EQ(m.enters, 1);
++    ASSERT_EQ(m.leaves, 1);
++    tdb_txn_free(t);
++
++    /* (b) the log append fails */
++    memset(&m, 0, sizeof(m));
++    m.fail_wal = 1;
++    t = cg_writing_txn(clock);
++    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_ERR_IO);
++    ASSERT_EQ(m.enters, 1);
++    ASSERT_EQ(m.leaves, 1);
++    tdb_txn_free(t);
++
++    /* (c) the apply fails after the record is durable */
++    memset(&m, 0, sizeof(m));
++    m.fail_apply = 1;
++    t = cg_writing_txn(clock);
++    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_ERR_IO);
++    ASSERT_EQ(m.enters, 1);
++    ASSERT_EQ(m.leaves, 1);
++    tdb_txn_free(t);
++
++    /* (d) prepare, then phase two: each call holds the gate once */
++    memset(&m, 0, sizeof(m));
++    t = cg_writing_txn(clock);
++    ASSERT_EQ(tdb_txn_prepare(t, &be, NULL, 0, xid, sizeof(xid)), TDB_SUCCESS);
++    ASSERT_EQ(m.enters, 1);
++    ASSERT_EQ(m.leaves, 1);
++    ASSERT_EQ(tdb_txn_commit_prepared(t, &be), TDB_SUCCESS);
++    ASSERT_EQ(m.enters, 2);
++    ASSERT_EQ(m.leaves, 2);
++    tdb_txn_free(t);
++
++    /* (e) prepare, then a phase two whose COMMIT record fails, which stays prepared */
++    memset(&m, 0, sizeof(m));
++    t = cg_writing_txn(clock);
++    ASSERT_EQ(tdb_txn_prepare(t, &be, NULL, 0, xid, sizeof(xid)), TDB_SUCCESS);
++    m.fail_wal = 1;
++    ASSERT_EQ(tdb_txn_commit_prepared(t, &be), TDB_ERR_IO);
++    ASSERT_EQ(m.enters, 2);
++    ASSERT_EQ(m.leaves, 2);
++    ASSERT_EQ(tdb_txn_state(t), TDB_TXN_PREPARED);
++    m.fail_wal = 0;
++    ASSERT_EQ(tdb_txn_rollback_prepared(t, &be), TDB_SUCCESS);
++    ASSERT_EQ(m.enters, 2); /* a rollback draws nothing and applies nothing */
++    tdb_txn_free(t);
++
++    /* (f) a read-only commit has nothing durable to do and never enters */
++    memset(&m, 0, sizeof(m));
++    t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
++    ASSERT_TRUE(t != NULL);
++    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
++    ASSERT_EQ(m.enters, 0);
++    ASSERT_EQ(m.leaves, 0);
++    tdb_txn_free(t);
++
++    tidesdb_mvcc_destroy(clock);
++}
++
++typedef struct
++{
++    tidesdb_t *db;
++    tidesdb_column_family_t *cf;
++    int id;
++    _Atomic(int) *stop;
++} cg_writer_arg_t;
++
++static void *cg_writer(void *arg)
++{
++    cg_writer_arg_t *a = (cg_writer_arg_t *)arg;
++    uint8_t value[CG_VALUE_SIZE];
++    memset(value, 'v', sizeof(value));
++    for (int i = 0; i < CG_TXNS; i++)
++    {
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin_with_isolation(a->db, TDB_ISOLATION_READ_COMMITTED, &txn),
++                  TDB_SUCCESS);
++        for (int j = 0; j < CG_PUTS; j++)
++        {
++            char key[CG_KEY_SIZE + 1];
++            snprintf(key, sizeof(key), "%02d%08d", a->id, i * CG_PUTS + j);
++            ASSERT_EQ(tidesdb_txn_put(txn, a->cf, (const uint8_t *)key, CG_KEY_SIZE, value,
++                                      sizeof(value), -1),
++                      TDB_SUCCESS);
++        }
++        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++        tidesdb_txn_free(txn);
++    }
++    return NULL;
++}
++
++static void *cg_flusher(void *arg)
++{
++    cg_writer_arg_t *a = (cg_writer_arg_t *)arg;
++    while (!atomic_load(a->stop))
++    {
++        /* a queue writers keep refilling may not drain in the wait, which is not this test's
++         * concern: the rotation it forces is */
++        (void)tidesdb_flush_memtable(a->db);
++        usleep(CG_FLUSH_US);
++    }
++    return NULL;
++}
++
++/* concurrent commits against rotations from the commit path and from a flushing thread: no entry
++ * lands outside the generation its record went to, and no younger memtable takes a sequence an
++ * older one already passed */
++void test_concurrent_commits_keep_g1_g2(void)
++{
++    (void)remove_directory(CG_DB_DIR);
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = CG_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_write_buffer_size = CG_BUFFER;
++    cfg.memtable_idle_flush_seconds = 0;
++    /* thousands of 64 KiB flushes deepen the flush tier faster than it merges, and the tier stall
++     * would hold each commit for the admission ceiling. the rotations are what is under test */
++    cfg.memtable_l0_queue_stall_threshold = 0;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    ASSERT_EQ(tidesdb_create_column_family(db, "cf0", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cf0");
++    ASSERT_TRUE(cf != NULL);
++
++    _Atomic(int) stop;
++    atomic_init(&stop, 0);
++    cg_writer_arg_t args[CG_WRITERS + 1];
++    pthread_t threads[CG_WRITERS + 1];
++    for (int i = 0; i <= CG_WRITERS; i++)
++    {
++        args[i] = (cg_writer_arg_t){.db = db, .cf = cf, .id = i, .stop = &stop};
++        ASSERT_EQ(
++            pthread_create(&threads[i], NULL, i < CG_WRITERS ? cg_writer : cg_flusher, &args[i]),
++            0);
++    }
++    for (int i = 0; i < CG_WRITERS; i++) ASSERT_EQ(pthread_join(threads[i], NULL), 0);
++    atomic_store(&stop, 1);
++    ASSERT_EQ(pthread_join(threads[CG_WRITERS], NULL), 0);
++
++    tidesdb_l0_gate_stats_t gs;
++    tidesdb_l0_gate_stats(db->l0, &gs);
++    tidesdb_db_stats_t st;
++    memset(&st, 0, sizeof(st));
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    printf("(flushes %llu, split applies %llu, seq inversions %llu) ",
++           (unsigned long long)st.flush_count, (unsigned long long)gs.split_applies,
++           (unsigned long long)gs.seq_inversions);
++    fflush(stdout); /* the counts are the diagnosis when the assertion below aborts */
++    ASSERT_TRUE(gs.split_applies == 0 && gs.seq_inversions == 0);
++    ASSERT_TRUE(st.flush_count > CG_MIN_FLUSHES);
++
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(CG_DB_DIR);
++}
++
++void test_stall_reason_named(void)
++{
++    ASSERT_TRUE(strcmp(tidesdb_stall_reason_name(TDB_STALL_COMMIT_GATE), "commit_gate") == 0);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_gate_fast_path, tests_passed);
++    RUN_TEST(test_close_waits_for_inflight, tests_passed);
++    RUN_TEST(test_closed_gate_turns_arrivals_away, tests_passed);
++    RUN_TEST(test_writer_preference, tests_passed);
++    RUN_TEST(test_rotation_waits_for_commit_inside_gate, tests_passed);
++    RUN_TEST(test_every_commit_path_balances_the_gate, tests_passed);
++    RUN_TEST(test_concurrent_commits_keep_g1_g2, tests_passed);
++    RUN_TEST(test_stall_reason_named, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
