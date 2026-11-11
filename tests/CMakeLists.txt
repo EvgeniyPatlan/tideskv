@@ -55,10 +55,10 @@ endforeach()
 # the commit gate suite tidesdb-commit-gate.patch adds, the flush wait suite
 # tidesdb-flush-wait-called-generations.patch adds, the lazy level cursor suite
 # tidesdb-lazy-level-cursors.patch adds, the memtable bloom suite tidesdb-memtable-bloom.patch adds,
-# and the upstream sstable suite that guards the builder it changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
+# the exact node arena suite tidesdb-node-arena-exact.patch adds, and the upstream sstable suite that guards the builder it changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
-foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable lazy_level_cursors memtable_bloom)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable lazy_level_cursors memtable_bloom btree_node_arena)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   # the btree internals include xxhash.h, which TidesDB keeps under external/
@@ -69,6 +69,8 @@ endforeach()
 # the arena suite counts allocations by overriding malloc, which a sanitizer's allocator cannot share
 if(NOT TIDESKV_SANITIZE)
   target_compile_definitions(tidesdb_btree_arena_tests PRIVATE ARENA_COUNT_ALLOCS)
+  # the exact node arena suite counts a node decode's allocations the same way
+  target_compile_definitions(tidesdb_btree_node_arena_tests PRIVATE NODE_ARENA_COUNT_ALLOCS)
 endif()
 # the syscall suite observes ftruncate and pthread_sigmask by overriding them, which a sanitizer's runtime
 # owns, so the overrides are built only without one
@@ -97,6 +99,8 @@ set_tests_properties(TidesDbCompactionExec TidesDbCompactionPartition PROPERTIES
 add_test(NAME TidesDbBtreeSinglePass COMMAND tidesdb_btree_single_pass_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the arena suite writes its scratch klogs under the working directory
 add_test(NAME TidesDbBtreeArena COMMAND tidesdb_btree_arena_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# the exact node arena suite writes its scratch klogs under the working directory
+add_test(NAME TidesDbBtreeNodeArena COMMAND tidesdb_btree_node_arena_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the syscall suite writes its scratch database under the working directory
 add_test(NAME TidesDbIoTrim COMMAND tidesdb_io_trim_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # the start level suite writes its scratch database under the working directory

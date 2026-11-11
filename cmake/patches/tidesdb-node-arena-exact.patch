@@ -1,0 +1,2238 @@
+--- a/src/base/arena.h
++++ b/src/base/arena.h
+@@ -65,6 +65,27 @@
+ arena_t *arena_create_concurrent(arena_pool_t *pool);
+ 
+ /**
++ * arena_create_exact
++ * open an arena over one block of exactly the bytes its consumer has already sized, rounded up to
++ * the arena alignment and allocated together with the arena itself, so the arena costs one malloc
++ * and reserves what it will hold rather than a whole pooled chunk. it is meant for a consumer that
++ * knows its total before the first allocation -- a decoded btree node held by the block cache,
++ * which charges the reserved figure. an allocation that does not fit what is left is still served,
++ * from a dedicated block, and counted by arena_exact_overflows, since it means the sizing was wrong
++ * @param bytes the bytes the consumer's allocations need, alignment padding included
++ * @return the arena, or NULL on allocation failure
++ */
++arena_t *arena_create_exact(size_t bytes);
++
++/**
++ * arena_exact_overflows
++ * how many allocations, process-wide, an exact arena has served from a dedicated block because
++ * they did not fit the block it was sized with
++ * @return the count since the process started
++ */
++int64_t arena_exact_overflows(void);
++
++/**
+  * arena_alloc
+  * bump-allocate aligned bytes from the arena, pulling a new chunk when the current one is
+  * exhausted; an allocation larger than the pool chunk size gets a dedicated block. safe to call
+--- a/src/base/arena.c
++++ b/src/base/arena.c
+@@ -10,6 +10,7 @@
+ 
+ #include <stddef.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ /* default usable bytes per recycled chunk */
+ #define ARENA_DEFAULT_CHUNK_SIZE (64 * 1024)
+@@ -109,8 +110,14 @@
+      * rounds a request up to a whole chunk, so a consumer that must honour a memory budget -- the
+      * block cache being the one that must -- has to charge this rather than total_used */
+     size_t total_reserved;
++    /* an exact arena's one block, allocated together with the arena and freed with it; NULL for a
++     * chunked arena. it is never given back to a pool and never freed on its own */
++    arena_chunk_t *embedded;
+ };
+ 
++/* allocations exact arenas served from a dedicated block because their sizing came up short */
++static _Atomic(int64_t) g_arena_exact_overflows = 0;
++
+ /* a thread's stable slot index, claimed once from a global counter; arena-independent, so it never
+  * caches an arena pointer and needs no aba generation guard */
+ static _Thread_local int t_arena_slot = -1;
+@@ -203,20 +210,43 @@
+     free(c);
+ }
+ 
+-/* return every chunk the arena holds and clear its list */
++/* return every chunk the arena holds and clear its list. an exact arena keeps its embedded block,
++ * emptied, as its only chunk -- it lives inside the arena's own allocation */
+ static void arena_release_chunks(arena_t *arena)
+ {
+     arena_chunk_t *c = arena->chunks;
+     while (c)
+     {
+         arena_chunk_t *const next = c->next;
+-        arena_pool_give(arena->pool, arena->shard, c);
++        if (c != arena->embedded) arena_pool_give(arena->pool, arena->shard, c);
+         c = next;
+     }
+     arena->chunks = NULL;
+     arena->current = NULL;
+     arena->total_reserved = 0;
+     arena->total_used = 0;
++    if (arena->embedded)
++    {
++        arena->embedded->used = 0;
++        arena->embedded->next = NULL;
++        arena->chunks = arena->embedded;
++        arena->current = arena->embedded;
++        arena->total_reserved = arena_header_size() + arena->embedded->capacity;
++    }
++}
++
++/* serve an allocation from a dedicated block sized to it, with alignment slack; it joins the chunk
++ * list for release but never becomes the current bump chunk */
++static void *arena_alloc_dedicated(arena_t *arena, const size_t size, const size_t align)
++{
++    arena_chunk_t *c = arena_chunk_alloc(size + align);
++    if (!c) return NULL;
++    void *const p = arena_chunk_bump(c, size, align);
++    c->next = arena->chunks;
++    arena->chunks = c;
++    arena->total_used += size;
++    arena->total_reserved += arena_header_size() + c->capacity;
++    return p;
+ }
+ 
+ /* push a chunk onto the concurrent arena's shared list; push-only during allocation (the list is
+@@ -349,6 +379,38 @@
+     return arena;
+ }
+ 
++arena_t *arena_create_exact(const size_t bytes)
++{
++    /* [arena_t][padding to the max alignment][chunk header][capacity] in one allocation. the chunk
++     * header is itself a multiple of the max alignment long, so the usable region after it starts
++     * aligned for anything, as every chunk's does */
++    const size_t arena_part = (sizeof(arena_t) + ARENA_MAX_ALIGN - 1) & ~(ARENA_MAX_ALIGN - 1);
++    const size_t capacity = (bytes + ARENA_MAX_ALIGN - 1) & ~(ARENA_MAX_ALIGN - 1);
++    if (capacity < bytes || capacity > SIZE_MAX - arena_part - arena_header_size()) return NULL;
++
++    uint8_t *const mem = malloc(arena_part + arena_header_size() + capacity);
++    if (!mem) return NULL;
++
++    arena_t *const arena = (arena_t *)(void *)mem;
++    memset(arena, 0, sizeof(*arena));
++    arena_chunk_t *const c = (arena_chunk_t *)(void *)(mem + arena_part);
++    c->next = NULL;
++    c->capacity = capacity;
++    c->used = 0;
++
++    arena->chunk_size = capacity;
++    arena->embedded = c;
++    arena->chunks = c;
++    arena->current = c;
++    arena->total_reserved = arena_header_size() + capacity;
++    return arena;
++}
++
++int64_t arena_exact_overflows(void)
++{
++    return atomic_load_explicit(&g_arena_exact_overflows, memory_order_relaxed);
++}
++
+ arena_t *arena_create_concurrent(arena_pool_t *pool)
+ {
+     arena_t *arena = arena_create(pool);
+@@ -379,20 +441,25 @@
+ 
+     if (arena->mt) return arena_alloc_concurrent(arena, size, align);
+ 
+-    /* an allocation larger than a standard chunk gets a dedicated block, sized with alignment
+-     * slack; it joins the chunk list for release but never becomes the current bump chunk */
+-    if (size > arena->chunk_size)
++    /* an exact arena bumps its one block; what does not fit was not in the sizing, so it is served
++     * from a block of its own and counted rather than pulling a standard chunk the arena has none
++     * of
++     */
++    if (arena->embedded)
+     {
+-        arena_chunk_t *c = arena_chunk_alloc(size + align);
+-        if (!c) return NULL;
+-        void *const p = arena_chunk_bump(c, size, align);
+-        c->next = arena->chunks;
+-        arena->chunks = c;
+-        arena->total_used += size;
+-        arena->total_reserved += arena_header_size() + c->capacity;
+-        return p;
++        void *const p = arena_chunk_bump(arena->embedded, size, align);
++        if (p)
++        {
++            arena->total_used += size;
++            return p;
++        }
++        atomic_fetch_add_explicit(&g_arena_exact_overflows, 1, memory_order_relaxed);
++        return arena_alloc_dedicated(arena, size, align);
+     }
+ 
++    /* an allocation larger than a standard chunk gets a dedicated block */
++    if (size > arena->chunk_size) return arena_alloc_dedicated(arena, size, align);
++
+     if (arena->current)
+     {
+         void *const p = arena_chunk_bump(arena->current, size, align);
+--- a/src/base/encoding/compress.h
++++ b/src/base/encoding/compress.h
+@@ -67,6 +67,28 @@
+ uint8_t *decompress_data(const uint8_t *data, size_t data_size, size_t *decompressed_size,
+                          tidesdb_compression_algorithm_t type);
+ 
++/* decompress_data_into's results */
++#define DECOMPRESS_INTO_OK    0
++#define DECOMPRESS_INTO_ERR   (-1)
++#define DECOMPRESS_INTO_SHORT (-2)
++
++/**
++ * decompress_data_into
++ * decompress into a buffer the caller holds rather than a fresh allocation, under the same prefix
++ * checks as decompress_data
++ * @param data the data to decompress
++ * @param data_size the size of the data
++ * @param dst where the output goes
++ * @param dst_cap bytes dst holds
++ * @param decompressed_size out -- the output length on success; must not be NULL
++ * @param type the compression algorithm the data was compressed with
++ * @return DECOMPRESS_INTO_OK, DECOMPRESS_INTO_SHORT when the size prefix claims more than dst_cap
++ *         (nothing is written), or DECOMPRESS_INTO_ERR on bad args, an unsupported type or bytes
++ *         that do not decode
++ */
++int decompress_data_into(const uint8_t *data, size_t data_size, uint8_t *dst, size_t dst_cap,
++                         size_t *decompressed_size, tidesdb_compression_algorithm_t type);
++
+ /* tidesdb_compression_available is part of the public surface and is declared in db.h, which this
+  * header includes above -- a caller rejects an unsupported algorithm up front rather than failing
+  * at compress or flush time. declaring it here as well is a redundant declaration the build treats
+--- a/src/base/encoding/compress.c
++++ b/src/base/encoding/compress.c
+@@ -203,116 +203,179 @@
+ 
+ /* ===== per-backend decompression ===== */
+ 
+-/* the front half every backend shares -- validate the size prefix the block was written with and
+- * allocate the output from it. max_expansion bounds how far a valid block of these compressed bytes
+- * could legitimately expand, so an implausible claim is refused before the allocation; pass
++/* the front half every backend shares -- validate the size prefix the block was written with.
++ * max_expansion bounds how far a valid block of these compressed bytes could legitimately expand,
++ * so an implausible claim is refused before any output buffer is sized from it; pass
+  * COMPRESS_NO_EXPANSION_BOUND where no ratio applies and only the UINT32_MAX cap holds. */
+-static uint8_t *decompress_alloc_from_prefix(const uint8_t *data, const size_t data_size,
+-                                             const uint64_t max_expansion, size_t *out_size)
++static int decompress_check_prefix(const uint8_t *data, const size_t data_size,
++                                   const uint64_t max_expansion, size_t *out_size)
+ {
+-    if (TDB_UNLIKELY(data_size < sizeof(uint64_t))) return NULL;
++    if (TDB_UNLIKELY(data_size < sizeof(uint64_t))) return -1;
+ 
+     const uint64_t original_size = decode_uint64_le_compat(data);
+-    if (TDB_UNLIKELY(original_size > UINT32_MAX)) return NULL;
++    if (TDB_UNLIKELY(original_size > UINT32_MAX)) return -1;
+     if (max_expansion != COMPRESS_NO_EXPANSION_BOUND &&
+         TDB_UNLIKELY(original_size > (uint64_t)(data_size - sizeof(uint64_t)) * max_expansion))
+-        return NULL;
++        return -1;
+ 
+     *out_size = (size_t)original_size;
+-    /* a zero-length original still allocates a byte, so the returned pointer is always non-NULL and
+-     * always freeable -- malloc(0) may hand back either, and a NULL would read here as a failed
+-     * decode. the same reason encoding_passthrough does it */
+-    return malloc(*out_size ? *out_size : 1);
++    return 0;
+ }
+ 
++/* each backend's body decodes the bytes after a prefix already checked into dst, which holds at
++ * least the claimed size, and returns 0 only when exactly that many bytes came out */
++
+ #ifdef TIDESDB_HAVE_SNAPPY
+-static uint8_t *decompress_snappy(const uint8_t *data, const size_t data_size, size_t *out_size)
++static int decompress_snappy_body(const uint8_t *data, const size_t data_size, uint8_t *dst,
++                                  const size_t claimed)
+ {
+-    uint8_t *out =
+-        decompress_alloc_from_prefix(data, data_size, COMPRESS_SNAPPY_MAX_EXPANSION, out_size);
+-    if (TDB_UNLIKELY(!out)) return NULL;
+-
+-    const size_t claimed = *out_size;
++    size_t got = claimed;
+     if (TDB_UNLIKELY(snappy_uncompress((const char *)(data + sizeof(uint64_t)),
+-                                       data_size - sizeof(uint64_t), (char *)out,
+-                                       out_size) != SNAPPY_OK))
+-    {
+-        free(out);
+-        return NULL;
+-    }
+-
++                                       data_size - sizeof(uint64_t), (char *)dst,
++                                       &got) != SNAPPY_OK))
++        return -1;
+     /* snappy can succeed with a shorter output that still fits the buffer, so hold it to the size
+      * prefix the way the LZ4 and ZSTD backends are held to theirs */
+-    if (TDB_UNLIKELY(*out_size != claimed))
+-    {
+-        free(out);
+-        return NULL;
+-    }
+-    return out;
++    return got == claimed ? 0 : -1;
+ }
+ #endif
+ 
+ #ifdef TIDESDB_HAVE_LZ4
+-static uint8_t *decompress_lz4(const uint8_t *data, const size_t data_size, size_t *out_size)
++static int decompress_lz4_body(const uint8_t *data, const size_t data_size, uint8_t *dst,
++                               const size_t claimed)
+ {
+-    uint8_t *out =
+-        decompress_alloc_from_prefix(data, data_size, COMPRESS_LZ4_MAX_EXPANSION, out_size);
+-    if (TDB_UNLIKELY(!out)) return NULL;
+-
+-    const int lz4_result = LZ4_decompress_safe((const char *)(data + sizeof(uint64_t)), (char *)out,
+-                                               (int)(data_size - sizeof(uint64_t)), (int)*out_size);
+-    if (TDB_UNLIKELY(lz4_result < 0 || lz4_result != (int)*out_size))
+-    {
+-        free(out);
+-        return NULL;
+-    }
+-    return out;
++    const int lz4_result = LZ4_decompress_safe((const char *)(data + sizeof(uint64_t)), (char *)dst,
++                                               (int)(data_size - sizeof(uint64_t)), (int)claimed);
++    return (lz4_result < 0 || lz4_result != (int)claimed) ? -1 : 0;
+ }
+ #endif
+ 
+ #ifdef TIDESDB_HAVE_ZSTD
+-static uint8_t *decompress_zstd(const uint8_t *data, const size_t data_size, size_t *out_size)
++/* ZSTD_decompress allocates a fresh decompression context on every call, about a hundred
++ * kilobytes, so each thread keeps one and reuses it; the key's destructor frees it at thread exit.
++ * the shared build is linked never to be unmapped, so the destructor stays callable (see the
++ * block manager's read buffer, which relies on the same) */
++static pthread_key_t compress_zstd_dctx_key;
++static pthread_once_t compress_zstd_dctx_once = PTHREAD_ONCE_INIT;
++static int compress_zstd_dctx_key_ready = 0;
++
++static void compress_zstd_dctx_free(void *ptr)
+ {
+-    /* zstd's RLE mode can expand arbitrarily, so no ratio bound applies here -- the UINT32_MAX cap
+-     * is the plausibility bound, and upstream frame checksums are what actually protect this
+-     * prefix from corruption */
+-    uint8_t *out =
+-        decompress_alloc_from_prefix(data, data_size, COMPRESS_NO_EXPANSION_BOUND, out_size);
+-    if (TDB_UNLIKELY(!out)) return NULL;
++    if (ptr) (void)ZSTD_freeDCtx((ZSTD_DCtx *)ptr);
++}
+ 
+-    const size_t zstd_result =
+-        ZSTD_decompress(out, *out_size, data + sizeof(uint64_t), data_size - sizeof(uint64_t));
+-    if (TDB_UNLIKELY(ZSTD_isError(zstd_result) || zstd_result != *out_size))
++static void compress_zstd_dctx_init_key(void)
++{
++    compress_zstd_dctx_key_ready =
++        pthread_key_create(&compress_zstd_dctx_key, compress_zstd_dctx_free) == 0;
++}
++
++/* the calling thread's context, created on first use, or NULL when one cannot be kept */
++static ZSTD_DCtx *compress_zstd_dctx(void)
++{
++    pthread_once(&compress_zstd_dctx_once, compress_zstd_dctx_init_key);
++    if (TDB_UNLIKELY(!compress_zstd_dctx_key_ready)) return NULL;
++    ZSTD_DCtx *dctx = (ZSTD_DCtx *)pthread_getspecific(compress_zstd_dctx_key);
++    if (dctx) return dctx;
++    dctx = ZSTD_createDCtx();
++    if (!dctx) return NULL;
++    if (TDB_UNLIKELY(pthread_setspecific(compress_zstd_dctx_key, dctx) != 0))
+     {
+-        free(out);
++        (void)ZSTD_freeDCtx(dctx);
+         return NULL;
+     }
+-    return out;
++    return dctx;
+ }
+-#endif
+ 
+-uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *decompressed_size,
+-                         const tidesdb_compression_algorithm_t type)
++static int decompress_zstd_body(const uint8_t *data, const size_t data_size, uint8_t *dst,
++                                const size_t claimed)
+ {
+-    /* every backend writes *decompressed_size, so a NULL out-param is a caller error */
+-    if (TDB_UNLIKELY(!data || !decompressed_size)) return NULL;
++    ZSTD_DCtx *dctx = compress_zstd_dctx();
++    const size_t zstd_result =
++        dctx ? ZSTD_decompressDCtx(dctx, dst, claimed, data + sizeof(uint64_t),
++                                   data_size - sizeof(uint64_t))
++             : ZSTD_decompress(dst, claimed, data + sizeof(uint64_t), data_size - sizeof(uint64_t));
++    return (ZSTD_isError(zstd_result) || zstd_result != claimed) ? -1 : 0;
++}
++#endif
++
++/* a backend's body and the expansion bound its prefix is held to, or a NULL body when the type is
++ * not a codec this build has */
++typedef int (*decompress_body_fn)(const uint8_t *data, size_t data_size, uint8_t *dst,
++                                  size_t claimed);
+ 
++static decompress_body_fn decompress_backend(const tidesdb_compression_algorithm_t type,
++                                             uint64_t *max_expansion)
++{
+     switch (type)
+     {
+ #ifdef TIDESDB_HAVE_SNAPPY
+         case TDB_COMPRESS_SNAPPY:
+-            return decompress_snappy(data, data_size, decompressed_size);
++            *max_expansion = COMPRESS_SNAPPY_MAX_EXPANSION;
++            return decompress_snappy_body;
+ #endif
+ #ifdef TIDESDB_HAVE_LZ4
+         case TDB_COMPRESS_LZ4:
+         case TDB_COMPRESS_LZ4_FAST:
+-            return decompress_lz4(data, data_size, decompressed_size);
++            *max_expansion = COMPRESS_LZ4_MAX_EXPANSION;
++            return decompress_lz4_body;
+ #endif
+ #ifdef TIDESDB_HAVE_ZSTD
+         case TDB_COMPRESS_ZSTD:
+-            return decompress_zstd(data, data_size, decompressed_size);
++            /* zstd's RLE mode can expand arbitrarily, so no ratio bound applies here -- the
++             * UINT32_MAX cap is the plausibility bound, and upstream frame checksums are what
++             * actually protect this prefix from corruption */
++            *max_expansion = COMPRESS_NO_EXPANSION_BOUND;
++            return decompress_zstd_body;
+ #endif
+         default:
++            (void)max_expansion;
+             return NULL;
+     }
+ }
++
++uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *decompressed_size,
++                         const tidesdb_compression_algorithm_t type)
++{
++    /* every backend writes *decompressed_size, so a NULL out-param is a caller error */
++    if (TDB_UNLIKELY(!data || !decompressed_size)) return NULL;
++
++    uint64_t max_expansion = COMPRESS_NO_EXPANSION_BOUND;
++    const decompress_body_fn body = decompress_backend(type, &max_expansion);
++    if (!body) return NULL;
++
++    size_t claimed = 0;
++    if (decompress_check_prefix(data, data_size, max_expansion, &claimed) != 0) return NULL;
++
++    /* a zero-length original still allocates a byte, so the returned pointer is always non-NULL and
++     * always freeable -- malloc(0) may hand back either, and a NULL would read here as a failed
++     * decode. the same reason encoding_passthrough does it */
++    uint8_t *out = malloc(claimed ? claimed : 1);
++    if (TDB_UNLIKELY(!out)) return NULL;
++    if (TDB_UNLIKELY(body(data, data_size, out, claimed) != 0))
++    {
++        free(out);
++        return NULL;
++    }
++    *decompressed_size = claimed;
++    return out;
++}
++
++int decompress_data_into(const uint8_t *data, const size_t data_size, uint8_t *dst,
++                         const size_t dst_cap, size_t *decompressed_size,
++                         const tidesdb_compression_algorithm_t type)
++{
++    if (TDB_UNLIKELY(!data || !decompressed_size || (!dst && dst_cap))) return DECOMPRESS_INTO_ERR;
++
++    uint64_t max_expansion = COMPRESS_NO_EXPANSION_BOUND;
++    const decompress_body_fn body = decompress_backend(type, &max_expansion);
++    if (!body) return DECOMPRESS_INTO_ERR;
++
++    size_t claimed = 0;
++    if (decompress_check_prefix(data, data_size, max_expansion, &claimed) != 0)
++        return DECOMPRESS_INTO_ERR;
++    if (claimed > dst_cap) return DECOMPRESS_INTO_SHORT;
++    if (claimed > 0 && body(data, data_size, dst, claimed) != 0) return DECOMPRESS_INTO_ERR;
++    *decompressed_size = claimed;
++    return DECOMPRESS_INTO_OK;
++}
+--- a/src/base/encoding/encoding.h
++++ b/src/base/encoding/encoding.h
+@@ -199,6 +199,26 @@
+                                    size_t *dst_size);
+ 
+ /**
++ * tidesdb_encoding_stages_decode_into
++ * invert a resolved chain into a buffer the caller holds, for a reader that reuses one buffer
++ * rather than taking an allocation per block. a single built-in stage decodes straight into dst; a
++ * user encoding or a longer chain runs its allocating transforms and copies the result in
++ * @param stages the resolved stages in write order
++ * @param count how many stages, 0 copies src verbatim
++ * @param src input bytes, borrowed
++ * @param src_size length of src in bytes
++ * @param dst where the output goes
++ * @param dst_cap bytes dst holds
++ * @param dst_size out -- the output length on success
++ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a bad argument or when the output does not fit
++ *         dst_cap (dst is then left unspecified), TDB_ERR_CORRUPTION when a built-in stage's bytes
++ * do not decode, or a transform's own error code
++ */
++int tidesdb_encoding_stages_decode_into(const tidesdb_encoding_stage_t *stages, int count,
++                                        const uint8_t *src, size_t src_size, uint8_t *dst,
++                                        size_t dst_cap, size_t *dst_size);
++
++/**
+  * tidesdb_encoding_pipeline_encode
+  * run src through the pipeline ids in encode order (left-to-right), producing a freshly allocated
+  * dst; a count of zero is a passthrough that returns an owned copy of src
+--- a/src/base/encoding/encoding.c
++++ b/src/base/encoding/encoding.c
+@@ -292,6 +292,64 @@
+     return encoding_run_stages(stages, count, 0, src, src_size, dst, dst_size);
+ }
+ 
++/* the compression algorithm a built-in decode stage runs, so a decode into a caller's buffer can go
++ * straight to the backend; -1 for the passthrough and for a user encoding, which has only the
++ * allocating transform */
++static int encoding_builtin_algorithm(const tidesdb_decode_fn fn)
++{
++    if (fn == encoding_decode_snappy) return TDB_COMPRESS_SNAPPY;
++    if (fn == encoding_decode_lz4 || fn == encoding_decode_lz4_fast) return TDB_COMPRESS_LZ4;
++    if (fn == encoding_decode_zstd) return TDB_COMPRESS_ZSTD;
++    return -1;
++}
++
++/* copy what a decode produced into the caller's buffer, refusing one too short to hold it */
++static int encoding_copy_into(const uint8_t *src, const size_t src_size, uint8_t *dst,
++                              const size_t dst_cap, size_t *dst_size)
++{
++    if (src_size > dst_cap) return TDB_ERR_INVALID_ARGS;
++    if (src_size) memcpy(dst, src, src_size);
++    *dst_size = src_size;
++    return TDB_SUCCESS;
++}
++
++int tidesdb_encoding_stages_decode_into(const tidesdb_encoding_stage_t *stages, const int count,
++                                        const uint8_t *src, const size_t src_size, uint8_t *dst,
++                                        const size_t dst_cap, size_t *dst_size)
++{
++    if (!dst_size || (!dst && dst_cap) || (!src && src_size)) return TDB_ERR_INVALID_ARGS;
++    if (count < 0 || (count > 0 && !stages)) return TDB_ERR_INVALID_ARGS;
++    if (count == 0) return encoding_copy_into(src, src_size, dst, dst_cap, dst_size);
++
++    if (count == 1)
++    {
++        const tidesdb_decode_fn fn = stages[0].decode;
++        if (fn == encoding_passthrough)
++            return encoding_copy_into(src, src_size, dst, dst_cap, dst_size);
++
++        const int algo = encoding_builtin_algorithm(fn);
++        if (algo >= 0)
++        {
++            const int rc = decompress_data_into(src, src_size, dst, dst_cap, dst_size,
++                                                (tidesdb_compression_algorithm_t)algo);
++            if (rc == DECOMPRESS_INTO_OK) return TDB_SUCCESS;
++            if (rc == DECOMPRESS_INTO_SHORT) return TDB_ERR_INVALID_ARGS;
++            TDB_DEBUG_LOG(TDB_LOG_ERROR, "decode failed, algorithm %d, %zu bytes stored", algo,
++                          src_size);
++            return TDB_ERR_CORRUPTION;
++        }
++    }
++
++    /* a user encoding, or a stacked chain, has only allocating transforms: run them and copy */
++    uint8_t *out = NULL;
++    size_t out_size = 0;
++    const int rc = encoding_run_stages(stages, count, 0, src, src_size, &out, &out_size);
++    if (rc != TDB_SUCCESS) return rc;
++    const int crc = encoding_copy_into(out, out_size, dst, dst_cap, dst_size);
++    free(out);
++    return crc;
++}
++
+ /* resolve the pipeline and run it; the by-id entry points exist for callers that hold ids rather
+  * than resolved stages, and pay one registry walk per call to get there */
+ static int encoding_run(const tidesdb_encoding_registry_t *reg, const uint8_t *ids, int count,
+--- a/src/sstable/btree/btree.h
++++ b/src/sstable/btree/btree.h
+@@ -87,8 +87,8 @@
+  * @param prev_offset offset of previous sibling (leaf nodes, for backward scan)
+  * @param next_offset offset of next sibling (leaf nodes, for forward scan)
+  * @param block_offset this node's offset in the file
+- * @param arena arena the node's storage was deserialized into, freed as a unit and returning its
+- * chunks to the shared pool rather than to the OS
++ * @param arena arena the node's storage was deserialized into, freed as a unit; a node read from
++ * storage gets one sized exactly to what it holds
+  */
+ struct btree_node_t
+ {
+@@ -113,8 +113,9 @@
+  * node in order on write and in reverse on read; the btree knows nothing about which algorithms
+  * these are. NULL, or a count of zero, stores nodes verbatim
+  * @param codec_count how many stages codec holds
+- * @param arena_pool the db-global chunk pool a decoded node's arena draws from, borrowed, or NULL
+- * to allocate directly
++ * @param arena_pool the db-global node chunk pool, borrowed, or NULL; decoded nodes no longer draw
++ * from it (each is built in an arena sized exactly to it), it is carried for the callers that set
++ * it
+  */
+ typedef struct
+ {
+@@ -545,8 +546,8 @@
+  * @param node output pointer to node
+  * @param codec resolved encoding stages to undo, in reverse; NULL or a zero count reads verbatim
+  * @param codec_count how many stages codec holds
+- * @param pool the db-global chunk pool a decoded node's arena draws from, or NULL to allocate
+- * directly; pooling is what keeps a block-cache miss off the process allocator's growth path
++ * @param pool unused: a decoded node is built in one arena sized exactly to it, a single allocation
++ * per read, rather than in a chunk from a pool that a cached node would hold at twice its size
+  * @param node_size_hint the tree's target node size, so the whole node arrives in the first pread;
+  * 0 leaves the block manager to its default guess and risks a second syscall on a node larger than
+  * it
+--- a/src/sstable/btree/btree_internal.h
++++ b/src/sstable/btree/btree_internal.h
+@@ -363,7 +363,8 @@
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+  * @param node out -- the decoded node on success, owning arena
+- * @param arena the arena the node is decoded into, destroyed by the caller on failure
++ * @param arena the arena the node is decoded into, destroyed by the caller on failure; NULL builds
++ * the node in an exact arena of its own, as the read path does, destroyed here on failure
+  * @return 0 on success, -1 when the bytes do not decode
+  */
+ int btree_node_deserialize_direct(const uint8_t *data, size_t data_size, btree_node_t **node,
+--- a/src/sstable/btree/btree_node.c
++++ b/src/sstable/btree/btree_node.c
+@@ -35,6 +35,33 @@
+         off += _vn;                                                                     \
+     } while (0)
+ 
++/* the arrays a node keeps are carved out of its arena at this alignment, which covers every element
++ * type they hold */
++_Static_assert(_Alignof(btree_entry_t) <= BTREE_ARENA_ALIGNMENT, "entries outgrow the alignment");
++_Static_assert(_Alignof(int64_t) <= BTREE_ARENA_ALIGNMENT, "child offsets outgrow the alignment");
++_Static_assert(_Alignof(size_t) <= BTREE_ARENA_ALIGNMENT, "key sizes outgrow the alignment");
++_Static_assert(_Alignof(uint8_t *) <= BTREE_ARENA_ALIGNMENT, "pointers outgrow the alignment");
++_Static_assert(sizeof(btree_entry_t) % _Alignof(uint8_t *) == 0, "entries misalign the next array");
++
++/* a thread keeps its decode buffers between reads; one grown past this by an outsized node is
++ * freed after the read rather than kept, so a single huge node does not pin its size per thread */
++#define BTREE_DECODE_TLS_RETAIN_MAX (1024 * 1024)
++
++/* the first size a thread's decode buffer takes, enough for a default node and its scratch */
++#define BTREE_DECODE_TLS_INITIAL_CAP (16 * 1024)
++
++/**
++ * btree_round_up
++ * round a size up to a power-of-two alignment
++ * @param n the size to round
++ * @param align the alignment, a power of two
++ * @return n rounded up
++ */
++static inline size_t btree_round_up(const size_t n, const size_t align)
++{
++    return (n + (align - 1)) & ~(size_t)(align - 1);
++}
++
+ /**
+  * btree_align_up
+  * round a size up to the arena's alignment, so the arrays carved out of one allocation each start
+@@ -44,100 +71,247 @@
+  */
+ static inline size_t btree_align_up(size_t n)
+ {
+-    return (n + (BTREE_ARENA_ALIGNMENT - 1)) & ~(size_t)(BTREE_ARENA_ALIGNMENT - 1);
++    return btree_round_up(n, BTREE_ARENA_ALIGNMENT);
++}
++
++/**
++ * btree_layout_add
++ * account for one allocation in a node's sizing the way the arena will bump it -- aligned from the
++ * end of the one before -- so the total is exactly what the node's allocations take
++ * @param used the bytes laid out so far, advanced past this allocation
++ * @param size the allocation's size
++ * @param align its alignment, a power of two
++ * @return 0 on success, -1 when the total would wrap size_t
++ */
++static int btree_layout_add(size_t *used, const size_t size, const size_t align)
++{
++    const size_t start = btree_round_up(*used, align);
++    if (start < *used || size > SIZE_MAX - start) return -1;
++    *used = start + size;
++    return 0;
++}
++
++/**
++ * btree_tls_buf_t
++ * one growable per-thread buffer
++ * @param buf the buffer, NULL until first use
++ * @param cap its size in bytes
++ */
++typedef struct
++{
++    uint8_t *buf;
++    size_t cap;
++} btree_tls_buf_t;
++
++/**
++ * btree_decode_tls_t
++ * a thread's node decode buffers. plain holds a decompressed node while it is deserialized and
++ * scratch the per-entry layout the decode walks; a decoded node copies everything it keeps into its
++ * own arena, so nothing a node holds ever points into either
++ * @param plain the decompressed node bytes
++ * @param scratch the decode's scratch arrays
++ */
++typedef struct
++{
++    btree_tls_buf_t plain;
++    btree_tls_buf_t scratch;
++} btree_decode_tls_t;
++
++/* the destructor behind this key frees a thread's buffers at its exit; the shared build is linked
++ * never to be unmapped, so it stays callable (the block manager's read buffer relies on the same)
++ */
++static pthread_key_t btree_decode_tls_key;
++static pthread_once_t btree_decode_tls_once = PTHREAD_ONCE_INIT;
++static int btree_decode_tls_key_ready = 0;
++
++static void btree_decode_tls_free(void *ptr)
++{
++    btree_decode_tls_t *tls = ptr;
++    if (!tls) return;
++    free(tls->plain.buf);
++    free(tls->scratch.buf);
++    free(tls);
++}
++
++static void btree_decode_tls_init_key(void)
++{
++    btree_decode_tls_key_ready =
++        pthread_key_create(&btree_decode_tls_key, btree_decode_tls_free) == 0;
++}
++
++/**
++ * btree_decode_tls
++ * the calling thread's decode buffers, created on first use
++ * @return the buffers, or NULL when they cannot be allocated or kept
++ */
++static btree_decode_tls_t *btree_decode_tls(void)
++{
++    pthread_once(&btree_decode_tls_once, btree_decode_tls_init_key);
++    if (!btree_decode_tls_key_ready) return NULL;
++    btree_decode_tls_t *tls = pthread_getspecific(btree_decode_tls_key);
++    if (tls) return tls;
++    tls = calloc(1, sizeof(*tls));
++    if (!tls) return NULL;
++    /* a failed store leaves nothing to free the buffers at thread exit, and the next read would
++     * allocate another set, so refuse rather than leak one per read */
++    if (pthread_setspecific(btree_decode_tls_key, tls) != 0)
++    {
++        free(tls);
++        return NULL;
++    }
++    return tls;
++}
++
++/**
++ * btree_tls_buf_get
++ * a thread buffer of at least need bytes, grown by doubling; what it held is not kept
++ * @param b the buffer
++ * @param need the bytes wanted
++ * @return the buffer, or NULL on allocation failure
++ */
++static uint8_t *btree_tls_buf_get(btree_tls_buf_t *b, size_t need)
++{
++    if (need == 0) need = 1;
++    if (need <= b->cap) return b->buf;
++    size_t cap = b->cap ? b->cap : BTREE_DECODE_TLS_INITIAL_CAP;
++    while (cap < need) cap = cap > SIZE_MAX / 2 ? need : cap * 2;
++    uint8_t *const grown = malloc(cap);
++    if (!grown) return NULL;
++    free(b->buf);
++    b->buf = grown;
++    b->cap = cap;
++    return grown;
++}
++
++/**
++ * btree_tls_buf_trim
++ * free a thread buffer an outsized node grew past the retain limit
++ * @param b the buffer
++ */
++static void btree_tls_buf_trim(btree_tls_buf_t *b)
++{
++    if (b->cap <= BTREE_DECODE_TLS_RETAIN_MAX) return;
++    free(b->buf);
++    b->buf = NULL;
++    b->cap = 0;
++}
++
++/**
++ * btree_node_begin
++ * open the arena a node is decoded into, sized exactly to need unless the caller supplied one, and
++ * carve the node itself out of it
++ * @param arena the caller's arena, or NULL to create an exact one
++ * @param need the bytes the node's allocations take, as btree_layout_add summed them
++ * @param type the node's type
++ * @param num_entries its entry or key count
++ * @return the zeroed node owning its arena, or NULL on failure (an arena created here is destroyed)
++ */
++static btree_node_t *btree_node_begin(arena_t *arena, const size_t need, const uint8_t type,
++                                      const uint32_t num_entries)
++{
++    arena_t *const a = arena ? arena : arena_create_exact(need);
++    if (!a) return NULL;
++    btree_node_t *n = arena_alloc(a, sizeof(btree_node_t), _Alignof(btree_node_t));
++    if (!n)
++    {
++        if (!arena) arena_destroy(a);
++        return NULL;
++    }
++    memset(n, 0, sizeof(btree_node_t));
++    n->arena = a;
++    n->type = type;
++    n->num_entries = num_entries;
++    return n;
++}
++
++/**
++ * btree_node_abandon
++ * undo btree_node_begin after a decode failed: an arena it created goes, a caller's is left to the
++ * caller, which destroys it
++ * @param n the half-built node
++ * @param arena the arena the caller passed, or NULL
++ */
++static void btree_node_abandon(btree_node_t *n, const arena_t *arena)
++{
++    if (!arena) arena_destroy(n->arena);
+ }
+ 
+ /**
+  * btree_leaf_scratch_t
+- * the per-entry arrays a leaf decode fills while walking the node and drops when it is done; they
+- * describe where each key's bytes are rather than holding them
+- * @param key_offsets each key's suffix position, relative to the start of the keys section
++ * what a leaf decode reads before it can size the node: each entry's metadata, and where each key's
++ * bytes are. it lives in the thread's scratch buffer, and the node keeps only a copy of the entries
++ * @param entries each entry's metadata, copied into the node once it is allocated
+  * @param prefix_lens how many leading bytes each key shares with the one before it
+  * @param suffix_lens how many bytes each key stores for itself
++ * @param key_offsets each key's suffix position, relative to the start of the keys section
++ * @param total_suffix_bytes the keys section's length
++ * @param total_key_bytes the rebuilt keys' bytes, each padded to the arena alignment
++ * @param total_inline_bytes the inline values' bytes
+  */
+ typedef struct
+ {
+-    uint16_t *key_offsets;
++    btree_entry_t *entries;
+     size_t *prefix_lens;
+     size_t *suffix_lens;
++    uint16_t *key_offsets;
++    size_t total_suffix_bytes;
++    size_t total_key_bytes;
++    size_t total_inline_bytes;
+ } btree_leaf_scratch_t;
+ 
+ /**
+- * btree_leaf_alloc_arrays
+- * carve the node's metadata arrays and the decode's scratch arrays out of the arena in two
+- * allocations, rejecting an entry count the node is too small to hold before sizing anything by it
+- * @param n the node being built, with num_entries already set
++ * btree_leaf_scratch_init
++ * carve a leaf decode's scratch arrays out of the thread's scratch buffer, rejecting an entry count
++ * the node is too small to hold before sizing anything by it
++ * @param ne the entry count
+  * @param off the offset the indirection table starts at
+  * @param data_size length of the encoded node
+- * @param arena the arena every array is carved from
+- * @param scratch receives the scratch arrays
+- * @return 0 on success, -1 when the count is not credible or the arena is exhausted
++ * @param tls the thread's decode buffers
++ * @param scratch receives the arrays
++ * @return 0 on success, -1 when the count is not credible or the buffer cannot grow
+  */
+-static int btree_leaf_alloc_arrays(btree_node_t *n, const size_t off, const size_t data_size,
+-                                   arena_t *arena, btree_leaf_scratch_t *scratch)
++static int btree_leaf_scratch_init(const uint32_t ne, const size_t off, const size_t data_size,
++                                   btree_decode_tls_t *tls, btree_leaf_scratch_t *scratch)
+ {
+-    const uint32_t ne = n->num_entries;
+-
+     /* the indirection table alone needs two bytes per entry -- reject an ne that can't fit before
+-     * allocating ne-sized arrays. the bound is compared by division rather than multiplying, so it
+-     * still holds where size_t is 32 bits and ne * 2 would wrap */
++     * sizing ne-long arrays. the bound is compared by division rather than multiplying, so it still
++     * holds where size_t is 32 bits and ne * 2 would wrap */
+     if (off > data_size || (size_t)ne > (data_size - off) / BTREE_KEY_OFFSET_BYTES) return -1;
+ 
+-    /* the metadata arrays are all sized from ne, so reject a count whose combined allocation would
+-     * wrap size_t before any of it is computed */
+-    const size_t meta_per_entry =
+-        sizeof(btree_entry_t) + sizeof(uint8_t *) + sizeof(size_t) + sizeof(uint8_t *);
+-    if ((size_t)ne > SIZE_MAX / meta_per_entry) return -1;
++    const size_t per_entry =
++        sizeof(btree_entry_t) + sizeof(size_t) + sizeof(size_t) + sizeof(uint16_t);
++    if ((size_t)ne > SIZE_MAX / per_entry) return -1;
+ 
+-    /* single arena alloc for all 4 metadata arrays */
+     const size_t entries_sz = ne * sizeof(btree_entry_t);
+-    const size_t keys_ptr_sz = ne * sizeof(uint8_t *);
+-    const size_t key_sizes_sz = ne * sizeof(size_t);
+-    const size_t values_ptr_sz = ne * sizeof(uint8_t *);
+-    uint8_t *meta_buf =
+-        arena_alloc(arena, entries_sz + keys_ptr_sz + key_sizes_sz + values_ptr_sz, 0);
+-    if (!meta_buf) return -1;
+-
+-    /* through void *, which is what says the alignment is established rather than assumed. the
+-     * arena hands back a maximally aligned block, and every offset below is a whole number of
+-     * pointers or size_ts into it, so each array starts where its type requires. casting straight
+-     * from uint8_t * is what a compiler cannot see that through */
+-    n->entries = (btree_entry_t *)(void *)meta_buf;
+-    n->keys = (uint8_t **)(void *)(meta_buf + entries_sz);
+-    n->key_sizes = (size_t *)(void *)(meta_buf + entries_sz + keys_ptr_sz);
+-    n->values = (uint8_t **)(void *)(meta_buf + entries_sz + keys_ptr_sz + key_sizes_sz);
+-
+-    /* only values needs zeroing (sparse -- vlog entries have no inline value) */
+-    memset(n->values, 0, values_ptr_sz);
+-
+-    /* single arena alloc for all 3 temp arrays, with the offsets array padded so the size_t arrays
+-     * after it start aligned */
+-    const size_t offsets_sz = btree_align_up(ne * sizeof(uint16_t));
+     const size_t lens_sz = ne * sizeof(size_t);
+-    uint8_t *temp_buf = arena_alloc(arena, offsets_sz + lens_sz + lens_sz, 0);
+-    if (!temp_buf) return -1;
++    uint8_t *buf = btree_tls_buf_get(&tls->scratch, ne * per_entry);
++    if (!buf) return -1;
+ 
+-    scratch->key_offsets = (uint16_t *)(void *)temp_buf;
+-    scratch->prefix_lens = (size_t *)(void *)(temp_buf + offsets_sz);
+-    scratch->suffix_lens = (size_t *)(void *)(temp_buf + offsets_sz + lens_sz);
++    /* through void *: the buffer is malloc'd, so maximally aligned, and each array starts a whole
++     * number of entries or size_ts into it */
++    memset(scratch, 0, sizeof(*scratch));
++    scratch->entries = (btree_entry_t *)(void *)buf;
++    scratch->prefix_lens = (size_t *)(void *)(buf + entries_sz);
++    scratch->suffix_lens = (size_t *)(void *)(buf + entries_sz + lens_sz);
++    scratch->key_offsets = (uint16_t *)(void *)(buf + entries_sz + 2 * lens_sz);
+     return 0;
+ }
+ 
+ /**
+  * btree_leaf_decode_entries
+- * read the key indirection table and every entry's metadata, leaving the offset at the keys section
+- * @param n the node being built, with its arrays allocated
++ * read the key indirection table and every entry's metadata into the scratch, leaving the offset
++ * at the keys section
++ * @param ne the entry count, bounded by btree_leaf_scratch_init
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+  * @param offp the offset the table starts at, advanced past the metadata
+- * @param scratch the scratch arrays, filled with each key's layout
++ * @param scratch the scratch arrays, filled with each entry and each key's layout
+  * @return 0 on success, -1 when the bytes do not decode
+  */
+-static int btree_leaf_decode_entries(btree_node_t *n, const uint8_t *data, const size_t data_size,
++static int btree_leaf_decode_entries(const uint32_t ne, const uint8_t *data, const size_t data_size,
+                                      size_t *offp, const btree_leaf_scratch_t *scratch)
+ {
+     const uint8_t *const end = data + data_size;
+-    const uint32_t ne = n->num_entries;
+     size_t off = *offp;
+ 
+     /* the indirection table is stored little-endian, bounded by the entry-count check already made
+@@ -151,6 +325,7 @@
+     uint64_t base_seq;
+     BT_VARINT(base_seq);
+ 
++    btree_entry_t *const entries = scratch->entries;
+     for (uint32_t i = 0; i < ne; i++)
+     {
+         uint64_t prefix_len, suffix_len, value_size, vlog_offset;
+@@ -170,17 +345,16 @@
+          * either, since the prefix is copied from it during reconstruction */
+         const uint64_t key_size = prefix_len + suffix_len;
+         if (key_size > UINT32_MAX || value_size > UINT32_MAX) return -1;
+-        if (i == 0 ? (prefix_len != 0) : (prefix_len > n->entries[i - 1].key_size)) return -1;
++        if (i == 0 ? (prefix_len != 0) : (prefix_len > entries[i - 1].key_size)) return -1;
+ 
+         scratch->prefix_lens[i] = (size_t)prefix_len;
+         scratch->suffix_lens[i] = (size_t)suffix_len;
+-        n->entries[i].key_size = (uint32_t)key_size;
+-        n->entries[i].value_size = (uint32_t)value_size;
+-        n->entries[i].vlog_offset = vlog_offset;
+-        n->entries[i].seq = base_seq + (uint64_t)seq_delta;
+-        n->entries[i].ttl = ttl;
+-        n->entries[i].flags = data[off++];
+-        n->key_sizes[i] = n->entries[i].key_size;
++        entries[i].key_size = (uint32_t)key_size;
++        entries[i].value_size = (uint32_t)value_size;
++        entries[i].vlog_offset = vlog_offset;
++        entries[i].seq = base_seq + (uint64_t)seq_delta;
++        entries[i].ttl = ttl;
++        entries[i].flags = data[off++];
+     }
+ 
+     *offp = off;
+@@ -188,49 +362,145 @@
+ }
+ 
+ /**
++ * btree_leaf_size_sections
++ * total the keys section, the rebuilt keys and the inline values from the decoded entries, bounding
++ * each against the node before anything is sized by it
++ * @param ne the entry count
++ * @param data_size length of the encoded node
++ * @param off the offset the keys section starts at
++ * @param scratch the decoded entries, receiving the totals
++ * @return 0 on success, -1 when a section cannot fit the node
++ */
++static int btree_leaf_size_sections(const uint32_t ne, const size_t data_size, const size_t off,
++                                    btree_leaf_scratch_t *scratch)
++{
++    /* the suffixes are stored verbatim in the keys section, so their total has to fit what is left
++     * of the buffer. this also bounds every reconstructed key size, since a key is its prefix
++     * (taken from the key before it) plus its own suffix -- without it a single corrupt suffix
++     * length sizes the node in the gigabytes, which the per-key bounds check would only reject
++     * after the memory was asked for */
++    size_t total_suffix = 0;
++    for (uint32_t i = 0; i < ne; i++)
++    {
++        total_suffix += scratch->suffix_lens[i];
++        if (off > data_size || total_suffix > data_size - off) return -1;
++    }
++
++    /* prefix compression lets a reconstructed key exceed the bytes it was stored in, so this total
++     * is larger than the keys section; the overflow check keeps a corrupt node from wrapping it */
++    size_t total_keys = 0;
++    size_t total_inline = 0;
++    for (uint32_t i = 0; i < ne; i++)
++    {
++        const btree_entry_t *e = &scratch->entries[i];
++        const size_t padded = btree_align_up(e->key_size);
++        if (total_keys > SIZE_MAX - padded) return -1;
++        total_keys += padded;
++        if (e->vlog_offset == 0 && e->value_size > 0)
++        {
++            total_inline += e->value_size;
++            if (total_inline > data_size) return -1; /* cap + overflow guard */
++        }
++    }
++
++    scratch->total_suffix_bytes = total_suffix;
++    scratch->total_key_bytes = total_keys;
++    scratch->total_inline_bytes = total_inline;
++    return 0;
++}
++
++/**
++ * btree_leaf_need
++ * the exact bytes a leaf's allocations take in its arena, in the order btree_decode_leaf makes them
++ * @param ne the entry count
++ * @param scratch the sized sections
++ * @param need receives the total
++ * @return 0 on success, -1 when the total would wrap size_t
++ */
++static int btree_leaf_need(const uint32_t ne, const btree_leaf_scratch_t *scratch, size_t *need)
++{
++    const size_t meta_per_entry =
++        sizeof(btree_entry_t) + sizeof(uint8_t *) + sizeof(size_t) + sizeof(uint8_t *);
++    if ((size_t)ne > SIZE_MAX / meta_per_entry) return -1;
++
++    size_t used = 0;
++    if (btree_layout_add(&used, sizeof(btree_node_t), _Alignof(btree_node_t)) != 0) return -1;
++    if (ne == 0)
++    {
++        *need = used;
++        return 0;
++    }
++    if (btree_layout_add(&used, ne * meta_per_entry, BTREE_ARENA_ALIGNMENT) != 0) return -1;
++    if (scratch->total_key_bytes > 0 &&
++        btree_layout_add(&used, scratch->total_key_bytes, BTREE_ARENA_ALIGNMENT) != 0)
++        return -1;
++    if (scratch->total_inline_bytes > 0 &&
++        btree_layout_add(&used, scratch->total_inline_bytes, 1) != 0)
++        return -1;
++    *need = used;
++    return 0;
++}
++
++/**
++ * btree_leaf_alloc_meta
++ * carve the node's four metadata arrays out of the arena in one allocation and fill the entries
++ * and key sizes from the scratch
++ * @param n the node being built
++ * @param scratch the decoded entries
++ * @return 0 on success, -1 when the arena is exhausted
++ */
++static int btree_leaf_alloc_meta(btree_node_t *n, const btree_leaf_scratch_t *scratch)
++{
++    const uint32_t ne = n->num_entries;
++    const size_t entries_sz = ne * sizeof(btree_entry_t);
++    const size_t keys_ptr_sz = ne * sizeof(uint8_t *);
++    const size_t key_sizes_sz = ne * sizeof(size_t);
++    const size_t values_ptr_sz = ne * sizeof(uint8_t *);
++    uint8_t *meta_buf = arena_alloc(
++        n->arena, entries_sz + keys_ptr_sz + key_sizes_sz + values_ptr_sz, BTREE_ARENA_ALIGNMENT);
++    if (!meta_buf) return -1;
++
++    /* through void *, which is what says the alignment is established rather than assumed. every
++     * offset below is a whole number of entries, pointers or size_ts into an aligned block */
++    n->entries = (btree_entry_t *)(void *)meta_buf;
++    n->keys = (uint8_t **)(void *)(meta_buf + entries_sz);
++    n->key_sizes = (size_t *)(void *)(meta_buf + entries_sz + keys_ptr_sz);
++    n->values = (uint8_t **)(void *)(meta_buf + entries_sz + keys_ptr_sz + key_sizes_sz);
++
++    memcpy(n->entries, scratch->entries, entries_sz);
++    for (uint32_t i = 0; i < ne; i++) n->key_sizes[i] = n->entries[i].key_size;
++
++    /* only values needs zeroing (sparse -- vlog entries have no inline value) */
++    memset(n->values, 0, values_ptr_sz);
++    return 0;
++}
++
++/**
+  * btree_leaf_rebuild_keys
+  * rebuild every key from its shared prefix and its stored suffix, leaving the offset past the keys
+  * section
+- * @param n the node being built, with its entry metadata decoded
++ * @param n the node being built, with its entry metadata copied in
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+  * @param offp the offset the keys section starts at, advanced past it
+- * @param arena the arena the key bytes are carved from
+- * @param scratch the decoded key layout
++ * @param scratch the decoded key layout and section totals
+  * @return 0 on success, -1 when the keys section does not fit the node
+  */
+ static int btree_leaf_rebuild_keys(btree_node_t *n, const uint8_t *data, const size_t data_size,
+-                                   size_t *offp, arena_t *arena,
+-                                   const btree_leaf_scratch_t *scratch)
++                                   size_t *offp, const btree_leaf_scratch_t *scratch)
+ {
+     const uint32_t ne = n->num_entries;
+     size_t off = *offp;
+-
+-    /* the suffixes are stored verbatim in the keys section that follows, so their total has to fit
+-     * what is left of the buffer. this also bounds every reconstructed key size, since a key is its
+-     * prefix (taken from the key before it) plus its own suffix -- without it a single corrupt
+-     * suffix length sizes the allocation below in the gigabytes, which the per-key bounds check
+-     * would only reject after the memory was asked for */
+-    size_t total_suffix_bytes = 0;
+-    for (uint32_t i = 0; i < ne; i++)
++    if (scratch->total_key_bytes == 0)
+     {
+-        total_suffix_bytes += scratch->suffix_lens[i];
+-        if (off > data_size || total_suffix_bytes > data_size - off) return -1;
+-    }
+-
+-    /* single arena alloc for all key data, then carve up with pointers. prefix compression lets a
+-     * reconstructed key exceed the bytes it was stored in, so this total is larger than the keys
+-     * section; the overflow check keeps a corrupt node from wrapping it into an undersized buffer
+-     */
+-    size_t total_key_bytes = 0;
+-    for (uint32_t i = 0; i < ne; i++)
+-    {
+-        const size_t padded = btree_align_up(n->entries[i].key_size);
+-        if (total_key_bytes > SIZE_MAX - padded) return -1;
+-        total_key_bytes += padded;
++        /* every key is empty: nothing to copy, and the pointers stay at the arrays' zero */
++        for (uint32_t i = 0; i < ne; i++) n->keys[i] = (uint8_t *)n->key_sizes;
++        *offp = off;
++        return 0;
+     }
+ 
+-    uint8_t *key_buf = arena_alloc(arena, total_key_bytes, 0);
++    /* one arena allocation for all key data, then carved up with pointers */
++    uint8_t *key_buf = arena_alloc(n->arena, scratch->total_key_bytes, BTREE_ARENA_ALIGNMENT);
+     if (!key_buf) return -1;
+ 
+     const size_t keys_start = off;
+@@ -265,91 +535,116 @@
+  * @param n the node being built, with its keys rebuilt
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+- * @param offp the offset the values section starts at, advanced past it
+- * @param arena the arena the value bytes are carved from
++ * @param off the offset the values section starts at
++ * @param total_inline_bytes the inline values' total, from the sizing pass
+  * @return 0 on success, -1 when the values section does not fit the node
+  */
+ static int btree_leaf_decode_values(btree_node_t *n, const uint8_t *data, const size_t data_size,
+-                                    size_t *offp, arena_t *arena)
++                                    const size_t off, const size_t total_inline_bytes)
+ {
+     const uint32_t ne = n->num_entries;
+-    size_t off = *offp;
++    if (total_inline_bytes == 0) return 0;
++
++    BT_NEED(total_inline_bytes);
++    uint8_t *val_buf = arena_alloc(n->arena, total_inline_bytes, 1);
++    if (!val_buf) return -1;
++    memcpy(val_buf, data + off, total_inline_bytes);
+ 
+-    size_t total_inline_bytes = 0;
++    size_t val_off = 0;
+     for (uint32_t i = 0; i < ne; i++)
+     {
+         if (n->entries[i].vlog_offset == 0 && n->entries[i].value_size > 0)
+         {
+-            total_inline_bytes += n->entries[i].value_size;
+-            if (total_inline_bytes > data_size) return -1; /* cap + overflow guard */
++            n->values[i] = val_buf + val_off;
++            val_off += n->entries[i].value_size;
+         }
+     }
+-
+-    if (total_inline_bytes > 0)
+-    {
+-        BT_NEED(total_inline_bytes);
+-        uint8_t *val_buf = arena_alloc(arena, total_inline_bytes, 0);
+-        if (!val_buf) return -1;
+-        memcpy(val_buf, data + off, total_inline_bytes);
+-
+-        size_t val_off = 0;
+-        for (uint32_t i = 0; i < ne; i++)
+-        {
+-            if (n->entries[i].vlog_offset == 0 && n->entries[i].value_size > 0)
+-            {
+-                n->values[i] = val_buf + val_off;
+-                val_off += n->entries[i].value_size;
+-            }
+-        }
+-    }
+-
+-    *offp = off + total_inline_bytes;
+     return 0;
+ }
+ 
+ /**
+  * btree_decode_leaf
+- * decode a leaf node body into the arena, picking up after the type and entry count
+- * @param n the node being built, with type and num_entries already set
++ * decode a leaf node body: walk it into the thread's scratch, size what the node keeps, then build
++ * the node in an arena of exactly that size
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+  * @param off the offset just past the entry count
+- * @param arena the arena every array is carved from
++ * @param ne the entry count
++ * @param arena the caller's arena, or NULL to create an exact one
++ * @param tls the thread's decode buffers
++ * @param out receives the node
+  * @return 0 on success, -1 when the bytes do not decode
+  */
+-static int btree_decode_leaf(btree_node_t *n, const uint8_t *data, const size_t data_size,
+-                             size_t off, arena_t *arena)
++static int btree_decode_leaf(const uint8_t *data, const size_t data_size, size_t off,
++                             const uint32_t ne, arena_t *arena, btree_decode_tls_t *tls,
++                             btree_node_t **out)
+ {
+     BT_NEED(BTREE_LEAF_LINK_BYTES * 2);
+-    n->prev_offset = decode_int64_le_compat(data + off);
++    const int64_t prev_offset = decode_int64_le_compat(data + off);
+     off += BTREE_LEAF_LINK_BYTES;
+-    n->next_offset = decode_int64_le_compat(data + off);
++    const int64_t next_offset = decode_int64_le_compat(data + off);
+     off += BTREE_LEAF_LINK_BYTES;
+ 
+-    if (n->num_entries == 0) return 0;
+-
+     btree_leaf_scratch_t scratch;
+-    if (btree_leaf_alloc_arrays(n, off, data_size, arena, &scratch) != 0) return -1;
+-    if (btree_leaf_decode_entries(n, data, data_size, &off, &scratch) != 0) return -1;
+-    if (btree_leaf_rebuild_keys(n, data, data_size, &off, arena, &scratch) != 0) return -1;
+-    return btree_leaf_decode_values(n, data, data_size, &off, arena);
++    memset(&scratch, 0, sizeof(scratch));
++    if (ne > 0)
++    {
++        if (btree_leaf_scratch_init(ne, off, data_size, tls, &scratch) != 0) return -1;
++        if (btree_leaf_decode_entries(ne, data, data_size, &off, &scratch) != 0) return -1;
++        if (btree_leaf_size_sections(ne, data_size, off, &scratch) != 0) return -1;
++    }
++
++    size_t need = 0;
++    if (btree_leaf_need(ne, &scratch, &need) != 0) return -1;
++    btree_node_t *n = btree_node_begin(arena, need, BTREE_NODE_LEAF, ne);
++    if (!n) return -1;
++    n->prev_offset = prev_offset;
++    n->next_offset = next_offset;
++
++    if (ne > 0 &&
++        (btree_leaf_alloc_meta(n, &scratch) != 0 ||
++         btree_leaf_rebuild_keys(n, data, data_size, &off, &scratch) != 0 ||
++         btree_leaf_decode_values(n, data, data_size, off, scratch.total_inline_bytes) != 0))
++    {
++        btree_node_abandon(n, arena);
++        return -1;
++    }
++    *out = n;
++    return 0;
+ }
+ 
+ /**
+- * btree_decode_internal
+- * decode an internal node body into the arena, picking up after the type and key count
+- * @param n the node being built, with type and num_entries already set
++ * btree_internal_scratch_t
++ * what an internal node decode reads before it can size the node, in the thread's scratch buffer
++ * @param child_offsets the decoded child offsets
++ * @param key_sizes each separator key's size
++ * @param total_key_bytes the separators' bytes, each padded to the arena alignment
++ */
++typedef struct
++{
++    int64_t *child_offsets;
++    size_t *key_sizes;
++    size_t total_key_bytes;
++} btree_internal_scratch_t;
++
++/**
++ * btree_internal_scan
++ * decode an internal node's child offsets and key sizes into the scratch and total its separators,
++ * leaving the offset at the separator bytes
+  * @param data the encoded node bytes, untrusted
+  * @param data_size length of data
+- * @param off the offset just past the key count
+- * @param arena the arena every array is carved from
++ * @param offp the offset just past the key count, advanced to the separators
++ * @param num_keys the key count
++ * @param tls the thread's decode buffers
++ * @param scratch receives the arrays and the total
+  * @return 0 on success, -1 when the bytes do not decode
+  */
+-static int btree_decode_internal(btree_node_t *n, const uint8_t *data, const size_t data_size,
+-                                 size_t off, arena_t *arena)
++static int btree_internal_scan(const uint8_t *data, const size_t data_size, size_t *offp,
++                               const uint32_t num_keys, btree_decode_tls_t *tls,
++                               btree_internal_scratch_t *scratch)
+ {
+     const uint8_t *const end = data + data_size;
+-    const uint32_t num_keys = n->num_entries;
++    size_t off = *offp;
+ 
+     /* each child contributes at least a one-byte delta varint and each separator at least a
+      * one-byte size varint, so a count that exceeds the bytes left is corrupt. rejecting it
+@@ -358,26 +653,14 @@
+     if (off > data_size || (size_t)num_keys >= data_size - off) return -1;
+ 
+     const uint32_t num_children = num_keys + 1;
+-
+-    /* the arrays below are sized from num_children, so reject a count whose combined
+-     * allocation would wrap size_t before any of it is computed */
+-    const size_t internal_per_entry = sizeof(int64_t) + sizeof(uint8_t *) + sizeof(size_t);
+-    if ((size_t)num_children > SIZE_MAX / internal_per_entry) return -1;
+-
+-    /* single arena alloc for child_offsets + keys ptrs + key_sizes */
+-    const size_t child_sz = num_children * sizeof(int64_t);
+-    const size_t ikeys_ptr_sz = num_keys * sizeof(uint8_t *);
+-    const size_t ikey_sizes_sz = num_keys * sizeof(size_t);
+-    const size_t internal_total = child_sz + ikeys_ptr_sz + ikey_sizes_sz;
+-    uint8_t *ibuf = arena_alloc(arena, internal_total, 0);
+-    if (!ibuf) return -1;
+-
+-    n->child_offsets = (int64_t *)(void *)ibuf;
+-    n->keys = (num_keys > 0) ? (uint8_t **)(void *)(ibuf + child_sz) : NULL;
+-    n->key_sizes = (num_keys > 0) ? (size_t *)(void *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
++    const size_t child_sz = (size_t)num_children * sizeof(int64_t);
++    uint8_t *buf = btree_tls_buf_get(&tls->scratch, child_sz + (size_t)num_keys * sizeof(size_t));
++    if (!buf) return -1;
++    scratch->child_offsets = (int64_t *)(void *)buf;
++    scratch->key_sizes = (size_t *)(void *)(buf + child_sz);
+ 
+     BT_NEED(8);
+-    int64_t base_offset = decode_int64_le_compat(data + off);
++    const int64_t base_offset = decode_int64_le_compat(data + off);
+     off += 8;
+ 
+     /* decode delta-encoded child offsets */
+@@ -391,7 +674,7 @@
+          * so the wrap is defined; an offset that ends up nonsensical fails when the child is
+          * read, which is the transient path the descent already handles */
+         const int64_t child = (int64_t)((uint64_t)prev_offset + (uint64_t)delta);
+-        n->child_offsets[i] = child;
++        scratch->child_offsets[i] = child;
+         prev_offset = child;
+     }
+ 
+@@ -401,19 +684,18 @@
+         uint64_t key_size;
+         BT_VARINT(key_size);
+         if (key_size > UINT32_MAX) return -1;
+-        n->key_sizes[i] = (size_t)key_size;
++        scratch->key_sizes[i] = (size_t)key_size;
+     }
+ 
+-    /* single arena alloc for all separator key data */
+     size_t total_ikey_bytes = 0;
+     size_t raw_ikey_bytes = 0;
+     for (uint32_t i = 0; i < num_keys; i++)
+     {
+-        const size_t padded = (n->key_sizes[i] + 7) & ~(size_t)7;
++        const size_t padded = btree_align_up(scratch->key_sizes[i]);
+         if (total_ikey_bytes > SIZE_MAX - padded) return -1;
+         total_ikey_bytes += padded;
+-        if (raw_ikey_bytes > SIZE_MAX - n->key_sizes[i]) return -1;
+-        raw_ikey_bytes += n->key_sizes[i];
++        if (raw_ikey_bytes > SIZE_MAX - scratch->key_sizes[i]) return -1;
++        raw_ikey_bytes += scratch->key_sizes[i];
+     }
+ 
+     /* separator keys are stored verbatim, so every one of those bytes has to be present in what
+@@ -422,21 +704,77 @@
+      * only catch after the memory was already asked for */
+     if (off > data_size || raw_ikey_bytes > data_size - off) return -1;
+ 
+-    if (total_ikey_bytes > 0)
++    scratch->total_key_bytes = total_ikey_bytes;
++    *offp = off;
++    return 0;
++}
++
++/**
++ * btree_decode_internal
++ * decode an internal node body: scan it into the thread's scratch, size what the node keeps, then
++ * build the node in an arena of exactly that size
++ * @param data the encoded node bytes, untrusted
++ * @param data_size length of data
++ * @param off the offset just past the key count
++ * @param num_keys the key count
++ * @param arena the caller's arena, or NULL to create an exact one
++ * @param tls the thread's decode buffers
++ * @param out receives the node
++ * @return 0 on success, -1 when the bytes do not decode
++ */
++static int btree_decode_internal(const uint8_t *data, const size_t data_size, size_t off,
++                                 const uint32_t num_keys, arena_t *arena, btree_decode_tls_t *tls,
++                                 btree_node_t **out)
++{
++    btree_internal_scratch_t scratch;
++    if (btree_internal_scan(data, data_size, &off, num_keys, tls, &scratch) != 0) return -1;
++
++    const uint32_t num_children = num_keys + 1;
++    const size_t internal_per_entry = sizeof(int64_t) + sizeof(uint8_t *) + sizeof(size_t);
++    if ((size_t)num_children > SIZE_MAX / internal_per_entry) return -1;
++    const size_t child_sz = num_children * sizeof(int64_t);
++    const size_t ikeys_ptr_sz = num_keys * sizeof(uint8_t *);
++    const size_t ikey_sizes_sz = num_keys * sizeof(size_t);
++
++    size_t need = 0;
++    if (btree_layout_add(&need, sizeof(btree_node_t), _Alignof(btree_node_t)) != 0 ||
++        btree_layout_add(&need, child_sz + ikeys_ptr_sz + ikey_sizes_sz, BTREE_ARENA_ALIGNMENT) !=
++            0 ||
++        (scratch.total_key_bytes > 0 &&
++         btree_layout_add(&need, scratch.total_key_bytes, BTREE_ARENA_ALIGNMENT) != 0))
++        return -1;
++
++    btree_node_t *n = btree_node_begin(arena, need, BTREE_NODE_INTERNAL, num_keys);
++    if (!n) return -1;
++
++    /* one arena allocation for child_offsets + keys ptrs + key_sizes */
++    uint8_t *ibuf =
++        arena_alloc(n->arena, child_sz + ikeys_ptr_sz + ikey_sizes_sz, BTREE_ARENA_ALIGNMENT);
++    uint8_t *ikey_buf = (ibuf && scratch.total_key_bytes > 0)
++                            ? arena_alloc(n->arena, scratch.total_key_bytes, BTREE_ARENA_ALIGNMENT)
++                            : NULL;
++    if (!ibuf || (scratch.total_key_bytes > 0 && !ikey_buf))
+     {
+-        uint8_t *ikey_buf = arena_alloc(arena, total_ikey_bytes, 0);
+-        if (!ikey_buf) return -1;
++        btree_node_abandon(n, arena);
++        return -1;
++    }
+ 
+-        size_t ikey_off = 0;
+-        for (uint32_t i = 0; i < num_keys; i++)
+-        {
+-            n->keys[i] = ikey_buf + ikey_off;
+-            BT_NEED(n->key_sizes[i]);
+-            memcpy(n->keys[i], data + off, n->key_sizes[i]);
+-            off += n->key_sizes[i];
+-            ikey_off += (n->key_sizes[i] + 7) & ~(size_t)7;
+-        }
++    n->child_offsets = (int64_t *)(void *)ibuf;
++    n->keys = (num_keys > 0) ? (uint8_t **)(void *)(ibuf + child_sz) : NULL;
++    n->key_sizes = (num_keys > 0) ? (size_t *)(void *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
++    memcpy(n->child_offsets, scratch.child_offsets, child_sz);
++    if (num_keys > 0) memcpy(n->key_sizes, scratch.key_sizes, ikey_sizes_sz);
++
++    /* the separators were bounded against the node by the scan, so each copy stays inside it */
++    size_t ikey_off = 0;
++    for (uint32_t i = 0; i < num_keys; i++)
++    {
++        n->keys[i] = ikey_buf ? ikey_buf + ikey_off : (uint8_t *)n->key_sizes;
++        if (n->key_sizes[i]) memcpy(n->keys[i], data + off, n->key_sizes[i]);
++        off += n->key_sizes[i];
++        ikey_off += btree_align_up(n->key_sizes[i]);
+     }
++    *out = n;
+     return 0;
+ }
+ 
+@@ -446,42 +784,45 @@
+ 
+ /**
+  * btree_node_deserialize_arena
+- * deserializes a node from optimized format using arena allocation
+- * all memory is allocated from the arena for O(1) bulk deallocation
++ * deserializes a node from optimized format. the node is walked first, then built in one arena:
++ * the caller's, or one created here sized exactly to what the node keeps, so a cached node reserves
++ * what it holds rather than a pooled chunk. everything the node keeps is copied into that arena;
++ * nothing it holds points into data or into the thread's scratch
+  * @param data node bytes
+  * @param data_size node size
+  * @param node output parameter for deserialized node
+- * @param arena arena allocator to use
++ * @param arena the arena to build in, or NULL to create an exact one (destroyed here on failure; a
++ * caller's arena is the caller's to destroy on failure)
+  * @return 0 on success, -1 on failure
+  */
+ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_size,
+                                         btree_node_t **node, arena_t *arena)
+ {
+-    if (!data || data_size < 2 || !node || !arena) return -1;
+-
+-    btree_node_t *n = arena_alloc(arena, sizeof(btree_node_t), 0);
+-    if (!n) return -1;
+-    memset(n, 0, sizeof(btree_node_t));
+-    n->arena = arena;
++    if (!data || data_size < 2 || !node) return -1;
+ 
+     size_t off = 0;
+-    n->type = data[off++]; /* data_size >= 2 guarantees this byte */
++    const uint8_t type = data[off++]; /* data_size >= 2 guarantees this byte */
+ 
+     /* only these two kinds have a decode. any other value would leave the entry count set from
+      * the input while the key, value and child arrays stayed null, and a reader binary-searches
+      * those arrays against that count, so a node like that reads as valid and dereferences null */
+-    if (n->type != BTREE_NODE_LEAF && n->type != BTREE_NODE_INTERNAL) return -1;
++    if (type != BTREE_NODE_LEAF && type != BTREE_NODE_INTERNAL) return -1;
+ 
+     uint64_t entry_count;
+     const size_t vn = btree_varint_decode_bounded(data + off, data + data_size, &entry_count);
+     if (vn == 0) return -1;
+     off += vn;
+     if (entry_count > UINT32_MAX) return -1;
+-    n->num_entries = (uint32_t)entry_count;
+ 
+-    const int rc = n->type == BTREE_NODE_LEAF
+-                       ? btree_decode_leaf(n, data, data_size, off, arena)
+-                       : btree_decode_internal(n, data, data_size, off, arena);
++    btree_decode_tls_t *tls = btree_decode_tls();
++    if (!tls) return -1;
++
++    btree_node_t *n = NULL;
++    const int rc =
++        type == BTREE_NODE_LEAF
++            ? btree_decode_leaf(data, data_size, off, (uint32_t)entry_count, arena, tls, &n)
++            : btree_decode_internal(data, data_size, off, (uint32_t)entry_count, arena, tls, &n);
++    btree_tls_buf_trim(&tls->scratch);
+     if (rc != 0) return rc;
+ 
+     *node = n;
+@@ -549,20 +890,25 @@
+ /**
+  * btree_node_decode_block
+  * run a stored node's bytes back through the encoding chain that wrote them, restoring the leaf
+- * links the encoder lifted out into the plaintext header
++ * links the encoder lifted out into the plaintext header. a single-stage chain decodes into the
++ * thread's plain buffer, grown to the header's original size, so a read allocates nothing for it; a
++ * stacked chain still takes an owned buffer
+  * @param block_data the block as it sits on disk, laid out
+  *                   [original_size:4][prev_offset:8][next_offset:8][encoded]
+  * @param block_size the block's length in bytes
+  * @param codec the encoding chain the node was written with
+  * @param codec_count how many stages codec holds
+  * @param offset the node's file offset, for the log lines
+- * @param out receives the freshly allocated plaintext, the caller's to free
++ * @param tls the thread's decode buffers
++ * @param out receives the plaintext, in the thread's plain buffer or in *owned
+  * @param out_size receives the plaintext length
++ * @param owned receives an allocation the caller frees, or NULL when out is the thread's buffer
+  * @return 0 on success, -1 when the chain failed or produced a length the header disagrees with
+  */
+ static int btree_node_decode_block(const uint8_t *block_data, const uint32_t block_size,
+                                    const tidesdb_encoding_stage_t *codec, const int codec_count,
+-                                   const int64_t offset, uint8_t **out, size_t *out_size)
++                                   const int64_t offset, btree_decode_tls_t *tls, uint8_t **out,
++                                   size_t *out_size, uint8_t **owned)
+ {
+     const uint32_t original_size = decode_uint32_le_compat(block_data);
+     const int64_t header_prev_offset =
+@@ -574,8 +920,22 @@
+ 
+     uint8_t *plain = NULL;
+     size_t plain_size = 0;
+-    if (tidesdb_encoding_stages_decode(codec, codec_count, encoded, encoded_size, &plain,
+-                                       &plain_size) != TDB_SUCCESS)
++    int rc;
++    *owned = NULL;
++    if (codec_count == 1)
++    {
++        plain = btree_tls_buf_get(&tls->plain, original_size);
++        if (!plain) return -1;
++        rc = tidesdb_encoding_stages_decode_into(codec, codec_count, encoded, encoded_size, plain,
++                                                 tls->plain.cap, &plain_size);
++    }
++    else
++    {
++        rc = tidesdb_encoding_stages_decode(codec, codec_count, encoded, encoded_size, &plain,
++                                            &plain_size);
++        if (rc == TDB_SUCCESS) *owned = plain;
++    }
++    if (rc != TDB_SUCCESS)
+     {
+         TDB_DEBUG_LOG(TDB_LOG_ERROR, "node decode failed at offset %lld, %d stages, %zu bytes",
+                       (long long)offset, codec_count, encoded_size);
+@@ -587,7 +947,8 @@
+          * different pipeline than the one recorded, not that the stored bytes are damaged */
+         TDB_DEBUG_LOG(TDB_LOG_ERROR, "node decode length mismatch at offset %lld, got %zu want %u",
+                       (long long)offset, plain_size, original_size);
+-        free(plain);
++        free(*owned);
++        *owned = NULL;
+         return -1;
+     }
+ 
+@@ -619,6 +980,9 @@
+                                const tidesdb_encoding_stage_t *codec, const int codec_count,
+                                arena_pool_t *pool, const uint32_t node_size_hint)
+ {
++    /* a decoded node now takes an arena sized exactly to itself rather than a chunk from the pool,
++     * so the pool goes unused here; the parameter stays for the callers that thread it through */
++    (void)pool;
+     if (!bm || offset < 0 || !node) return -1;
+ 
+     /* borrow the verified block rather than take an owned copy -- deserialization copies what it
+@@ -632,36 +996,27 @@
+ 
+     const uint8_t *data = block_data_ptr;
+     size_t data_size = block_size;
+-    uint8_t *decompressed = NULL;
++    uint8_t *owned = NULL;
++    btree_decode_tls_t *tls = NULL;
+ 
+     if (codec_count > 0 && block_size > BTREE_COMPRESSED_NODE_HEADER_SIZE)
+     {
+-        if (btree_node_decode_block(block_data_ptr, block_size, codec, codec_count, offset,
+-                                    &decompressed, &data_size) != 0)
++        /* the plain buffer is distinct from the block manager's read buffer the block was borrowed
++         * from, so decoding one into the other is safe */
++        tls = btree_decode_tls();
++        uint8_t *plain = NULL;
++        if (!tls || btree_node_decode_block(block_data_ptr, block_size, codec, codec_count, offset,
++                                            tls, &plain, &data_size, &owned) != 0)
+             return -1;
+-        data = decompressed;
+-    }
+-
+-    /* one arena per node rather than the N+7 separate allocations the deserialized form would
+-     * otherwise take, so btree_node_free releases the whole node by destroying it */
+-    arena_t *arena = arena_create(pool);
+-    if (!arena)
+-    {
+-        free(decompressed);
+-        return -1;
++        data = plain;
+     }
+ 
+-    const int result = btree_node_deserialize_arena(data, data_size, node, arena);
+-    if (result == 0)
+-    {
+-        (*node)->block_offset = offset;
+-    }
+-    else
+-    {
+-        arena_destroy(arena);
+-    }
++    /* the node is built in one exact arena, so btree_node_free releases it by destroying that */
++    const int result = btree_node_deserialize_arena(data, data_size, node, NULL);
++    if (result == 0) (*node)->block_offset = offset;
+ 
+-    free(decompressed);
++    free(owned);
++    if (tls) btree_tls_buf_trim(&tls->plain);
+     return result;
+ }
+ 
+@@ -705,9 +1060,10 @@
+                                    (uint32_t)tree->config.target_node_size) != 0)
+         return -1;
+ 
+-    /* what the arena reserved, not what the node used. the node's chunk is rounded up to the
+-     * pool's chunk size and stays held for as long as the cache keeps the node, so charging the
+-     * used figure lets the cache hold several times the budget it was given */
++    /* what the arena reserved, which is what the process holds for as long as the cache keeps the
++     * node. the arena is sized exactly to the node, so this is within a block header and alignment
++     * of what the node uses; were it ever not -- an arena from a pool rounds up to a whole chunk --
++     * charging the used figure would let the cache hold more than the budget it was given */
+     const size_t cost =
+         sizeof(btree_node_t) + (fresh->arena ? arena_bytes_reserved(fresh->arena) : 0);
+     (void)cache_put(tree->node_cache, tree->cache_key_prefix, (uint64_t)offset, fresh, 0, cost,
+--- a/src/engine/engine.c
++++ b/src/engine/engine.c
+@@ -38,7 +38,11 @@
+ #define ENGINE_ARENA_CHUNK_SIZE (1u << 20)  /* 1 MiB chunks */
+ #define ENGINE_ARENA_MAX_CACHED (16u << 20) /* retain up to 16 MiB of freed chunks */
+ 
+-/* the pool a decoded btree node carves its arena from. a node's decode needs about twice the node
++/* the pool a decoded btree node used to carve its arena from. a decoded node is now built in one
++ * arena sized exactly to what it keeps (arena_create_exact), so the block cache charges about the
++ * node rather than a chunk twice its size and the pool sits idle; it stays because the families,
++ * flush and compaction still thread it through to the btree config. the history below is why it
++ * was sized the way it is. a node's decode needs about twice the node
+  * size, and a cached node holds its chunk for as long as it stays cached -- so the chunk is sized
+  * to one node's decode rather than to the memtable's much larger unit. drawing from the memtable
+  * pool instead would park a megabyte per cached node to use a fraction of it, and the block cache
+--- /dev/null
++++ b/test/btree_node_arena__tests.c
+@@ -0,0 +1,554 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* a decoded btree node is sized before it is built: the decode walks the node into thread-local
++ * scratch, adds up what the node keeps, and carves it all out of one exact arena block, so the node
++ * cache, which charges what the arena reserved, is charged about what the node holds rather than a
++ * pooled chunk twice its size. a compressed node is decompressed into a thread-local buffer rather
++ * than a fresh allocation per read. these cases check that the sizing is right (nothing spills out
++ * of the block, reserved is within a few bytes of allocated), that the cache now holds more nodes
++ * per byte, that a miss allocates about once, and that every read returns what it did before, for
++ * each codec this build has and three node sizes */
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/base/arena.h"
++#include "../src/base/encoding/compress.h"
++#include "../src/base/encoding/encoding.h"
++#include "../src/base/errors.h"
++#include "../src/cache/cache.h"
++#include "../src/io/block_manager.h"
++#include "../src/sstable/btree/btree.h"
++#include "../src/sstable/btree/btree_internal.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define NA_DIR        "." PATH_SEPARATOR "test_btree_node_arena"
++#define NA_DIR_MODE   0755
++#define NA_KLOG       NA_DIR PATH_SEPARATOR "1.klog"
++#define NA_KEYS       50000
++#define NA_KEY_MAX    32
++#define NA_VALUE_MIN  10
++#define NA_VALUE_MAX  300
++#define NA_CACHE      (64u << 20)
++#define NA_POOL_CHUNK (2 * 4096) /* what the engine's node pool uses for 4 KiB nodes */
++
++/* allocation counting, as in the builder arena suite: the binary's own malloc family forwards to
++ * glibc and counts while enabled. a sanitizer owns the allocator, so the override and the case that
++ * needs it exist only when NODE_ARENA_COUNT_ALLOCS is defined, which the build does without one */
++#ifdef NODE_ARENA_COUNT_ALLOCS
++extern void *__libc_malloc(size_t);
++extern void *__libc_calloc(size_t, size_t);
++extern void *__libc_realloc(void *, size_t);
++extern void __libc_free(void *);
++
++static volatile int g_counting = 0;
++static volatile uint64_t g_allocs = 0;
++
++void *malloc(size_t n)
++{
++    if (g_counting) g_allocs++;
++    return __libc_malloc(n);
++}
++
++void *calloc(size_t a, size_t b)
++{
++    if (g_counting) g_allocs++;
++    return __libc_calloc(a, b);
++}
++
++void *realloc(void *p, size_t n)
++{
++    if (g_counting) g_allocs++;
++    return __libc_realloc(p, n);
++}
++
++void free(void *p)
++{
++    __libc_free(p);
++}
++#endif
++
++static tidesdb_encoding_registry_t g_reg;
++static tidesdb_encoding_stage_t g_lz4[1];
++static tidesdb_encoding_stage_t g_zstd[1];
++
++typedef struct
++{
++    const char *name;
++    const tidesdb_encoding_stage_t *codec;
++    int codec_count;
++} na_mode_t;
++
++static na_mode_t g_modes[3];
++static int g_mode_count = 0;
++
++static const size_t g_node_sizes[] = {4096, 16384, 65536};
++#define NA_NODE_SIZE_COUNT (sizeof(g_node_sizes) / sizeof(g_node_sizes[0]))
++
++/* the codecs this build can run: none always, lz4 and zstd when built with compression */
++static int na_init_codecs(void)
++{
++    if (tidesdb_encoding_registry_init(&g_reg) != TDB_SUCCESS) return 0;
++    g_modes[g_mode_count++] = (na_mode_t){"none", NULL, 0};
++    const uint8_t lz4[1] = {TDB_COMPRESS_LZ4};
++    if (tidesdb_encoding_resolve(&g_reg, lz4, 1, g_lz4, 1) == 1)
++        g_modes[g_mode_count++] = (na_mode_t){"lz4", g_lz4, 1};
++    else
++        printf("lz4 unavailable in this build\n");
++    const uint8_t zstd[1] = {TDB_COMPRESS_ZSTD};
++    if (tidesdb_encoding_resolve(&g_reg, zstd, 1, g_zstd, 1) == 1)
++        g_modes[g_mode_count++] = (na_mode_t){"zstd", g_zstd, 1};
++    else
++        printf("zstd unavailable in this build\n");
++    return 1;
++}
++
++static const na_mode_t *na_mode(const char *name)
++{
++    for (int i = 0; i < g_mode_count; i++)
++        if (strcmp(g_modes[i].name, name) == 0) return &g_modes[i];
++    return NULL;
++}
++
++static uint32_t na_hash(uint64_t i)
++{
++    uint64_t x = i * 0x9E3779B97F4A7C15ULL + 0x7654321ULL;
++    x ^= x >> 29;
++    x *= 0xBF58476D1CE4E5B9ULL;
++    x ^= x >> 32;
++    return (uint32_t)x;
++}
++
++/* entry i: a key that sorts by i, and a value of 10-300 bytes */
++static size_t na_key(uint8_t *buf, uint64_t i)
++{
++    return (size_t)snprintf((char *)buf, NA_KEY_MAX, "node%010" PRIu64, i);
++}
++
++static size_t na_value(uint8_t *buf, uint64_t i)
++{
++    const size_t n = NA_VALUE_MIN + na_hash(i) % (NA_VALUE_MAX - NA_VALUE_MIN + 1);
++    for (size_t j = 0; j < n; j++) buf[j] = (uint8_t)(i * 7 + j * 13);
++    return n;
++}
++
++static void na_check_entry(const uint8_t *k, size_t ks, const uint8_t *v, size_t vs, uint64_t i)
++{
++    uint8_t wk[NA_KEY_MAX], wv[NA_VALUE_MAX];
++    const size_t wks = na_key(wk, i);
++    const size_t wvs = na_value(wv, i);
++    ASSERT_EQ(ks, wks);
++    ASSERT_EQ(memcmp(k, wk, ks), 0);
++    ASSERT_EQ(vs, wvs);
++    ASSERT_EQ(memcmp(v, wv, vs), 0);
++}
++
++/* one table on disk with its builder's tree */
++typedef struct
++{
++    block_manager_t *bm;
++    btree_builder_t *builder;
++    btree_t *tree;
++    cache_t *cache;
++    arena_pool_t *pool;
++    btree_config_t cfg;
++} na_table_t;
++
++static void na_build(na_table_t *t, const na_mode_t *m, size_t node_size, uint64_t n)
++{
++    memset(t, 0, sizeof(*t));
++    (void)remove_directory(NA_DIR);
++    ASSERT_EQ(mkdir(NA_DIR, NA_DIR_MODE), 0);
++    ASSERT_EQ(block_manager_open(&t->bm, NA_KLOG, BLOCK_MANAGER_SYNC_NONE), 0);
++    t->pool = arena_pool_create(NA_POOL_CHUNK, NA_CACHE);
++    ASSERT_TRUE(t->pool != NULL);
++    t->cfg = (btree_config_t){.target_node_size = node_size,
++                              .codec = m->codec,
++                              .codec_count = m->codec_count,
++                              .arena_pool = t->pool};
++    ASSERT_EQ(btree_builder_new(&t->builder, t->bm, &t->cfg), 0);
++    uint8_t k[NA_KEY_MAX], v[NA_VALUE_MAX];
++    for (uint64_t i = 0; i < n; i++)
++    {
++        const size_t ks = na_key(k, i);
++        const size_t vs = na_value(v, i);
++        ASSERT_EQ(btree_builder_add(t->builder, k, ks, v, vs, 0, i + 1, 0, 0), 0);
++    }
++    ASSERT_EQ(btree_builder_finish(t->builder, &t->tree), 0);
++    t->tree->config.arena_pool = t->pool;
++
++    const cache_config_t cc = {.capacity_bytes = NA_CACHE};
++    t->cache = cache_create(&cc);
++    ASSERT_TRUE(t->cache != NULL);
++    btree_set_node_cache(t->tree, t->cache, 0x5eed);
++}
++
++static void na_drop(na_table_t *t)
++{
++    btree_free(t->tree);
++    btree_builder_free(t->builder);
++    (void)block_manager_close(t->bm);
++    cache_destroy(t->cache);
++    arena_pool_destroy(t->pool);
++    (void)remove_directory(NA_DIR);
++}
++
++static void na_point_gets(btree_t *tree, uint64_t n, uint64_t step)
++{
++    uint8_t k[NA_KEY_MAX + 1];
++    for (uint64_t i = 0; i < n; i += step)
++    {
++        const size_t ks = na_key(k, i);
++        uint8_t *gv = NULL;
++        size_t gvs = 0;
++        uint64_t vlog = 0, seq = 0;
++        int64_t ttl = 0;
++        uint8_t del = 0;
++        ASSERT_EQ(btree_get(tree, k, ks, &gv, &gvs, &vlog, &seq, &ttl, &del), 0);
++        na_check_entry(k, ks, gv, gvs, i);
++        ASSERT_EQ(seq, i + 1);
++        ASSERT_EQ(del, 0);
++        free(gv);
++
++        /* a key just past this one is absent */
++        k[ks] = '!';
++        gv = NULL;
++        ASSERT_TRUE(btree_get(tree, k, ks + 1, &gv, &gvs, &vlog, &seq, &ttl, &del) != 0);
++        free(gv);
++    }
++}
++
++static void na_scan(btree_t *tree, uint64_t n, int backward)
++{
++    btree_cursor_t *c = NULL;
++    ASSERT_EQ(btree_cursor_init(&c, tree), 0);
++    ASSERT_EQ(backward ? btree_cursor_goto_last(c) : btree_cursor_goto_first(c), 0);
++    uint64_t seen = 0;
++    while (btree_cursor_valid(c))
++    {
++        uint8_t *k = NULL, *v = NULL;
++        size_t ks = 0, vs = 0;
++        uint64_t vlog = 0, seq = 0;
++        int64_t ttl = 0;
++        uint8_t del = 0;
++        ASSERT_EQ(btree_cursor_get(c, &k, &ks, &v, &vs, &vlog, &seq, &ttl, &del), 0);
++        const uint64_t i = backward ? n - 1 - seen : seen;
++        na_check_entry(k, ks, v, vs, i);
++        ASSERT_EQ(seq, i + 1);
++        seen++;
++        if ((backward ? btree_cursor_prev(c) : btree_cursor_next(c)) != 0) break;
++    }
++    ASSERT_EQ(seen, n);
++    ASSERT_EQ(btree_cursor_read_failed(c), 0);
++    btree_cursor_free(c);
++}
++
++/* the offsets of up to max leaves, first to last, read without the cache */
++static size_t na_leaf_offsets(const na_table_t *t, int64_t *out, size_t max)
++{
++    size_t got = 0;
++    int64_t off = t->tree->first_leaf_offset;
++    while (off >= 0 && got < max)
++    {
++        btree_node_t *node = NULL;
++        ASSERT_EQ(btree_node_read_with_codec(t->bm, off, &node, t->cfg.codec, t->cfg.codec_count,
++                                             t->pool, (uint32_t)t->cfg.target_node_size),
++                  0);
++        ASSERT_EQ(node->type, BTREE_NODE_LEAF);
++        out[got++] = off;
++        off = node->next_offset;
++        btree_node_free(node);
++    }
++    return got;
++}
++
++/* every allocation a node decode makes fits the exact block it sized: none spills, for point
++ * gets and both cursors over every codec and node size */
++static void test_exact_arena_holds_whole_node(void)
++{
++    for (int mi = 0; mi < g_mode_count; mi++)
++    {
++        for (size_t si = 0; si < NA_NODE_SIZE_COUNT; si++)
++        {
++            na_table_t t;
++            na_build(&t, &g_modes[mi], g_node_sizes[si], NA_KEYS);
++            const int64_t before = arena_exact_overflows();
++            na_point_gets(t.tree, NA_KEYS, 3);
++            na_scan(t.tree, NA_KEYS, 0);
++            na_scan(t.tree, NA_KEYS, 1);
++            ASSERT_EQ(arena_exact_overflows() - before, 0);
++            na_drop(&t);
++        }
++    }
++}
++
++/* a cached node's arena reserves what it allocated plus the block header and alignment: within
++ * 64 bytes, for leaves and for the root */
++static void test_reserved_near_allocated(void)
++{
++    int64_t offs[500];
++    for (int mi = 0; mi < g_mode_count; mi++)
++    {
++        for (size_t si = 0; si < NA_NODE_SIZE_COUNT; si++)
++        {
++            na_table_t t;
++            na_build(&t, &g_modes[mi], g_node_sizes[si], NA_KEYS);
++            const size_t n = na_leaf_offsets(&t, offs, 500);
++            ASSERT_TRUE(n >= 20);
++            size_t worst = 0;
++            for (size_t i = 0; i <= n; i++)
++            {
++                const int64_t off = i < n ? offs[i] : t.tree->root_offset;
++                btree_node_t *node = NULL;
++                cache_entry_t *pin = NULL;
++                ASSERT_EQ(btree_node_read_cached(t.tree, off, &node, &pin), 0);
++                ASSERT_TRUE(pin != NULL);
++                const size_t res = arena_bytes_reserved(node->arena);
++                const size_t alloc = arena_bytes_allocated(node->arena);
++                ASSERT_TRUE(res >= alloc);
++                if (res - alloc > worst) worst = res - alloc;
++                btree_node_done(node, pin);
++            }
++            printf("\n  %s %zu: worst reserved - allocated %zu over %zu leaves and the root",
++                   g_modes[mi].name, g_node_sizes[si], worst, n);
++            fflush(stdout);
++            ASSERT_TRUE(worst <= 64);
++            na_drop(&t);
++        }
++    }
++    printf("\n");
++}
++
++/* 4 KiB lz4 leaves: 2000 distinct leaves read into a 64 MiB cache are charged under 6 KiB each,
++ * where a pooled 8 KiB chunk per node charged over 8 KiB */
++static void test_cache_charges_under_six_kib_per_leaf(void)
++{
++    const na_mode_t *m = na_mode("lz4");
++    if (!m)
++    {
++        printf("  skipped: lz4 unavailable\n");
++        return;
++    }
++    enum
++    {
++        LEAVES = 2000
++    };
++    static int64_t offs[LEAVES];
++    na_table_t t;
++    na_build(&t, m, 4096, 3 * NA_KEYS / 2);
++    ASSERT_EQ(na_leaf_offsets(&t, offs, LEAVES), (size_t)LEAVES);
++    for (size_t i = 0; i < LEAVES; i++)
++    {
++        btree_node_t *node = NULL;
++        cache_entry_t *pin = NULL;
++        ASSERT_EQ(btree_node_read_cached(t.tree, offs[i], &node, &pin), 0);
++        btree_node_done(node, pin);
++    }
++    cache_stats_t st;
++    cache_get_stats(t.cache, &st);
++    ASSERT_EQ(st.entries, (uint64_t)LEAVES);
++    const uint64_t per_leaf = st.bytes_used / st.entries;
++    printf("\n  %" PRIu64 " bytes charged per cached 4 KiB lz4 leaf (%" PRIu64 " leaves)\n",
++           per_leaf, st.entries);
++    fflush(stdout);
++    ASSERT_TRUE(per_leaf < 6144);
++    na_drop(&t);
++}
++
++#ifdef NODE_ARENA_COUNT_ALLOCS
++/* 1000 cache-miss reads of compressed 4 KiB leaves allocate about once each: the node's arena,
++ * where the decompressed copy and a separate arena chunk each cost one more */
++static void test_decode_mallocs_per_miss(void)
++{
++    enum
++    {
++        READS = 1000
++    };
++    static int64_t offs[READS];
++    int ran = 0;
++    for (int mi = 0; mi < g_mode_count; mi++)
++    {
++        const na_mode_t *m = &g_modes[mi];
++        if (m->codec_count == 0) continue;
++        ran = 1;
++        na_table_t t;
++        na_build(&t, m, 4096, NA_KEYS);
++        ASSERT_EQ(na_leaf_offsets(&t, offs, READS), (size_t)READS);
++
++        btree_node_t *nodes[1];
++        g_allocs = 0;
++        g_counting = 1;
++        for (size_t i = 0; i < READS; i++)
++        {
++            nodes[0] = NULL;
++            const int rc =
++                btree_node_read_with_codec(t.bm, offs[i], &nodes[0], t.cfg.codec, t.cfg.codec_count,
++                                           t.pool, (uint32_t)t.cfg.target_node_size);
++            if (rc != 0) g_counting = 0;
++            ASSERT_EQ(rc, 0);
++            btree_node_free(nodes[0]);
++        }
++        g_counting = 0;
++        printf("\n  %s: %" PRIu64 " allocations for %d leaf reads\n", m->name, g_allocs, READS);
++        fflush(stdout);
++        ASSERT_TRUE(g_allocs <= 1100);
++        na_drop(&t);
++    }
++    if (!ran) printf("  skipped: no compression codec in this build\n");
++}
++#endif
++
++/* an exact arena serves what it was sized for from its block, and an allocation past that from a
++ * block of its own, counted, accounted and freed with the arena */
++static void test_exact_arena_overflow_falls_back(void)
++{
++    arena_t *a = arena_create_exact(100);
++    ASSERT_TRUE(a != NULL);
++    const size_t reserved = arena_bytes_reserved(a);
++    ASSERT_TRUE(reserved >= 100 && reserved <= 100 + 64);
++
++    const int64_t before = arena_exact_overflows();
++    uint8_t *p = arena_alloc(a, 60, 8);
++    uint8_t *q = arena_alloc(a, 40, 1);
++    ASSERT_TRUE(p != NULL && q != NULL);
++    memset(p, 1, 60);
++    memset(q, 2, 40);
++    ASSERT_EQ(arena_exact_overflows() - before, 0);
++    ASSERT_EQ(arena_bytes_reserved(a), reserved);
++
++    uint8_t *r = arena_alloc(a, 4000, 0);
++    ASSERT_TRUE(r != NULL);
++    memset(r, 3, 4000);
++    ASSERT_EQ(arena_exact_overflows() - before, 1);
++    ASSERT_TRUE(arena_bytes_reserved(a) >= reserved + 4000);
++    ASSERT_EQ(arena_bytes_allocated(a), (size_t)4100);
++    ASSERT_EQ(p[59], 1);
++    ASSERT_EQ(q[39], 2);
++
++    /* a reset empties the block and drops the overflow, and the block serves again */
++    arena_reset(a);
++    ASSERT_EQ(arena_bytes_reserved(a), reserved);
++    ASSERT_EQ(arena_bytes_allocated(a), (size_t)0);
++    ASSERT_TRUE(arena_alloc(a, 100, 1) != NULL);
++    ASSERT_EQ(arena_exact_overflows() - before, 1);
++    arena_destroy(a);
++
++    /* a zero-byte arena is valid and overflows on its first allocation */
++    a = arena_create_exact(0);
++    ASSERT_TRUE(a != NULL);
++    ASSERT_TRUE(arena_alloc(a, 8, 0) != NULL);
++    ASSERT_EQ(arena_exact_overflows() - before, 2);
++    arena_destroy(a);
++}
++
++/* a decode into a caller's buffer gives the allocating decode's bytes, and refuses a buffer too
++ * short for them, for every codec and for a stacked chain */
++static void test_decode_into_matches_and_refuses_short(void)
++{
++    uint8_t src[5000];
++    for (size_t i = 0; i < sizeof(src); i++) src[i] = (uint8_t)((i * 31) % 7 + (i / 100));
++    for (int mi = 0; mi < g_mode_count + 1; mi++)
++    {
++        tidesdb_encoding_stage_t stacked[2];
++        const tidesdb_encoding_stage_t *codec;
++        int count;
++        if (mi < g_mode_count)
++        {
++            codec = g_modes[mi].codec;
++            count = g_modes[mi].codec_count;
++        }
++        else
++        {
++            /* the last mode stacks the first real codec over none, which takes the copying path */
++            const uint8_t ids[2] = {TDB_COMPRESS_NONE,
++                                    g_mode_count > 1 ? TDB_COMPRESS_LZ4 : TDB_COMPRESS_NONE};
++            ASSERT_EQ(tidesdb_encoding_resolve(&g_reg, ids, 2, stacked, 2), 2);
++            codec = stacked;
++            count = 2;
++        }
++        uint8_t *enc = NULL;
++        size_t enc_size = 0;
++        ASSERT_EQ(tidesdb_encoding_stages_encode(codec, count, src, sizeof(src), &enc, &enc_size),
++                  TDB_SUCCESS);
++        uint8_t dst[sizeof(src) + 16];
++        size_t got = 0;
++        ASSERT_EQ(tidesdb_encoding_stages_decode_into(codec, count, enc, enc_size, dst, sizeof(dst),
++                                                      &got),
++                  TDB_SUCCESS);
++        ASSERT_EQ(got, sizeof(src));
++        ASSERT_EQ(memcmp(dst, src, sizeof(src)), 0);
++        ASSERT_EQ(tidesdb_encoding_stages_decode_into(codec, count, enc, enc_size, dst,
++                                                      sizeof(src) - 1, &got),
++                  TDB_ERR_INVALID_ARGS);
++        if (count == 1 && enc_size > 16)
++        {
++            /* damaged compressed bytes do not decode */
++            uint8_t *bad = malloc(enc_size);
++            ASSERT_TRUE(bad != NULL);
++            memcpy(bad, enc, enc_size);
++            for (size_t i = 12; i < enc_size; i++) bad[i] ^= 0x5a;
++            const int rc = tidesdb_encoding_stages_decode_into(codec, count, bad, enc_size, dst,
++                                                               sizeof(dst), &got);
++            if (g_modes[mi].codec_count > 0)
++                ASSERT_TRUE(rc != TDB_SUCCESS || got != sizeof(src) ||
++                            memcmp(dst, src, sizeof(src)) != 0);
++            free(bad);
++        }
++        free(enc);
++    }
++}
++
++/* point gets, both cursors and absent keys read what was written, for every codec and node size */
++static void test_round_trip_unchanged(void)
++{
++    for (int mi = 0; mi < g_mode_count; mi++)
++    {
++        for (size_t si = 0; si < NA_NODE_SIZE_COUNT; si++)
++        {
++            na_table_t t;
++            na_build(&t, &g_modes[mi], g_node_sizes[si], NA_KEYS);
++            na_point_gets(t.tree, NA_KEYS, 1);
++            na_scan(t.tree, NA_KEYS, 0);
++            na_scan(t.tree, NA_KEYS, 1);
++
++            /* the same reads with no cache, each node decoded and freed per use */
++            btree_set_node_cache(t.tree, NULL, 0);
++            na_point_gets(t.tree, NA_KEYS, 11);
++            na_scan(t.tree, NA_KEYS, 0);
++            na_scan(t.tree, NA_KEYS, 1);
++            na_drop(&t);
++        }
++    }
++}
++
++int main(int argc, char **argv)
++{
++    ASSERT_TRUE(na_init_codecs());
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST(test_exact_arena_holds_whole_node, tests_passed);
++    RUN_TEST(test_reserved_near_allocated, tests_passed);
++    RUN_TEST(test_cache_charges_under_six_kib_per_leaf, tests_passed);
++#ifdef NODE_ARENA_COUNT_ALLOCS
++    RUN_TEST(test_decode_mallocs_per_miss, tests_passed);
++#else
++    printf("skipped: test_decode_mallocs_per_miss (a sanitizer owns the allocator)\n");
++#endif
++    RUN_TEST(test_round_trip_unchanged, tests_passed);
++    RUN_TEST(test_exact_arena_overflow_falls_back, tests_passed);
++    RUN_TEST(test_decode_into_matches_and_refuses_short, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}
