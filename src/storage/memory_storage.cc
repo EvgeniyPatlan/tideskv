@@ -169,7 +169,7 @@ class MemoryWriteTxn final : public WriteTxn {
   }
 
   Status Put(ColumnFamily cf, std::string_view key, std::string_view value) override {
-    const Status st = Check(ValidateKey(key));
+    Status st = Check(ValidateKey(key));
     if (!st.ok()) return st;
     if (meta_hook_ != nullptr && cf == ColumnFamily::kMeta) meta_hook_->OnMetaPut(key, value);
     return Buffer(Status::Ok(), Op{Op::Kind::kPut, cf, std::string(key), std::string(value)});

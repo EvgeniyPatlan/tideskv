@@ -112,7 +112,7 @@ Status SpecialKeyService::RebuildNow(size_t capacity) {
   }
   SpecialKeyFilter::Bits old;
   // Under the barrier: no meta Put is buffered and uncommitted now.
-  const Status quiesced = engine_.Quiesce([&] { old = filter_.Install(std::move(next)); });
+  Status quiesced = engine_.Quiesce([&] { old = filter_.Install(std::move(next)); });
   old = SpecialKeyFilter::Bits();  // the previous bits are freed here, outside the gate
   if (!quiesced.ok()) return quiesced;
   auto scanned = ScanSpecialKeys(storage_, filter_, stop_);

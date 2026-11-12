@@ -38,7 +38,7 @@ class ReplyBuilder {
   // Moves the pending reply into *out (its old content is discarded) and keeps *out's old capacity,
   // cleared, for the next reply, unless it exceeds kMaxRetainedCapacity.
   void SwapOut(std::string* out);
-  static constexpr size_t kMaxRetainedCapacity = 64 * 1024;
+  static constexpr size_t kMaxRetainedCapacity = size_t{64} * 1024;
   size_t size() const { return buf_.size(); }
   bool empty() const { return buf_.empty(); }
   void Truncate(size_t n) {  // drops bytes after n (no-op if the buffer is not larger)
