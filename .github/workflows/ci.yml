@@ -83,6 +83,7 @@ jobs:
     timeout-minutes: 45
     # No service container: DEBUG DIGEST needs redis-server --enable-debug-command yes, and services
     # cannot pass server arguments, so compat.sh starts the redis:7.2.5 reference itself.
+    # It likewise starts the apache/kvrocks:2.17.0 reference for --kvrocks.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -96,6 +97,9 @@ jobs:
       - run: scripts/compat.sh build/release/src/tideskv-server --diff
         env:
           TIDESKV_DIFF_SEEDS: "1-20"
+      - run: scripts/compat.sh build/release/src/tideskv-server --kvrocks
+        env:
+          TIDESKV_DIFF_SEEDS: "1-5"
 
   tidy:
     runs-on: ubuntu-24.04
