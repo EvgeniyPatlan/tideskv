@@ -9,6 +9,8 @@
 #   U3: age.* age.seconds settle-age du-after-age;  U1 Kvrocks: compact.status settle-compact du-after-compact
 #   pass B: reload/ reload.seconds reload.settle (U3: reload-age.*) open.rates open25|open50|open75.*
 #   U5: load-<size>/ load-<size>.seconds settle-load-<size> du-after-load-<size> <size>.*
+#   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end idle.status
+#   U6: load/ load.seconds settle-load du-after-load c1|c8|c64|c256.*
 #   U8: summary.json (no server)
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes).
 # shellcheck disable=SC2034  # UC_RATE is read by uc_phase
@@ -165,6 +167,50 @@ case_U5() {
     _uc_cell U5 "$rep" "$p" || return 1
     _uc_down
     remove_data
+  done
+}
+
+# U2: fixed-rate SET/GET churn with expiry, then an idle period. The du sampler runs from before the churn to after the
+# idle period (du.csv); du-end and dbsize-end (keys left once everything should have expired; recorded, not checked)
+# are taken at the end. Kvrocks-cron differs from kvrocks only by its config line.
+_uc_dbsize_end() {
+  local rep=$1 i got="" prev="" tries=1
+  if [[ $SERVER_NAME == kvrocks* ]]; then cli DBSIZE SCAN >/dev/null; tries=${UC_DBSIZE_TRIES:-900}; fi
+  for ((i = 0; i < tries; i++)); do
+    got=$(cli DBSIZE | tr -d '\r')
+    # Kvrocks' cached count stays 0 until the scan lands: take the first number that repeats
+    if [[ $got =~ ^[0-9]+$ ]] && { [[ $SERVER_NAME != kvrocks* ]] || [[ $got == "$prev" ]]; }; then break; fi
+    prev=$got
+    if ((i + 1 < tries)); then sleep 2; fi
+  done
+  echo "${got:-unknown}" >"$OUT/$rep/dbsize-end"
+}
+
+case_U2() {
+  local s=$1 rep=U2/$1/rep$2 spid rc=0
+  _uc_up "$s" U2 || return 1
+  uc_du_sampler "$OUT/data/$s" "$UC_U2_DU_EVERY" "$OUT/$rep/du.csv" & spid=$!
+  UC_CELL_WARMUP=0 UC_CELL_DURATION=$UC_U2_WRITE_S _uc_cell U2 "$rep" churn || rc=1
+  if ((rc == 0)); then
+    sleep "$UC_U2_IDLE_S"
+    echo ok >"$OUT/$rep/idle.status"
+    _uc_check_alive "$rep/idle"
+    [[ $(head -1 "$OUT/$rep/idle.status") == ok ]] || { _uc_fail "idle failed: $(head -1 "$OUT/$rep/idle.status")"; rc=1; }
+  fi
+  stop_sampler "$spid"
+  ((rc == 0)) || return 1
+  uc_du_snapshot "$OUT/data/$s" >"$OUT/$rep/du-end"
+  _uc_dbsize_end "$rep"
+}
+
+# U6: strict durability, fixed preload, closed-loop connection sweep with at most 10 s of warm-up per cell.
+case_U6() {
+  local rep=U6/$1/rep$2 ph
+  _uc_up "$1" U6 || return 1
+  _uc_load U6 "$rep" load "$U6_KEYS" || return 1
+  _uc_settle_du "$rep" load || return 1
+  for ph in $(uc_phases U6); do
+    UC_CELL_WARMUP=$((UC_WARMUP < 10 ? UC_WARMUP : 10)) UC_CELL_DURATION=$UC_U6_S _uc_cell U6 "$rep" "$ph" || return 1
   done
 }
 

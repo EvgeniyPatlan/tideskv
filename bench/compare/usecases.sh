@@ -32,6 +32,10 @@ if [[ $UC_MODE == quick ]]; then QUIESCE_MAX=${QUIESCE_MAX:-60}; else QUIESCE_MA
 bench_init "$OUT_ARG"
 build_tideskv_image
 docker pull -q "$KVROCKS_IMAGE" >/dev/null; docker pull -q "$MEMTIER_IMAGE" >/dev/null; docker pull -q "$CLI_IMAGE" >/dev/null
+if [[ " $UC_CASES_RUN " == *" U6 "* ]]; then
+  if [[ $UC_MODE == quick ]]; then FIO_FSYNC_RUNTIME=5 FIO_FSYNC_SIZE=256m; else FIO_FSYNC_RUNTIME=30 FIO_FSYNC_SIZE=1g; fi
+  run_fio_fsync  # before any server: the disk's own durable 4 KiB write latency
+fi
 remove_data  # a resumed run starts every repetition on an empty data/
 uc_write_meta
 for c in $UC_CASES_RUN; do uc_dispatch "$c"; done

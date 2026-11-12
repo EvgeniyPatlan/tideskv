@@ -339,6 +339,26 @@ run_fio() {
   if ((rc)); then FIO_STATUS="failed at QD $qd (exit $rc)"; else FIO_STATUS=ok; fi
 }
 
+# fio 4 KiB random writes with an fsync after each (queue depth 1, the durable-commit latency floor of U6): FIO_FSYNC_RUNTIME s
+# on a FIO_FSYNC_SIZE file under $OUT/fio. Writes $OUT/fio/fsync.json and sets FIO_FSYNC_STATUS (ok, skipped: ..., failed ...).
+run_fio_fsync() {
+  local dir=$OUT/fio c=tideskv-bench-fio-$TS-fsync rc=0
+  if ! docker image inspect "$FIO_IMAGE" >/dev/null 2>&1 && ! docker pull -q "$FIO_IMAGE" >/dev/null 2>&1; then
+    log "fio: cannot pull $FIO_IMAGE; skipping the fsync latency probe"
+    FIO_FSYNC_STATUS="skipped: cannot pull $FIO_IMAGE"; return 0
+  fi
+  mkdir -p "$dir"; chmod 0777 "$dir"
+  _track "$c"
+  log "fio fsync"
+  docker run --rm --name "$c" --network none --cpuset-cpus "$CLIENT_CPUS" -v "$dir:/f" --entrypoint fio "$FIO_IMAGE" \
+    --name=fsync --filename=/f/fio-fsync.dat --size="${FIO_FSYNC_SIZE:-1g}" --rw=randwrite --bs=4k --fsync=1 --direct=0 \
+    --ioengine=sync --iodepth=1 --numjobs=1 --runtime="${FIO_FSYNC_RUNTIME:-30}" --time_based --output-format=json \
+    --output=/f/fsync.json >"$dir/fsync.log" 2>&1 || { rc=$?; log "fio fsync failed ($rc); see fio/fsync.log"; }
+  docker run --rm --name "tideskv-bench-clean-fio-$TS-fsync" --network none -v "$dir:/f" --entrypoint rm "$CLI_IMAGE" \
+    -f /f/fio-fsync.dat >/dev/null 2>&1 || log "could not delete $dir/fio-fsync.dat"
+  if ((rc)); then FIO_FSYNC_STATUS="failed (exit $rc)"; else FIO_FSYNC_STATUS=ok; fi
+}
+
 # ---- shared by run.sh and the use-case runner ----
 
 # Waits for the server to go quiet and records the wait in $1.

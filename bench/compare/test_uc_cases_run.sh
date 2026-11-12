@@ -12,12 +12,12 @@ check() { if [[ $2 != "$3" ]]; then echo "FAIL $1: got [$2] want [$3]"; fail=1; 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-EV=() MT_LOG=() MT_CNAMES=() MT_FAIL="" DBSIZE_REPLY=999999999
+EV=() START_LEVELS=() MT_LOG=() MT_CNAMES=() MT_FAIL="" DBSIZE_REPLY=999999999
 # shellcheck disable=SC2034  # read by the memtier stub through ${!var}
 STUB_OPS_tideskv=100000 STUB_OPS_kvrocks=80000
 # shellcheck disable=SC2317  # the stubs are invoked indirectly by the code under test
 {
-start_server() { EV+=("$1:start"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"; }
+start_server() { EV+=("$1:start") START_LEVELS+=("$1:$2"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"; }
 parity_check() { return 0; }
 stop_server() { SERVER_CONTAINER=""; }
 remove_data() { EV+=("remove_data"); }
@@ -173,6 +173,41 @@ DBSIZE_REPLY=$((U4_KEYS * 99 / 100 - 1)) UC_FAIL_REASON=""
 rc=0; case_U4 tideskv 9 2>/dev/null || rc=$?
 check load-check-fails "$rc ${UC_FAIL_REASON:0:17}" "1 load check failed"
 DBSIZE_REPLY=999999999
+
+# ---- U2: the du sampler spans churn and idle; U6: strict start, cells in order ----
+OUT=$TMP/u2 UC_MODE=quick
+uc_sizes quick
+UC_U2_WRITE_S=7 UC_U2_IDLE_S=1 UC_U2_DU_EVERY=1 U6_KEYS=1000 UC_U6_S=4
+U2_LOG=$TMP/u2.ev
+# shellcheck disable=SC2317
+{
+uc_du_sampler() {
+  echo sampler-start >>"$U2_LOG"
+  echo "epoch_s,bytes,wal_archive_bytes" >"$3"
+  trap 'echo sampler-stopped >>"$U2_LOG"; exit 0' TERM
+  while :; do sleep 0.2; done
+}
+memtier() { if [[ $1 == */churn ]]; then echo "churn-$CUR" >>"$U2_LOG"; echo "args $*" >>"$U2_LOG"; fi; EV+=("$CUR:${1#*/rep*/}"); mkdir -p "$(dirname "$OUT/$1")"; printf '{"ALL STATS":{"Totals":{"Ops/sec":1}}}\n' >"$OUT/$1.json"; }
+sleep() { [[ ${1:-} == 1 && -n ${U2_IDLE_MARK:-} ]] && echo idle >>"$U2_LOG"; command sleep "$@"; }
+}
+UC_DBSIZE_TRIES=3 U2_IDLE_MARK=1
+: >"$U2_LOG"
+EV=()
+uc_dispatch U2 2>/dev/null
+check u2-three-configs "$(evs)" "tideskv:start tideskv:churn kvrocks:start kvrocks:churn kvrocks-cron:start kvrocks-cron:churn"
+check u2-sampler-spans-idle "$(grep -v '^args' "$U2_LOG" | tr '\n' ' ')" \
+  "sampler-start churn-tideskv idle sampler-stopped sampler-start churn-kvrocks idle sampler-stopped sampler-start churn-kvrocks-cron idle sampler-stopped "
+check u2-churn-seconds "$(grep -m1 '^args' "$U2_LOG" | grep -o -- '--test-time=[0-9]*')" "--test-time=7"
+check u2-files "$(count_files "$OUT/U2/kvrocks-cron/rep1" du.csv du-end dbsize-end churn.json churn.status)" 5
+check u2-done "$(cat "$OUT/U2/tideskv/rep1/done") $(cat "$OUT/U2/kvrocks/rep1/done")" "ok ok"
+check u2-dbsize-recorded "$(cat "$OUT/U2/kvrocks/rep1/dbsize-end")" 999999999
+unset -f sleep
+EV=() START_LEVELS=()
+OUT=$TMP/u6
+uc_dispatch U6 2>/dev/null
+check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
+check u6-strict "${START_LEVELS[*]}" "tideskv:strict kvrocks:strict"
+check u6-done "$(cat "$OUT/U6/tideskv/rep1/done")" ok
 
 # ---- shellcheck ----
 if command -v shellcheck >/dev/null; then
