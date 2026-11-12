@@ -10,6 +10,9 @@ bench/compare/run.sh --medium  # ~8 GB dataset, full's timings, needs ~85 GB fre
 bench/compare/run.sh           # full: ~24 GB dataset, 60 s warm-up, 180 s runs, ~3 h
 bench/compare/run.sh --large   # W7 only: 256 KiB values, 32 GiB per server, needs ~80 GiB free, ~1.5-2 h
 bench/compare/run.sh --large --smoke  # W7 on 512 keys (128 MiB), 10 s warm-up, 30 s runs, ~15 min
+bench/compare/run.sh --cases           # common cases C1-C8, medium (~12 GB logical), needs ~68 GB free, several hours
+bench/compare/run.sh --cases --quick   # C1-C8 small, 1 repeat, about 1 h
+bench/compare/run.sh --cases --smoke   # start both servers at both levels, run the diff and probes, no loads
 ```
 
 Options:
@@ -17,6 +20,7 @@ Options:
 - `--dirty`: build TidesKV from the working tree instead of HEAD.
 - `--out DIR`: write the run somewhere other than `build/bench/`. The run refuses a `DIR/data` that is not empty.
 - `--no-w7-sweep`: with `--large` (an error without it), skip the R32 pass at workers 16.
+- `--cases`: run C1-C8 (below) instead of W1-W7. `--large --cases` is an error.
 
 Environment:
 - `SERVER_CPUS` (default `0-3`), `SERVER_MEM` (`8g`) and `CLIENT_CPUS` (`8-15`) set the limits.
@@ -115,6 +119,64 @@ fio curve follows the table.
 - A failed page-cache drop is a warning in the phase's status and under the table. At full size, an R4/R32 cell
   with under 0.5 × (stored ÷ logical bytes, at most 1) disk reads per GET is flagged "cache not dropped?" (about 0.75
   and 0.97 are expected for uncompressed data).
+
+## Common cases (C1-C8)
+
+`--cases` replaces W1-W7 with workloads modelled on how Kvrocks is used in production (cache, session hashes,
+counters, set membership, leaderboards, feeds, batch reads, a shared tenant). It runs the same Docker limits, both
+durability levels and the same report layout. Spec: `notes/superpowers/specs/2026-11-12-kvrocks-common-cases-design.md`.
+
+| Case | Traffic | Data, quick | Data, medium |
+|---|---|---|---|
+| C1 TTL cache | GET / `SET EX 60` / `SET EX 3600` 18:1:1 over a keyspace whose top 20% expired after load | 200k keys, 2 KB | 3M keys, 2 KB |
+| C2 session hash | `HGETALL` / `HSET` 1 field / `EXPIRE 1800` 6:3:1 | 100k hashes, 30 fields of 50 B | 2M hashes |
+| C3 counters | `INCRBY` 15, `HINCRBY` 10 (one per `hstats:<i>`), `GET` 25; Gaussian hot keys | 100k keys | 1M keys |
+| C4 membership | `SADD` / `SISMEMBER` / `SSCAN 0 COUNT 100` 4:15:1 | 10 sets x 20k members | 100 sets x 100k |
+| C5 leaderboard | `ZINCRBY` / `ZREVRANGE 0 9` / `ZREVRANK` / `ZSCORE` 4:3:2:1 | 5 boards x 100k | 20 boards x 1M |
+| C6 feed | `LPUSH` / `LTRIM 0 999` / `LRANGE 0 49` 2:1:7 | 20k lists, avg 200 x 100 B | 20k lists, avg 500 |
+| C7 batch | `MGET` of 20 keys / `MSET` of 10 pairs 9:1 | 1M keys, 100 B | 10M keys |
+| C8 mixed tenant | C1, C2 and C5 mixes at once (2 threads x 16 clients each) plus a `SCAN` sweeper at 5/s | C1+C2+C5 data | C1+C2+C5 data |
+
+C8 is the headline row and comes first in the report. Out of scope, because TidesKV lacks them: bitmaps, streams,
+geo and HyperLogLog.
+
+Modes:
+- `--cases`: medium, about 12 GB logical per server, needs about 68 GB free disk, takes several hours, 3 repeats.
+- `--cases --quick`: small, 1 repeat.
+- `--cases --smoke`: starts both servers at both levels, runs the diff and probes, loads nothing, and exits non-zero
+  unless every case passed the diff.
+
+Rules:
+- **The diff gates the timing.** Before any load, `TestKvrocksCases` runs in `golang:1.22` against both bench
+  containers and writes `cases-diff.json` and `cases-diff.log`. Only cases marked `pass` are timed. A case that is
+  `diverged`, or whose diff did not run, shows in the report with no numbers and makes `report.py` exit 1.
+- **memtier drives every case**, with `--command`; each `__key__` draws its own key, so `MGET __key__ x20` reads 20
+  random keys. There is no Go load driver.
+- **Repeats and medians.** Medium runs 3 repeats, quick 1. The report shows the median run by ops/s (an even count
+  takes the upper-middle run). A cell is `ERR` if any repeat failed.
+- **Ratio** is TidesKV ops/s divided by Kvrocks ops/s; above 1 means TidesKV is ahead. A ratio within 0.95-1.05
+  inclusive shows as `≈`.
+- **Fixed-rate pass.** C1-C7 also run at 10,000 ops/s in total, split per connection; the report shows achieved
+  ops/s, p99 and CPU µs/op. C8 has no fixed-rate pass.
+- **C8** runs three memtier processes (the C1, C2 and C5 mixes at 2x16 each) and a `SCAN` sweeper at 5/s. Its ops/s
+  is the sum of the three; its p50/p99/p99.9 are the worst part's; the scan p99 is shown separately.
+- **C3 skew.** No zipf: `--command-key-pattern=G` over a narrowed key range (median N/2, +-3 sigma with sigma = 1% of
+  N), because memtier 2.1.4 rejects `--key-stddev`/`--key-median` together with `--command`.
+- **Data shapes** are cut from the spec's to keep load times reasonable: C4 reads with `SSCAN 0 COUNT 100`, not
+  `SMEMBERS`; C6 lists are capped at 1000; C7 `MGET`s 20 keys.
+- **Expiry.** The top 20% of C1's keys are loaded first with `EX 30` (quick) or `EX 120` (medium). After all loads
+  the run waits out the TTL from that server's own load end, then settles. The report gives DBSIZE against the
+  live-expected count plus other keys, the excess, and the data dir bytes before, after and freed.
+
+Run only the diff against Kvrocks, without the benchmark:
+
+```bash
+scripts/compat.sh build/tideskv-server --kvrocks         # starts apache/kvrocks:2.17.0 on 127.0.0.1:${TIDESKV_KVROCKS_PORT:-16666}
+scripts/compat.sh build/tideskv-server --diff --kvrocks  # the whole suite against Redis and Kvrocks
+```
+
+`--kvrocks` alone runs only `go test ./diff -run TestKvrocksCases`. `TIDESKV_DIFF_SEEDS` sets the seed count (CI
+uses 1-5). `kvrocksQuirks` is empty: Kvrocks 2.17 matched on every stream.
 
 ## Reading the report
 
