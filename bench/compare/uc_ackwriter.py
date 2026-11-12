@@ -7,17 +7,19 @@
       whose reply never came is not logged) or when the server answers with an error. Prints `acked <total>` and
       exits 0, or exits 2 if any thread stopped on an error reply or could not connect. --command is a test hook.
   verify --host H --port P --log FILE --out JSON
-      Reads every FILE.*, MGETs the keys in batches of 1000 and writes {"acked", "lost", "lost_sample" (first 10)}:
-      a key counts as lost when MGET returns nil. Retries while the server is not reachable or answers an error
-      (up to 60 s).
-  probe  --host H --port P --out JSON (--until-p99 MS --timeout S | --baseline-secs S)
-         (--log FILE | --prefix PFX --keymax N) [--t0 EPOCH_MS]
-      One connection. Recovery mode (--until-p99): PING until PONG (pong_ms), then GET random keys in 1 s windows
-      until a window's p99 <= MS; recovered_ms is the end of that window. Both are measured from t0 (default: the
-      probe's own start), so pass the host's epoch ms taken just before starting the server. Within --timeout
-      seconds of t0, else pong_ms / recovered_ms are null. Baseline mode (--baseline-secs S): GETs for S seconds,
-      no PING wait, writes {"p99_ms", "requests", "windows"}. Keys come from the writer's logs (--log: acked keys)
-      or are PFX<1..keymax> (the preload).
+      Reads every FILE.* (a last line without its newline is skipped), MGETs the keys in batches of 1000 and writes
+      {"acked", "lost", "lost_sample", "corrupt", "corrupt_sample"} (samples: first 10). A key is lost when MGET
+      returns nil, corrupt when its value is not the key's suffix after the last ':' (the writer's seq). Retries
+      while the server is not reachable or answers an error (up to 60 s).
+  probe  --host H --port P --prefix PFX --keymax N --out JSON
+         (--until-p99 MS --timeout S | --baseline-secs S) [--t0 EPOCH_MS | --t0-file PATH]
+      One connection, GETs of random PFX<1..N> keys (the preload) in 100 ms windows. Baseline mode (--baseline-secs):
+      runs for S seconds with no PING wait and writes {"p99_ms" (all requests), "requests", "hits", "windows"}.
+      Recovery mode (--until-p99): waits for t0 (--t0-file: waits for PATH to appear, holding the epoch ms the host
+      wrote just before starting the server; --t0: given now; default: the probe's start), polls connect+PING every
+      5 ms until PONG (pong_ms), then runs windows until 3 consecutive ones have p99 <= MS; recovered_ms is the start
+      of the first of those, from t0. pong_ms / recovered_ms are null if not reached within --timeout seconds of t0.
+      Exits 1 if no GET found a key (hits == 0): the probe would be timing misses.
 """
 import argparse
 import glob
@@ -31,8 +33,10 @@ import threading
 import time
 
 BATCH = 1000
-WINDOW_S = 1.0
-LOG_KEYS_PER_FILE = 20000
+WINDOW_S = 0.1
+POLL_S = 0.005
+PASSING_WINDOWS = 3
+T0_FILE_WAIT_S = 600
 
 
 class Conn:
@@ -82,15 +86,15 @@ class Conn:
         raise ConnectionError("bad reply %r" % line)
 
 
-def connect_retry(host, port, until):
+def connect_retry(host, port, until, poll=0.01):
     """A Conn, retrying refused connects and name lookups until the monotonic time UNTIL; None on timeout."""
     while True:
         try:
-            return Conn(host, port)
+            return Conn(host, port, timeout=5)
         except OSError:
             if time.monotonic() >= until:
                 return None
-            time.sleep(0.01)
+            time.sleep(poll)
 
 
 # ---- write ----
@@ -140,9 +144,8 @@ def _log_keys(log_path):
     for path in sorted(glob.glob(log_path + ".*")):
         with open(path) as f:
             for line in f:
-                key = line.strip()
-                if key:
-                    yield key
+                if line.endswith("\n") and line.strip():  # a last line cut off by the kill is not a whole ack
+                    yield line.strip()
 
 
 def _mget(conn_box, a, keys):
@@ -167,15 +170,19 @@ def _mget(conn_box, a, keys):
 
 
 def cmd_verify(a):
-    acked, lost, sample, batch, box = 0, 0, [], [], [None]
+    acked, lost, corrupt, sample, bad, batch, box = 0, 0, 0, [], [], [], [None]
 
     def check():
-        nonlocal lost
+        nonlocal lost, corrupt
         for key, val in zip(batch, _mget(box, a, batch)):
             if val is None:
                 lost += 1
                 if len(sample) < 10:
                     sample.append(key)
+            elif val != key.rsplit(":", 1)[-1].encode():
+                corrupt += 1
+                if len(bad) < 10:
+                    bad.append(key)
 
     for key in _log_keys(a.log):
         acked += 1
@@ -186,8 +193,8 @@ def cmd_verify(a):
     if batch:
         check()
     with open(a.out, "w") as f:
-        json.dump({"acked": acked, "lost": lost, "lost_sample": sample}, f)
-    print("acked %d lost %d" % (acked, lost))
+        json.dump({"acked": acked, "lost": lost, "lost_sample": sample, "corrupt": corrupt, "corrupt_sample": bad}, f)
+    print("acked %d lost %d corrupt %d" % (acked, lost, corrupt))
     return 0
 
 
@@ -199,39 +206,33 @@ def _p99(lat):
 
 
 def _probe_keys(a):
-    if a.log:
-        keys = []
-        for path in sorted(glob.glob(a.log + ".*")):
-            with open(path) as f:
-                keys += [k.strip() for _, k in zip(range(LOG_KEYS_PER_FILE), f) if k.strip()]
-        if not keys:
-            raise SystemExit("probe: no keys in %s.*" % a.log)
-        return lambda: random.choice(keys)
     if not a.prefix or not a.keymax:
-        raise SystemExit("probe: give --log, or --prefix and --keymax")
+        raise SystemExit("probe: give --prefix and --keymax")
     return lambda: "%s%d" % (a.prefix, random.randint(1, a.keymax))
 
 
 def _window(conn, pick, seconds):
-    """GETs for SECONDS on CONN; returns (latencies in ms, error or None)."""
-    lat, end = [], time.perf_counter() + seconds
+    """GETs for SECONDS on CONN; returns (latencies in ms, hits, error or None)."""
+    lat, hits, end = [], 0, time.perf_counter() + seconds
     try:
         while time.perf_counter() < end:
             t = time.perf_counter()
             reply = conn.command("GET", pick())
             lat.append((time.perf_counter() - t) * 1000)
             if isinstance(reply, RuntimeError):
-                return lat, str(reply)
+                return lat, hits, str(reply)
+            if reply is not None:
+                hits += 1
     except OSError as e:
-        return lat, str(e)
-    return lat, None
+        return lat, hits, str(e)
+    return lat, hits, None
 
 
 def _wait_pong(a, t0, deadline):
-    """(conn, pong_ms) once the server answers PING, or (None, None) at the deadline (monotonic clock)."""
+    """(conn, pong_ms) once the server answers PING (polled every POLL_S), or (None, None) at the deadline."""
     conn = None
     while time.monotonic() < deadline:
-        conn = conn or connect_retry(a.host, a.port, deadline)
+        conn = conn or connect_retry(a.host, a.port, deadline, POLL_S)
         if conn is None:
             break
         try:
@@ -240,35 +241,42 @@ def _wait_pong(a, t0, deadline):
         except OSError:
             conn.close()
             conn = None
-        time.sleep(0.01)
+        time.sleep(POLL_S)
     return None, None
 
 
-def _win_record(t0, start, lat, err):
-    return {"start_ms": round((start - t0) * 1000), "requests": len(lat),
+def _win_record(t0, start, lat, hits, err):
+    return {"start_ms": round((start - t0) * 1000), "requests": len(lat), "hits": hits,
             "p99_ms": round(_p99(lat), 3) if lat else None, "error": err}
 
 
 def probe_recovery(a, pick, t0):
     deadline = time.monotonic() + max(0.0, t0 + a.timeout - time.time())
-    res = {"pong_ms": None, "recovered_ms": None, "until_p99_ms": a.until_p99, "windows": []}
+    res = {"pong_ms": None, "recovered_ms": None, "until_p99_ms": a.until_p99, "requests": 0, "hits": 0, "windows": []}
     conn, pong = _wait_pong(a, t0, deadline)
     if conn is None:
         return res
     res["pong_ms"] = round(pong)
+    run, run_start = 0, None
     while time.monotonic() < deadline:
         start = time.time()
-        lat, err = _window(conn, pick, min(WINDOW_S, max(0.0, deadline - time.monotonic())))
-        w = _win_record(t0, start, lat, err)
+        lat, hits, err = _window(conn, pick, WINDOW_S)
+        w = _win_record(t0, start, lat, hits, err)
         res["windows"].append(w)
+        res["requests"] += len(lat)
+        res["hits"] += hits
         if err:
             conn.close()
-            conn = connect_retry(a.host, a.port, deadline)
+            run, conn = 0, connect_retry(a.host, a.port, deadline, POLL_S)
             if conn is None:
                 break
-        elif lat and time.monotonic() < deadline and w["p99_ms"] <= a.until_p99:
-            res["recovered_ms"] = round((time.time() - t0) * 1000)
-            break
+        elif lat and w["p99_ms"] <= a.until_p99:
+            run, run_start = run + 1, run_start if run else start
+            if run == PASSING_WINDOWS:
+                res["recovered_ms"] = round((run_start - t0) * 1000)
+                break
+        else:
+            run = 0
     return res
 
 
@@ -276,26 +284,50 @@ def probe_baseline(a, pick):
     conn = connect_retry(a.host, a.port, time.monotonic() + 30)
     if conn is None:
         raise SystemExit("probe: cannot connect to %s:%d" % (a.host, a.port))
-    all_lat, windows, t0 = [], [], time.time()
+    all_lat, hits, windows, t0 = [], 0, [], time.time()
     while time.time() - t0 < a.baseline_secs:
         start = time.time()
-        lat, err = _window(conn, pick, min(WINDOW_S, a.baseline_secs - (start - t0)))
+        lat, h, err = _window(conn, pick, min(WINDOW_S, max(0.001, a.baseline_secs - (start - t0))))
         if err:
             raise SystemExit("probe: baseline read failed: %s" % err)
         all_lat += lat
-        windows.append(_win_record(t0, start, lat, None))
-    return {"p99_ms": round(_p99(all_lat), 3) if all_lat else None, "requests": len(all_lat), "windows": windows}
+        hits += h
+        windows.append(_win_record(t0, start, lat, h, None))
+    return {"p99_ms": round(_p99(all_lat), 3) if all_lat else None, "requests": len(all_lat), "hits": hits,
+            "windows": windows}
+
+
+def _read_t0(a):
+    if a.t0_file:
+        end = time.monotonic() + T0_FILE_WAIT_S
+        while time.monotonic() < end:
+            try:
+                with open(a.t0_file) as f:
+                    text = f.read().strip()
+                if text:
+                    return int(text) / 1000.0
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.002)
+        raise SystemExit("probe: %s did not appear in %d s" % (a.t0_file, T0_FILE_WAIT_S))
+    return a.t0 / 1000.0 if a.t0 else time.time()
 
 
 def cmd_probe(a):
     if (a.until_p99 is None) == (a.baseline_secs is None):
         raise SystemExit("probe: give --until-p99 (with --timeout) or --baseline-secs")
     pick = _probe_keys(a)
-    t0 = a.t0 / 1000.0 if a.t0 else time.time()
-    res = probe_baseline(a, pick) if a.baseline_secs is not None else probe_recovery(a, pick, t0)
+    if a.baseline_secs is not None:
+        res = probe_baseline(a, pick)
+    else:
+        res = probe_recovery(a, pick, _read_t0(a))
     with open(a.out, "w") as f:
         json.dump(res, f)
     print(json.dumps({k: v for k, v in res.items() if k != "windows"}))
+    if res["requests"] and res["hits"] == 0:
+        print("probe: hits == 0: none of the %d GETs found a key (wrong key format or empty preload?)" % res["requests"],
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -319,10 +351,10 @@ def main(argv=None):
     p.add_argument("--until-p99", type=float)
     p.add_argument("--timeout", type=float, default=300)
     p.add_argument("--baseline-secs", type=float)
-    p.add_argument("--log")
     p.add_argument("--prefix")
     p.add_argument("--keymax", type=int)
     p.add_argument("--t0", type=int, help="epoch ms the server was started (default: now)")
+    p.add_argument("--t0-file", help="wait for this file, holding the epoch ms the server was started")
     a = ap.parse_args(argv)
     return {"write": cmd_write, "verify": cmd_verify, "probe": cmd_probe}[a.mode](a)
 

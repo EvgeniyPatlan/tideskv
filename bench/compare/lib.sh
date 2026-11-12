@@ -194,6 +194,8 @@ start_server() {
   local common=(--detach --name "$SERVER_CONTAINER" --network "$NET" --cpuset-cpus "$SERVER_CPUS"
                 --memory "$SERVER_MEM" --memory-swap "$SERVER_MEM" --ulimit "nofile=$SERVER_NOFILE:$SERVER_NOFILE")
   conf=$(write_server_conf "$server" "$level") || return 1
+  # START_T0_FILE (U7's restart): the epoch ms just before docker run, written atomically for a waiting probe
+  if [[ -n ${START_T0_FILE:-} ]]; then date +%s%3N >"$START_T0_FILE.tmp" && mv "$START_T0_FILE.tmp" "$START_T0_FILE"; fi
   if [[ $server == tideskv ]]; then
     SERVER_PORT=6379
     docker run "${common[@]}" -v "$data:/data" -v "$conf:/etc/tideskv.conf:ro" "$TIDESKV_IMAGE" /etc/tideskv.conf >/dev/null

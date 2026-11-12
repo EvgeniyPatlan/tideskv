@@ -117,58 +117,121 @@ class AckWriterTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(self.logged(), [])
 
+    def probe(self, *args, timeout=60):
+        out = os.path.join(self.dir, "probe-%d.json" % len(os.listdir(self.dir)))
+        r = run_tool("probe", "--host", "127.0.0.1", "--port", self.fake.port, "--prefix", "k:", "--keymax", 1,
+                     "--out", out, *args, timeout=timeout)
+        data = None
+        if os.path.exists(out):
+            with open(out) as f:
+                data = json.load(f)
+        return r, data
+
     def test_probe_times(self):
         t0 = int(time.time() * 1000)
         self.serve(startup_delay=0.5)
         self.fake.store[b"k:1"] = b"v"
-        out = os.path.join(self.dir, "probe.json")
-        r = run_tool("probe", "--t0", t0, "--host", "127.0.0.1", "--port", self.fake.port, "--until-p99", 1000, "--timeout", 20,
-                     "--prefix", "k:", "--keymax", 1, "--out", out)
+        r, p = self.probe("--t0", t0, "--until-p99", 1000, "--timeout", 20)
         self.assertEqual(r.returncode, 0, r.stderr)
-        with open(out) as f:
-            p = json.load(f)
         self.assertGreaterEqual(p["pong_ms"], 500)
-        self.assertLess(p["pong_ms"], 5000)
-        self.assertGreaterEqual(p["recovered_ms"], p["pong_ms"] + 1000)  # a whole 1 s window after the PONG
+        self.assertLess(p["pong_ms"], 700)  # polled every few ms, not once a second
+        # the start of the first of 3 consecutive 100 ms windows under the threshold: soon after the PONG
+        self.assertGreaterEqual(p["recovered_ms"], p["pong_ms"])
+        self.assertLess(p["recovered_ms"], p["pong_ms"] + 500)
+        self.assertGreater(p["hits"], 0)
         self.assertLessEqual(p["windows"][0]["p99_ms"], 1000)
 
-    def test_probe_t0_is_the_clock_start(self):
+    def test_probe_recovery_needs_three_passing_windows(self):
         self.serve()
-        out = os.path.join(self.dir, "probe.json")
-        t0 = int(time.time() * 1000) - 3000  # the server "started" 3 s before the probe did
-        r = run_tool("probe", "--host", "127.0.0.1", "--port", self.fake.port, "--until-p99", 1000, "--timeout", 20,
-                     "--prefix", "k:", "--keymax", 1, "--t0", t0, "--out", out)
+        self.fake.store[b"k:1"] = b"v"
+        r, p = self.probe("--until-p99", 0.0000001, "--timeout", 1)  # nothing passes
         self.assertEqual(r.returncode, 0, r.stderr)
-        with open(out) as f:
-            self.assertGreaterEqual(json.load(f)["pong_ms"], 3000)
+        self.assertIsNotNone(p["pong_ms"])
+        self.assertIsNone(p["recovered_ms"])
+        self.assertGreater(len(p["windows"]), 3)
 
-    def test_probe_baseline_and_log_keys(self):
+    def test_probe_waits_for_the_t0_file(self):
         self.serve()
-        out = os.path.join(self.dir, "base.json")
-        r = run_tool("probe", "--host", "127.0.0.1", "--port", self.fake.port, "--baseline-secs", 1,
-                     "--prefix", "k:", "--keymax", 5, "--out", out)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.fake.store[b"k:1"] = b"v"
+        t0file = os.path.join(self.dir, "t0")
+        out = os.path.join(self.dir, "p.json")
+        proc = subprocess.Popen([sys.executable, TOOL, "probe", "--host", "127.0.0.1", "--port", str(self.fake.port),
+                                 "--prefix", "k:", "--keymax", "1", "--until-p99", "1000", "--timeout", "20",
+                                 "--t0-file", t0file, "--out", out], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(1)
+        self.assertIsNone(proc.poll(), "the probe must wait for the t0 file")
+        tmp = t0file + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(int(time.time() * 1000) - 2000))  # the server "started" 2 s ago
+        os.rename(tmp, t0file)
+        proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0)
         with open(out) as f:
-            b = json.load(f)
-        self.assertGreater(b["p99_ms"], 0)
-        self.assertGreater(b["requests"], 10)
-        with open(self.log + ".0", "w") as f:
-            f.write("a\nb\n")
-        out2 = os.path.join(self.dir, "after.json")
-        r = run_tool("probe", "--host", "127.0.0.1", "--port", self.fake.port, "--until-p99", 1000, "--timeout", 10,
-                     "--log", self.log, "--out", out2)
+            self.assertGreaterEqual(json.load(f)["pong_ms"], 2000)
+
+    def test_probe_baseline_counts_hits(self):
+        self.serve()
+        self.fake.store[b"k:1"] = b"v"
+        r, b = self.probe("--baseline-secs", 1)
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(b["p99_ms"], 0)
+        self.assertEqual(b["hits"], b["requests"])
+        self.assertGreater(b["requests"], 10)
+        self.assertGreaterEqual(len(b["windows"]), 9)  # 100 ms windows
+
+    def test_probe_zero_hits_fails(self):
+        self.serve()  # the keys the probe reads do not exist
+        r, b = self.probe("--baseline-secs", 1)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hits", r.stderr)
+        r, p = self.probe("--until-p99", 1000, "--timeout", 5)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(p["hits"], 0)
 
     def test_probe_timeout_reports_nulls(self):
         self.serve(startup_delay=30)
-        out = os.path.join(self.dir, "probe.json")
-        r = run_tool("probe", "--host", "127.0.0.1", "--port", self.fake.port, "--until-p99", 1, "--timeout", 1,
-                     "--prefix", "k:", "--keymax", 1, "--out", out)
+        r, p = self.probe("--until-p99", 1, "--timeout", 1)
         self.assertEqual(r.returncode, 0, r.stderr)
-        with open(out) as f:
-            p = json.load(f)
         self.assertIsNone(p["pong_ms"])
         self.assertIsNone(p["recovered_ms"])
+
+    def test_corrupt_value_is_not_lost(self):
+        self.serve()
+        self.write_for(0.5)
+        self.fake.restart(0)
+        bad = self.logged()[0]
+        self.fake.store[bad.encode()] = b"bogus"
+        v = self.verify()
+        self.assertEqual((v["lost"], v["corrupt"], v["corrupt_sample"]), (0, 1, [bad]))
+
+    def test_partial_last_log_line_is_skipped(self):
+        self.serve()
+        with open(self.log + ".0", "w") as f:
+            f.write("k0:0\nk0:1\nk0:2")  # the writer was killed mid-line
+        self.fake.store[b"k0:0"] = b"0"
+        self.fake.store[b"k0:1"] = b"1"
+        v = self.verify()
+        self.assertEqual((v["acked"], v["lost"]), (2, 0))
+
+    def test_earlier_point_keys_do_not_mask_later_losses(self):
+        """Each point has its own prefix on the same data: point 2's dropped keys stay lost although point 1 wrote
+        keys of the same thread/seq shape (a constant prefix would let them mask it)."""
+        self.serve()
+        for point in ("p1", "p2"):
+            self.log = os.path.join(self.dir, point)
+            box = []
+            t = threading.Thread(target=lambda: box.append(run_tool(
+                "write", "--host", "127.0.0.1", "--port", self.fake.port, "--conns", 2, "--prefix", point + "-",
+                "--log", self.log)))
+            t.start()
+            time.sleep(0.4)
+            self.fake.kill(drop_last=0)
+            t.join(30)
+            self.fake.restart(0)
+        self.fake.drop(*self.logged()[:3])  # point 2 loses three acked keys
+        v = self.verify()
+        self.assertEqual(v["lost"], 3)
+        self.assertEqual(v["corrupt"], 0)
 
 
 if __name__ == "__main__":
