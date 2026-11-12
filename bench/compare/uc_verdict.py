@@ -35,17 +35,27 @@ class Verdict:
     note: str
 
 
+def _all_errors(values: list[float | None], errors: list[str]) -> tuple[str, ...]:
+    """Every None in values is covered by an error: given messages first, then 'rep <i> failed' (1-based)."""
+    failed = [i for i, v in enumerate(values) if v is None]
+    messages = list(errors) + [f"rep {i + 1} failed" for i in failed[len(errors):]]
+    if not any(v is not None for v in values):
+        messages.append("no data")
+    return tuple(messages)
+
+
 def summarize(values: list[float | None], errors: list[str]) -> Summary:
-    """Summarize repetitions; None marks a failed repetition and its message is listed in errors."""
+    """Summarize repetitions; None marks a failed repetition, and every failure is reflected in errors."""
     present = [v for v in values if v is not None]
+    all_errors = _all_errors(values, errors)
     if not present:
-        return Summary(median=0.0, lo=0.0, hi=0.0, n=0, errors=tuple(errors))
+        return Summary(median=0.0, lo=0.0, hi=0.0, n=0, errors=all_errors)
     return Summary(
         median=statistics.median(present),
         lo=min(present),
         hi=max(present),
         n=len(present),
-        errors=tuple(errors),
+        errors=all_errors,
     )
 
 
@@ -63,6 +73,10 @@ def ratio(t: Summary, k: Summary, higher_is_better: bool) -> float | None:
 
 
 def _band(t: Summary, k: Summary) -> float:
+    """Relative spread of either side with a positive median, floored at MIN_BAND; inf if a zero median has spread."""
+    for s in (t, k):
+        if s.median == 0 and s.hi > s.lo:
+            return math.inf
     spreads = [(s.hi - s.lo) / s.median for s in (t, k) if s.median > 0]
     return max(spreads + [MIN_BAND])
 
@@ -86,6 +100,8 @@ def verdict(t: Summary, k: Summary, higher_is_better: bool, quick: bool) -> Verd
         return Verdict(LABEL_NO_VERDICT, r, band, "quick run")
     if t.n < 2 or k.n < 2:
         return Verdict(LABEL_NO_VERDICT, r, band, "single repetition")
+    if math.isinf(band):
+        return Verdict(LABEL_TIE, r, band, "zero median with spread")
     if r > 1 + band:
         return Verdict(LABEL_TIDESKV, r, band, "")
     if r < 1 / (1 + band):
@@ -95,7 +111,7 @@ def verdict(t: Summary, k: Summary, higher_is_better: bool, quick: bool) -> Verd
 
 def best_kvrocks(configs: dict[str, Summary], higher_is_better: bool) -> str:
     """Name of the Kvrocks config with the best median, ignoring configs that have errors."""
-    valid = {name: s for name, s in configs.items() if not s.errors}
+    valid = {name: s for name, s in configs.items() if not s.errors and s.n > 0}
     if not valid:
         raise ValueError("no Kvrocks config without errors")
     pick = max if higher_is_better else min
@@ -104,6 +120,8 @@ def best_kvrocks(configs: dict[str, Summary], higher_is_better: bool) -> str:
 
 def case_label(verdicts: list[Verdict]) -> str:
     """Row label: 'mixed' when TidesKV and Kvrocks both win some metric, else the headline (first) verdict's label."""
+    if not verdicts:
+        return LABEL_NO_VERDICT
     labels = {v.label for v in verdicts}
     if LABEL_TIDESKV in labels and LABEL_KVROCKS in labels:
         return "mixed"
@@ -111,5 +129,7 @@ def case_label(verdicts: list[Verdict]) -> str:
 
 
 def flag_under_target(achieved: float, target: float) -> bool:
-    """True when the achieved rate is below 95% of the target (target must be positive)."""
+    """True when the achieved rate is below 95% of the target."""
+    if target <= 0:
+        raise ValueError(f"target must be positive, got {target}")
     return achieved / target < UNDER_TARGET_FRACTION
