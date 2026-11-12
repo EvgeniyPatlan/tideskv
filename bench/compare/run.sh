@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # TidesKV vs Kvrocks comparison benchmark (notes spec 2026-10-18).
-# Usage: bench/compare/run.sh [--quick|--medium|--large [--no-w7-sweep]] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
+# Usage: bench/compare/run.sh [--quick|--medium|--large [--no-w7-sweep]] [--cases] [--smoke] [--relaxed-mode none|interval] [--dirty] [--out DIR]
 #   --relaxed-mode defaults to none; --out defaults to build/bench/<UTC timestamp> and must not hold a non-empty data/
 #   --large runs W7 (256 KiB values) only; with --smoke on 512 keys and 10/30 s phases
+#   --cases runs the Kvrocks common cases C1-C8 (cases.sh), medium unless --quick; with --smoke only the diff and probes
 #   env (defaults): SERVER_CPUS 0-3, SERVER_MEM 8g (large 4g), CLIENT_CPUS 8-15, THREADS 4, CLIENTS 50,
 #     WARMUP/DURATION 60/180 (quick 10/30; medium as full), QUIESCE_MAX 600 (quick 60), all in seconds
 # shellcheck source-path=SCRIPTDIR disable=SC2034  # ROOT, SIZE and DIRTY are read by lib.sh and the phases Task 4 adds
@@ -15,24 +16,33 @@ ROOT=$(cd "$HERE/../.." && pwd)
 source "$HERE/workloads.sh"
 # shellcheck source=lib.sh
 source "$HERE/lib.sh"
+# shellcheck source=workloads_cases.sh
+source "$HERE/workloads_cases.sh"
+# shellcheck source=cases.sh
+source "$HERE/cases.sh"
 
-SIZE=full RELAXED=none DIRTY=0 SMOKE=0 OUT_ARG="" W7_SWEEP=1
+SIZE=full RELAXED=none DIRTY=0 SMOKE=0 OUT_ARG="" W7_SWEEP=1 CASES_MODE=0
 while (($#)); do
   case $1 in
     --quick) SIZE=quick ;;
     --medium) SIZE=medium ;;
     --large) SIZE=large ;;
     --no-w7-sweep) W7_SWEEP=0 ;;
+    --cases) CASES_MODE=1 ;;
     --smoke) SMOKE=1 ;;
     --relaxed-mode) RELAXED=${2:?--relaxed-mode needs a value}; shift ;;
     --dirty) DIRTY=1 ;;
     --out) OUT_ARG=${2:?--out needs a value}; shift ;;
-    -h|--help) sed -n 2,7p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,8p "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 [[ $RELAXED == none || $RELAXED == interval ]] || { echo "--relaxed-mode must be none or interval" >&2; exit 2; }
+if ((CASES_MODE)); then
+  if [[ $SIZE == large ]]; then echo "--cases cannot be combined with --large" >&2; exit 2; fi
+  if [[ $SIZE != quick ]]; then SIZE=medium; fi
+fi
 # --large --smoke is a real W7 run on a tiny dataset, not the start-and-probe smoke
 if [[ $SIZE == large ]] && ((SMOKE)); then SIZE=large-smoke SMOKE=0; fi
 if ((!W7_SWEEP)) && [[ $SIZE != large* ]]; then echo "--no-w7-sweep needs --large" >&2; exit 2; fi
@@ -393,6 +403,10 @@ run_large() {
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   bench_init "$OUT_ARG"
   build_tideskv_image
+  if ((CASES_MODE)); then
+    if ((SMOKE)); then run_cases_smoke; exit; fi
+    run_cases
+  fi
   if ((SMOKE)); then run_smoke; exit; fi
   if [[ $SIZE == large* ]]; then run_large; fi
   run_full
