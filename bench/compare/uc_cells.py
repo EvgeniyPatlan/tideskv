@@ -13,6 +13,7 @@ import uc_verdict
 
 CLIENT_BOUND_PCT = 85.0
 MIN_HIT_RATE = 0.99
+UNSTABLE_CV = 0.25
 WINDOW_POINTS = 10
 SET_REPLY_BYTES = 5    # "+OK\r\n"
 INT_REPLY_BYTES = 4    # ":0\r\n" / ":1\r\n"
@@ -158,17 +159,34 @@ def over_10x(phase):
 # ---- disk ----
 
 def du_rows(path):
-    """[(epoch_s, bytes excluding the WAL archive, wal_archive_bytes)] of a du sampler file (header + rows)."""
+    """[(epoch_s, used, wal_used, apparent, wal_apparent, basis)] of a du sampler file (header + rows), WAL archive
+    taken out of `used` and `apparent`. `used` is allocated bytes (columns 4-5) when the file has them, else the
+    apparent size and basis says so."""
     out = []
     try:
         for line in read_text(path).splitlines()[1:]:
-            e, total, wal = (int(x) for x in line.split(","))
-            out.append((e, max(0, total - wal), wal))
+            row = [int(x) for x in line.split(",")]
+            e, total, wal = row[:3]
+            if len(row) >= 5:
+                out.append((e, max(0, row[3] - row[4]), row[4], max(0, total - wal), wal, "allocated"))
+            else:
+                out.append((e, max(0, total - wal), wal, max(0, total - wal), wal, "apparent size"))
     except (OSError, ValueError) as e:
         raise CellError("unreadable du file %s: %s" % (os.path.basename(path), e))
     if not out:
         raise CellError("%s has no rows" % os.path.basename(path))
     return out
+
+
+def disk_basis(rep_dir, src):
+    """'allocated' or 'apparent size' for a disk source of a repetition (a du file, or summary.json:<field>), or None."""
+    try:
+        if src.startswith("summary.json:"):
+            d = json.loads(read_text(os.path.join(rep_dir, "summary.json"))).get(src.split(":", 1)[1])
+            return None if d is None else "allocated" if "allocated_bytes" in d else "apparent size"
+        return du_rows(os.path.join(rep_dir, src))[-1][5]
+    except (OSError, ValueError, CellError):
+        return None
 
 
 def du_peak(rep):
@@ -266,8 +284,15 @@ def client_cpu_pct(rep_dir, phase, client_cpus):
         return None
 
 
+def ops_cv(series):
+    """Coefficient of variation of the per-second request counts of a memtier Time-Serie (0.0 when unknowable)."""
+    counts = [p.get("Count", 0) for p in series.values()]
+    mean = sum(counts) / len(counts) if counts else 0
+    return statistics.pstdev(counts) / mean if len(counts) > 1 and mean > 0 else 0.0
+
+
 def cell_flags(rep_dir, phase, client_cpus):
-    """{'client_bound': pct, 'under_target': (achieved, target)} for the entries that apply to this cell."""
+    """{'client_bound': pct, 'under_target': (achieved, target), 'unstable': cv (U6 only)} for what applies to a cell."""
     out = {}
     pct_used = client_cpu_pct(rep_dir, phase, client_cpus) if client_cpus else None
     if pct_used is not None and pct_used > CLIENT_BOUND_PCT:
@@ -278,16 +303,16 @@ def cell_flags(rep_dir, phase, client_cpus):
         target = conf["rate_limit"] * conf["clients"] * conf["threads"]
         if target > 0 and uc_verdict.flag_under_target(achieved, target):
             out["under_target"] = (achieved, float(target))
+        if case_of(rep_dir) == "U6" and ops_cv(d["ALL STATS"]["Totals"]["Time-Serie"]) > UNSTABLE_CV:
+            out["unstable"] = ops_cv(d["ALL STATS"]["Totals"]["Time-Serie"])
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return out
 
 
-
-
 # ---- fio baselines ----
 
-def _fio_job(path, direction):
+def fio_job(path, direction):
     text = read_text(path)
     job = json.loads(text[text.index("{"):])["jobs"][0]
     d = job[direction]
@@ -310,9 +335,9 @@ def fio_baselines(run_dir):
         m = re.fullmatch(r"qd(\d+)\.json", n)
         try:
             if m:
-                out["read"][int(m.group(1))] = _fio_job(os.path.join(d, n), "read")
+                out["read"][int(m.group(1))] = fio_job(os.path.join(d, n), "read")
             elif n == "fsync.json":
-                out["fsync"] = _fio_job(os.path.join(d, n), "write")
+                out["fsync"] = fio_job(os.path.join(d, n), "write")
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return out

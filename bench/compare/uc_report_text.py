@@ -2,6 +2,7 @@
 import json
 import math
 
+import uc_cells
 import uc_report_method
 
 CASES = ("U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "F1")
@@ -39,19 +40,28 @@ OTHER_NOTES = {
            "Closed-loop latency is not compared across servers (they run at different throughputs): latency verdicts "
            "come from the open-loop phases, which run in full mode only."],
     "U2": ["Neither server had a manual COMPACT: forcing one on a single side would not be a like-for-like comparison.",
-           "Misses are expected (keys expire), so the GET hit rate is reported, not checked."],
+           "GETs draw keys from a 1e9-key space, so nearly all are negative lookups; the hit rate is reported as "
+           "information, not checked."],
     "U3": ["Both servers had the same aging. Background debt is shown as information, not as a verdict."],
     "U4": ["HGET/HGETALL replies are not hit-counted by memtier, so the reply check covers the integer replies of "
            "HSET and HDEL only.",
            "Per-command ops/s follow the mix ops/s (the command ratio is fixed) and are not counted separately."],
     "U5": ["Both Kvrocks configurations are shown so that neither blob threshold is cherry-picked."],
-    "U6": ["Strict durability on both sides. The fsync baseline of this disk is in the methodology section."],
+    "U6": ["Strict durability on both sides. The disk's fsync floor was measured right before each server's sweep "
+           "(below), because it drifts.",
+           "Writes per fsync: not observable. The INFO of neither server reports an fsync count (its sync_* fields are "
+           "replication counters), so group-commit batch size cannot be read.",
+           "A cell whose per-second ops vary by more than a quarter (coefficient of variation above 0.25) is flagged "
+           "unstable and gets no verdict: the disk's fsync rate was not steady."],
     "U7": ["This is a process kill (SIGTERM/SIGKILL), not an OS crash or power loss.",
            "pong_ms and recovered_ms are measured from docker run returning; docker's own time is shown separately.",
            "The recovery threshold is 2x the warm pre-kill p99 of the same server.",
            "Acked counts are not throughput: how many writes were acknowledged before the signal depends on the "
            "server's speed and says nothing about durability."],
-    "U8": ["TidesKV has no COMPACT, so the compaction figure exists for Kvrocks only.",
+    "U8": ["TidesKV has no COMPACT, so the compaction figure exists for Kvrocks only. It was taken after U1's load and "
+           "both closed-loop phases, so it is not a fresh-load figure.",
+           "Time to quiet cannot be shorter than the settle check's window; a value at that floor is shown as \"≤ floor\" "
+           "and gets no verdict.",
            "U8 reads U1's load and U3's aging; it runs no server of its own."],
 }
 
@@ -60,18 +70,29 @@ def fmt(v, unit):
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return "–"
     if unit == "bytes":
-        return "%.2f GiB" % (v / (1 << 30)) if v >= 1 << 30 else "%.1f MiB" % (v / (1 << 20)) if v >= 1 << 20 else "%d B" % v
+        for size, name in ((1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")):
+            if v >= size:
+                return "%.2f GiB" % (v / size) if name == "GiB" else "%.1f %s" % (v / size, name)
+        return "%d B" % v
     return {"ops/s": "{:,.0f}", "ms": "{:.3f} ms", "count": "{:,.0f}", "s": "{:.1f} s", "%": "{:.1f}%"}.get(unit, "{:g}").format(v)
 
 
-def fmt_cell(c, unit):
+def fmt_cell(c, unit, floor=None):
     if c is None:
         return "n/a"
     if c["errors"]:
         return "ERR: " + "; ".join(c["errors"])[:110]
+    if floor and c["median"] <= floor:
+        return "≤ %g s (floor)" % floor
     if c["n"] > 1 and c["lo"] != c["hi"]:
-        return "%s [%s–%s]" % (fmt(c["median"], unit), fmt(c["lo"], unit).split(" ")[0], fmt(c["hi"], unit))
+        return "%s [%s–%s]" % (fmt(c["median"], unit), fmt(c["lo"], unit), fmt(c["hi"], unit))
     return fmt(c["median"], unit)
+
+
+def headline(entries):
+    """The headline metric of a case; when it was not run (U3's open-loop cells in a quick run) the first metric with a
+    verdict slot, so the summary row still shows a number."""
+    return next((e for e in entries if e["headline"]), None) or next((e for e in entries if not e["info"]), None)
 
 
 def fmt_ratio(v):
@@ -120,7 +141,7 @@ def _reason(head):
 def _matrix(summary):
     out = ["| Case | Models | Verdict | Ratio median [range] | vs Kvrocks config | Reason |", "|---|---|---|---|---|---|"]
     for case, cs in summary["cases"].items():
-        head = next((e for e in cs["metrics"] if e["headline"]), None)
+        head = headline(cs["metrics"])
         rng = "–"
         if head and head["verdict"] and head["verdict"]["ratio"] is not None:
             r = head["verdict"]["ratio"]
@@ -188,8 +209,8 @@ def _setup(case, cs, summary):
         out.append("Dataset:mem after the load%s, from on-disk bytes excluding the WAL archive (not the logical size), "
                    "against SERVER_MEM %s: %s." % (" (the 16 KB phase)" if case == "U5" else "",
                                                    summary["meta"].get("server_mem"), "; ".join(parts)))
-        if any(b < mem for b in st["after_load"].values()):
-            out.append("**The dataset fits in memory on at least one side: this case does not exercise the disk.**")
+        if case not in ("U6", "U7") and any(b < mem for b in st["after_load"].values()):
+            out.append("**Note: data fits in page cache on at least one side, so this case does not exercise the disk.**")
     out.append("")
     out += ["- %s: %s" % (NAMES[s], ", ".join("`%s`" % x for x in lines) or "no config read back")
             for s, lines in st["config"].items()]
@@ -215,7 +236,7 @@ def _results(cs):
             verdict += " (%s)" % v["note"] if v["note"] else ""
             if any(_kvrocks_has_errors(x) for x in (e,)) and e["vs"]:
                 verdict += " [vs best valid Kvrocks config]"
-        cells = [fmt_cell(e["configs"].get(s), e["unit"]) for s in servers]
+        cells = [fmt_cell(e["configs"].get(s), e["unit"], e.get("floor")) for s in servers]
         out.append("| %s | %s | %s | %s |" % (e["title"] + (" †" if e["note"] else ""), " | ".join(cells),
                                               fmt_ratio(v) if v else "–", verdict))
     return out
@@ -234,6 +255,8 @@ def _notes(cs):
         seen.add(key)
         d = f["detail"]
         text = ("client-bound: memtier used %.0f%% of the client CPUs, no verdict for this cell" % d if f["kind"] == "client_bound"
+                else "unstable: ops/s per second varied with a coefficient of variation of %.2f (limit %.2f), no verdict for this cell"
+                % (d, uc_cells.UNSTABLE_CV) if f["kind"] == "unstable"
                 else "under target: achieved %s of %s ops/s offered, latency verdict withheld" % (fmt(d[0], "ops/s"), fmt(d[1], "ops/s")))
         out.append("- %s rep%d %s: %s." % (NAMES[f["server"]], f["rep"], f["phase"], text))
     for e in cs["metrics"]:
@@ -283,11 +306,22 @@ def _extras(case, cs, summary):
         out += ["Per-point rows (SIGTERM and SIGKILL at each write time) are information; the \"all points\" rows are "
                 "the ones counted in the case label and the pros and cons. A server that never recovered shows ERR with "
                 "the cause.", ""]
-    if case == "U6" and (summary.get("fio") or {}).get("fsync"):
-        fs = summary["fio"]["fsync"]
-        out += ["**Disk floor** (fio, 4 KiB writes with an fsync each, queue depth 1): %.0f writes/s%s." % (
-            fs["iops"], ", fsync latency mean %.3f ms" % fs["sync_mean_ms"] if fs.get("sync_mean_ms") else ""), ""]
+    if case == "U6":
+        floors = [("%s rep%d" % (NAMES[s], r), fs) for s, reps in (ex.get("fio") or {}).items() for r, fs in reps.items()]
+        start = (summary.get("fio") or {}).get("fsync")
+        if start:
+            floors.insert(0, ("start of run", start))
+        if floors:
+            out += ["**Disk floor** (fio, 4 KiB writes with an fsync each, queue depth 1), measured right before each "
+                    "server's sweep:", ""]
+            out += ["- %s: %.0f writes/s%s" % (who, fs["iops"], _fsync_lat(fs)) for who, fs in floors] + [""]
     return out
+
+
+def _fsync_lat(fs):
+    if not fs.get("sync_mean_ms"):
+        return ""
+    return ", fsync latency mean %.3f ms%s" % (fs["sync_mean_ms"], ", p99 %.3f ms" % fs["sync_p99_ms"] if fs.get("sync_p99_ms") else "")
 
 
 def _num(v):

@@ -15,7 +15,7 @@ import uc_cells
 import uc_verdict
 from uc_cells import CellError, NotRun
 from uc_metrics import metrics_for
-from uc_report_text import CASES, F1_NOT_RUN, F2_NOT_RUN, NAMES, render  # noqa: F401  (render is re-exported)
+from uc_report_text import headline, CASES, F1_NOT_RUN, F2_NOT_RUN, NAMES, render  # noqa: F401  (render is re-exported)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVERS = {"U2": ("tideskv", "kvrocks", "kvrocks-cron"), "U5": ("tideskv", "kvrocks", "kvrocks-blob")}
@@ -32,9 +32,10 @@ def _rep_numbers(case_dir):
 
 
 def rep_status(rep_dir, phase):
-    """'ok' or the reason a repetition (or, for a two-pass case's closed phases, pass A) did not finish."""
-    pass_a = ("done", "closed.done") if phase is None or phase.startswith("open") else ("closed.done", "done")
-    for name in pass_a:
+    """'ok' or the reason a repetition did not finish. A two-pass case's closed phases are judged by closed.done (pass
+    A), everything else (open phases, the repetition as a whole) by done, which pass B writes last."""
+    names = ("closed.done", "done") if phase is not None and not phase.startswith("open") else ("done",)
+    for name in names:
         try:
             return uc_cells.read_text(os.path.join(rep_dir, name)) or "empty done file"
         except OSError:
@@ -89,6 +90,8 @@ def _withhold(metric, flags):
     if not metric.phase:
         return None
     mine = [f for f in flags if f["phase"] == metric.phase]
+    if any(f["kind"] == "unstable" for f in mine):
+        return "unstable: ops/s varied between seconds (CV above %.2f), the disk was not steady" % uc_cells.UNSTABLE_CV
     if any(f["kind"] == "client_bound" for f in mine):
         return "client-bound: memtier used over %d%% of the client CPUs" % uc_cells.CLIENT_BOUND_PCT
     if metric.unit == LATENCY_UNIT and any(f["kind"] == "under_target" for f in mine):
@@ -96,7 +99,7 @@ def _withhold(metric, flags):
     return None
 
 
-def _decide(metric, sums, flags, quick):
+def _decide(metric, sums, flags, quick, floor=None):
     t = sums.get("tideskv")
     ks = {n: s for n, s in sums.items() if n.startswith("kvrocks") and s is not None}
     if metric.info or t is None or not ks:
@@ -104,7 +107,7 @@ def _decide(metric, sums, flags, quick):
     best = _pick_k(ks, metric.higher_is_better)
     k = ks[best or next(iter(ks))]
     v = uc_verdict.verdict(t, k, metric.higher_is_better, quick)
-    why = _withhold(metric, flags)
+    why = _withhold(metric, flags) or ("time to quiet is at the measurement floor of %g s" % floor if floor else None)
     if why and v.label != uc_verdict.LABEL_NO_VERDICT:
         v = uc_verdict.Verdict(uc_verdict.LABEL_NO_VERDICT, v.ratio, v.band, why)
     elif why and not v.note:
@@ -123,9 +126,22 @@ def _flags(case_dir, servers, reps, phases, client_cpus):
     return out
 
 
-def _metric_entry(metric, sums, verdict, best, rng, flags):
+def _at_floor(metric, sums, meta):
+    """The measurement floor when any valid value of this metric is at or under it, else None."""
+    floor = meta.get(metric.floor_key) if metric.floor_key else None
+    valid = [x for x in sums.values() if x and not x.errors and x.n]
+    return floor if floor and any(x.median <= floor for x in valid) else None
+
+
+def _basis(metric, servers, reps, case_dir):
+    """'allocated' when every du source of the metric has allocated bytes, else 'apparent size'."""
+    found = {uc_cells.disk_basis(os.path.join(case_dir, s, "rep%d" % r), metric.disk_src) for s in servers for r in reps}
+    return "allocated" if found == {"allocated"} else "apparent size"
+
+
+def _metric_entry(metric, sums, verdict, best, rng, flags, title, floor):
     why = _withhold(metric, flags)
-    return {"key": metric.key, "title": metric.title, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
+    return {"key": metric.key, "title": title, "floor": floor, "unit": metric.unit, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
             "headline": metric.headline, "info": metric.info, "pros_cons": metric.pros_cons, "note": metric.note,
             "phase": metric.phase, "withheld": why,
             "configs": {s: None if x is None else {"median": x.median, "lo": x.lo, "hi": x.hi, "n": x.n,
@@ -220,10 +236,12 @@ def _extras(case, case_dir, servers, reps):
                     state = uc_cells.u2_end_state(rep_dir)
                     state["du_end"] = uc_cells.du_rows(os.path.join(rep_dir, "du-end"))[-1][1]
                     out.setdefault("end_state", {}).setdefault(s, {})[r] = state
+                elif case == "U6":
+                    out.setdefault("fio", {}).setdefault(s, {})[r] = uc_cells.fio_job(os.path.join(rep_dir, "fio", "fsync.json"), "write")
                 elif case == "U3":
                     kind = "tideskv" if s == "tideskv" else "kvrocks"
                     out.setdefault("debt", {}).setdefault(s, {})[r] = uc_cells.debt_values(rep_dir, "closed", kind)
-            except (OSError, CellError, NotRun):
+            except (OSError, ValueError, KeyError, IndexError, TypeError, CellError, NotRun):
                 continue
     return out
 
@@ -236,7 +254,7 @@ def _build_case(case, run_dir, meta, quick):
     metrics = metrics_for(case, run_dir)
     phases = sorted({m.phase for m in metrics if m.phase})
     flags = _flags(case_dir, servers, reps, phases, meta.get("client_cpus"))
-    entries, failed = [], []
+    entries, failed, bases = [], [], {}
     for s in servers:
         for r in reps:
             st = rep_status(os.path.join(case_dir, s, "rep%d" % r), None)
@@ -247,9 +265,15 @@ def _build_case(case, run_dir, meta, quick):
         failed += ["%s %s" % (case, e) for e in cell_errors]
         if not ran:
             continue
-        v, best, rng = _decide(m, sums, flags, quick)
-        entries.append(_metric_entry(m, sums, v, best, rng, flags))
-    head = next((e for e in entries if e["headline"]), None)
+        title, floor = m.title, _at_floor(m, sums, meta)
+        if m.disk_src:
+            bases[m.key] = _basis(m, servers, reps, case_dir)
+            title = title.replace("{basis}", bases[m.key])
+        elif m.twin_of and bases.get(m.twin_of) != "allocated":
+            continue  # the main figure is apparent size already
+        v, best, rng = _decide(m, sums, flags, quick, floor)
+        entries.append(_metric_entry(m, sums, v, best, rng, flags, title, floor))
+    head = headline(entries)
     return {"servers": servers, "reps": reps, "metrics": entries, "flags": flags, "failed": sorted(set(failed)),
             "label": _case_label(entries) if entries else uc_verdict.LABEL_NO_VERDICT,
             "setup": _setup(case, run_dir, case_dir, servers, reps[0] if reps else 1, head["phase"] if head else None),

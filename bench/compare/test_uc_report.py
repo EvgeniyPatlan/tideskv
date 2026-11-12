@@ -56,6 +56,10 @@ class Run:
     def du(self, case, server, rep, name, total, wal):
         self.write("%s/%s/rep%d/%s" % (case, server, rep, name), "epoch_s,bytes,wal_archive_bytes\n1,%d,%d\n" % (total, wal))
 
+    def read(self, rel):
+        with open(self.path(*rel.split("/"))) as f:
+            return f.read()
+
     def report(self):
         s = uc_report.build(self.dir)
         return s, uc_report.render(s)

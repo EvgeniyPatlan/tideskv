@@ -8,7 +8,7 @@ metrics_for(case, run_dir).
 import os
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from uc_cells import (CellError, NotRun, _json, _num, _reads, cache_hit_rate, du_peak, du_rows, hit_rate, ops, over_10x,
@@ -28,11 +28,15 @@ class Metric:
     only: str | None = None   # "kvrocks": exists on Kvrocks only
     pros_cons: bool = True    # counted in the pros and cons lists and the case label (headline always)
     note: str = ""
+    disk_src: str | None = None   # du file or summary.json:<field> read; {basis} in the title says allocated or apparent
+    twin_of: str | None = None    # apparent-size twin of a disk metric (dropped when that metric is apparent already)
+    floor_key: str | None = None  # meta.json key of a measurement floor: values at or under it get no verdict
 
 
 
 
 def _du_last(name, col=1):
+    """Last row of a du file; col 1 = used (allocated, else apparent), 2 = WAL archive, 3 = apparent size."""
     def f(rep):
         _reads(rep, name)
         return float(du_rows(os.path.join(rep, name))[-1][col])
@@ -41,13 +45,30 @@ def _du_last(name, col=1):
 
 # ---- U8 ----
 
-def _u8(field_name, wal=True, only=None):
+def _u8_used(d, apparent=False):
+    if "allocated_bytes" in d and not apparent:
+        return float(max(0, d["allocated_bytes"] - d["wal_archive_allocated_bytes"]))
+    return float(max(0, d["bytes"] - d["wal_archive_bytes"]))
+
+
+def _u8(field_name, apparent=False):
     def f(rep):
         d = _json(rep, "summary.json").get(field_name)
         if d is None:
             raise NotRun(field_name)
-        return float(max(0, d["bytes"] - d["wal_archive_bytes"])) if wal else _num(d)
+        return _u8_used(d, apparent)
     return f
+
+
+def _u8_plain(field_name):
+    return lambda rep: _num(_json(rep, "summary.json")[field_name])
+
+
+def _u8_growth(rep):
+    d = _json(rep, "summary.json")
+    if d.get("du_after_age") is None or d.get("u3_du_after_load") is None:
+        raise NotRun("U3 disk figures")
+    return _u8_used(d["du_after_age"]) - _u8_used(d["u3_du_after_load"])
 
 
 def _u8_settle(rep):
@@ -151,38 +172,58 @@ def _build_metrics():
                _m("closed-uniform_ops", "closed-uniform ops/s", True, False, ops("closed-uniform"), "ops/s", "closed-uniform")] \
         + _open() + [_m("cache_hit", "block cache hit rate (closed-gauss)", True, False, cache_hit_rate("closed-gauss"), "%",
                         info=True, only="kvrocks", note="Kvrocks only: TidesKV's INFO has no hit/miss counters")]
-    m["U2"] = [_m("du_end", "disk at end (excl. WAL archive)", False, True, _du_last("du-end"), "bytes"),
+    basis = "{basis}, excl. WAL archive"
+    m["U2"] = [_m("du_end", "disk at end (%s)" % basis, False, True, _du_last("du-end"), "bytes", disk_src="du-end"),
+               _m("du_end_apparent", "disk at end (apparent size, excl. WAL archive)", False, False, _du_last("du-end", 3),
+                  "bytes", info=True, twin_of="du_end"),
                _m("churn_p999", "churn p99.9", False, False, pct("churn", "p99.90"), "ms", "churn"),
-               _m("du_peak", "peak disk (excl. WAL archive)", False, False, du_peak, "bytes"),
+               _m("du_peak", "peak disk (%s)" % basis, False, False, du_peak, "bytes", disk_src="du.csv"),
                _m("churn_ops", "churn ops/s (fixed rate)", True, False, ops("churn"), "ops/s", "churn", info=True),
-               _m("churn_hit", "churn GET hit rate (misses expected)", True, False, hit_rate("churn"), "%", "churn", info=True),
-               _m("wal_archive", "WAL archive at end", False, False, _du_last("du-end", 2), "bytes", info=True)]
-    m["U3"] = [_m("closed_p999", "closed p99.9", False, True, pct("closed", "p99.90"), "ms", "closed"),
+               _m("churn_hit", "GET hit rate (negative lookups over a 1e9-key space)", True, False, hit_rate("churn"), "%",
+                  "churn", info=True, note="most GETs ask for keys never written, so a low rate is by design; reported, not checked"),
+               _m("wal_archive", "WAL archive at end ({basis})", False, False, _du_last("du-end", 2), "bytes", info=True,
+                  disk_src="du-end")]
+    m["U3"] = [_m("closed_p999", "closed p99.9 (not compared: servers run at different loads)", False, False,
+                  pct("closed", "p99.90"), "ms", "closed", info=True),
                _m("closed_ops", "closed ops/s", True, False, ops("closed"), "ops/s", "closed"),
                _m("windows_over_10x", "windows over 10x median p99.9", False, False, over_10x("closed"), "count", "closed")] \
-        + [x for x in _open() if x.key.endswith("_p999")]
+        + [replace(x, headline=x.key == "open50_p999") for x in _open() if x.key.endswith("_p999")]
     m["U4"] = [_m("mix_ops", "mix ops/s", True, True, ops("mix"), "ops/s", "mix"),
-               _m("mix_p99", "mix p99", False, False, pct("mix", "p99.00"), "ms", "mix")] \
+               _m("mix_p99", "mix p99 (not compared: closed loop)", False, False, pct("mix", "p99.00"), "ms", "mix", info=True)] \
         + [_m(s.lower() + "_ops", "%s ops/s" % s.upper().rstrip("S"), True, False, ops("mix", s), "ops/s", "mix",
               pros_cons=False, note="fixed command ratio: follows mix ops/s")
            for s in ("Hgets", "Hsets", "Hgetalls", "Hdels")]
     m["U5"] = []
     for sz in ("v1k", "v4k", "v16k"):
+        src = "du-after-load-" + sz
         m["U5"] += [_m(sz + "_ops", "%s ops/s" % sz, True, sz == "v4k", ops(sz), "ops/s", sz),
-                    _m(sz + "_p99", "%s p99" % sz, False, False, pct(sz, "p99.00"), "ms", sz),
-                    _m(sz + "_du", "%s disk after load (excl. WAL archive)" % sz, False, False,
-                       _du_last("du-after-load-" + sz), "bytes")]
+                    _m(sz + "_p99", "%s p99 (not compared: closed loop)" % sz, False, False, pct(sz, "p99.00"), "ms", sz,
+                       info=True),
+                    _m(sz + "_du", "%s disk after load (%s)" % (sz, basis), False, False, _du_last(src), "bytes", disk_src=src),
+                    _m(sz + "_du_apparent", "%s disk after load (apparent size, excl. WAL archive)" % sz, False, False,
+                       _du_last(src, 3), "bytes", info=True, twin_of=sz + "_du")]
     m["U6"] = []
     for c in ("c1", "c8", "c64", "c256"):
         m["U6"] += [_m(c + "_ops", "%s ops/s" % c, True, c == "c64", ops(c), "ops/s", c),
-                    _m(c + "_p99", "%s p99" % c, False, False, pct(c, "p99.00"), "ms", c)]
+                    _m(c + "_p99", "%s p99 (not compared: closed loop)" % c, False, False, pct(c, "p99.00"), "ms", c, info=True)]
     m["U7"] = _u7_headline()
-    m["U8"] = [_m("du_after_load", "disk after load (excl. WAL archive)", False, True, _u8("du_after_load"), "bytes"),
-               _m("load_ops", "bulk load ops/s", True, False, _u8("load_ops_per_s", wal=False), "ops/s"),
-               _m("settle_s", "time to quiet after load", False, False, _u8_settle, "s"),
-               _m("du_after_age", "disk after U3 aging (excl. WAL archive)", False, False, _u8("du_after_age"), "bytes"),
-               _m("after_compact", "disk after COMPACT (excl. WAL archive)", False, False, _u8("kvrocks_after_compact"),
-                  "bytes", info=True, only="kvrocks", note="Kvrocks only: TidesKV has no COMPACT")]
+    src = "summary.json:"
+    m["U8"] = [_m("du_after_load", "disk after load (%s)" % basis, False, True, _u8("du_after_load"), "bytes",
+                  disk_src=src + "du_after_load"),
+               _m("du_after_load_apparent", "disk after load (apparent size, excl. WAL archive)", False, False,
+                  _u8("du_after_load", True), "bytes", info=True, twin_of="du_after_load"),
+               _m("load_ops", "bulk load ops/s", True, False, _u8_plain("load_ops_per_s"), "ops/s"),
+               _m("settle_s", "time to quiet after load", False, False, _u8_settle, "s", floor_key="quiesce_window_s"),
+               _m("u3_load", "U3 disk after its load (%s)" % basis, False, False, _u8("u3_du_after_load"), "bytes", info=True,
+                  disk_src=src + "u3_du_after_load"),
+               _m("age_growth", "U3 disk growth during aging (%s)" % basis, False, False, _u8_growth, "bytes", info=True,
+                  disk_src=src + "du_after_age"),
+               _m("du_after_age", "disk after U3 aging (%s)" % basis, False, False, _u8("du_after_age"), "bytes",
+                  disk_src=src + "du_after_age"),
+               _m("after_compact", "disk after COMPACT (%s)" % basis, False, False, _u8("kvrocks_after_compact"), "bytes",
+                  info=True, only="kvrocks", disk_src=src + "kvrocks_after_compact",
+                  note="Kvrocks only: TidesKV has no COMPACT. Measured after U1's load and both closed-loop phases, "
+                       "on a store that has served traffic")]
     return m
 
 

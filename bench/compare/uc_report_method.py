@@ -21,12 +21,14 @@ def _fmt_bytes(n):
 
 
 def _setting_lines(summary):
-    """{server: sorted set of config lines} over every case's config block, for the tuning list."""
-    out = {}
-    for case in summary["cases"].values():
+    """{level: {server: set of config lines}} and {level: [cases]} over every case's config block."""
+    out, cases = {}, {}
+    for name, case in summary["cases"].items():
+        level = case["setup"]["level"]
+        cases.setdefault(level, []).append(name)
         for server, lines in case["setup"]["config"].items():
-            out.setdefault(server, set()).update(lines)
-    return out
+            out.setdefault(level, {}).setdefault(server, set()).update(lines)
+    return out, cases
 
 
 def _shared(summary):
@@ -49,6 +51,8 @@ def _fio_lines(fio):
         out.append("- fio 256 KiB random reads (O_DIRECT) on the benchmark filesystem: " + "; ".join(
             "QD%d %.0f MB/s, %.0f IOPS" % (qd, r["mbs"], r["iops"]) for qd, r in sorted(reads.items())) + ".")
     fs = fio.get("fsync")
+    if not reads:
+        out.append("- fio random-read baseline: not run in this run.")
     if fs:
         lat = ""
         if fs.get("sync_mean_ms"):
@@ -57,7 +61,9 @@ def _fio_lines(fio):
                 lat += ", p99 %.3f ms" % fs["sync_p99_ms"]
         out.append("- fio 4 KiB random writes with an fsync after each, queue depth 1 (the durable-commit floor of U6): "
                    "%.0f writes/s%s." % (fs["iops"], lat))
-    return out or ["- fio baselines: not run in this run."]
+    if not fs:
+        out.append("- fio fsync baseline: measured per server before each U6 sweep (see U6), not at the start of the run.")
+    return out
 
 
 def methodology(summary):
@@ -101,8 +107,14 @@ def methodology(summary):
     lines += ["### Settings on each side", "",
               "Both servers get the shared parity configuration plus the case's documented choice. Every setting that "
               "was written, as read back:", ""]
-    for server, ls in sorted(_setting_lines(summary).items()):
-        lines.append("- %s: %s" % (server, ", ".join("`%s`" % x for x in sorted(ls)) or "defaults"))
+    by_level, level_cases = _setting_lines(summary)
+    for level in ("relaxed", "strict"):
+        if level not in by_level:
+            continue
+        lines += ["**%s** (%s)" % (level.capitalize(), ", ".join(level_cases[level])), ""]
+        lines += ["- %s: %s" % (server, ", ".join("`%s`" % x for x in sorted(ls)) or "defaults")
+                  for server, ls in sorted(by_level[level].items())] + [""]
+    lines.pop()
     lines += ["", "### Not covered in v1", ""] + ["- " + x for x in NOT_COVERED]
     lines += ["", "### For Kvrocks maintainers", "", INVITATION, ""]
     return lines
