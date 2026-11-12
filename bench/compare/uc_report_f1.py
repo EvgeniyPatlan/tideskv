@@ -81,7 +81,7 @@ def _error_text_rows(matrix, servers):
 
 LEGEND = (
     "Reference: %s (the neutral oracle: a command is `same` when its reply equals Redis'). %d cases, each on a flushed "
-    "database, every command of a case compared, one repetition (the run is deterministic).",
+    "database, every command of a case compared, one repetition (expiry-timing cases, such as EXPIRE with 0 or a negative time, can differ between runs).",
     "Per case: `differs`: a reply differs from Redis'. `unsupported`: every difference is a refusal, the server answers unknown "
     "command or subcommand (or Kvrocks' equivalents, see `is_unknown` in `f1_matrix.py`) where Redis succeeds. `extra`: Redis 7.2 "
     "itself answers unknown command and the server answers anything else, so any non-refusal reply counts as having the command "
@@ -165,7 +165,8 @@ def _listing(names, cap=12):
 def f1_items(matrix):
     """F1 pros and cons, the same rules for both servers. Cons: every server's undocumented differences, one item per
     root cause (the kind of Redis' reply and of the server's), naming families and commands. Pros: a family (other than the
-    type probes) where one server has no undocumented difference and the other has some. A type only one side accepts: a
+    type probes) where one server is `same` in every case and the other has undocumented differences (a documented
+    absence is no pro). A type only one side accepts: a
     pro for that side, a con for the other."""
     items = {"tideskv_pros": [], "tideskv_cons": [], "kvrocks_pros": [], "kvrocks_cons": []}
     servers = _servers(matrix)
@@ -180,9 +181,9 @@ def f1_items(matrix):
         if fam in TYPE_FAMILIES:  # a type a server documents as missing is no pro; the types rule below covers it
             continue
         for (good, gn), (bad, bn) in (servers, servers[::-1]):
-            if good in d and bad in d and d[good]["undocumented"] == 0 and d[bad]["undocumented"] > 0:
-                items[good + "_pros"].append("F1 %s: %s has no undocumented difference from Redis 7.2; %s has %d case(s)" % (
-                    fam, gn, bn, d[bad]["undocumented"]))
+            if good in d and bad in d and d[good]["same"] == d["cases"] and d[bad]["undocumented"] > 0:
+                items[good + "_pros"].append("F1 %s: %s matches Redis 7.2 on all %d cases; %s has %d undocumented case(s)" % (
+                    fam, gn, d["cases"], bn, d[bad]["undocumented"]))
     (ka, na), (kb, nb) = servers
     for c in matrix["cases"]:
         if c["family"] not in TYPE_FAMILIES:

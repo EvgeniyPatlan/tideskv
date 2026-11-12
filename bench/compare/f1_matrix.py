@@ -70,8 +70,10 @@ def _parse_command(line):
 
 
 def parse_documented(path):
-    """{(target section, family, case): [{url, note, command}]} from `## kvrocks` / `## tideskv` sections of lines
-    `family | case @CMD | url | note`. @CMD is mandatory: the label applies to a differing command CMD of that case."""
+    """{(target section, family, case): [{url, note, command, index}]} from `## kvrocks` / `## tideskv` sections of lines
+    `family | case @CMD | url | note`. @CMD is mandatory. A bare command word covers every differing CMD of the case. A line
+    that pins the full argv (`@GET a`) or the 1-based command index (`@DBSIZE #3`) covers only that command; a note
+    starting "follows from" (a difference that only follows from an earlier documented one) must pin."""
     out, section = {}, None
     with open(path) as f:
         for raw in f:
@@ -85,10 +87,14 @@ def parse_documented(path):
             if section is None or len(parts) != 4:
                 raise ValueError("%s: bad line %r" % (path, line))
             name, sep, cmd = parts[1].partition(" @")
-            if not sep or not cmd.strip():
+            m = re.match(r"^(.*?)(?: #(\d+))?$", cmd.strip())
+            if not sep or not m.group(1).strip():
                 raise ValueError("%s: line without @COMMAND: %r" % (path, line))
-            out.setdefault((section, parts[0], name), []).append(
-                {"url": parts[2], "note": parts[3], "command": cmd.strip().upper()})
+            argv = m.group(1).upper().split()
+            entry = {"url": parts[2], "note": parts[3], "command": " ".join(argv), "index": int(m.group(2) or 0) or None}
+            if parts[3].lower().startswith("follows from") and len(argv) == 1 and not entry["index"]:
+                raise ValueError("%s: a follows-from line must pin the full command or its #index: %r" % (path, line))
+            out.setdefault((section, parts[0], name), []).append(entry)
     return out
 
 
@@ -254,11 +260,12 @@ def _name(argv):
 
 def _compare(commands, ref_replies, conn):
     """Every command of the case against the reference's recorded replies: {status, diffs, error_text, accepts}."""
-    diffs, texts, accepts = [], [], None
+    diffs, texts, accepts, n = [], [], None, 0
     for c, ref in zip(commands, ref_replies):
         if c["sleep"]:
             time.sleep(c["sleep"])
             continue
+        n += 1
         got = conn.call(c["argv"])
         if accepts is None:
             accepts = not is_unknown(got, c["argv"])
@@ -266,7 +273,7 @@ def _compare(commands, ref_replies, conn):
         if text:
             texts.append({"command": _name(c["argv"]), "ref": show(ref), "got": show(got)})
         if status != "same":
-            diffs.append({"command": _name(c["argv"]), "status": status, "ref": show(ref), "got": show(got),
+            diffs.append({"command": _name(c["argv"]), "n": n, "status": status, "ref": show(ref), "got": show(got),
                           "ref_kind": kind(ref), "got_kind": kind(got), "documented": None})
     return {"status": _overall(diffs), "diffs": diffs, "error_text": texts, "accepts": bool(accepts),
             "documented": None, "undocumented": [d["command"] for d in diffs]}
@@ -279,20 +286,26 @@ def _overall(diffs):
     return "differs" if "differs" in states else sorted(states)[-1]  # unsupported, else extra
 
 
+def _covers(entry, d):
+    words = d["command"].upper().split()
+    if entry["index"] and d["n"] != entry["index"]:
+        return False
+    want = entry["command"].split()
+    return words == want if len(want) > 1 else words[0] == want[0]
+
+
 def label(res, entries):
-    """Documented labels per differing command (`differs`/`unsupported` ones only; entries are the server's lines for
-    the case). The case is documented only when every one of its differences is; a partly documented one is `differs`
-    and names the undocumented commands."""
-    for d in res["diffs"]:
-        if d["status"] in ("differs", "unsupported"):
-            word = d["command"].split()[0].upper()
-            d["documented"] = next(({"url": e["url"], "note": e["note"]} for e in entries if e["command"] == word), None)
-    open_cmds = [d["command"] for d in res["diffs"] if d["status"] in ("differs", "unsupported") and not d["documented"]]
-    res["undocumented"] = open_cmds
+    """Documented labels per differing command (`differs`/`unsupported` ones only; entries are the server's lines for the
+    case, see parse_documented). The case is documented when every one of those differences is (`extra` commands are no
+    differences); a partly documented one is `differs` and names the undocumented commands."""
     flagged = [d for d in res["diffs"] if d["status"] in ("differs", "unsupported")]
-    if flagged and not open_cmds and len(flagged) == len(res["diffs"]):
+    for d in flagged:
+        d["documented"] = next(({"url": e["url"], "note": e["note"]} for e in entries if _covers(e, d)), None)
+    open_cmds = [d["command"] for d in flagged if not d["documented"]]
+    res["undocumented"] = open_cmds
+    if flagged and not open_cmds:
         res["documented"] = [d["documented"] for d in flagged]
-    elif flagged and len(open_cmds) < len(flagged):
+    elif len(open_cmds) < len(flagged):
         res["status"] = "differs"  # partly documented
     return res
 

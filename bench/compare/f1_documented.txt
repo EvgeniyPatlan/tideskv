@@ -7,6 +7,7 @@
 ## kvrocks
 zset | zrangebylex with mixed scores @ZRANGEBYLEX | https://kvrocks.apache.org/docs/supported-commands | ZRANGEBYLEX/ZREVRANGEBYLEX/ZREMRANGEBYLEX order by member and disregard scores
 zset | zrangebylex with mixed scores @ZREMRANGEBYLEX | https://kvrocks.apache.org/docs/supported-commands | ZRANGEBYLEX/ZREVRANGEBYLEX/ZREMRANGEBYLEX order by member and disregard scores
+zset | zrangebylex with mixed scores @ZRANGE z 0 -1 WITHSCORES | https://kvrocks.apache.org/docs/supported-commands | follows from ZREMRANGEBYLEX ignoring scores (it removed other members)
 set | spop with count @SPOP | https://kvrocks.apache.org/docs/supported-commands | SPOP pops in key order, not at random
 set | spop single and missing @SPOP | https://kvrocks.apache.org/docs/supported-commands | SPOP pops in key order, not at random
 set | srandmember with count @SRANDMEMBER | https://kvrocks.apache.org/docs/supported-commands | SRANDMEMBER returns the first N members
@@ -19,13 +20,13 @@ server/info | cluster commands outside cluster mode @CLUSTER | https://kvrocks.a
 tracking | client tracking on @CLIENT | https://kvrocks.apache.org/docs/supported-commands | CLIENT TRACKING is marked unsupported
 scripting | script kill with no script running @SCRIPT | https://kvrocks.apache.org/docs/supported-commands | SCRIPT KILL is marked unsupported
 list | brpoplpush @BRPOPLPUSH | https://kvrocks.apache.org/docs/supported-commands | BRPOPLPUSH is marked unsupported (deprecated)
-list | brpoplpush @LRANGE | https://kvrocks.apache.org/docs/supported-commands | follows from the unsupported BRPOPLPUSH (nothing was moved)
+list | brpoplpush @LRANGE dst 0 -1 | https://kvrocks.apache.org/docs/supported-commands | follows from the unsupported BRPOPLPUSH (nothing was moved)
 object | object encoding @OBJECT | https://kvrocks.apache.org/docs/supported-commands | OBJECT ENCODING, FREQ, IDLETIME and REFCOUNT are unsupported
 notifications | keyspace events config @CONFIG | https://github.com/apache/kvrocks/discussions/3533 | keyspace notifications are a design proposal, not built
 keyspace | select database @SELECT | https://kvrocks.apache.org/docs/supported-commands | SELECT only switches databases when redis-databases is above 0 (default 0)
-keyspace | select database @GET | https://kvrocks.apache.org/docs/supported-commands | follows from SELECT not switching databases at redis-databases 0
+keyspace | select database @GET a | https://kvrocks.apache.org/docs/supported-commands | follows from SELECT not switching databases at redis-databases 0
 keyspace | select out of range @SELECT | https://kvrocks.apache.org/docs/supported-commands | SELECT only switches databases when redis-databases is above 0 (default 0)
-transactions | multi select @GET | https://kvrocks.apache.org/docs/supported-commands | follows from SELECT not switching databases at redis-databases 0
+transactions | multi select @GET a | https://kvrocks.apache.org/docs/supported-commands | follows from SELECT not switching databases at redis-databases 0
 
 ## tideskv
 streams | xadd xlen @XADD | docs/tutorial.md#differences-from-redis | Streams is listed as not supported yet
@@ -45,6 +46,6 @@ keyspace | move @MOVE | docs/tutorial.md#differences-from-redis | MOVE is listed
 keyspace | swapdb @SWAPDB | docs/tutorial.md#differences-from-redis | SWAPDB is listed as not supported yet
 object | object encoding @OBJECT | docs/tutorial.md#differences-from-redis | OBJECT is listed as not supported yet
 server/info | client list @CLIENT | docs/tutorial.md#differences-from-redis | CLIENT LIST is listed as not supported yet
-keyspace | copy @GET | docs/tutorial.md#differences-from-redis | follows from the unsupported COPY
-keyspace | move @EXISTS | docs/tutorial.md#differences-from-redis | follows from the unsupported MOVE
-keyspace | swapdb @DBSIZE | docs/tutorial.md#differences-from-redis | follows from the unsupported SWAPDB
+keyspace | copy @GET b | docs/tutorial.md#differences-from-redis | follows from the unsupported COPY
+keyspace | move @EXISTS a | docs/tutorial.md#differences-from-redis | follows from the unsupported MOVE
+keyspace | swapdb @DBSIZE #3 | docs/tutorial.md#differences-from-redis | follows from the unsupported SWAPDB

@@ -341,8 +341,8 @@ class ReportTest(unittest.TestCase):
             part = lambda a, b: pros.split("**%s**" % a)[1].split("**%s**" % b)[0]
             tp, tc, kp, kc = part("TidesKV pros", "TidesKV cons"), part("TidesKV cons", "Kvrocks pros"), \
                 part("Kvrocks pros", "Kvrocks cons"), pros.split("**Kvrocks cons**")[1].split("**Even")[0]
-            self.assertIn("F1 hash: TidesKV has no undocumented difference from Redis 7.2; Kvrocks has 1 case(s)", tp)
-            self.assertIn("F1 set: Kvrocks has no undocumented difference from Redis 7.2; TidesKV has 1 case(s)", kp)
+            self.assertIn("F1 hash: TidesKV matches Redis 7.2 on all 1 cases; Kvrocks has 1 undocumented case(s)", tp)
+            self.assertIn("F1 set: Kvrocks matches Redis 7.2 on all 1 cases; TidesKV has 1 undocumented case(s)", kp)
             self.assertIn("F1 type: TidesKV has Streams, Kvrocks does not", tp)
             self.assertIn("F1 type: Kvrocks has JSON, TidesKV does not", kp)
             # one item per root cause: WRONGTYPE replaced by ERR in two families is one Kvrocks con
@@ -359,6 +359,17 @@ class ReportTest(unittest.TestCase):
             # documented-only differences are no con
             self.assertFalse(any("ZLEXCOUNT" in x for x in kc.splitlines()))
             self.assertTrue(any("ZRANGE" in x and "zset" in x for x in kc.splitlines()))  # the undocumented part of a partly documented case
+
+    def test_documented_absence_is_no_family_pro(self):
+        m = json.loads(json.dumps(F1_MATRIX))
+        m["cases"].append(case("tracking", "client tracking", _res("unsupported", [dif("CLIENT TRACKING ON", "unsupported", doc=DOC)]),
+                               _res("unsupported", [dif("CLIENT TRACKING ON", "unsupported")])))
+        m["cases"][-1]["results"]["tideskv"], m["cases"][-1]["results"]["kvrocks"] = (
+            _res("unsupported", [dif("CLIENT TRACKING ON", "unsupported")]),
+            _res("unsupported", [dif("CLIENT TRACKING ON", "unsupported", doc=DOC)]))
+        items = uc_report_text.f1_items(m)
+        self.assertFalse([x for x in items["kvrocks_pros"] if "tracking" in x])  # Kvrocks documents the gap, it is no pro
+        self.assertTrue([x for x in items["tideskv_cons"] if "CLIENT TRACKING" in x])  # TidesKV's undocumented gap stays a con
 
     def test_f1_items_are_symmetric(self):
         swap = {"tideskv": "kvrocks", "kvrocks": "tideskv"}

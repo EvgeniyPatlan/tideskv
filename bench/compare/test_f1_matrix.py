@@ -158,6 +158,36 @@ class MatrixTest(unittest.TestCase):
         self.assertEqual((r["status"], r["documented"], r["undocumented"]), ("differs", None, ["DBSIZE"]))
         self.assertIsNotNone(r["diffs"][0]["documented"])
 
+    def test_follows_from_entry_covers_only_the_pinned_command(self):
+        t = self.server(GET=lambda c: b"$1\r\n2\r\n")
+        cases = "## strings | c\nSET a 1\nGET a\nGET b\nDBSIZE\n"
+        doc = "## kvrocks\nstrings | c @GET a | https://kvrocks.apache.org/x | follows from SET not storing\n"
+        r = self.result(self.run_matrix(cases, [("kvrocks", t)], self.server(), doc), "kvrocks")
+        self.assertEqual([bool(d["documented"]) for d in r["diffs"]], [True, False])  # GET b is another command
+        self.assertEqual(r["undocumented"], ["GET b"])
+        self.assertEqual(r["status"], "differs")
+
+    def test_follows_from_entry_can_pin_the_command_index(self):
+        t = self.server(DBSIZE=lambda c: b":9\r\n")
+        cases = "## strings | c\nDBSIZE\nSET a 1\nDBSIZE\n"
+        doc = "## kvrocks\nstrings | c @DBSIZE #3 | https://kvrocks.apache.org/x | follows from x\n"
+        r = self.result(self.run_matrix(cases, [("kvrocks", t)], self.server(), doc), "kvrocks")
+        self.assertEqual([(d["n"], bool(d["documented"])) for d in r["diffs"]], [(1, False), (3, True)])
+
+    def test_follows_from_must_be_pinned(self):
+        with self.assertRaises(ValueError):
+            f1_matrix.parse_documented(self.write("d.txt", "## kvrocks\nstrings | c @GET | https://x | follows from y\n"))
+        entries = f1_matrix.parse_documented(self.write("e.txt", "## kvrocks\nstrings | c @GET a | https://x | follows from y\n"))
+        self.assertEqual(entries[("kvrocks", "strings", "c")][0]["command"], "GET A")
+
+    def test_extra_does_not_keep_a_documented_case_undocumented(self):
+        t = self.server(FOO=lambda c: UNKNOWN, BAR=lambda c: b":1\r\n")
+        ref = self.server(FOO=lambda c: OK, BAR=lambda c: UNKNOWN)
+        doc = "## kvrocks\ngeo | c @FOO | https://kvrocks.apache.org/x | n\n"
+        r = self.result(self.run_matrix("## geo | c\nFOO x\nBAR x\n", [("kvrocks", t)], ref, doc), "kvrocks")
+        self.assertEqual([d["status"] for d in r["diffs"]], ["unsupported", "extra"])
+        self.assertEqual((r["status"], len(r["documented"]), r["undocumented"]), ("unsupported", 1, []))
+
     def test_documented_file_requires_a_command(self):
         with self.assertRaises(ValueError):
             f1_matrix.parse_documented(self.write("d.txt", "## kvrocks\nstrings | c | https://x | n\n"))
