@@ -64,7 +64,7 @@ Every workload runs at two durability levels:
 - Pages a removed container read stay in the host page cache, charged to its dead memory cgroup, and a new container can read them without being charged. So before every server start, the harness runs a host `sync` and drops the data dir's files from the page cache (`dd iflag=nocache count=0` per file). After every server stop it runs `sync` again.
 - Before each workload's warm-up, after the load and after the strict restart, the harness waits until the server container uses under 5% of one core and writes at most 1 MiB over 5 s, capped at `QUIESCE_MAX`. The report shows each wait as "settle s"; a capped wait shows as `≥N (cap)`. One workload's background flush and compaction debt then shows up as settle time instead of slowing the next workload.
 - memtier runs on separate cores (`CLIENT_CPUS`).
-- Both servers use 4 workers, a 2 GB block cache, a 64 MB memtable and LZ4 compression.
+- Both servers use 4 workers, a 2 GB block cache, a 256 MB memtable and LZ4 compression.
 - The report's Fairness section shows the values read back from each running server. The run fails if any differs from the plan.
 - The data is loaded once per server at the relaxed level. The workloads run W1..W6 at relaxed, then again after a restart at strict. W5 and W6 remove data, so the strict pass sees what the relaxed pass left. Both servers go through the same sequence.
 - Every memtier client uses its own seed (`--distinct-client-seed --randomize`) and random data, so no workload replays identical keys or values.

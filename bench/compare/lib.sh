@@ -229,10 +229,10 @@ cli() {
 _parity_expect() {
   local server=$1 level=$2
   if [[ $server == tideskv ]]; then
-    echo "workers $SERVER_WORKERS"; echo "block-cache-size $((BLOCK_CACHE_MB << 20))"; echo "memtable-size 67108864"
+    echo "workers $SERVER_WORKERS"; echo "block-cache-size $((BLOCK_CACHE_MB << 20))"; echo "memtable-size 268435456"
     echo "compression $COMPRESSION"; echo "sync-mode $([[ $level == strict ]] && echo full || echo "$RELAXED")"
   else
-    echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 64"
+    echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 256"
     echo "rocksdb.compression $COMPRESSION"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
     if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"; fi
     if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}"; fi
