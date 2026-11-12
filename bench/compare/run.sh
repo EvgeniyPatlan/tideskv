@@ -77,17 +77,6 @@ disk_check() {
   if (( free < need )); then log "not enough disk: need $need bytes, $free free under $OUT"; return 1; fi
 }
 
-# "N logical CPUs on M physical cores" for SERVER_CPUS (on this host 0-3 is 2 cores with SMT).
-server_cores() {
-  local part c cpus=() parts
-  IFS=, read -ra parts <<<"$SERVER_CPUS"
-  for part in "${parts[@]}"; do
-    if [[ $part == *-* ]]; then for ((c = ${part%-*}; c <= ${part#*-}; c++)); do cpus+=("$c"); done; else cpus+=("$part"); fi
-  done
-  echo "${#cpus[@]} logical CPUs on $(lscpu -p=CPU,CORE | awk -F, -v l=" ${cpus[*]} " \
-    '!/^#/ && index(l, " " $1 " ") {print $2}' | sort -u | wc -l) physical cores"
-}
-
 # meta.json: one key=value argument per field, "#key=value" for integers; META_EXTRA adds fields (W7's).
 META_EXTRA=()
 write_meta() {
@@ -144,30 +133,6 @@ load_all() {
   LOAD_SECONDS=$(( $(date +%s) - start ))
 }
 
-# Waits for the server to go quiet and records the wait in $1.
-settle() {
-  local r
-  # in the background so that a TERM or INT is handled now: bash runs a trap only once the foreground
-  # command returns, and a wait can last QUIESCE_MAX
-  quiesce >"$1" & wait $! || { log "cannot read $SERVER_CONTAINER's cgroup ($SERVER_CGROUP)"; return 1; }
-  r=$(<"$1")
-  log "$SERVER_NAME $(settle_text "$r")"
-}
-
-# "settled after 12s", or "did not settle within 600s" for a capped wait
-settle_text() {
-  if [[ $1 == *capped ]]; then echo "did not settle within ${1%% *}s"; else echo "settled after ${1}s"; fi
-}
-
-# Stops the docker stats loop and any sample still in flight, so no post-run sample is recorded.
-stop_sampler() {
-  kill -STOP "$1" 2>/dev/null || return 0
-  pkill -P "$1" 2>/dev/null || true
-  kill "$1" 2>/dev/null || true
-  kill -CONT "$1" 2>/dev/null || true
-  wait "$1" 2>/dev/null || true
-}
-
 # shellcheck disable=SC2317
 _run_cb() { RUN_ARGS=("$@"); }
 # shellcheck disable=SC2317
@@ -175,7 +140,7 @@ _del_cb() { DEL_ARGS=("$@"); }
 
 # Warm-up then the timed run of one workload; records .json, .stats.jsonl, .status.
 run_workload() {
-  local level=$1 w=$2 base="$CUR/$1/$2" line reply stats_pid del_pid=""
+  local level=$1 w=$2 base="$CUR/$1/$2" line reply del_pid=""
   mkdir -p "$OUT/$CUR/$level"
   while read -r line; do
     # shellcheck disable=SC2086
@@ -190,24 +155,7 @@ run_workload() {
     wl_run_w6_del _del_cb
     memtier "$CUR/$level/W6-del" --test-time="$DURATION" "${DEL_ARGS[@]}" & del_pid=$!
   fi
-  # docker stats gives peak memory; CPU is the cgroup's usage_usec delta over exactly the timed run
-  ( while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
-    >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
-  local cpu0 cpu1
-  if [[ $CUR == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info0" || true; fi
-  cpu0=$(cg_sample) || cpu0=""
-  if memtier "$base" "${common[@]}" --test-time="$DURATION" "${RUN_ARGS[@]}"; then
-    echo ok >"$OUT/$base.status"
-  else
-    echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
-  fi
-  cpu1=$(cg_sample) || cpu1=""
-  if [[ -n $cpu0 && -n $cpu1 ]]; then
-    echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"
-    echo $(( ${cpu1##* } - ${cpu0##* } )) >"$OUT/$base.io"
-  fi
-  if [[ $CUR == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
-  stop_sampler "$stats_pid"
+  measure_memtier "$base" "${common[@]}" --test-time="$DURATION" "${RUN_ARGS[@]}"
   if [[ -n $del_pid ]] && ! wait "$del_pid"; then
     echo "W6 DEL memtier failed; see $CUR/$level/W6-del.log" >>"$OUT/$base.status"
     if [[ $(head -1 "$OUT/$base.status") == ok ]]; then sed -i 1d "$OUT/$base.status"; fi
@@ -217,8 +165,6 @@ run_workload() {
     return 1
   fi
 }
-
-_du() { du -sb "$1" | cut -f1; }
 
 # Records why a server's run failed, then stops it so it cannot keep the server cores during the other run.
 _server_failed() {
@@ -252,13 +198,6 @@ run_server() {
   stop_server
   printf '{"after_load_bytes": %s, "end_bytes": %s, "load_seconds": %s, "logical_bytes": %s}\n' \
     "$after" "$(_du "$data")" "$LOAD_SECONDS" "$(wl_logical_bytes)" >"$OUT/$server/disk.json"
-}
-
-# The servers write the data dirs as other uids, so the host user cannot delete them: empty them from a container.
-remove_data() {
-  [[ -d $OUT/data ]] || return 0
-  docker run --rm --name "tideskv-bench-clean-$TS" -v "$OUT/data:/d" --entrypoint find "$CLI_IMAGE" \
-    /d -mindepth 1 -delete >/dev/null 2>&1 || log "could not empty $OUT/data"
 }
 
 run_full() {

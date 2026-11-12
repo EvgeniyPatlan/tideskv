@@ -338,3 +338,73 @@ run_fio() {
     -f /f/fio.dat >/dev/null 2>&1 || log "could not delete $dir/fio.dat"
   if ((rc)); then FIO_STATUS="failed at QD $qd (exit $rc)"; else FIO_STATUS=ok; fi
 }
+
+# ---- shared by run.sh and the use-case runner ----
+
+# Waits for the server to go quiet and records the wait in $1.
+settle() {
+  local r
+  # in the background so that a TERM or INT is handled now: bash runs a trap only once the foreground
+  # command returns, and a wait can last QUIESCE_MAX
+  quiesce >"$1" & wait $! || { log "cannot read $SERVER_CONTAINER's cgroup ($SERVER_CGROUP)"; return 1; }
+  r=$(<"$1")
+  log "$SERVER_NAME $(settle_text "$r")"
+}
+
+# "settled after 12s", or "did not settle within 600s" for a capped wait
+settle_text() {
+  if [[ $1 == *capped ]]; then echo "did not settle within ${1%% *}s"; else echo "settled after ${1}s"; fi
+}
+
+# Stops the docker stats loop and any sample still in flight, so no post-run sample is recorded.
+stop_sampler() {
+  kill -STOP "$1" 2>/dev/null || return 0
+  pkill -P "$1" 2>/dev/null || true
+  kill "$1" 2>/dev/null || true
+  kill -CONT "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
+_du() { du -sb "$1" | cut -f1; }
+
+# The servers write the data dirs as other uids, so the host user cannot delete them: empty them from a container.
+remove_data() {
+  [[ -d $OUT/data ]] || return 0
+  docker run --rm --name "tideskv-bench-clean-$TS" -v "$OUT/data:/d" --entrypoint find "$CLI_IMAGE" \
+    /d -mindepth 1 -delete >/dev/null 2>&1 || log "could not empty $OUT/data"
+}
+
+# "N logical CPUs on M physical cores" for SERVER_CPUS (on this host 0-3 is 2 cores with SMT).
+server_cores() {
+  local part c cpus=() parts
+  IFS=, read -ra parts <<<"$SERVER_CPUS"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then for ((c = ${part%-*}; c <= ${part#*-}; c++)); do cpus+=("$c"); done; else cpus+=("$part"); fi
+  done
+  echo "${#cpus[@]} logical CPUs on $(lscpu -p=CPU,CORE | awk -F, -v l=" ${cpus[*]} " \
+    '!/^#/ && index(l, " " $1 " ") {print $2}' | sort -u | wc -l) physical cores"
+}
+
+# The timed-run measurement shared by run.sh's run_workload and the use-case runner: starts the docker stats sampler,
+# samples the server cgroup around one memtier run (NAME is relative to $OUT, the rest are memtier arguments) and writes
+# NAME.{json,stats.jsonl,cpu,io,status}, plus .info0/.info1 (INFO persistence) when $CUR is tideskv.
+measure_memtier() {
+  local base=$1 stats_pid cpu0 cpu1; shift
+  # docker stats gives peak memory; CPU is the cgroup's usage_usec delta over exactly the timed run
+  ( while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
+    >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
+  if [[ ${CUR:-} == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info0" || true; fi
+  cpu0=$(cg_sample) || cpu0=""
+  if memtier "$base" "$@"; then
+    echo ok >"$OUT/$base.status"
+  else
+    echo "memtier exited $?; see $base.log" >"$OUT/$base.status"
+  fi
+  cpu1=$(cg_sample) || cpu1=""
+  if [[ -n $cpu0 && -n $cpu1 ]]; then
+    echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"
+    echo $(( ${cpu1##* } - ${cpu0##* } )) >"$OUT/$base.io"
+  fi
+  if [[ ${CUR:-} == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
+  stop_sampler "$stats_pid"
+}
