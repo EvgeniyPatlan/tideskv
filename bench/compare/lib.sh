@@ -6,6 +6,8 @@ MEMTIER_IMAGE=redislabs/memtier_benchmark:2.1.4
 CLI_IMAGE=redis:7.2.5
 # W7's disk ceiling (fio 3.13). Pinned by digest; run_fio skips and says so in meta.json when it cannot be pulled.
 FIO_IMAGE=xridge/fio@sha256:c58227616c9d2ef4c7d9c762a382d5921608ee3cf4b6aef7d99c4f964089d9c3
+# The use-case suite's Python tools (U7's ack-writer, verify and probe) run in this image, pinned by digest (python:3.12.7-slim).
+PY_IMAGE=python@sha256:60d9996b6a8a3689d36db740b49f4327be3be09a21122bd02fb8895abb38b50d
 SERVER_CPUS=${SERVER_CPUS:-0-3}
 CLIENT_CPUS=${CLIENT_CPUS:-8-15}
 SERVER_MEM=${SERVER_MEM:-8g}
@@ -200,6 +202,8 @@ start_server() {
     docker run "${common[@]}" -v "$data:/var/lib/kvrocks/data" -v "$conf:/etc/kvrocks.conf:ro" \
       --entrypoint kvrocks "$KVROCKS_IMAGE" -c /etc/kvrocks.conf >/dev/null
   fi
+  # START_NOWAIT=1 (U7's restart): return at once, so the caller's probe measures the time to the first PONG itself
+  if ((${START_NOWAIT:-0})); then log "$server ($level) started, not waiting for it"; return 0; fi
   local i
   for ((i = 0; i < 60; i++)); do
     if [[ $(cli PING 2>/dev/null) == PONG ]]; then

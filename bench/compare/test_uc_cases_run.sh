@@ -232,6 +232,62 @@ _uc_dbsize_end dbs
 check dbsize-end-tideskv-direct "$(cat "$OUT/dbs/dbsize-end")" 0
 DBSIZE_REPLY=999999999
 
+# ---- U7: per kill point = baseline probe, writer, signal, restart, probe, verify (strict, both servers) ----
+OUT=$TMP/u7 UC_MODE=quick
+uc_sizes quick
+U7_KEYS=1000 UC_U7_SECS="5 15" UC_U7_TIMES=1 SERVER_PORT=6379 NET=testnet SCAN_TRACK="" DBSIZE_REPLY=999999999
+rm -f "$TMP/scanwait"
+# shellcheck disable=SC2317
+{
+start_server() {
+  EV+=("$CUR:start${START_NOWAIT:+-nowait}") START_LEVELS+=("$1:$2"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"
+}
+stop_server() { EV+=("$CUR:stop"); SERVER_CONTAINER=""; }
+sleep() { EV+=("$CUR:sleep-$1"); }
+_uc_u7_wait_writing() { EV+=("$CUR:writing"); }
+_uc_u7_writer_start() { EV+=("$CUR:writer"); }
+_uc_u7_wait_exit() { EV+=("$CUR:exit-$1"); }
+docker() {
+  case $* in
+    "kill -s "*) EV+=("$CUR:signal-${3}") ;;
+    *ExitCode*) echo "${WRITER_RC:-0}" ;;
+    "logs "*) echo "acked 42" ;;
+    *State.Running*) echo true ;;
+  esac
+}
+_uc_py() {
+  local dir=$1 mode=$2; shift 2
+  EV+=("$CUR:$mode") PY_ARGS+=("$mode $*")
+  case $mode in
+    probe) if [[ $* == *--baseline-secs* ]]; then echo '{"p99_ms": 0.75}' >"$OUT/$dir/baseline.json"; fi ;;
+    verify) echo '{"acked": 42, "lost": 0, "lost_sample": []}' >"$OUT/$dir/verify.json" ;;
+  esac
+}
+}
+EV=() START_LEVELS=() PY_ARGS=()
+uc_dispatch U7 2>/dev/null
+check u7-done "$(cat "$OUT/U7/tideskv/rep1/done") $(cat "$OUT/U7/kvrocks/rep1/done")" "ok ok"
+check u7-strict "${START_LEVELS[*]}" "tideskv:strict tideskv:strict tideskv:strict tideskv:strict tideskv:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict"
+seq_of() { printf '%s\n' "${EV[@]}" | grep "^$1:" | grep -v -e ':load' -e 'exit-tideskv-bench' | sed 's/^[^:]*://' | tr '\n' ' '; }
+check u7-sequence-tideskv "$(seq_of tideskv)" \
+  "start probe writer writing sleep-5 signal-TERM exit-c-tideskv stop start-nowait probe verify probe writer writing sleep-5 signal-KILL exit-c-tideskv stop start-nowait probe verify probe writer writing sleep-15 signal-TERM exit-c-tideskv stop start-nowait probe verify probe writer writing sleep-15 signal-KILL exit-c-tideskv stop start-nowait probe verify stop "
+check u7-point-files "$(count_files "$OUT/U7/kvrocks/rep1/kill-15" baseline.json until-p99-ms verify.json signal.epoch_ms restart.epoch_ms writer.out writer.status)" 7
+check u7-term-seconds "$([[ -s $OUT/U7/kvrocks/rep1/term-5/term.seconds && ! -e $OUT/U7/kvrocks/rep1/kill-5/term.seconds ]] && echo y)" y
+check u7-until-is-2x-baseline "$(cat "$OUT/U7/tideskv/rep1/term-5/until-p99-ms")" "1.5"
+check u7-probe-args "$(printf '%s\n' "${PY_ARGS[@]}" | grep -m1 '^probe .*--until-p99' | grep -o -e '--until-p99 [0-9.]*' -e '--t0 [0-9]*' | sed 's/[0-9]\{13\}/T0/' | tr '\n' ' ')" "--until-p99 1.5 --t0 T0 "
+check u7-load-pipeline "$(cat "$OUT/U7/tideskv/rep1/load.pipeline")" 32
+# repeats get a run<i> sub-directory
+OUT=$TMP/u7t UC_U7_SECS="5" UC_U7_TIMES=2
+EV=()
+uc_dispatch U7 2>/dev/null
+check u7-times-dirs "$(cd "$OUT/U7/tideskv/rep1" && printf '%s ' term-5/run* kill-5/run*)" "term-5/run1 term-5/run2 kill-5/run1 kill-5/run2 "
+# a failing writer fails the cell and says why
+OUT=$TMP/u7f UC_U7_TIMES=1 WRITER_RC=2
+uc_dispatch U7 2>/dev/null
+check u7-writer-fail "$(cut -c1-21 "$OUT/U7/tideskv/rep1/done")" "the writer exited 2: "
+WRITER_RC=0
+unset -f sleep
+
 # ---- shellcheck ----
 if command -v shellcheck >/dev/null; then
   if (cd "$HERE" && shellcheck -x uc_cases_run.sh test_uc_cases_run.sh); then check shellcheck ok ok; else check shellcheck fail ok; fi

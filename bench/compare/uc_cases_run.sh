@@ -12,6 +12,11 @@
 #   <load>.pipeline: the load's memtier --pipeline (the load is unmeasured, pipelined alike on every server)
 #   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end (or `unverified`) value-size idle.status
 #   U6: load/ load.seconds settle-load du-after-load c1|c8|c64|c256.*
+#   U7: load/ load.seconds settle-load du-after-load, then per kill point <sig>-<t>/ (sig term|kill, t = seconds of writes
+#       before the signal), or <sig>-<t>/run<i>/ for i = 1..UC_U7_TIMES when that is above 1, holding: baseline.json
+#       (probe, 10 s before the writer), until-p99-ms (2 x its p99), ack.<thread> (the writer's acked-key logs), writer.out,
+#       writer.status (exit code), signal.epoch_ms, term.seconds (TERM only: signal to exit), restart.epoch_ms (t0 of the
+#       restart), probe.json (pong_ms, recovered_ms) and verify.json (acked, lost, lost_sample)
 #   U8: summary.json (no server)
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes).
 # shellcheck disable=SC2034  # UC_RATE is read by uc_phase
@@ -271,4 +276,106 @@ print(json.dumps({
 }, indent=2))
 PY
     { _uc_fail "could not write U8 summary.json from U1/U3 files"; return 1; }
+}
+
+# ---- U7: crash and restart, with the acknowledged-write checker (uc_ackwriter.py, run in PY_IMAGE) ----
+
+# _uc_py DIR ARGS...: uc_ackwriter.py in a PY_IMAGE container on the bench network with $OUT/DIR as /out, as the host user.
+_uc_py() {
+  local dir=$1 c=tideskv-bench-py-$TS-$RANDOM; shift
+  _track "$c"
+  docker run --rm --name "$c" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" \
+    -v "$OUT/$dir:/out" -v "$HERE_RUN/uc_ackwriter.py:/uc_ackwriter.py:ro" "$PY_IMAGE" python -I /uc_ackwriter.py "$@"
+}
+
+# Waits up to SECS for container NAME to stop; returns 1 on timeout.
+_uc_u7_wait_exit() {
+  local name=$1 i
+  for ((i = 0; i < $2 * 10; i++)); do
+    [[ $(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) == true ]] || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# The writer's first acknowledged write is logged: the kill timer starts then, not at container start.
+_uc_u7_wait_writing() {
+  local i
+  for ((i = 0; i < 300; i++)); do
+    [[ -s $OUT/$1/ack.0 ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# _uc_u7_writer_start DIR NAME: the ack-writer on the server, detached.
+_uc_u7_writer_start() {
+  _track "$2"
+  docker run -d --name "$2" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" \
+    -v "$OUT/$1:/out" -v "$HERE_RUN/uc_ackwriter.py:/uc_ackwriter.py:ro" "$PY_IMAGE" python -I /uc_ackwriter.py write \
+    --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --conns "${UC_U7_CONNS:-16}" --prefix ack- --log /out/ack >/dev/null
+}
+
+# _uc_u7_signal DIR SIG: SIG the server container and wait (60 s at most) for it to exit; TERM's shutdown time is recorded.
+_uc_u7_signal() {
+  local d=$1 sig=$2 start
+  date +%s%3N >"$OUT/$d/signal.epoch_ms"
+  start=$(date +%s%3N)
+  docker kill -s "$sig" "$SERVER_CONTAINER" >/dev/null || { _uc_fail "docker kill -s $sig failed"; return 1; }
+  _uc_u7_wait_exit "$SERVER_CONTAINER" 60 || { _uc_fail "$SERVER_NAME still running 60 s after SIG$sig"; return 1; }
+  if [[ $sig == TERM ]]; then _uc_since "$start" >"$OUT/$d/term.seconds"; fi
+}
+
+# The ack-writer ends by itself when its connections drop; collect its output and exit code.
+_uc_u7_writer_collect() {
+  local d=$1 w=$2 rc
+  _uc_u7_wait_exit "$w" 60 || { _uc_fail "the writer did not exit after the server did"; return 1; }
+  docker logs "$w" >"$OUT/$d/writer.out" 2>&1 || true
+  rc=$(docker inspect -f '{{.State.ExitCode}}' "$w" 2>/dev/null)
+  docker rm "$w" >/dev/null 2>&1 || true
+  echo "$rc" >"$OUT/$d/writer.status"
+  [[ $rc == 0 ]] || { _uc_fail "the writer exited $rc: $(tail -1 "$OUT/$d/writer.out")"; return 1; }
+}
+
+# One kill point, files in DIR (relative to $OUT): baseline probe, writer, signal, restart, probe, verify.
+_uc_u7_point() {
+  local d=$1 sig=$2 t=$3 w=tideskv-bench-writer-$TS-$RANDOM until t0
+  mkdir -p "$OUT/$d"
+  _uc_py "$d" probe --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --baseline-secs 10 --prefix u7: \
+    --keymax "$U7_KEYS" --out /out/baseline.json >/dev/null || { _uc_fail "baseline probe failed"; return 1; }
+  until=$(python3 -c 'import json, sys; print(2 * json.load(open(sys.argv[1]))["p99_ms"])' "$OUT/$d/baseline.json") \
+    || { _uc_fail "no p99 in $d/baseline.json"; return 1; }
+  echo "$until" >"$OUT/$d/until-p99-ms"
+  _uc_u7_writer_start "$d" "$w" || { _uc_fail "could not start the writer"; return 1; }
+  _uc_u7_wait_writing "$d" || { _uc_fail "the writer acked nothing in 30 s"; return 1; }
+  sleep "$t"
+  _uc_u7_signal "$d" "$sig" || return 1
+  _uc_u7_writer_collect "$d" "$w" || return 1
+  stop_server || true  # keeps the server's log, removes the dead container
+  t0=$(date +%s%3N)
+  echo "$t0" >"$OUT/$d/restart.epoch_ms"
+  START_NOWAIT=1 start_server "$SERVER_NAME" strict "$OUT/data/$SERVER_NAME" || { _uc_fail "restart failed"; return 1; }
+  _uc_py "$d" probe --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --until-p99 "$until" \
+    --timeout "${UC_U7_PROBE_TIMEOUT:-300}" --t0 "$t0" --log /out/ack --out /out/probe.json >/dev/null \
+    || { _uc_fail "recovery probe failed"; return 1; }
+  _uc_py "$d" verify --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --log /out/ack --out /out/verify.json >/dev/null \
+    || { _uc_fail "verify failed"; return 1; }
+}
+
+# U7: strict durability. One preload, then for every kill point (UC_U7_SECS seconds of writes before the signal) and
+# signal (TERM, KILL), UC_U7_TIMES times: the point restarts the server on the same data dir, so the next one starts
+# from the recovered server.
+case_U7() {
+  local s=$1 rep=U7/$1/rep$2 ph sig t i d
+  _uc_up "$s" U7 || return 1
+  _uc_load U7 "$rep" load "$U7_KEYS" || return 1
+  _uc_settle_du "$rep" load || return 1
+  for ph in $(uc_phases U7); do
+    sig=${ph%-*} t=${ph#*-}
+    for ((i = 1; i <= UC_U7_TIMES; i++)); do
+      d=$rep/$ph
+      if ((UC_U7_TIMES > 1)); then d=$d/run$i; fi
+      _uc_u7_point "$d" "${sig^^}" "$t" || return 1
+    done
+  done
 }
