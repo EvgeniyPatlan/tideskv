@@ -319,7 +319,11 @@ rc=0; size_bytes 8x >/dev/null 2>&1 || rc=$?
 check size-bytes-bad "$((rc != 0))" 1
 SIZE=quick; wl_sizes quick
 # the kvrocks-blob DBSIZE cache needs the same DBSIZE SCAN as kvrocks
-check load-kvrocks-glob "$(declare -f load_all | grep -c 'SERVER_NAME == kvrocks\*')" 2
+check load-kvrocks-glob "$(declare -f load_check | grep -c 'SERVER_NAME == kvrocks\*')" 2
+# load_all checks through load_check, whose default verify list is wl_verify_cmds
+check load-all-calls-check "$(declare -f load_all | grep -c '^ *load_check || return 1')" 1
+# shellcheck disable=SC2016  # the literal text of run.sh
+check load-check-default "$(declare -f load_check | grep -c 'verify=${1:-wl_verify_cmds}')" 1
 # a W7 memtier container carries $TS so bench_cleanup's name filter finds it
 # shellcheck disable=SC2016  # the literal text of run.sh
 check w7-memtier-name "$(declare -f run_w7_phase | grep -c 'mc="tideskv-bench-memtier-$TS-w7-')" 1

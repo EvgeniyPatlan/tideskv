@@ -57,8 +57,9 @@ _diff_go_test() {
   if [[ -n $hc && -d $hc ]]; then cp -a "$hc/." "$cache/" 2>/dev/null || log "could not copy the Go build cache $hc"; fi
   if [[ -n $hm && -d $hm ]]; then extra+=(-v "$hm:/gomod:ro" -e GOMODCACHE=/gomod -e GOFLAGS=-mod=mod -e GOPROXY=off); fi
   if ! docker image inspect "$GO_IMAGE" >/dev/null 2>&1; then docker pull -q "$GO_IMAGE" >/dev/null 2>&1 || true; fi
-  local _rc=0
-  docker run --rm --name "tideskv-bench-diff-go-$TS" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" \
+  local _rc=0 gc="tideskv-bench-diff-go-$TS"
+  _track "$gc"
+  docker run --rm --name "$gc" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" \
     --user "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/gocache -v "$cache:/gocache" \
     -v "$ROOT/tests/compat:/src:ro" -w /src "${extra[@]}" \
     -e "TIDESKV_OURS_ADDR=$(_diff_name tideskv):6379" -e "TIDESKV_KVROCKS_ADDR=$(_diff_name kvrocks):6666" \
@@ -146,25 +147,8 @@ cases_load_all() {
     wc_load "$ds" _load_cb || { log "load of $ds failed; see $CUR/load/"; return 1; }
     if [[ $ds == cache_exp ]]; then CASE_EXP_END=$(_q_now); fi
   done
-  _cases_load_check || return 1
+  load_check wc_verify_cmds || return 1
   LOAD_SECONDS=$(( $(_q_now) - start ))
-}
-
-# load_all's check over wc_verify_cmds: Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run.
-_cases_load_check() {
-  local want line got i tries
-  if [[ $SERVER_NAME == kvrocks* ]]; then cli DBSIZE SCAN >/dev/null; fi
-  while read -r want line; do
-    tries=1
-    if [[ $SERVER_NAME == kvrocks* && $line == DBSIZE ]]; then tries=900; fi
-    for ((i = 0; i < tries; i++)); do
-      # shellcheck disable=SC2086
-      got=$(cli $line)
-      [[ $got =~ ^[0-9]+$ ]] && (( got >= want )) && break
-      if ((i + 1 < tries)); then sleep 2; fi
-    done
-    if ! [[ $got =~ ^[0-9]+$ ]] || (( got < want )); then log "load check failed: $line = [$got], want >= $want"; return 1; fi
-  done < <(wc_verify_cmds)
 }
 
 _kv_scan_ts() { cli INFO keyspace 2>/dev/null | tr -d '\r' | sed -n 's/^last_dbsize_scan_timestamp://p'; }
@@ -350,11 +334,17 @@ run_cases() {
   exit $rc
 }
 
-# Both servers at both levels: the diff, then every case's probe lines on each (no loads, no memtier).
+# Both servers at both levels: the diff (every case must pass), then every case's probe lines on each (no loads, no
+# memtier).
 run_cases_smoke() {
   wc_sizes "$SIZE"
   run_case_diff
-  if grep -q '"diff did not run"' "$OUT/cases-diff.json"; then log "the diff did not run for every case; see $OUT/cases-diff.log"; return 1; fi
+  local bad
+  # shellcheck disable=SC2086  # one argument per case
+  bad=$(python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+print(" ".join("%s=%s" % (c, d.get(c)) for c in sys.argv[2:] if d.get(c) != "pass"))' "$OUT/cases-diff.json" $CASES)
+  if [[ -n $bad ]]; then log "smoke: not every case passed the diff: $bad; see $OUT/cases-diff.log"; return 1; fi
   local server level c err
   for server in tideskv kvrocks; do
     for level in relaxed strict; do

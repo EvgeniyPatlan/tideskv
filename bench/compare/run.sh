@@ -130,15 +130,22 @@ EOF
 _load_cb() { memtier "$CUR/load/$LOAD_NAME-$LOAD_N" "$@" || return; LOAD_N=$((LOAD_N + 1)); }
 
 load_all() {
-  local ds start line want got i
+  local ds start
   start=$(date +%s)
   for ds in $DATASETS; do
     LOAD_NAME=$ds LOAD_N=1
     log "loading $ds"
     wl_load "$ds" _load_cb || { log "load of $ds failed; see $CUR/load/"; return 1; }
   done
-  # Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run; poll only that line for the scan to land.
-  local tries
+  load_check || return 1
+  LOAD_SECONDS=$(( $(date +%s) - start ))
+}
+
+# Checks the loaded data against "<want> <command>" lines from $1 (default wl_verify_cmds; --cases passes
+# wc_verify_cmds). Kvrocks' DBSIZE is a cache that stays 0 until a DBSIZE SCAN has run; poll only that line for the
+# scan to land.
+load_check() {
+  local verify=${1:-wl_verify_cmds} line want got i tries
   if [[ $SERVER_NAME == kvrocks* ]]; then cli DBSIZE SCAN >/dev/null; fi
   while read -r want line; do
     tries=1
@@ -150,8 +157,7 @@ load_all() {
       if ((i + 1 < tries)); then sleep 2; fi
     done
     if ! [[ $got =~ ^[0-9]+$ ]] || (( got < want )); then log "load check failed: $line = [$got], want >= $want"; return 1; fi
-  done < <(wl_verify_cmds)
-  LOAD_SECONDS=$(( $(date +%s) - start ))
+  done < <("$verify")
 }
 
 # Waits for the server to go quiet and records the wait in $1.

@@ -202,6 +202,35 @@ check timed-no-info "$(find "$OUT/tideskv" -name '*.info0' | wc -l)" 0
 check disk-json "$(python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1]))))' "$OUT/tideskv/disk.json")" \
   "['after_load_bytes', 'end_bytes', 'load_seconds', 'logical_bytes']"
 
+# ---- the Go diff container is tracked, so bench_cleanup removes it ----
+reset; CONTAINERS=(); FAKE_GO=pass
+run_case_diff
+check diff-go-tracked "$(printf '%s\n' "${CONTAINERS[@]}" | grep -cx "tideskv-bench-diff-go-$TS")" 1
+check diff-go-named "$(grep -c -- "--name tideskv-bench-diff-go-$TS " "$T/docker.calls")" 1
+
+# ---- smoke: every case must pass the diff ----
+reset; SIZE=quick; wc_sizes quick; FAKE_GO=c3; rc=0
+run_cases_smoke || rc=$?
+check smoke-diverged-fails "$(yn test "$rc" -ne 0)" yes
+check smoke-diverged-no-ok "$(grep -c 'smoke ok' "$T/log")" 0
+check smoke-diverged-names-c3 "$(yn grep -q 'C3=diverged' "$T/log")" yes
+reset; FAKE_GO=fail; rc=0
+run_cases_smoke || rc=$?
+check smoke-not-run-fails "$(yn test "$rc" -ne 0)" yes
+reset; FAKE_GO=pass; rc=0
+run_cases_smoke || rc=$?
+check smoke-pass "$rc $(grep -c 'smoke ok' "$T/log")" "0 1"
+
+# ---- the shared load check: default wl_verify_cmds, --cases passes wc_verify_cmds ----
+reset; SERVER_NAME=tideskv
+# shellcheck disable=SC2317  # the fake verify list is called by load_check
+check load-check-default "$( wl_verify_cmds() { echo "1 HLEN wl-default"; }; load_check; grep -c 'wl-default' "$T/cli.calls")" 1
+reset; SERVER_NAME=tideskv
+# shellcheck disable=SC2317  # the fake verify list is called by load_check
+check load-check-cases "$( wc_verify_cmds() { echo "1 HLEN wc-cases"; }; load_check wc_verify_cmds; grep -c 'wc-cases' "$T/cli.calls")" 1
+check cases-load-uses-shared "$(declare -f cases_load_all | grep -c 'load_check wc_verify_cmds')" 1
+check no-copied-check "$(declare -F _cases_load_check >/dev/null && echo yes || echo no)" no
+
 # ---- probe failure stops the case, not the server ----
 reset; wc_sizes quick
 run_case_diff
