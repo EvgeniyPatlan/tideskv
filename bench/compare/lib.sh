@@ -170,6 +170,11 @@ write_server_conf() {
         -e "s/^rocksdb.block_cache_size .*/rocksdb.block_cache_size $BLOCK_CACHE_MB/" \
         -e "s/^rocksdb.compression .*/rocksdb.compression $COMPRESSION/" "$HERE/kvrocks.conf" >"$conf" || return
     if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}" >>"$conf"; fi
+    # UC_EXTRA_CONF (array, use-case suite): more "key value" lines, skipped when already in the conf
+    local line
+    for line in ${UC_EXTRA_CONF[@]+"${UC_EXTRA_CONF[@]}"}; do
+      grep -qxF -- "$line" "$conf" || echo "$line" >>"$conf"
+    done
     if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}" >>"$conf"; fi
   fi
   echo "$conf"
@@ -232,10 +237,14 @@ _parity_expect() {
     echo "workers $SERVER_WORKERS"; echo "block-cache-size $((BLOCK_CACHE_MB << 20))"; echo "memtable-size 268435456"
     echo "compression $COMPRESSION"; echo "sync-mode $([[ $level == strict ]] && echo full || echo "$RELAXED")"
   else
-    echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 256"
-    echo "rocksdb.compression $COMPRESSION"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
-    if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"; fi
-    if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}"; fi
+    # a line that a later source repeats (kvrocks-blob's, via UC_EXTRA_CONF) is checked once
+    {
+      echo "workers $SERVER_WORKERS"; echo "rocksdb.block_cache_size $BLOCK_CACHE_MB"; echo "rocksdb.write_buffer_size 256"
+      echo "rocksdb.compression $COMPRESSION"; echo "rocksdb.write_options.sync $([[ $level == strict ]] && echo yes || echo no)"
+      if [[ $server == kvrocks-blob ]]; then printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"; fi
+      if ((W7_LARGE)); then printf '%s\n' "${KVROCKS_LARGE_CONF[@]}"; fi
+      if [[ -n ${UC_EXTRA_CONF[*]+x} ]]; then printf '%s\n' "${UC_EXTRA_CONF[@]}"; fi
+    } | awk '!seen[$0]++'
   fi
 }
 

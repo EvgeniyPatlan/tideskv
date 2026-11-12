@@ -43,6 +43,30 @@ uc_sizes() {
   UC_U2_CLIENTS=25
 }
 
+# Cache accounting (spec §4 U1, note 2026-11-12-uc-cache-accounting): TidesDB charges btree nodes (index) and
+# pr_filter (bloom) blobs to its block cache, so Kvrocks keeps its default rocksdb.cache_index_and_filter_blocks yes
+# and needs no extra line. "charged" goes into meta.json (cache_accounting).
+UC_CACHE_ACCOUNTING=charged
+UC_CACHE_LINES=()
+
+# Extra "key value" config lines of SERVER, one per line (the runner reads them into UC_EXTRA_CONF; lib.sh appends
+# them to the Kvrocks conf and to _parity_expect, skipping lines already there, so kvrocks-blob's lines, which
+# write_server_conf adds itself, are not doubled). Needs KVROCKS_BLOB_CONF from lib.sh.
+uc_conf_lines() {
+  case $1 in
+    tideskv) ;;
+    kvrocks) ((${#UC_CACHE_LINES[@]})) && printf '%s\n' "${UC_CACHE_LINES[@]}" ;;
+    kvrocks-cron)
+      echo "compaction-checker-cron * * * * *"
+      ((${#UC_CACHE_LINES[@]})) && printf '%s\n' "${UC_CACHE_LINES[@]}" ;;
+    kvrocks-blob)
+      printf '%s\n' "${KVROCKS_BLOB_CONF[@]}"
+      ((${#UC_CACHE_LINES[@]})) && printf '%s\n' "${UC_CACHE_LINES[@]}" ;;
+    *) echo "uc_conf_lines: unknown server $1" >&2; return 2 ;;
+  esac
+  return 0
+}
+
 uc_cases() { echo "U1 U2 U3 U4 U5 U6 U7 U8 F1"; }
 
 uc_servers() {

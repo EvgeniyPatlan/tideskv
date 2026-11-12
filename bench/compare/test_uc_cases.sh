@@ -4,6 +4,9 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=uc_cases.sh
 source "$HERE/uc_cases.sh"
+# uc_conf_lines reads KVROCKS_BLOB_CONF from lib.sh (variables only, no side effects)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$HERE/lib.sh"
 fail=0
 check() { if [[ $2 != "$3" ]]; then echo "FAIL $1: got [$2] want [$3]"; fail=1; else echo "ok   $1"; fi; }
 calls=()
@@ -34,6 +37,14 @@ check phases-u6 "$(uc_phases U6)" "c1 c8 c64 c256"
 check phases-u7-full "$(uc_phases U7)" "term-10 kill-10 term-60 kill-60 term-120 kill-120"
 check phases-u8 "$(uc_phases U8)" "report-only"
 check phases-f1 "$(uc_phases F1)" "matrix"
+
+# extra server config lines (U2 cron, U5 blob, cache accounting)
+check conf-tideskv-lines "$(uc_conf_lines tideskv | wc -l)" 0
+check conf-kvrocks-lines "$(uc_conf_lines kvrocks | wc -l) ${#UC_CACHE_LINES[@]}" "0 0"
+check conf-cron-lines "$(uc_conf_lines kvrocks-cron)" "compaction-checker-cron * * * * *"
+check conf-blob-lines "$(uc_conf_lines kvrocks-blob)" "$(printf '%s\n' "${KVROCKS_BLOB_CONF[@]}")"
+check conf-cache-accounting "$UC_CACHE_ACCOUNTING" charged
+check conf-unknown "$(uc_conf_lines bogus 2>/dev/null || echo rc=$?)" "rc=2"
 
 UC_RATE=37
 calls=(); uc_phase U1 closed-gauss record

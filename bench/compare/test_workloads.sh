@@ -273,6 +273,21 @@ check parity-blob "$(_parity_expect kvrocks-blob relaxed | tail -2 | xargs)" \
   "rocksdb.enable_blob_files yes rocksdb.min_blob_size 4096"
 check parity-kvrocks-no-blob "$(_parity_expect kvrocks relaxed | grep -c blob)" 0
 check conf-kvrocks-wal-default "$(grep -c '^rocksdb.wal_' "$(write_server_conf kvrocks relaxed)")" 0
+# UC_EXTRA_CONF (use-case suite hook): appended to the Kvrocks conf and to parity, never doubled, empty = unchanged
+UC_EXTRA_CONF=("compaction-checker-cron * * * * *")
+conf=$(write_server_conf kvrocks-cron relaxed)
+check conf-cron-extra "$(grep -c '^compaction-checker-cron \* \* \* \* \*$' "$conf")" 1
+check parity-cron-extra "$(_parity_expect kvrocks-cron relaxed | tail -1)" "compaction-checker-cron * * * * *"
+check conf-tideskv-no-extra "$(grep -c compaction-checker "$(write_server_conf tideskv relaxed)")" 0
+UC_EXTRA_CONF=("rocksdb.enable_blob_files yes" "rocksdb.min_blob_size 4096")
+conf=$(write_server_conf kvrocks-blob relaxed)
+check conf-blob-not-doubled "$(grep -c '^rocksdb.enable_blob_files yes$' "$conf")" 1
+check parity-blob-not-doubled "$(_parity_expect kvrocks-blob relaxed | grep -c blob)" 2
+UC_EXTRA_CONF=()
+base=$(write_server_conf kvrocks relaxed)
+check conf-extra-empty "$(sed 's/^$//' "$base" | wc -l) $(grep -c compaction-checker "$base")" "$(wc -l <"$base") 0"
+unset UC_EXTRA_CONF
+check conf-extra-unset "$(write_server_conf kvrocks relaxed >/dev/null && _parity_expect kvrocks relaxed | wc -l)" 5
 # --large: no WAL archive on either Kvrocks, and parity reads it back
 W7_LARGE=1
 for s in kvrocks kvrocks-blob; do
