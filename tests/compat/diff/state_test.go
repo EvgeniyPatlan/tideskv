@@ -29,10 +29,10 @@ func TestDumpStateCanonical(t *testing.T) {
 	}
 	want := map[string]string{
 		"s":  "string|+|\"v\"",
-		"h":  "hash|-1|\"a\\x001\\x00b\\x002\"",
-		"st": "set|-1|\"x\\x00y\"",
-		"z":  "zset|-1|\"a\\x001\\x00b\\x002\"",
-		"l":  "list|-1|\"1\\x002\"",
+		"h":  "hash|-1|\"a\" \"1\" \"b\" \"2\"",
+		"st": "set|-1|\"x\" \"y\"",
+		"z":  "zset|-1|\"a\" \"1\" \"b\" \"2\"",
+		"l":  "list|-1|\"1\" \"2\"",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
@@ -48,5 +48,50 @@ func TestDiffStateReportsBothSides(t *testing.T) {
 	}
 	if got[0] != `k1: tideskv=x kvrocks=y` {
 		t.Fatalf("line0 %q", got[0])
+	}
+}
+
+func TestEncodeValueDistinguishesNulFromSplit(t *testing.T) {
+	a := encodeValue("list", "-1", []string{"a\x00b"})
+	b := encodeValue("list", "-1", []string{"a", "b"})
+	if a == b {
+		t.Fatalf("encodings collide: %s", a)
+	}
+}
+
+func TestTTLClass(t *testing.T) {
+	for n, want := range map[int64]string{-1: "-1", 0: "+", 1: "+", 100: "+"} {
+		got, skip, err := ttlClass(n)
+		if err != nil || skip || got != want {
+			t.Fatalf("ttlClass(%d) = %q %v %v, want %q", n, got, skip, err, want)
+		}
+	}
+	if _, skip, err := ttlClass(-2); err != nil || !skip {
+		t.Fatalf("-2 should skip")
+	}
+	if _, _, err := ttlClass(-5); err == nil {
+		t.Fatalf("-5 should error")
+	}
+}
+
+func TestDumpStateSubSecondTTLIsExpiring(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+	c, err := Dial(srv.HostPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, cmd := range [][]string{{"SET", "k", "v"}, {"PEXPIRE", "k", "400"}} {
+		if r, err := c.Do(cmd...); err != nil || r.Kind == '-' {
+			t.Fatalf("%v: %v %v", cmd, r, err)
+		}
+	}
+	got, err := DumpState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "string|+|\"v\""; got["k"] != want {
+		t.Fatalf("got %q, want %q", got["k"], want)
 	}
 }

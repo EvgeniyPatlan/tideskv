@@ -85,13 +85,38 @@ func dumpKey(c *Conn, key string) (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("TTL %q: bad reply %s", key, ttl)
 	}
-	t := "-1"
-	if n > 0 {
-		t = "+"
-	} else if n == -2 {
+	t, skip, err := ttlClass(n)
+	if err != nil {
+		return "", false, fmt.Errorf("TTL %q: %w", key, err)
+	}
+	if skip {
 		return "", false, nil
 	}
-	return typ + "|" + t + "|" + strconv.Quote(strings.Join(elems, "\x00")), true, nil
+	return encodeValue(typ, t, elems), true, nil
+}
+
+// ttlClass maps a TTL reply to "-1" (no expiry) or "+" (expiring; includes 0, which servers
+// report for a positive sub-second remainder). skip=true means the key is gone (-2).
+func ttlClass(n int64) (class string, skip bool, err error) {
+	switch {
+	case n == -1:
+		return "-1", false, nil
+	case n == -2:
+		return "", true, nil
+	case n >= 0:
+		return "+", false, nil
+	}
+	return "", false, fmt.Errorf("unexpected negative TTL %d", n)
+}
+
+// encodeValue renders "type|ttl|" followed by each element %q-quoted and space-joined, so
+// ["a\x00b"] and ["a","b"] stay distinct.
+func encodeValue(typ, ttl string, elems []string) string {
+	q := make([]string, len(elems))
+	for i, e := range elems {
+		q[i] = strconv.Quote(e)
+	}
+	return typ + "|" + ttl + "|" + strings.Join(q, " ")
 }
 
 func canonicalElems(c *Conn, typ, key string) ([]string, error) {
