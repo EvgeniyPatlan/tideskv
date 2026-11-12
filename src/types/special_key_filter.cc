@@ -35,19 +35,25 @@ Probe Locate(std::string_view key, size_t blocks) {
 
 SpecialKeyFilter::SpecialKeyFilter(size_t initial_capacity, size_t max_bytes)
     : max_capacity_(std::max<size_t>(1, max_bytes * 8 / kBitsPerKey)) {
-  Allocate(initial_capacity);
+  (void)Install(PrepareBits(initial_capacity));
 }
 
-// Strong guarantee: if the allocation throws, the old bits, block count, capacity and count stay as they
-// were.
-void SpecialKeyFilter::Allocate(size_t capacity) {
-  capacity = std::max<size_t>(1, std::min(capacity, max_capacity_));
-  const size_t blocks = BlocksFor(capacity, kBitsPerKey);
-  std::unique_ptr<std::atomic<uint64_t>[]> words(new std::atomic<uint64_t>[blocks * kWordsPerBlock]());
-  words_ = std::move(words);
-  blocks_ = blocks;
-  capacity_.store(capacity, std::memory_order_relaxed);
+SpecialKeyFilter::Bits SpecialKeyFilter::PrepareBits(size_t capacity) const {
+  Bits b;
+  b.capacity_ = std::max<size_t>(1, std::min(capacity, max_capacity_));
+  b.blocks_ = BlocksFor(b.capacity_, kBitsPerKey);
+  b.words_.reset(new std::atomic<uint64_t>[b.blocks_ * kWordsPerBlock]());  // zeroed; may throw
+  return b;
+}
+
+SpecialKeyFilter::Bits SpecialKeyFilter::Install(Bits next) noexcept {
+  Bits old;
+  old.words_ = std::exchange(words_, std::move(next.words_));
+  old.blocks_ = std::exchange(blocks_, next.blocks_);
+  old.capacity_ = capacity_.exchange(next.capacity_, std::memory_order_relaxed);
   count_.store(0, std::memory_order_relaxed);
+  state_.store(State::kBuilding, std::memory_order_release);
+  return old;
 }
 
 void SpecialKeyFilter::OnMetaPut(std::string_view meta_key, std::string_view value) noexcept {
@@ -86,8 +92,8 @@ void SpecialKeyFilter::set_enabled(bool on) noexcept { enabled_.store(on, std::m
 bool SpecialKeyFilter::enabled() const noexcept { return enabled_.load(std::memory_order_relaxed); }
 
 void SpecialKeyFilter::Reset(size_t capacity) {
-  Allocate(capacity);  // may throw std::bad_alloc: the old filter and its state are then left intact
-  state_.store(State::kBuilding, std::memory_order_release);
+  // PrepareBits may throw std::bad_alloc before anything changed: the old filter and its state stay intact
+  (void)Install(PrepareBits(capacity));
 }
 
 void SpecialKeyFilter::MarkReady() noexcept {

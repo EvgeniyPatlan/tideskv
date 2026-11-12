@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <new>
 #include <string>
@@ -13,14 +14,14 @@ namespace tideskv {
 namespace {
 
 constexpr auto kPollInterval = std::chrono::milliseconds(100);
-constexpr auto kRetryInterval = std::chrono::seconds(1);
 constexpr size_t kGrowthFactor = 4;
+constexpr uint64_t kScanHeadroom = 2;  // a rebuild after a scan that overflowed is sized for twice its count
 constexpr size_t kStopCheckEvery = 1024;  // keys between two looks at the stop flag
 
 // One chunk from a fresh view: up to kScanChunk keys after *last (from the first key when !*started).
 // *done once the CF is exhausted.
 Status ScanChunk(Storage& storage, SpecialKeyFilter& filter, const std::atomic<bool>& stop, std::string* last,
-                 bool* started, bool* done) {
+                 bool* started, bool* done, uint64_t* specials) {
   auto view = storage.BeginRead();
   if (!view.ok()) return view.status();
   // Not through the block cache: this thread is long-lived and mostly idle, so blocks it cached would be
@@ -36,7 +37,10 @@ Status ScanChunk(Storage& storage, SpecialKeyFilter& filter, const std::atomic<b
   size_t n = 0;
   while (st.ok() && i.Valid() && n < kScanChunk) {
     if (n % kStopCheckEvery == 0 && stop.load(std::memory_order_relaxed)) return Status::Ok();
-    if (encoding::MetaIsSpecial(i.value())) filter.Insert(i.key());
+    if (encoding::MetaIsSpecial(i.value())) {
+      filter.Insert(i.key());
+      ++*specials;
+    }
     last->assign(i.key());
     *started = true;
     ++n;
@@ -49,18 +53,33 @@ Status ScanChunk(Storage& storage, SpecialKeyFilter& filter, const std::atomic<b
 
 }  // namespace
 
-Status ScanSpecialKeys(Storage& storage, SpecialKeyFilter& filter, const std::atomic<bool>& stop) {
+Result<uint64_t> ScanSpecialKeys(Storage& storage, SpecialKeyFilter& filter, const std::atomic<bool>& stop) {
   std::string last;
   bool started = false;
   bool done = false;
+  uint64_t specials = 0;
   while (!done && !stop.load(std::memory_order_relaxed)) {
-    if (Status st = ScanChunk(storage, filter, stop, &last, &started, &done); !st.ok()) return st;
+    if (Status st = ScanChunk(storage, filter, stop, &last, &started, &done, &specials); !st.ok()) return st;
   }
-  return Status::Ok();
+  return specials;
 }
 
-SpecialKeyService::SpecialKeyService(SpecialKeyFilter& filter, Storage& storage, Engine& engine)
-    : filter_(filter), storage_(storage), engine_(engine) {}
+size_t GrownFilterCapacity(size_t capacity, uint64_t specials, size_t max_capacity) {
+  const uint64_t wanted = std::max<uint64_t>(uint64_t{capacity} * kGrowthFactor, specials * kScanHeadroom);
+  return static_cast<size_t>(std::min<uint64_t>(wanted, max_capacity));
+}
+
+std::chrono::milliseconds RebuildRetryDelay(unsigned failures, std::chrono::milliseconds base,
+                                            std::chrono::milliseconds max) {
+  if (failures == 0 || base >= max) return std::min(base, max);
+  std::chrono::milliseconds d = base;
+  for (unsigned i = 1; i < failures && d < max; ++i) d *= 2;  // stops doubling at the cap: no overflow
+  return std::min(d, max);
+}
+
+SpecialKeyService::SpecialKeyService(SpecialKeyFilter& filter, Storage& storage, Engine& engine,
+                                     SpecialKeyRetryPolicy retry)
+    : filter_(filter), storage_(storage), engine_(engine), retry_(retry) {}
 
 SpecialKeyService::~SpecialKeyService() { Stop(); }
 
@@ -82,19 +101,24 @@ void SpecialKeyService::Stop() {
 uint64_t SpecialKeyService::rebuilds() const { return rebuilds_.load(std::memory_order_relaxed); }
 
 Status SpecialKeyService::RebuildNow(size_t capacity) {
-  Status reset = Status::Ok();
-  const Status quiesced = engine_.Quiesce([&] {
-    try {
-      filter_.Reset(capacity);  // under the barrier: no meta Put is buffered and uncommitted now
-    } catch (const std::bad_alloc&) {
-      reset = Status::Internal("cannot allocate the special-key filter for " + std::to_string(capacity) +
-                               " keys");  // the old filter stays as it was, complete
-    }
-  });
+  // Allocated and zeroed before the gate (up to 64 MiB of page faults), so reads and writes wait only for
+  // the O(1) swap. On bad_alloc the gate is never taken and the old filter stays as it was, complete.
+  SpecialKeyFilter::Bits next;
+  try {
+    next = filter_.PrepareBits(capacity);
+  } catch (const std::bad_alloc&) {
+    return Status::Internal("cannot allocate the special-key filter for " + std::to_string(capacity) +
+                            " keys");
+  }
+  SpecialKeyFilter::Bits old;
+  // Under the barrier: no meta Put is buffered and uncommitted now.
+  const Status quiesced = engine_.Quiesce([&] { old = filter_.Install(std::move(next)); });
+  old = SpecialKeyFilter::Bits();  // the previous bits are freed here, outside the gate
   if (!quiesced.ok()) return quiesced;
-  if (!reset.ok()) return reset;
-  if (Status st = ScanSpecialKeys(storage_, filter_, stop_); !st.ok()) return st;  // stays kBuilding
-  if (stop_.load()) return Status::Internal("special-key scan stopped");           // partial: never ready
+  auto scanned = ScanSpecialKeys(storage_, filter_, stop_);
+  if (!scanned.ok()) return scanned.status();                             // stays kBuilding
+  if (stop_.load()) return Status::Internal("special-key scan stopped");  // partial: never ready
+  last_scan_specials_ = *scanned;
   filter_.MarkReady();
   rebuilds_.fetch_add(1, std::memory_order_relaxed);
   return Status::Ok();
@@ -128,21 +152,24 @@ void SpecialKeyService::NoteSaturation() {
 void SpecialKeyService::Run() {
   bool rebuild = true;  // the startup build
   size_t capacity = filter_.Capacity();
-  bool failing = false;
+  unsigned failures = 0;  // consecutive failed rebuilds: the retry backs off so a persistent failure does
+                          // not take the exclusive gate (and rescan) every second
   bool saw_loading = false;
   while (!stop_.load()) {
     if (rebuild) {
       const Status st = RebuildNow(capacity);
       if (stop_.load()) return;
       if (!st.ok()) {
-        if (!failing)
-          spdlog::warn("special-key filter rebuild failed (retrying every second): {}", st.ToString());
-        failing = true;
-        if (!WaitFor(kRetryInterval)) return;
+        ++failures;
+        const auto delay = RebuildRetryDelay(failures, retry_.base, retry_.max);
+        if (failures == 1)
+          spdlog::warn("special-key filter rebuild failed (retrying with backoff from {} ms to {} ms): {}",
+                       retry_.base.count(), retry_.max.count(), st.ToString());
+        if (!WaitFor(delay)) return;
         continue;
       }
-      if (failing) spdlog::info("special-key filter rebuilt after an earlier failure");
-      failing = false;
+      if (failures > 0) spdlog::info("special-key filter rebuilt after {} failed attempts", failures);
+      failures = 0;
       rebuild = false;
       NoteSaturation();
     }
@@ -155,7 +182,12 @@ void SpecialKeyService::Run() {
     if (saw_loading || grow) {
       saw_loading = false;
       rebuild = true;
-      capacity = grow ? filter_.Capacity() * kGrowthFactor : filter_.Capacity();
+      // Sized from what the last scan counted (Count() undercounts an overfull filter), so a restart over
+      // many specials rescans once or twice instead of growing 4x per pass.
+      capacity = grow ? GrownFilterCapacity(filter_.Capacity(),
+                                            std::max<uint64_t>(last_scan_specials_, filter_.Count()),
+                                            filter_.MaxCapacity())
+                      : filter_.Capacity();
       continue;
     }
     NoteSaturation();

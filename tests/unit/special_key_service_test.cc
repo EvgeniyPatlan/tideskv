@@ -256,6 +256,76 @@ TEST(SpecialKeyServiceErrors, FailedStartupRebuildIsRetried) {
   storage.SetMetaPutHook(nullptr);
 }
 
+// Minor 3: a rebuild that keeps failing backs off (each attempt takes the exclusive gate and rescans), and
+// the service recovers once the failure clears. At a 10 ms base doubling to 80 ms, 600 ms holds about 10
+// attempts; a fixed 10 ms retry would make about 60.
+TEST(SpecialKeyServiceErrors, PersistentFailureBacksOff) {
+  test::FaultyStorage storage;
+  LockManager locks;
+  FakeClock clock;
+  Engine engine{storage, locks, clock};
+  SpecialKeyFilter filter;
+  storage.SetMetaPutHook(&filter);
+  SpecialKeyService service(filter, storage, engine,
+                            {std::chrono::milliseconds(10), std::chrono::milliseconds(80)});
+  storage.fail_begin_read_always = true;
+  service.Start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  const int attempts = storage.begin_reads.load();
+  EXPECT_GE(attempts, 4);
+  EXPECT_LE(attempts, 15);
+  EXPECT_EQ(filter.state(), SpecialKeyFilter::State::kBuilding);
+  storage.fail_begin_read_always = false;
+  ASSERT_TRUE(WaitFor([&] { return filter.state() == SpecialKeyFilter::State::kReady; }));
+  EXPECT_EQ(service.rebuilds(), 1u);
+  service.Stop();
+  storage.SetMetaPutHook(nullptr);
+}
+
+TEST(SpecialKeyServiceRetry, DelayDoublesToTheCap) {
+  using std::chrono::milliseconds;
+  const milliseconds base(1000), cap(60000);
+  EXPECT_EQ(RebuildRetryDelay(1, base, cap), milliseconds(1000));
+  EXPECT_EQ(RebuildRetryDelay(2, base, cap), milliseconds(2000));
+  EXPECT_EQ(RebuildRetryDelay(3, base, cap), milliseconds(4000));
+  EXPECT_EQ(RebuildRetryDelay(6, base, cap), milliseconds(32000));
+  EXPECT_EQ(RebuildRetryDelay(7, base, cap), milliseconds(60000));
+  EXPECT_EQ(RebuildRetryDelay(1000000, base, cap), milliseconds(60000));  // no overflow
+  EXPECT_EQ(RebuildRetryDelay(0, base, cap), milliseconds(1000));
+  EXPECT_EQ(RebuildRetryDelay(3, milliseconds(100), milliseconds(50)), milliseconds(50));
+}
+
+// Minor 1: a growth rebuild is sized from what the scan counted, not 4x at a time.
+TEST(SpecialKeyServiceGrowth, CapacityFollowsTheScanCount) {
+  constexpr size_t kMax = size_t{1} << 30;
+  EXPECT_EQ(GrownFilterCapacity(1 << 20, 1'500'000, kMax), size_t{4} << 20);     // 4x covers it
+  EXPECT_EQ(GrownFilterCapacity(1 << 20, 20'000'000, kMax), 40'000'000u);        // straight to 2x the count
+  EXPECT_EQ(GrownFilterCapacity(1 << 20, 20'000'000, 30'000'000), 30'000'000u);  // at most the maximum
+  EXPECT_EQ(GrownFilterCapacity(1 << 20, 0, kMax), size_t{4} << 20);
+}
+
+// A start over many more specials than the initial capacity: one scan that overflows, then one sized from
+// its count (4x steps from 1024 would take 1024 -> 4096 -> 16384, three scans).
+TEST_F(SpecialKeyServiceTest, StartupOverManySpecialsRescansOnce) {
+  std::vector<std::pair<std::string, std::string>> kvs;
+  for (int i = 0; i < 10000; ++i) kvs.emplace_back("h" + std::to_string(i), Hash());
+  Seed(storage, kvs);
+  SpecialKeyFilter filter(1024);
+  storage.SetMetaPutHook(&filter);
+  SpecialKeyService service(filter, storage, engine);
+  service.Start();
+  ASSERT_TRUE(WaitFor([&] {
+    return service.rebuilds() >= 2 && filter.state() == SpecialKeyFilter::State::kReady &&
+           !filter.NeedsGrowth();
+  }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the watch loop polls every 100 ms
+  EXPECT_EQ(service.rebuilds(), 2u);
+  EXPECT_EQ(filter.Capacity(), 20000u);
+  EXPECT_EQ(Check(storage, filter).missing, 0u);
+  service.Stop();
+  storage.SetMetaPutHook(nullptr);
+}
+
 TEST_F(SpecialKeyServiceTest, SaturatedFilterIsMarked) {
   std::vector<std::pair<std::string, std::string>> kvs;
   for (int i = 0; i < 3000; ++i) kvs.emplace_back("h" + std::to_string(i), Hash());

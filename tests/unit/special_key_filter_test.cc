@@ -8,6 +8,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "encoding/meta_codec.h"
@@ -124,6 +125,31 @@ TEST(SpecialKeyFilter, FailedResetKeepsTheOldFilterIntact) {
   EXPECT_EQ(f.Count(), count);
   EXPECT_EQ(f.Capacity(), cap);
   for (int i = 0; i < 100; ++i) EXPECT_TRUE(f.MayContain("k" + std::to_string(i)));
+}
+
+// Minor 2: the bits are allocated before the gate (PrepareBits changes nothing) and only swapped under it;
+// Install hands back the previous bits so they are freed outside it too.
+TEST(SpecialKeyFilter, PreparedBitsAreInstalledByASwap) {
+  SpecialKeyFilter f(1000);
+  for (int i = 0; i < 100; ++i) f.Insert("k" + std::to_string(i));
+  f.MarkReady();
+  const size_t count = f.Count();
+  SpecialKeyFilter::Bits next = f.PrepareBits(5000);
+  EXPECT_EQ(next.capacity(), 5000u);
+  EXPECT_EQ(f.Capacity(), 1000u);  // preparing touched nothing
+  EXPECT_EQ(f.Count(), count);
+  EXPECT_EQ(f.state(), SpecialKeyFilter::State::kReady);
+  for (int i = 0; i < 100; ++i) EXPECT_TRUE(f.MayContain("k" + std::to_string(i)));
+
+  SpecialKeyFilter::Bits old = f.Install(std::move(next));
+  EXPECT_EQ(old.capacity(), 1000u);
+  EXPECT_EQ(f.Capacity(), 5000u);
+  EXPECT_EQ(f.Count(), 0u);
+  EXPECT_EQ(f.state(), SpecialKeyFilter::State::kBuilding);
+  EXPECT_FALSE(f.MayContain("k0"));
+  f.Insert("k0");
+  EXPECT_TRUE(f.MayContain("k0"));
+  EXPECT_EQ(f.PrepareBits(size_t{1} << 40).capacity(), f.MaxCapacity());  // clamped like Reset
 }
 
 TEST(SpecialKeyFilter, ConcurrentInsertAndQuery) {
