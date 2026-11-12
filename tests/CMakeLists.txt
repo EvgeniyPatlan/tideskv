@@ -56,10 +56,10 @@ endforeach()
 # tidesdb-flush-wait-called-generations.patch adds, the lazy level cursor suite
 # tidesdb-lazy-level-cursors.patch adds, the memtable bloom suite tidesdb-memtable-bloom.patch adds,
 # the exact node arena suite tidesdb-node-arena-exact.patch adds, the queued memtable byte budget suite
-# tidesdb-l0-queue-byte-budget.patch adds, and the upstream sstable suite that guards the builder it changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
+# tidesdb-l0-queue-byte-budget.patch adds, the cache bypass suite tidesdb-iter-no-cache-fill.patch adds, and the upstream sstable suite that guards the builder it changes. the upstream btree suite is not built: it calls btree_node_deserialize_direct, which TidesDB
 # compiles only with TDB_TEST_INTERNALS, defined when TIDESDB_BUILD_TESTS is on (Dependencies.cmake turns
 # it off)
-foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable lazy_level_cursors memtable_bloom btree_node_arena l0_queue_bytes)
+foreach(suite cache merge_iter random_read range_covering compaction_partition btree_single_pass btree_arena io_trim compression_start_level wal_flusher commit_gate flush_wait sstable lazy_level_cursors memtable_bloom btree_node_arena l0_queue_bytes iter_no_cache_fill)
   add_executable(tidesdb_${suite}_tests ${tidesdb_SOURCE_DIR}/test/${suite}__tests.c)
   target_include_directories(tidesdb_${suite}_tests PRIVATE ${tidesdb_SOURCE_DIR}/src)
   # the btree internals include xxhash.h, which TidesDB keeps under external/
@@ -124,6 +124,8 @@ add_test(NAME TidesDbMemtableBloom COMMAND tidesdb_memtable_bloom_tests WORKING_
 # recovery case's child process reopens
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/l0_queue_bytes_scratch)
 add_test(NAME TidesDbL0QueueBytes COMMAND tidesdb_l0_queue_bytes_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/l0_queue_bytes_scratch)
+# the cache bypass suite writes its scratch database under the working directory
+add_test(NAME TidesDbIterNoCacheFill COMMAND tidesdb_iter_no_cache_fill_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 file(GLOB INTEGRATION_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cc)
 if(INTEGRATION_SOURCES AND TARGET tideskv-server)

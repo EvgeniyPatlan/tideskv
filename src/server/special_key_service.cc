@@ -5,6 +5,7 @@
 #include <chrono>
 #include <new>
 #include <string>
+#include <utility>
 
 #include "encoding/meta_codec.h"
 
@@ -22,7 +23,12 @@ Status ScanChunk(Storage& storage, SpecialKeyFilter& filter, const std::atomic<b
                  bool* started, bool* done) {
   auto view = storage.BeginRead();
   if (!view.ok()) return view.status();
-  auto it = (*view)->NewIterator(ColumnFamily::kMeta);
+  // Not through the block cache: this thread is long-lived and mostly idle, so blocks it cached would be
+  // freed cross-thread by the workers that evict them, which neither allocator lets them reuse (about one
+  // extra cache of resident memory), and a full pass would replace the workload's hot set anyway.
+  IterOptions opts;
+  opts.fill_cache = false;
+  auto it = (*view)->NewIterator(ColumnFamily::kMeta, std::move(opts));
   if (!it.ok()) return it.status();
   Iterator& i = **it;
   Status st = *started ? i.Seek(*last) : i.SeekToFirst();

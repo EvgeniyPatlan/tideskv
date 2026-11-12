@@ -5,6 +5,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "encoding/key_codec.h"
@@ -422,6 +423,48 @@ TEST(TidesStorageMaint, StatsReportBlockCacheUse) {
   ASSERT_TRUE(after.ok());
   EXPECT_GT(after->block_cache_entries, 0u);
   EXPECT_GT(after->block_cache_bytes, 0u);
+}
+
+// An iterator with fill_cache = false reads flushed data without adding to the block cache, and sees what a
+// cached iterator sees (which does fill it).
+TEST(TidesStorageMaint, IteratorWithoutCacheFillLeavesBlockCache) {
+  TempDir dir;
+  auto s = MustOpen(OptionsFor(dir));
+  ASSERT_NE(s, nullptr);
+  {
+    auto txn = s->BeginWrite();
+    ASSERT_TRUE(txn.ok());
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k" + std::to_string(i), std::string(100, 'v')).ok());
+    }
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  ASSERT_TRUE(s->Checkpoint().ok());
+  auto scan = [&](bool fill_cache) {
+    std::vector<std::pair<std::string, std::string>> rows;
+    auto view = s->BeginRead();
+    EXPECT_TRUE(view.ok());
+    IterOptions opts;
+    opts.fill_cache = fill_cache;
+    auto it = (*view)->NewIterator(ColumnFamily::kMeta, std::move(opts));
+    EXPECT_TRUE(it.ok());
+    for (Status st = (*it)->SeekToFirst(); st.ok() && (*it)->Valid(); st = (*it)->Next())
+      rows.emplace_back(std::string((*it)->key()), std::string((*it)->value()));
+    return rows;
+  };
+  auto before = s->Stats();
+  ASSERT_TRUE(before.ok());
+  const auto uncached = scan(false);
+  EXPECT_EQ(uncached.size(), 1000u);
+  auto after = s->Stats();
+  ASSERT_TRUE(after.ok());
+  EXPECT_EQ(after->block_cache_entries, before->block_cache_entries);
+  EXPECT_EQ(after->block_cache_bytes, before->block_cache_bytes);
+
+  EXPECT_EQ(scan(true), uncached);
+  auto cached = s->Stats();
+  ASSERT_TRUE(cached.ok());
+  EXPECT_GT(cached->block_cache_entries, before->block_cache_entries);
 }
 
 // B10: the queued-memtable byte budget is raised to two memtables when set smaller, so a lone sealed

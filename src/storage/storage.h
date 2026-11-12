@@ -21,6 +21,11 @@ inline constexpr size_t kMaxNativeRangeDeletes = 30;
 struct IterOptions {
   std::string lower;  // inclusive; empty = from the first key
   std::string upper;  // exclusive; empty = to the last key
+  // false: read stored blocks without looking them up in, pinning them from or adding them to the block
+  // cache, for a one-pass bulk scan that would otherwise evict the hot set and leave the cached blocks'
+  // memory owned by its (long-lived, mostly idle) thread. Results are the same; storages without a
+  // cache ignore it.
+  bool fill_cache = true;
 };
 
 // A new Iterator is unpositioned (Valid() == false) until a Seek* call.

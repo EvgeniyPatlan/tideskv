@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -84,6 +85,45 @@ TEST(SpecialKeyServiceTides, ScanRacesWithWriters) {
   view->reset();
   service.Stop();
   (*storage)->SetMetaPutHook(nullptr);
+}
+
+// The startup scan reads the meta CF without filling the block cache: run on the service's long-lived thread,
+// cached blocks would be freed cross-thread by the evicting workers and never reused (about one extra cache
+// of resident memory), and the pass would evict the workload's hot set.
+TEST(SpecialKeyServiceTides, ScanLeavesBlockCacheUntouched) {
+  test::TempDir dir;
+  StorageOptions o;
+  o.path = (dir.path() / "db").string();
+  o.sync_mode = SyncMode::kNone;
+  auto storage = TidesStorage::Open(o);
+  ASSERT_TRUE(storage.ok()) << storage.status().ToString();
+  {
+    auto txn = (*storage)->BeginWrite();
+    ASSERT_TRUE(txn.ok());
+    for (int i = 0; i < 20000; ++i) {
+      ASSERT_TRUE((*txn)
+                      ->Put(ColumnFamily::kMeta, encoding::MetaKeyFor(0, "k" + std::to_string(i)),
+                            i % 3 ? Hash() : Ttl())
+                      .ok());
+    }
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  ASSERT_TRUE((*storage)->Checkpoint().ok());  // the scan reads sstables, not the memtable
+  auto before = (*storage)->Stats();
+  ASSERT_TRUE(before.ok());
+  SpecialKeyFilter filter;
+  std::atomic<bool> stop{false};
+  ASSERT_TRUE(ScanSpecialKeys(**storage, filter, stop).ok());
+  auto after = (*storage)->Stats();
+  ASSERT_TRUE(after.ok());
+  EXPECT_EQ(after->block_cache_entries, before->block_cache_entries);
+  EXPECT_EQ(after->block_cache_bytes, before->block_cache_bytes);
+  auto view = (*storage)->BeginRead();
+  ASSERT_TRUE(view.ok());
+  auto c = CheckSpecialKeys(**view, filter);
+  ASSERT_TRUE(c.ok()) << c.status().ToString();
+  EXPECT_EQ(c->specials, 20000u);
+  EXPECT_EQ(c->missing, 0u);
 }
 
 }  // namespace

@@ -55,7 +55,11 @@ set(TIDESDB_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-node-arena-exact.patch"
   # memtable_l0_queue_max_bytes: a byte budget for the queued immutables beside the count limit, so a large
   # write buffer does not turn the count writers need through a merge into more memory than the host has
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-l0-queue-byte-budget.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-l0-queue-byte-budget.patch"
+  # tidesdb_iter_new_opts with bypass_cache: a one-pass bulk scan reads its sstable blocks straight from
+  # disk, as compaction does, so it neither replaces the cache's hot set nor leaves a cache's worth of node
+  # memory owned by the thread that ran it
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-iter-no-cache-fill.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.

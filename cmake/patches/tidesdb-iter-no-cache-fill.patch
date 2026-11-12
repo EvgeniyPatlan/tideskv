@@ -1,0 +1,867 @@
+diff --git a/include/db.h b/include/db.h
+index 86b1cea..aa675e0 100644
+--- a/include/db.h
++++ b/include/db.h
+@@ -1364,6 +1364,49 @@ int tidesdb_iter_new_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, cons
+                            size_t lower_size, const uint8_t *upper, size_t upper_size,
+                            tidesdb_iter_t **iter);
+ 
++/**
++ * tidesdb_iter_options_t
++ * how tidesdb_iter_new_opts opens an iterator. a zeroed struct asks for exactly what
++ * tidesdb_iter_new does, so a field added later defaults to today's behaviour
++ * @param lower range start, inclusive, or NULL for a scan over the whole column family; as
++ *              tidesdb_iter_new_range, set both ends or neither
++ * @param lower_size size of lower in bytes
++ * @param upper range end, inclusive for the purpose of choosing sstables, or NULL
++ * @param upper_size size of upper in bytes
++ * @param bypass_cache non-zero to read sstable blocks straight from disk, without looking them up
++ *              in the block cache, pinning them from it or inserting them into it -- the way
++ *              compaction reads. use it for a one-pass bulk scan (a rebuild, an export, a full
++ *              sync): such a scan would otherwise replace the cache's hot set with blocks read
++ *              once, and leave the memory of every block it inserted owned by the thread that ran
++ *              it, which on a long-lived and mostly idle thread other threads cannot reuse after
++ *              they evict them. memtables are read as always. the keys and values seen are the
++ *              same either way; only where the blocks come from differs
++ */
++typedef struct tidesdb_iter_options_t
++{
++    const uint8_t *lower;
++    size_t lower_size;
++    const uint8_t *upper;
++    size_t upper_size;
++    int bypass_cache;
++} tidesdb_iter_options_t;
++
++/**
++ * tidesdb_iter_new_opts
++ * create an iterator over a column family at the transaction snapshot, as tidesdb_iter_new or,
++ * with both ends set, tidesdb_iter_new_range, with the options above
++ * @param txn transaction providing the read snapshot
++ * @param cf column family to iterate
++ * @param opts the options, or NULL for tidesdb_iter_new's defaults
++ * @param iter out -- the new iterator
++ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn, cf or iter or when only one end of the
++ *         range is set, TDB_ERR_LOCKED when the descriptor budget or a moving source set left the
++ *         scan unopenable and the call should be retried, or TDB_ERR_MEMORY, TDB_ERR_IO or
++ *         TDB_ERR_CORRUPTION from a source read
++ */
++int tidesdb_iter_new_opts(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
++                          const tidesdb_iter_options_t *opts, tidesdb_iter_t **iter);
++
+ /**
+  * tidesdb_iter_seek
+  * position the iterator at the first key >= the given key
+diff --git a/src/column_family/cf_iter.c b/src/column_family/cf_iter.c
+index 2d7e2b8..ac75fc4 100644
+--- a/src/column_family/cf_iter.c
++++ b/src/column_family/cf_iter.c
+@@ -24,8 +24,8 @@
+  * from under the sizing query, so a pathological churn cannot spin forever */
+ #define CF_ITER_MAX_RETRY 8
+ 
+-/* every scan built here reads through the block cache. the bulk readers that deliberately bypass
+- * it -- compaction -- assemble their sstable iterators directly rather than coming through here */
++/* what cf_iter_new and cf_iter_new_bounded open their sstable cursors with: through the block
++ * cache. a bulk reader that should leave the cache alone asks cf_iter_new_opts for use_cache 0 */
+ #define CF_ITER_USE_CACHE 1
+ 
+ struct cf_iter
+@@ -47,6 +47,7 @@ struct cf_iter
+     merge_source_t
+         *sources; /* ws overlay, then n_mts memtables, then L1 sstables and deeper levels */
+     merge_iter_t *merge;
++    int use_cache; /* what every sstable cursor of this iterator is opened with */
+ };
+ 
+ /* pin the L0 memtables into the iterator, growing the array if a rotation raced the sizing query */
+@@ -224,7 +225,7 @@ static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out, int *n_out)
+         if (end - i > 1)
+         {
+             level_merge_source(&it->runs[runs++], &it->ssts[i], &it->iters[i], &it->rt_idx[i],
+-                               end - i, CF_ITER_USE_CACHE, &out[n++]);
++                               end - i, it->use_cache, &out[n++]);
+         }
+         else
+         {
+@@ -232,7 +233,7 @@ static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out, int *n_out)
+              * it reports a reader budget it cannot honour as busy, which is retryable back
+              * pressure and nothing like a read that failed, and a caller told i/o has no way to
+              * tell the two apart */
+-            const int rc = sstable_iter_new(it->ssts[i], CF_ITER_USE_CACHE, &it->iters[i]);
++            const int rc = sstable_iter_new(it->ssts[i], it->use_cache, &it->iters[i]);
+             if (rc != TDB_SUCCESS) return rc;
+             sstable_merge_source(it->iters[i], &out[n++]);
+         }
+@@ -287,6 +288,12 @@ int cf_iter_new(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot, writeset_merge_so
+ int cf_iter_new_bounded(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot,
+                         writeset_merge_source_t *ws_src, const cf_iter_bounds_t *bounds,
+                         cf_iter_t **out)
++{
++    return cf_iter_new_opts(cf, l0, snapshot, ws_src, bounds, CF_ITER_USE_CACHE, out);
++}
++
++int cf_iter_new_opts(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot, writeset_merge_source_t *ws_src,
++                     const cf_iter_bounds_t *bounds, const int use_cache, cf_iter_t **out)
+ {
+     if (!cf || !l0 || !out)
+     {
+@@ -303,6 +310,7 @@ int cf_iter_new_bounded(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot,
+     it->cf = cf;
+     it->snapshot = snapshot;
+     it->l0 = l0;
++    it->use_cache = use_cache ? 1 : 0;
+     it->ws_src = ws_src; /* owned now, freed by cf_iter_free even on the error path below */
+ 
+     int rc = cf_iter_pin_mts(it, l0);
+diff --git a/src/column_family/cf_iter.h b/src/column_family/cf_iter.h
+index 9c0de9f..454a8c6 100644
+--- a/src/column_family/cf_iter.h
++++ b/src/column_family/cf_iter.h
+@@ -83,6 +83,27 @@ int cf_iter_new_bounded(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot,
+                         writeset_merge_source_t *ws_src, const cf_iter_bounds_t *bounds,
+                         cf_iter_t **out);
+ 
++/**
++ * cf_iter_new_opts
++ * as cf_iter_new_bounded, but told whether the iterator's sstable cursors read through the block
++ * cache. with use_cache 0 every table cursor, including a level run's cursors opened lazily as the
++ * walk reaches them, reads its nodes straight from disk the way compaction does: a miss is not
++ * inserted, nothing is looked up or pinned, and each decoded node is freed by the thread that
++ * walks past it. that keeps a one-pass bulk read from evicting the cache's hot set and from
++ * leaving a cache's worth of node memory owned by the reading thread. memtables are read as
++ * always; they never go through the cache
++ * @param cf the column family
++ * @param l0 the shared L0 whose memtables are pinned into the iterator
++ * @param snapshot the sequence ceiling versions are resolved against
++ * @param ws_src optional write-set overlay, owned by the iterator on every path
++ * @param bounds the range the caller will read, or NULL for an iterator over the whole family
++ * @param use_cache non-zero to read sstable nodes through the block cache, 0 to bypass it
++ * @param out out -- the iterator on success
++ * @return as cf_iter_new_bounded
++ */
++int cf_iter_new_opts(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot, writeset_merge_source_t *ws_src,
++                     const cf_iter_bounds_t *bounds, int use_cache, cf_iter_t **out);
++
+ /**
+  * cf_iter_free
+  * free the iterator, closing every cursor and dropping every memtable and sstable pin. safe on NULL
+diff --git a/src/db.c b/src/db.c
+index 980d44e..0c67910 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -362,6 +362,19 @@ int tidesdb_iter_new_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, cons
+         engine_iter_new_range(txn, (cf_t *)cf, lower, lower_size, upper, upper_size, iter));
+ }
+ 
++int tidesdb_iter_new_opts(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
++                          const tidesdb_iter_options_t *opts, tidesdb_iter_t **iter)
++{
++    if (!txn || !cf || !iter) return TDB_ERR_INVALID_ARGS;
++    if (!opts) return tdb_public_rc(engine_iter_new(txn, (cf_t *)cf, iter));
++    /* a range needs both ends to choose sstables by, as tidesdb_iter_new_range does; one end alone
++     * is a caller mistake rather than half a range */
++    if ((opts->lower == NULL) != (opts->upper == NULL)) return TDB_ERR_INVALID_ARGS;
++    return tdb_public_rc(engine_iter_new_opts(txn, (cf_t *)cf, opts->lower, opts->lower_size,
++                                              opts->upper, opts->upper_size,
++                                              opts->bypass_cache ? 0 : 1, iter));
++}
++
+ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
+ {
+     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
+diff --git a/src/engine/engine.h b/src/engine/engine.h
+index 35e58c1..0c0c5b4 100644
+--- a/src/engine/engine.h
++++ b/src/engine/engine.h
+@@ -827,6 +827,18 @@ int engine_iter_new(tidesdb_txn_t *txn, cf_t *cf, tidesdb_iter_t **out);
+ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, size_t lower_size,
+                           const uint8_t *upper, size_t upper_size, tidesdb_iter_t **out);
+ 
++/**
++ * engine_iter_new_opts
++ * as engine_iter_new_range, but told whether the scan's sstable cursors read through the block
++ * cache (cf_iter_new_opts); NULL ends make an unbounded scan
++ * @param use_cache non-zero to read through the block cache, 0 to read sstable nodes from disk
++ * without looking them up in the cache or inserting them
++ * @return as engine_iter_new_range
++ */
++int engine_iter_new_opts(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, size_t lower_size,
++                         const uint8_t *upper, size_t upper_size, int use_cache,
++                         tidesdb_iter_t **out);
++
+ /**
+  * engine_iter_free
+  * free an iterator and release its L0 pins and sstable references. one whose transaction was freed
+diff --git a/src/engine/engine_iter.c b/src/engine/engine_iter.c
+index 27a6fd8..2b90672 100644
+--- a/src/engine/engine_iter.c
++++ b/src/engine/engine_iter.c
+@@ -119,6 +119,13 @@ int engine_iter_new(tidesdb_txn_t *txn, cf_t *cf, tidesdb_iter_t **out)
+ 
+ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, size_t lower_size,
+                           const uint8_t *upper, size_t upper_size, tidesdb_iter_t **out)
++{
++    return engine_iter_new_opts(txn, cf, lower, lower_size, upper, upper_size, 1, out);
++}
++
++int engine_iter_new_opts(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, size_t lower_size,
++                         const uint8_t *upper, size_t upper_size, const int use_cache,
++                         tidesdb_iter_t **out)
+ {
+     if (!txn || !cf || !out) return TDB_ERR_INVALID_ARGS;
+ 
+@@ -152,7 +159,8 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
+         writeset_merge_source_new(tdb_txn_writeset(txn->inner), (uint32_t)cf->cf_id, snapshot);
+     const cf_iter_bounds_t bounds = {
+         .lower = lower, .lower_size = lower_size, .upper = upper, .upper_size = upper_size};
+-    const int rc = cf_iter_new_bounded(cf, txn->db->l0, snapshot, ws_src, &bounds, &it->inner);
++    const int rc =
++        cf_iter_new_opts(cf, txn->db->l0, snapshot, ws_src, &bounds, use_cache, &it->inner);
+     if (rc != TDB_SUCCESS)
+     {
+         tdb_txn_read_release(txn->inner);
+diff --git a/test/iter_no_cache_fill__tests.c b/test/iter_no_cache_fill__tests.c
+new file mode 100644
+index 0000000..71b810d
+--- /dev/null
++++ b/test/iter_no_cache_fill__tests.c
+@@ -0,0 +1,638 @@
++/**
++ *
++ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* an iterator opened with bypass_cache reads its sstable blocks straight from disk, as compaction
++ * does, and leaves the block cache exactly as it found it: no insert, no lookup, no pin. these
++ * cases hold it to that over a family larger than the cache whose keys are spread across the
++ * memtable, the flush tier and the deeper levels -- a level run's cursors included, which open
++ * lazily as the walk reaches them -- and hold it to the same keys and values a cached scan
++ * returns, whole and over a bounded range, cold and warm */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../src/base/errors.h"
++#include "../src/cache/cache.h"
++#include "../src/column_family/cf_iter.h"
++#include "../src/compaction/compaction_exec.h"
++#include "../src/flush/flush.h"
++#include "../src/sstable/sstable.h"
++#include "db.h"
++#include "test_utils.h"
++
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define NC_DB_DIR "." PATH_SEPARATOR "test_iter_no_cache_fill_db"
++#define NC_CF     "cf0"
++
++/* a family several times the cache: 60000 keys of about 200 bytes against a 1 MiB cache */
++#define NC_KEYS        60000
++#define NC_VALUE_SIZE  200
++#define NC_BATCH       500
++#define NC_CACHE_BYTES (1u << 20)
++#define NC_BUFFER      (512u << 10)
++/* the reopened database's write buffer holds the whole memtable pass, so nothing flushes under a
++ * scan */
++#define NC_QUIET_BUFFER (64u << 20)
++/* background work settles when neither a flush nor a compaction has run for this many 10 ms polls
++ */
++#define NC_QUIET_POLLS  30
++#define NC_SETTLE_POLLS 6000
++/* scans that report locked are retried, as the iterator api asks */
++#define NC_LOCKED_RETRIES 1000
++
++/* what one scan saw, kept as one buffer of length-prefixed keys and values so two scans compare
++ * with a single memcmp */
++typedef struct
++{
++    uint8_t *buf;
++    size_t len;
++    size_t cap;
++    int rows;
++} nc_scan_t;
++
++static void nc_key(char *buf, size_t cap, int i)
++{
++    snprintf(buf, cap, "k%08d", i);
++}
++
++/* the value of key i at version gen: its bytes name both, so a stale version cannot pass */
++static void nc_value(uint8_t *buf, int i, int gen)
++{
++    for (int b = 0; b < NC_VALUE_SIZE; b++) buf[b] = (uint8_t)('a' + (i * 31 + gen * 7 + b) % 26);
++    snprintf((char *)buf, NC_VALUE_SIZE, "v%d.%d.", i, gen);
++}
++
++static tidesdb_config_t nc_config(const size_t buffer)
++{
++    tidesdb_config_t cfg = tidesdb_default_config();
++    cfg.db_path = NC_DB_DIR;
++    cfg.memtable_sync_mode = TDB_SYNC_NONE;
++    cfg.memtable_write_buffer_size = buffer;
++    cfg.memtable_idle_flush_seconds = 0;
++    cfg.block_cache_size = NC_CACHE_BYTES;
++    cfg.num_flush_threads = 1;
++    cfg.num_compaction_threads = 1;
++    cfg.log_level = TDB_LOG_WARN;
++    return cfg;
++}
++
++static tidesdb_t *nc_open(const int create_cf, const size_t buffer, tidesdb_column_family_t **cf)
++{
++    const tidesdb_config_t cfg = nc_config(buffer);
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    if (create_cf)
++    {
++        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++        cc.keep_values_inline =
++            1; /* the values live in the key log, so the scan reads its blocks */
++        ASSERT_EQ(tidesdb_create_column_family(db, NC_CF, &cc), TDB_SUCCESS);
++    }
++    *cf = tidesdb_get_column_family(db, NC_CF);
++    ASSERT_TRUE(*cf != NULL);
++    return db;
++}
++
++/* write version gen of every step-th key in [0, NC_KEYS), deleting instead where del says so */
++static void nc_write(tidesdb_t *db, tidesdb_column_family_t *cf, const int step, const int gen,
++                     const int del)
++{
++    uint8_t value[NC_VALUE_SIZE];
++    for (int i = 0; i < NC_KEYS;)
++    {
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
++        for (int j = 0; j < NC_BATCH && i < NC_KEYS; j++, i += step)
++        {
++            char key[16];
++            nc_key(key, sizeof(key), i);
++            if (del)
++            {
++                ASSERT_EQ(tidesdb_txn_delete(txn, cf, (const uint8_t *)key, strlen(key)),
++                          TDB_SUCCESS);
++                continue;
++            }
++            nc_value(value, i, gen);
++            ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key), value,
++                                      sizeof(value), -1),
++                      TDB_SUCCESS);
++        }
++        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
++        tidesdb_txn_free(txn);
++    }
++}
++
++static void nc_compact(tidesdb_t *db, tidesdb_column_family_t *cf)
++{
++    int rc = TDB_ERR_LOCKED;
++    for (int attempt = 0; attempt < NC_LOCKED_RETRIES && rc == TDB_ERR_LOCKED; attempt++)
++    {
++        rc = tidesdb_compact(db, cf);
++        if (rc == TDB_ERR_LOCKED) usleep(10000);
++    }
++    if (rc != TDB_SUCCESS) printf("(compact: %d) ", rc);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++}
++
++static void nc_flush(tidesdb_t *db)
++{
++    int rc = TDB_ERR_LOCKED;
++    for (int attempt = 0; attempt < NC_LOCKED_RETRIES && rc == TDB_ERR_LOCKED; attempt++)
++        rc = tidesdb_flush_memtable(db);
++    ASSERT_EQ(rc, TDB_SUCCESS);
++}
++
++/* wait out the merges the reopened flush tier triggers: a compaction drops its inputs' blocks from
++ * the cache, which a scan measuring the cache must not see */
++static void nc_settle(tidesdb_t *db, tidesdb_column_family_t *cf)
++{
++    int quiet = 0;
++    for (int i = 0; i < NC_SETTLE_POLLS && quiet < NC_QUIET_POLLS; i++)
++    {
++        quiet = (tidesdb_is_flushing(db) || tidesdb_is_compacting(cf)) ? 0 : quiet + 1;
++        usleep(10000);
++    }
++    ASSERT_EQ(quiet, NC_QUIET_POLLS);
++}
++
++/* the layout the scans read: what a forced compaction merged into the deeper levels, the flush
++ * tier above it, and the memtable over both, each holding versions the next one shadows -- deletes
++ * included. returns the reopened database with nothing running in the background */
++static tidesdb_t *nc_build(tidesdb_column_family_t **cf)
++{
++    (void)remove_directory(NC_DB_DIR);
++    tidesdb_t *db = nc_open(1, NC_BUFFER, cf);
++    nc_write(db, *cf, 1, 1, 0);
++    nc_flush(db);
++    nc_compact(db, *cf); /* the first pass merged down out of the flush tier */
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++
++    db = nc_open(0, NC_QUIET_BUFFER, cf);
++    nc_settle(db, *cf);
++    /* a newer version of every 29th key in the flush tier, and every 31st deleted there: few enough
++     * that the flush tier stays under its capacity and no merge is due */
++    nc_write(db, *cf, 29, 2, 0);
++    nc_write(db, *cf, 31, 0, 1);
++    nc_flush(db);
++    nc_settle(db, *cf);
++    nc_write(db, *cf, 13, 3, 0); /* the newest version of every 13th key, in the memtable only */
++    nc_settle(db, *cf);
++
++    tidesdb_cf_stats_t st;
++    memset(&st, 0, sizeof(st));
++    ASSERT_EQ(tidesdb_get_cf_stats(*cf, &st), TDB_SUCCESS);
++    int deep = 0;
++    printf("(levels:");
++    for (int l = 0; l < st.num_levels && l < TDB_MAX_LEVELS; l++)
++    {
++        printf(" %d", st.level_num_sstables[l]);
++        if (l > 0 && st.level_num_sstables[l] > 0) deep = 1;
++    }
++    printf(") ");
++    fflush(stdout);
++    /* the scan crosses the flush tier and a deeper level. that level is usually a run of several
++     * tables, but how many the merge writes depends on timing;
++     * test_bypass_run_leaves_cache_unchanged lays a run out by hand */
++    ASSERT_TRUE(deep);
++    ASSERT_TRUE(st.level_num_sstables[0] > 0);
++    return db;
++}
++
++static void nc_append(nc_scan_t *s, const uint8_t *p, size_t n)
++{
++    if (s->len + n + sizeof(n) > s->cap)
++    {
++        s->cap = (s->cap + n + sizeof(n)) * 2;
++        s->buf = realloc(s->buf, s->cap);
++        ASSERT_TRUE(s->buf != NULL);
++    }
++    memcpy(s->buf + s->len, &n, sizeof(n));
++    memcpy(s->buf + s->len + sizeof(n), p, n);
++    s->len += sizeof(n) + n;
++}
++
++/* byte-wise key order, a prefix before its extensions */
++static int nc_cmp(const uint8_t *a, size_t an, const uint8_t *b, size_t bn)
++{
++    const int c = memcmp(a, b, an < bn ? an : bn);
++    if (c != 0) return c;
++    return an < bn ? -1 : (an > bn ? 1 : 0);
++}
++
++/* one forward walk over the options' range (from its lower end, or the first key) in a fresh
++ * read-committed transaction, retried whole while the engine reports locked */
++static void nc_scan(tidesdb_t *db, tidesdb_column_family_t *cf, const tidesdb_iter_options_t *opts,
++                    nc_scan_t *out)
++{
++    for (int attempt = 0; attempt < NC_LOCKED_RETRIES; attempt++)
++    {
++        out->len = 0;
++        out->rows = 0;
++        tidesdb_txn_t *txn = NULL;
++        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn),
++                  TDB_SUCCESS);
++        tidesdb_iter_t *it = NULL;
++        int rc = tidesdb_iter_new_opts(txn, cf, opts, &it);
++        if (rc == TDB_SUCCESS)
++            rc = opts && opts->lower ? tidesdb_iter_seek(it, opts->lower, opts->lower_size)
++                                     : tidesdb_iter_seek_to_first(it);
++        while (rc == TDB_SUCCESS && tidesdb_iter_valid(it))
++        {
++            uint8_t *k = NULL, *v = NULL;
++            size_t ks = 0, vs = 0;
++            ASSERT_EQ(tidesdb_iter_key_value(it, &k, &ks, &v, &vs), TDB_SUCCESS);
++            const int past =
++                opts && opts->upper && nc_cmp(k, ks, opts->upper, opts->upper_size) > 0;
++            if (!past)
++            {
++                nc_append(out, k, ks);
++                nc_append(out, v, vs);
++                out->rows++;
++            }
++            free(k);
++            free(v);
++            if (past) break;
++            rc = tidesdb_iter_next(it);
++        }
++        tidesdb_iter_free(it);
++        tidesdb_txn_free(txn);
++        if (rc == TDB_SUCCESS || rc == TDB_ERR_NOT_FOUND) return;
++        ASSERT_EQ(rc, TDB_ERR_LOCKED);
++    }
++    ASSERT_TRUE(0);
++}
++
++static tidesdb_cache_stats_t nc_cache(tidesdb_t *db)
++{
++    tidesdb_cache_stats_t s;
++    memset(&s, 0, sizeof(s));
++    ASSERT_EQ(tidesdb_get_cache_stats(db, &s), TDB_SUCCESS);
++    ASSERT_EQ(s.enabled, 1);
++    return s;
++}
++
++/* the cache did not move at all: nothing inserted, nothing looked up */
++static void nc_assert_cache_untouched(const tidesdb_cache_stats_t *a,
++                                      const tidesdb_cache_stats_t *b)
++{
++    ASSERT_EQ(a->total_entries, b->total_entries);
++    ASSERT_EQ(a->total_bytes, b->total_bytes);
++    ASSERT_EQ(a->hits, b->hits);
++    ASSERT_EQ(a->misses, b->misses);
++}
++
++static void nc_assert_same(const nc_scan_t *a, const nc_scan_t *b)
++{
++    ASSERT_EQ(a->rows, b->rows);
++    ASSERT_EQ(a->len, b->len);
++    ASSERT_EQ(memcmp(a->buf, b->buf, a->len), 0);
++}
++
++/* the rows a full scan must return: every key not deleted by the every-31st pass, unless the
++ * memtable's every-13th pass wrote it again */
++static int nc_expected_rows(void)
++{
++    int rows = 0;
++    for (int i = 0; i < NC_KEYS; i++) rows += (i % 31 != 0) || (i % 13 == 0);
++    return rows;
++}
++
++/* a whole-family scan that bypasses the cache leaves it as it was, cold and then warm, and returns
++ * what a cached scan returns */
++void test_bypass_scan_leaves_cache_unchanged(void)
++{
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = nc_build(&cf);
++    const tidesdb_iter_options_t bypass = {.bypass_cache = 1};
++    nc_scan_t uncached = {0}, cached = {0}, again = {0};
++
++    const tidesdb_cache_stats_t cold = nc_cache(db);
++    nc_scan(db, cf, &bypass, &uncached);
++    const tidesdb_cache_stats_t after_bypass = nc_cache(db);
++    nc_assert_cache_untouched(&cold, &after_bypass);
++    ASSERT_EQ(uncached.rows, nc_expected_rows());
++
++    /* the cached scan reads the same rows and does fill the cache, so the bypass above was not
++     * unchanged merely because nothing reached the sstables */
++    nc_scan(db, cf, NULL, &cached);
++    nc_assert_same(&uncached, &cached);
++    const tidesdb_cache_stats_t warm = nc_cache(db);
++    ASSERT_TRUE(warm.total_entries > cold.total_entries);
++    ASSERT_TRUE(warm.misses > cold.misses);
++    printf("(%d rows, cache %zu entries %zu bytes after the cached scan) ", cached.rows,
++           warm.total_entries, warm.total_bytes);
++    fflush(stdout);
++
++    /* with the cache full of the family's blocks a bypass scan neither hits nor evicts them */
++    nc_scan(db, cf, &bypass, &again);
++    nc_assert_same(&uncached, &again);
++    const tidesdb_cache_stats_t after_warm_bypass = nc_cache(db);
++    nc_assert_cache_untouched(&warm, &after_warm_bypass);
++
++    free(uncached.buf);
++    free(cached.buf);
++    free(again.buf);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(NC_DB_DIR);
++}
++
++/* a bounded bypass scan returns what the same bounded scan through the cache returns, and leaves
++ * the cache alone; one end alone is refused, and no options are tidesdb_iter_new's defaults */
++void test_bounded_bypass_scan_matches(void)
++{
++    tidesdb_column_family_t *cf = NULL;
++    tidesdb_t *db = nc_build(&cf);
++    char lo[16], hi[16];
++    nc_key(lo, sizeof(lo), NC_KEYS / 4);
++    nc_key(hi, sizeof(hi), NC_KEYS / 2);
++    tidesdb_iter_options_t opts = {.lower = (const uint8_t *)lo,
++                                   .lower_size = strlen(lo),
++                                   .upper = (const uint8_t *)hi,
++                                   .upper_size = strlen(hi),
++                                   .bypass_cache = 1};
++    nc_scan_t uncached = {0}, cached = {0}, full = {0};
++
++    const tidesdb_cache_stats_t before = nc_cache(db);
++    nc_scan(db, cf, &opts, &uncached);
++    const tidesdb_cache_stats_t after = nc_cache(db);
++    nc_assert_cache_untouched(&before, &after);
++    ASSERT_TRUE(uncached.rows > 0);
++
++    opts.bypass_cache = 0;
++    nc_scan(db, cf, &opts, &cached);
++    nc_assert_same(&uncached, &cached);
++    ASSERT_TRUE(nc_cache(db).total_entries > before.total_entries);
++
++    /* a zeroed options struct is the plain iterator, through the cache */
++    const tidesdb_iter_options_t zero = {0};
++    nc_scan(db, cf, &zero, &full);
++    ASSERT_EQ(full.rows, nc_expected_rows());
++
++    tidesdb_txn_t *txn = NULL;
++    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
++    tidesdb_iter_t *it = NULL;
++    const tidesdb_iter_options_t lower_only = {
++        .lower = (const uint8_t *)lo, .lower_size = strlen(lo), .bypass_cache = 1};
++    ASSERT_EQ(tidesdb_iter_new_opts(txn, cf, &lower_only, &it), TDB_ERR_INVALID_ARGS);
++    const tidesdb_iter_options_t upper_only = {
++        .upper = (const uint8_t *)hi, .upper_size = strlen(hi), .bypass_cache = 1};
++    ASSERT_EQ(tidesdb_iter_new_opts(txn, cf, &upper_only, &it), TDB_ERR_INVALID_ARGS);
++    ASSERT_EQ(tidesdb_iter_new_opts(NULL, cf, &opts, &it), TDB_ERR_INVALID_ARGS);
++    ASSERT_TRUE(it == NULL);
++    tidesdb_txn_free(txn);
++
++    free(uncached.buf);
++    free(cached.buf);
++    free(full.buf);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(NC_DB_DIR);
++}
++
++/* ---- a level run under the flush tier and a memtable, through cf_iter_new_opts ---- */
++
++#define NR_DB_DIR     "." PATH_SEPARATOR "test_iter_no_cache_fill_run_db"
++#define NR_MAX_LEVEL  12
++#define NR_PROB       0.25f
++#define NR_RUN_LEVEL  2
++#define NR_TABLES     12
++#define NR_PER        400
++#define NR_RUN_SEQ    1000u
++#define NR_L1_SEQ     100000u
++#define NR_MT_SEQ     200000u
++#define NR_CACHE      (64u << 10) /* far below the run's klogs, so a cached walk must evict */
++#define NR_NODE_BYTES 1024
++
++typedef struct
++{
++    tidesdb_encoding_registry_t reg;
++    vlog_t *vlog;
++    cache_t *cache;
++    fd_manager_t fdm;
++    tidesdb_manifest_t *manifest;
++    char manifest_path[256];
++    tidesdb_l0_t *l0;
++    cf_t *cf;
++    _Atomic(uint64_t) next_id;
++    uint64_t generation;
++} nr_db_t;
++
++static void nr_open(nr_db_t *db)
++{
++    memset(db, 0, sizeof(*db));
++    (void)remove_directory(NR_DB_DIR);
++    ASSERT_EQ(mkdir(NR_DB_DIR, 0755), 0);
++    ASSERT_EQ(tidesdb_encoding_registry_init(&db->reg), 0);
++    const vlog_config_t vc = {.sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
++    ASSERT_EQ(vlog_open(NR_DB_DIR, &vc, &db->vlog), VLOG_OK);
++    const cache_config_t cc = {.capacity_bytes = NR_CACHE};
++    db->cache = cache_create(&cc);
++    ASSERT_TRUE(db->cache != NULL);
++    ASSERT_EQ(fd_manager_init(&db->fdm, 0), 0);
++    snprintf(db->manifest_path, sizeof(db->manifest_path), "%s%sMANIFEST", NR_DB_DIR,
++             PATH_SEPARATOR);
++    db->manifest = tidesdb_manifest_open(db->manifest_path);
++    ASSERT_TRUE(db->manifest != NULL);
++
++    tidesdb_column_family_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    snprintf(cfg.name, sizeof(cfg.name), "%s", "cf0");
++    cfg.level_size_ratio = 10;
++    cfg.min_levels = 3;
++    cfg.btree_klog_block_size = NR_NODE_BYTES;
++    ASSERT_EQ(
++        cf_create(NR_DB_DIR, 0, &cfg, &db->reg, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf),
++        0);
++    ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
++    db->l0 = tidesdb_l0_create(64 * 1024, 8, NR_MAX_LEVEL, NR_PROB, NULL, NULL);
++    tidesdb_l0_set_active(db->l0,
++                          tidesdb_memtable_create(NULL, 0, 0, NR_MAX_LEVEL, NR_PROB, NULL, NULL));
++    atomic_init(&db->next_id, 100);
++    db->generation = 1;
++}
++
++static void nr_close(nr_db_t *db)
++{
++    tidesdb_l0_destroy(db->l0);
++    cf_free(db->cf);
++    tidesdb_manifest_close(db->manifest);
++    fd_manager_destroy(&db->fdm);
++    cache_destroy(db->cache);
++    vlog_close(db->vlog);
++    (void)remove_directory(NR_DB_DIR);
++}
++
++/* key i at seq into the active memtable, a tombstone when deleted; the value names both */
++static void nr_put(nr_db_t *db, const int i, const uint64_t seq, const int deleted)
++{
++    char k[16], v[48];
++    nc_key(k, sizeof(k), i);
++    snprintf(v, sizeof(v), "value-%d-at-%llu", i, (unsigned long long)seq);
++    ASSERT_EQ(tidesdb_l0_apply(db->l0, 0, (const uint8_t *)k, strlen(k),
++                               deleted ? NULL : (const uint8_t *)v, deleted ? 0 : strlen(v), -1,
++                               seq, deleted ? SKIP_LIST_FLAG_DELETED : 0),
++              TDB_SUCCESS);
++}
++
++/* rotate the active memtable and flush it into one L1 table, returning its id */
++static uint64_t nr_flush(nr_db_t *db)
++{
++    db->generation++;
++    ASSERT_EQ(
++        tidesdb_l0_rotate(db->l0, tidesdb_memtable_create(NULL, db->generation, db->generation,
++                                                          NR_MAX_LEVEL, NR_PROB, NULL, NULL)),
++        TDB_SUCCESS);
++    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(db->l0);
++    const uint64_t id = atomic_load(&db->next_id);
++    cf_t *cfs[1] = {db->cf};
++    flush_ctx_t fx = {.l0 = db->l0,
++                      .cfs = cfs,
++                      .n_cfs = 1,
++                      .manifest = db->manifest,
++                      .manifest_path = db->manifest_path,
++                      .next_sstable_id = &db->next_id,
++                      .fdm = &db->fdm,
++                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                      .value_threshold = 1u << 20};
++    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
++    return id;
++}
++
++/* a run of NR_TABLES tables at the run level, then two overlapping L1 tables rewriting and deleting
++ * keys across it, then a memtable over all of it */
++static void nr_build(nr_db_t *db)
++{
++    uint64_t ids[NR_TABLES];
++    for (int f = 0; f < NR_TABLES; f++)
++    {
++        for (int i = 0; i < NR_PER; i++) nr_put(db, f * NR_PER + i, NR_RUN_SEQ + (uint64_t)i, 0);
++        ids[f] = nr_flush(db);
++    }
++    const compaction_job_t move = {.input_ids = ids,
++                                   .n_inputs = NR_TABLES,
++                                   .target_level = NR_RUN_LEVEL,
++                                   .is_largest_level = 1,
++                                   .split = COMPACTION_SPLIT_NONE,
++                                   .is_move = 1};
++    const compaction_ctx_t cx = {.cf = db->cf,
++                                 .manifest = db->manifest,
++                                 .manifest_path = db->manifest_path,
++                                 .next_sstable_id = &db->next_id,
++                                 .gc_floor = UINT64_MAX,
++                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
++                                 .value_threshold = 1u << 20};
++    ASSERT_EQ(compaction_exec(&cx, &move), TDB_SUCCESS);
++    ASSERT_EQ(level_set_count(db->cf->levels, NR_RUN_LEVEL), NR_TABLES);
++
++    for (int pass = 0; pass < 2; pass++)
++    {
++        for (int i = pass; i < NR_TABLES * NR_PER; i += 9)
++            nr_put(db, i, NR_L1_SEQ + (uint64_t)(pass * NR_TABLES * NR_PER + i), i % 4 == 0);
++        (void)nr_flush(db);
++    }
++    for (int i = 5; i < NR_TABLES * NR_PER; i += 17) nr_put(db, i, NR_MT_SEQ + (uint64_t)i, 0);
++}
++
++/* one full forward walk, every visible key and value appended */
++static void nr_walk(nr_db_t *db, const int use_cache, nc_scan_t *out)
++{
++    out->len = 0;
++    out->rows = 0;
++    cf_iter_t *it = NULL;
++    ASSERT_EQ(cf_iter_new_opts(db->cf, db->l0, UINT64_MAX, NULL, NULL, use_cache, &it),
++              TDB_SUCCESS);
++    int rc = cf_iter_seek_first(it);
++    while (rc == TDB_SUCCESS && cf_iter_valid(it))
++    {
++        const uint8_t *k = NULL, *v = NULL;
++        size_t ks = 0, vs = 0;
++        uint64_t seq = 0, vlog = 0;
++        int64_t ttl = 0;
++        uint8_t deleted = 0;
++        ASSERT_EQ(cf_iter_get(it, &k, &ks, &seq, &v, &vs, &vlog, &ttl, &deleted), TDB_SUCCESS);
++        ASSERT_EQ(deleted, 0);
++        ASSERT_EQ(vlog, (uint64_t)0);
++        nc_append(out, k, ks);
++        nc_append(out, v, vs);
++        out->rows++;
++        rc = cf_iter_next(it);
++    }
++    ASSERT_TRUE(rc == TDB_SUCCESS || rc == TDB_ERR_NOT_FOUND);
++    cf_iter_free(it);
++}
++
++static void nr_assert_untouched(const cache_stats_t *a, const cache_stats_t *b)
++{
++    ASSERT_EQ(a->entries, b->entries);
++    ASSERT_EQ(a->bytes_used, b->bytes_used);
++    ASSERT_EQ(a->hits, b->hits);
++    ASSERT_EQ(a->misses, b->misses);
++}
++
++/* the cursors of a level run open lazily, each with the iterator's choice: a bypassing walk over a
++ * run, the flush tier and a memtable leaves the cache alone, cold and warm, and reads what a
++ * cached walk reads */
++void test_bypass_run_leaves_cache_unchanged(void)
++{
++    nr_db_t db;
++    nr_open(&db);
++    nr_build(&db);
++    nc_scan_t uncached = {0}, cached = {0}, again = {0};
++
++    cache_stats_t cold, after, warm, after_warm;
++    cache_get_stats(db.cache, &cold);
++    const int64_t opened = sstable_iters_opened();
++    nr_walk(&db, 0, &uncached);
++    /* every table was reached: the run's twelve and the two L1 tables */
++    ASSERT_EQ(sstable_iters_opened() - opened, (int64_t)(NR_TABLES + 2));
++    cache_get_stats(db.cache, &after);
++    nr_assert_untouched(&cold, &after);
++
++    nr_walk(&db, 1, &cached);
++    nc_assert_same(&uncached, &cached);
++    cache_get_stats(db.cache, &warm);
++    ASSERT_TRUE(warm.entries > cold.entries);
++    ASSERT_TRUE(warm.evictions > cold.evictions); /* the walk read more than the cache holds */
++
++    nr_walk(&db, 0, &again);
++    nc_assert_same(&uncached, &again);
++    cache_get_stats(db.cache, &after_warm);
++    nr_assert_untouched(&warm, &after_warm);
++
++    int rows = 0;
++    for (int i = 0; i < NR_TABLES * NR_PER; i++)
++    {
++        /* the newest L1 pass that wrote i decides, unless the memtable wrote it after */
++        const int l1 = (i % 9 == 1) ? 1 : (i % 9 == 0) ? 0 : -1;
++        const int dead = l1 >= 0 && i % 4 == 0 && i % 17 != 5;
++        rows += !dead;
++    }
++    ASSERT_EQ(uncached.rows, rows);
++    printf("(%d rows, %llu cached entries, %llu evictions) ", rows,
++           (unsigned long long)warm.entries, (unsigned long long)warm.evictions);
++    fflush(stdout);
++
++    free(uncached.buf);
++    free(cached.buf);
++    free(again.buf);
++    nr_close(&db);
++}
++
++int main(int argc, char **argv)
++{
++    INIT_TEST_FILTER(argc, argv);
++    RUN_TEST_HANDLE_BALANCED(test_bypass_scan_leaves_cache_unchanged, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_bounded_bypass_scan_matches, tests_passed);
++    RUN_TEST_HANDLE_BALANCED(test_bypass_run_leaves_cache_unchanged, tests_passed);
++    PRINT_TEST_RESULTS(tests_passed, tests_failed);
++    return tests_failed > 0 ? 1 : 0;
++}

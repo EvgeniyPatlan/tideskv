@@ -16,7 +16,8 @@ namespace tideskv {
 
 // Fills a SpecialKeyFilter from the meta CF: chunks of kScanChunk keys, each through a fresh BeginRead
 // view and iterator, resuming strictly after the last key seen; Insert for every MetaIsSpecial value.
-// Returns early (OK) when stop is set.
+// Returns early (OK) when stop is set. Reads without filling the block cache (IterOptions::fill_cache =
+// false).
 inline constexpr size_t kScanChunk = 65536;
 Status ScanSpecialKeys(Storage& storage, SpecialKeyFilter& filter, const std::atomic<bool>& stop);
 
