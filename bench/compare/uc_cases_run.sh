@@ -9,7 +9,8 @@
 #   U3: age.* age.seconds settle-age du-after-age;  U1 Kvrocks: compact.status settle-compact du-after-compact
 #   pass B: reload/ reload.seconds reload.settle (U3: reload-age.*) open.rates open25|open50|open75.*
 #   U5: load-<size>/ load-<size>.seconds settle-load-<size> du-after-load-<size> <size>.*
-#   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end idle.status
+#   <load>.pipeline: the load's memtier --pipeline (the load is unmeasured, pipelined alike on every server)
+#   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end (or `unverified`) value-size idle.status
 #   U6: load/ load.seconds settle-load du-after-load c1|c8|c64|c256.*
 #   U8: summary.json (no server)
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes).
@@ -30,7 +31,10 @@ _uc_up() {
 _uc_down() { stop_server; SERVER_CONTAINER=""; }
 
 # shellcheck disable=SC2317  # callbacks are invoked indirectly by uc_load / uc_phase
-_uc_load_cb() { memtier "$UC_LOAD_DIR/$UC_LOAD_N" "$@" || return; UC_LOAD_N=$((UC_LOAD_N + 1)); }
+_uc_load_cb() {
+  local a
+  for a in "$@"; do [[ $a == --pipeline=* ]] && UC_LOAD_PIPELINE=${a#--pipeline=}; done
+  memtier "$UC_LOAD_DIR/$UC_LOAD_N" "$@" || return; UC_LOAD_N=$((UC_LOAD_N + 1)); }
 # shellcheck disable=SC2317
 _uc_args_cb() { UC_ARGS=("$@"); }
 
@@ -50,10 +54,11 @@ _uc_dbsize_ok() {
 # _uc_load CASE REP NAME KEYS [U5 PHASE]: memtier load into REP/NAME/, NAME.seconds, then the DBSIZE check.
 _uc_load() {
   local c=$1 rep=$2 name=$3 keys=$4 start
-  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1
+  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1 UC_LOAD_PIPELINE=""
   start=$(date +%s%3N)
   uc_load "$c" _uc_load_cb ${5:+"$5"} || { _uc_fail "load failed; see $rep/$name/"; return 1; }
   _uc_since "$start" >"$OUT/$rep/$name.seconds"
+  echo "${UC_LOAD_PIPELINE:-1}" >"$OUT/$rep/$name.pipeline"  # the unmeasured load is pipelined (same for every server)
   _uc_dbsize_ok "$keys"
 }
 
@@ -173,17 +178,26 @@ case_U5() {
 # U2: fixed-rate SET/GET churn with expiry, then an idle period. The du sampler runs from before the churn to after the
 # idle period (du.csv); du-end and dbsize-end (keys left once everything should have expired; recorded, not checked)
 # are taken at the end. Kvrocks-cron differs from kvrocks only by its config line.
+_uc_scan_ts() { cli INFO keyspace | tr -d '\r' | sed -n 's/^last_dbsize_scan_timestamp://p'; }
+
+# Kvrocks 2.17: DBSIZE SCAN runs in the background and INFO keyspace's last_dbsize_scan_timestamp changes when it lands
+# (checked on a live 2.17.0 container: 0 -> epoch seconds, with the key count updated at the same time). Until then DBSIZE
+# is a cached 0, so wait for the timestamp to change (UC_DBSIZE_TRIES polls, UC_DBSIZE_POLL s apart); no change = "unverified".
 _uc_dbsize_end() {
-  local rep=$1 i got="" prev="" tries=1
-  if [[ $SERVER_NAME == kvrocks* ]]; then cli DBSIZE SCAN >/dev/null; tries=${UC_DBSIZE_TRIES:-900}; fi
-  for ((i = 0; i < tries; i++)); do
+  local rep=$1 i before="" now="" got=""
+  if [[ $SERVER_NAME == kvrocks* ]]; then
+    before=$(_uc_scan_ts)
+    cli DBSIZE SCAN >/dev/null
+    for ((i = 0; i < ${UC_DBSIZE_TRIES:-900}; i++)); do
+      now=$(_uc_scan_ts)
+      if [[ $now =~ ^[0-9]+$ && $now != "$before" ]]; then got=$(cli DBSIZE | tr -d '\r'); break; fi
+      sleep "${UC_DBSIZE_POLL:-2}"
+    done
+  else
     got=$(cli DBSIZE | tr -d '\r')
-    # Kvrocks' cached count stays 0 until the scan lands: take the first number that repeats
-    if [[ $got =~ ^[0-9]+$ ]] && { [[ $SERVER_NAME != kvrocks* ]] || [[ $got == "$prev" ]]; }; then break; fi
-    prev=$got
-    if ((i + 1 < tries)); then sleep 2; fi
-  done
-  echo "${got:-unknown}" >"$OUT/$rep/dbsize-end"
+  fi
+  [[ $got =~ ^[0-9]+$ ]] || got=unverified
+  echo "$got" >"$OUT/$rep/dbsize-end"
 }
 
 case_U2() {
@@ -192,13 +206,15 @@ case_U2() {
   uc_du_sampler "$OUT/data/$s" "$UC_U2_DU_EVERY" "$OUT/$rep/du.csv" & spid=$!
   UC_CELL_WARMUP=0 UC_CELL_DURATION=$UC_U2_WRITE_S _uc_cell U2 "$rep" churn || rc=1
   if ((rc == 0)); then
-    sleep "$UC_U2_IDLE_S"
+    sleep "$UC_U2_IDLE_S" & wait $!  # in the background so a TERM is handled now, as in settle
     echo ok >"$OUT/$rep/idle.status"
     _uc_check_alive "$rep/idle"
     [[ $(head -1 "$OUT/$rep/idle.status") == ok ]] || { _uc_fail "idle failed: $(head -1 "$OUT/$rep/idle.status")"; rc=1; }
   fi
   stop_sampler "$spid"
   ((rc == 0)) || return 1
+  # the value size of the churn, for the report's live-bytes estimate (dbsize-end x value-size)
+  printf '%s\n' "${UC_ARGS[@]}" | sed -n 's/^--data-size=//p' >"$OUT/$rep/value-size"
   uc_du_snapshot "$OUT/data/$s" >"$OUT/$rep/du-end"
   _uc_dbsize_end "$rep"
 }

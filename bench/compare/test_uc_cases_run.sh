@@ -32,8 +32,14 @@ memtier() {
 }
 cli() {
   case $* in
-    "DBSIZE SCAN") echo OK ;;
-    DBSIZE) echo "$DBSIZE_REPLY" ;;
+    "DBSIZE SCAN") if [[ -n ${SCAN_TRACK:-} ]]; then echo "${SCAN_DELAY:-0}" >"$TMP/scanwait"; fi; echo OK ;;  # the scan lands after SCAN_DELAY INFO polls
+    "INFO keyspace")
+      if [[ -e $TMP/scanwait ]]; then
+        w=$(<"$TMP/scanwait")
+        if ((w > 0)); then echo $((w - 1)) >"$TMP/scanwait"; else rm -f "$TMP/scanwait"; echo $(($(cat "$TMP/scants" 2>/dev/null || echo 0) + 1)) >"$TMP/scants"; fi
+      fi
+      echo "last_dbsize_scan_timestamp:$(cat "$TMP/scants" 2>/dev/null || echo 0)" ;;
+    DBSIZE) if [[ -e $TMP/scanwait ]]; then echo 0; else echo "$DBSIZE_REPLY"; fi ;;  # cached 0 until the scan lands
     INFO*) echo "is_compacting:no" ;;
     COMPACT) echo "$CUR:compact" >>"$TMP/compacts"; echo OK ;;  # cli runs in $(...): log to a file
     *) echo OK ;;
@@ -190,7 +196,7 @@ uc_du_sampler() {
 memtier() { if [[ $1 == */churn ]]; then echo "churn-$CUR" >>"$U2_LOG"; echo "args $*" >>"$U2_LOG"; fi; EV+=("$CUR:${1#*/rep*/}"); mkdir -p "$(dirname "$OUT/$1")"; printf '{"ALL STATS":{"Totals":{"Ops/sec":1}}}\n' >"$OUT/$1.json"; }
 sleep() { [[ ${1:-} == 1 && -n ${U2_IDLE_MARK:-} ]] && echo idle >>"$U2_LOG"; command sleep "$@"; }
 }
-UC_DBSIZE_TRIES=3 U2_IDLE_MARK=1
+UC_DBSIZE_TRIES=3 U2_IDLE_MARK=1 SCAN_TRACK=1
 : >"$U2_LOG"
 EV=()
 uc_dispatch U2 2>/dev/null
@@ -200,14 +206,31 @@ check u2-sampler-spans-idle "$(grep -v '^args' "$U2_LOG" | tr '\n' ' ')" \
 check u2-churn-seconds "$(grep -m1 '^args' "$U2_LOG" | grep -o -- '--test-time=[0-9]*')" "--test-time=7"
 check u2-files "$(count_files "$OUT/U2/kvrocks-cron/rep1" du.csv du-end dbsize-end churn.json churn.status)" 5
 check u2-done "$(cat "$OUT/U2/tideskv/rep1/done") $(cat "$OUT/U2/kvrocks/rep1/done")" "ok ok"
-check u2-dbsize-recorded "$(cat "$OUT/U2/kvrocks/rep1/dbsize-end")" 999999999
+check u2-dbsize-recorded "$(cat "$OUT/U2/kvrocks/rep1/dbsize-end") $(cat "$OUT/U2/tideskv/rep1/dbsize-end")" "999999999 999999999"
+check u2-value-size "$(cat "$OUT/U2/kvrocks/rep1/value-size")" 1024
 unset -f sleep
+SCAN_TRACK=""; rm -f "$TMP/scanwait"
 EV=() START_LEVELS=()
 OUT=$TMP/u6
 uc_dispatch U6 2>/dev/null
 check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
 check u6-strict "${START_LEVELS[*]}" "tideskv:strict kvrocks:strict"
 check u6-done "$(cat "$OUT/U6/tideskv/rep1/done")" ok
+check u6-load-pipeline-recorded "$(cat "$OUT/U6/tideskv/rep1/load.pipeline")" 32
+
+SCAN_TRACK=1; rm -f "$TMP/scanwait"
+# Kvrocks' DBSIZE is a cached 0 until the scan lands: wait for it, and never record the false 0
+SERVER_NAME=kvrocks DBSIZE_REPLY=424242 UC_DBSIZE_POLL=0.01 UC_DBSIZE_TRIES=50 SCAN_DELAY=3
+mkdir -p "$OUT/dbs"; rm -f "$TMP/scanwait"
+_uc_dbsize_end dbs
+check dbsize-end-waits-for-scan "$(cat "$OUT/dbs/dbsize-end")" 424242
+SCAN_DELAY=1000 UC_DBSIZE_TRIES=4
+_uc_dbsize_end dbs
+check dbsize-end-timeout-unverified "$(cat "$OUT/dbs/dbsize-end")" unverified
+SERVER_NAME=tideskv; rm -f "$TMP/scanwait"; DBSIZE_REPLY=0
+_uc_dbsize_end dbs
+check dbsize-end-tideskv-direct "$(cat "$OUT/dbs/dbsize-end")" 0
+DBSIZE_REPLY=999999999
 
 # ---- shellcheck ----
 if command -v shellcheck >/dev/null; then
