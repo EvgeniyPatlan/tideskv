@@ -57,7 +57,7 @@ wc_load() {
     boards)
       for ((i = 1; i <= C5_BOARDS; i++)); do
         # shellcheck disable=SC2046
-        "$cb" "--command=ZADD lb:$i __key__ __key__" "--key-prefix=" $(_cseq "$C5_MEMBERS") || return
+        "$cb" "--command=ZADD lb:$i __key__ __key__" "--key-prefix=" $(_cseq $((2 * C5_MEMBERS))) || return
       done ;;
     feeds)
       # R, not P: each LPUSH lands on a random list, so C6_LISTS lists grow to ~C6_AVG elements
@@ -82,7 +82,7 @@ _wc_c1() {
 }
 
 _wc_c2() {
-  _wc_args=(); _wc_add 6 R "HGETALL __key__"; _wc_add 3 R "HSET __key__ f1 __data__"; _wc_add 1 R "EXPIRE __key__ 3600"
+  _wc_args=(); _wc_add 6 R "HGETALL __key__"; _wc_add 3 R "HSET __key__ f1 __data__"; _wc_add 1 R "EXPIRE __key__ 1800"
   # shellcheck disable=SC2046
   "$1" "${_wc_args[@]}" "--data-size=$C2_VALUE" "--random-data" "--key-prefix=sess:" $(_random "$C2_KEYS")
 }
@@ -176,8 +176,9 @@ wc_probe() {
 }
 
 wc_verify_cmds() {
-  # 99% of the planned count: memtier skips edge ids
-  echo "$(( (C1_KEYS + C2_KEYS + C3_KEYS + C4_SETS + C5_BOARDS + C6_LISTS + C7_KEYS) * 99 / 100 )) DBSIZE"
+  # 99% of the planned count: memtier skips edge ids. The cache_exp keys (0.2 * C1_KEYS) are left out: they expire
+  # while the later datasets load.
+  echo "$(( (C1_KEYS * 8 / 10 + C2_KEYS + C3_KEYS + C4_SETS + C5_BOARDS + C6_LISTS + C7_KEYS) * 99 / 100 )) DBSIZE"
   echo "$C2_FIELDS HLEN sess:1"
   echo "$(( C4_MEMBERS * 99 / 100 )) SCARD set:1"
   echo "$(( C5_MEMBERS * 99 / 100 )) ZCARD lb:1"

@@ -68,6 +68,8 @@ check sets-prefix "$(has "${calls[0]}" "--key-prefix=m:")" yes
 calls=(); wc_load boards record
 check boards-calls "${#calls[@]}" "$C5_BOARDS"
 check boards-cmd "$(has "${calls[0]}" "--command=ZADD lb:1 __key__ __key__")" yes
+# two __key__ placeholders each draw a key, so ids run to 2 x C5_MEMBERS (as W4)
+check boards-range "$(has "${calls[0]}" "--key-maximum=200000")" yes
 check boards-prefix "$(has "${calls[0]}" $'--key-prefix=\x1f')" yes
 calls=(); wc_load feeds record
 check feeds-cmd "$(has "${calls[0]}" "--command=LPUSH __key__ __data__")" yes
@@ -98,6 +100,7 @@ check c1-ex60 "$(has "${calls[0]}" "EX 60")" yes
 check c1-ex3600 "$(has "${calls[0]}" "EX 3600")" yes
 calls=(); wc_run C2 record
 check c2-hgetall "$(has "${calls[0]}" "--command=HGETALL __key__")" yes
+check c2-expire "$(has "${calls[0]}" "--command=EXPIRE __key__ 1800")" yes
 check c2-prefix "$(has "${calls[0]}" "--key-prefix=sess:")" yes
 calls=(); wc_run C3 record
 check c3-commands "$(count_word "${calls[0]}" "--command-key-pattern=G")" 12
@@ -151,7 +154,7 @@ check verify-hlen "$(wc_verify_cmds | grep -c '^30 HLEN sess:1$')" 1
 check verify-scard "$(wc_verify_cmds | grep -c '^19800 SCARD set:1$')" 1
 check verify-zcard "$(wc_verify_cmds | grep -c '^99000 ZCARD lb:1$')" 1
 check verify-llen "$(wc_verify_cmds | grep -c '^1 LLEN feed:1$')" 1
-check verify-dbsize "$(wc_verify_cmds | grep -c ' DBSIZE$')" 1
+check verify-dbsize "$(wc_verify_cmds | grep ' DBSIZE$')" "1366214 DBSIZE"
 
 bash -n "$HERE/workloads_cases.sh" || fail=1
 exit $fail
