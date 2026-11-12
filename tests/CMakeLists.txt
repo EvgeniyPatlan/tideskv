@@ -184,6 +184,9 @@ if(Python3_FOUND)
   add_test(NAME bench_report
     COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_report.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  add_test(NAME bench_report_cases
+    COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_report_cases.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 endif()
 
 add_test(NAME bench_workloads

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turns a bench/compare run directory into report.md and summary.json (spec 2026-10-18 §7; W7 in report_w7.py).
+"""Turns a bench/compare run directory into report.md and summary.json (spec 2026-10-18 §7; W7 in report_w7.py, C1-C8 in report_cases.py).
 
 Usage: report.py <run_dir>    exit 0 when every cell is ok, 1 otherwise.
 """
@@ -283,11 +283,10 @@ def _w6_lines(meta, by, lv):
     return lines
 
 
-def render(meta, cells, disks, configs, run_dir=None):
-    by = {(c["server"], c["level"], c["workload"]): c for c in cells}
-    relaxed = meta.get("relaxed_mode", "none")
+def header_lines(meta, title="# TidesKV vs Kvrocks"):
+    """Title, the run's identity line, the client line and the quiesce paragraph, as the W1-W6 report writes them."""
     m = lambda k: meta.get(k, "?")
-    out = ["# TidesKV vs Kvrocks", "",
+    out = [title, "",
            "TidesKV `%s`, `%s`, `%s`; size `%s`; warm-up %ss, timed %ss; server cpus `%s`, memory `%s`; host %s; %s." % (
                m("tideskv_sha"), m("kvrocks_image"), m("memtier_image"), m("size"),
                m("warmup_s"), m("duration_s"), m("server_cpus"), m("server_mem"),
@@ -301,6 +300,27 @@ def render(meta, cells, disks, configs, run_dir=None):
                 "uses under %s%% of one core and writes at most %s bytes over %s s (cap %s s); the settle columns show "
                 "that wait in seconds." % (m("quiesce_cpu_pct"), m("quiesce_write_bytes"), m("quiesce_window_s"),
                                            m("quiesce_max_s")), ""]
+    return out
+
+
+def fairness_lines(meta, configs):
+    m = lambda k: meta.get(k, "?")
+    out = ["## Fairness", ""]
+    if "server_nofile" in meta:
+        cores = " (%s)" % meta["server_cores"] if meta.get("server_cores") else ""
+        out += ["Both server containers: cpus `%s`%s, memory `%s`, open files %s." % (
+            m("server_cpus"), cores, m("server_mem"), m("server_nofile")), ""]
+    out += ["Settings read back from each running server with CONFIG GET.", ""]
+    for s in SERVERS:
+        if s in configs:
+            out += ["### " + NAMES[s], "", "```", configs[s], "```", ""]
+    return out
+
+
+def render(meta, cells, disks, configs, run_dir=None):
+    by = {(c["server"], c["level"], c["workload"]): c for c in cells}
+    relaxed = meta.get("relaxed_mode", "none")
+    out = header_lines(meta)
     out += ["A ratio above 1 means TidesKV is ahead on throughput.", ""]
     titles = {"relaxed": "Relaxed durability (TidesKV `sync-mode %s` vs Kvrocks `rocksdb.write_options.sync no`)" % relaxed,
               "strict": "Strict durability (TidesKV `sync-mode full` vs Kvrocks `rocksdb.write_options.sync yes`)"}
@@ -345,15 +365,7 @@ def render(meta, cells, disks, configs, run_dir=None):
             "|---|---|---|---|---|---|---|---|"]
     for s in SERVERS:
         out.append(_disk_row(s, disks))
-    out += ["", "## Fairness", ""]
-    if "server_nofile" in meta:
-        cores = " (%s)" % meta["server_cores"] if meta.get("server_cores") else ""
-        out += ["Both server containers: cpus `%s`%s, memory `%s`, open files %s." % (
-            m("server_cpus"), cores, m("server_mem"), m("server_nofile")), ""]
-    out += ["Settings read back from each running server with CONFIG GET.", ""]
-    for s in SERVERS:
-        if s in configs:
-            out += ["### " + NAMES[s], "", "```", configs[s], "```", ""]
+    out += [""] + fairness_lines(meta, configs)
     return "\n".join(out) + "\n"
 
 
@@ -363,6 +375,9 @@ def main(argv):
         return 2
     run_dir = argv[0]
     meta, cells, disks, configs = load(run_dir)
+    if meta.get("mode") == "cases":
+        import report_cases  # noqa: E402  (imports this module back)
+        return report_cases.write(run_dir, meta, disks, configs)
     import report_w7  # noqa: E402  (imports this module back)
     if report_w7.is_large(meta, run_dir):
         report_w7.load_extras(run_dir, disks, configs)
