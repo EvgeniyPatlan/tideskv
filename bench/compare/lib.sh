@@ -194,8 +194,8 @@ start_server() {
   local common=(--detach --name "$SERVER_CONTAINER" --network "$NET" --cpuset-cpus "$SERVER_CPUS"
                 --memory "$SERVER_MEM" --memory-swap "$SERVER_MEM" --ulimit "nofile=$SERVER_NOFILE:$SERVER_NOFILE")
   conf=$(write_server_conf "$server" "$level") || return 1
-  # START_T0_FILE (U7's restart): the epoch ms just before docker run, written atomically for a waiting probe
-  if [[ -n ${START_T0_FILE:-} ]]; then date +%s%3N >"$START_T0_FILE.tmp" && mv "$START_T0_FILE.tmp" "$START_T0_FILE"; fi
+  local t_before t_after
+  t_before=$(date +%s%3N)
   if [[ $server == tideskv ]]; then
     SERVER_PORT=6379
     docker run "${common[@]}" -v "$data:/data" -v "$conf:/etc/tideskv.conf:ro" "$TIDESKV_IMAGE" /etc/tideskv.conf >/dev/null
@@ -204,6 +204,12 @@ start_server() {
     docker run "${common[@]}" -v "$data:/var/lib/kvrocks/data" -v "$conf:/etc/kvrocks.conf:ro" \
       --entrypoint kvrocks "$KVROCKS_IMAGE" -c /etc/kvrocks.conf >/dev/null
   fi
+  t_after=$(date +%s%3N)
+  # U7's restart: START_T0_FILE gets the epoch ms right after docker run returned (the process is exec'd by then; container
+  # create and network attach are not in it), written atomically for a waiting probe; START_RUN_MS_FILE gets docker run's
+  # own duration in ms
+  if [[ -n ${START_T0_FILE:-} ]]; then echo "$t_after" >"$START_T0_FILE.tmp" && mv "$START_T0_FILE.tmp" "$START_T0_FILE"; fi
+  if [[ -n ${START_RUN_MS_FILE:-} ]]; then echo $((t_after - t_before)) >"$START_RUN_MS_FILE"; fi
   # START_NOWAIT=1 (U7's restart): return at once, so the caller's probe measures the time to the first PONG itself
   if ((${START_NOWAIT:-0})); then log "$server ($level) started, not waiting for it"; return 0; fi
   local i

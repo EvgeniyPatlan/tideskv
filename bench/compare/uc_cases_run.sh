@@ -17,8 +17,8 @@
 #       (probe of the preload keys in 100 ms windows, 10 s before the writer: p99_ms, requests, hits), until-p99-ms (2 x its
 #       p99), ack.<thread> (the writer's acked-key logs; keys are ack-r<rep>-<sig>-<t>-<run>-<thread>:<seq>, unique per
 #       point because the data dir is kept), writer.out, writer.status (exit code; probe.status likewise), signal.epoch_ms, term.seconds (TERM
-#       only: signal to exit), restart.epoch_ms (t0: written by start_server just before the restart's docker run),
-#       probe.json / probe.out (pong_ms, recovered_ms = start of the first 3 consecutive passing 100 ms windows, hits;
+#       only: signal to exit), restart.epoch_ms (t0: written by start_server right after the restart's docker run returned) and restart.docker_run_ms (that docker run's duration),
+#       probe.json / probe.out (pong_ms, restart_misses = requests - hits (not a failure), recovered_ms = start of the first 3 consecutive passing 100 ms windows, hits;
 #       the probe container is started before the kill and waits for restart.epoch_ms) and verify.json (acked, lost,
 #       lost_sample, corrupt, corrupt_sample)
 #   U8: summary.json (no server)
@@ -369,7 +369,8 @@ _uc_u7_point() {
   _uc_u7_signal "$d" "$sig" || return 1
   _uc_u7_tool_collect "$d" "$w" writer.out "the writer" 60 || return 1
   stop_server || true  # keeps the server's log, removes the dead container
-  START_NOWAIT=1 START_T0_FILE=$OUT/$d/restart.epoch_ms start_server "$SERVER_NAME" strict "$OUT/data/$SERVER_NAME" \
+  START_NOWAIT=1 START_T0_FILE=$OUT/$d/restart.epoch_ms START_RUN_MS_FILE=$OUT/$d/restart.docker_run_ms \
+    start_server "$SERVER_NAME" strict "$OUT/data/$SERVER_NAME" \
     || { _uc_fail "restart failed"; return 1; }
   _uc_u7_tool_collect "$d" "$p" probe.out "the recovery probe" $((${UC_U7_PROBE_TIMEOUT:-300} + 60)) || return 1
   _uc_py "$d" verify --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --log /out/ack --out /out/verify.json >/dev/null \

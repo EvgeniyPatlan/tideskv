@@ -139,6 +139,7 @@ class AckWriterTest(unittest.TestCase):
         self.assertGreaterEqual(p["recovered_ms"], p["pong_ms"])
         self.assertLess(p["recovered_ms"], p["pong_ms"] + 500)
         self.assertGreater(p["hits"], 0)
+        self.assertEqual(p["restart_misses"], 0)
         self.assertLessEqual(p["windows"][0]["p99_ms"], 1000)
 
     def test_probe_recovery_needs_three_passing_windows(self):
@@ -178,6 +179,14 @@ class AckWriterTest(unittest.TestCase):
         self.assertEqual(b["hits"], b["requests"])
         self.assertGreater(b["requests"], 10)
         self.assertGreaterEqual(len(b["windows"]), 9)  # 100 ms windows
+
+    def test_probe_reports_restart_misses_without_failing(self):
+        self.serve()
+        self.fake.store[b"k:1"] = b"v"  # k:2 is missing
+        r, p = self.probe("--keymax", 2, "--until-p99", 1000, "--timeout", 5)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(p["restart_misses"], 0)
+        self.assertEqual(p["restart_misses"], p["requests"] - p["hits"])
 
     def test_probe_zero_hits_fails(self):
         self.serve()  # the keys the probe reads do not exist

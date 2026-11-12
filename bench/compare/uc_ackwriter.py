@@ -19,7 +19,7 @@
       wrote just before starting the server; --t0: given now; default: the probe's start), polls connect+PING every
       5 ms until PONG (pong_ms), then runs windows until 3 consecutive ones have p99 <= MS; recovered_ms is the start
       of the first of those, from t0. pong_ms / recovered_ms are null if not reached within --timeout seconds of t0.
-      Exits 1 if no GET found a key (hits == 0): the probe would be timing misses.
+      restart_misses = requests - hits (recovery mode). Exits 1 if no GET found a key (hits == 0): the probe would be timing misses.
 """
 import argparse
 import glob
@@ -277,6 +277,7 @@ def probe_recovery(a, pick, t0):
                 break
         else:
             run = 0
+    res["restart_misses"] = res["requests"] - res["hits"]  # reported, not an error: verify owns loss
     return res
 
 

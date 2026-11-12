@@ -240,7 +240,7 @@ rm -f "$TMP/scanwait"
 # shellcheck disable=SC2317
 {
 start_server() {
-  EV+=("$CUR:start${START_NOWAIT:+-nowait}${START_T0_FILE:+-t0file}") START_LEVELS+=("$1:$2"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"
+  EV+=("$CUR:start${START_NOWAIT:+-nowait}${START_T0_FILE:+-t0file}${START_RUN_MS_FILE:+-runms}") START_LEVELS+=("$1:$2"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"
 }
 stop_server() { EV+=("$CUR:stop"); SERVER_CONTAINER=""; }
 sleep() { EV+=("$CUR:sleep-$1"); }
@@ -272,7 +272,7 @@ check u7-done "$(cat "$OUT/U7/tideskv/rep1/done") $(cat "$OUT/U7/kvrocks/rep1/do
 check u7-strict "${START_LEVELS[*]}" "tideskv:strict tideskv:strict tideskv:strict tideskv:strict tideskv:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict"
 seq_of() { printf '%s\n' "${EV[@]}" | grep "^$1:" | grep -v -e ':load' -e 'exit-tideskv-bench' | sed 's/^[^:]*://' | tr '\n' ' '; }
 check u7-sequence-tideskv "$(seq_of tideskv)" \
-  "start probe probe-up writer writing sleep-5 signal-TERM exit-c-tideskv rm stop start-nowait-t0file rm verify probe probe-up writer writing sleep-5 signal-KILL exit-c-tideskv rm stop start-nowait-t0file rm verify probe probe-up writer writing sleep-15 signal-TERM exit-c-tideskv rm stop start-nowait-t0file rm verify probe probe-up writer writing sleep-15 signal-KILL exit-c-tideskv rm stop start-nowait-t0file rm verify stop "
+  "start probe probe-up writer writing sleep-5 signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-5 signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-15 signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-15 signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify stop "
 check u7-point-files "$(count_files "$OUT/U7/kvrocks/rep1/kill-15" baseline.json until-p99-ms verify.json signal.epoch_ms writer.out writer.status probe.status)" 7
 check u7-term-seconds "$([[ -s $OUT/U7/kvrocks/rep1/term-5/term.seconds && ! -e $OUT/U7/kvrocks/rep1/kill-5/term.seconds ]] && echo y)" y
 check u7-until-is-2x-baseline "$(cat "$OUT/U7/tideskv/rep1/term-5/until-p99-ms")" "1.5"
@@ -293,6 +293,23 @@ uc_dispatch U7 2>/dev/null
 check u7-writer-fail "$(cut -c1-21 "$OUT/U7/tideskv/rep1/done")" "the writer exited 2: "
 WRITER_RC=0
 unset -f sleep
+
+# ---- start_server's restart timestamps: t0 after docker run, with docker run's duration recorded apart ----
+(
+  source "$HERE/lib.sh"
+  OUT=$TMP/t0 TS=t SERVER_CPUS=0 SERVER_MEM=1g TIDESKV_IMAGE=img
+  mkdir -p "$OUT"
+  evict_cache() { :; }; write_server_conf() { echo "$TMP/conf"; }; _track() { :; }; log() { :; }
+  docker() { if [[ $1 == run ]]; then sleep 0.3; fi; }
+  before=$(date +%s%3N)
+  START_NOWAIT=1 START_T0_FILE=$OUT/t0 START_RUN_MS_FILE=$OUT/run-ms start_server tideskv strict "$OUT/data"
+  after=$(date +%s%3N)
+  t0=$(<"$OUT/t0") run=$(<"$OUT/run-ms")
+  ok_t0=n; ((t0 >= before + 300 && t0 <= after)) && ok_t0=y
+  ok_run=n; ((run >= 300 && run < 1000)) && ok_run=y
+  echo "$ok_t0 $ok_run" >"$OUT/result"
+)
+check start-t0-after-docker-run "$(cat "$TMP/t0/result")" "y y"
 
 # ---- shellcheck ----
 if command -v shellcheck >/dev/null; then
