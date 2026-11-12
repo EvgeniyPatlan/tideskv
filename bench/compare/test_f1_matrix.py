@@ -62,14 +62,23 @@ class MatrixTest(unittest.TestCase):
         t = self.server(GET=lambda c: b"$1\r\n2\r\n")
         m = self.run_matrix("## strings | c\nSET a 1\nGET a\nDBSIZE\n", [("t", t)], self.server())
         r = self.result(m, "t")
-        self.assertEqual((r["status"], r["command"], r["ref"], r["got"]), ("differs", "GET a", '"1"', '"2"'))
+        d = r["diffs"][0]
+        self.assertEqual((r["status"], d["command"], d["ref"], d["got"]), ("differs", "GET a", '"1"', '"2"'))
+
+    def test_every_command_is_compared_after_a_difference(self):
+        t = self.server(GET=lambda c: b"$1\r\n2\r\n", DBSIZE=lambda c: b":9\r\n")
+        m = self.run_matrix("## strings | c\nSET a 1\nGET a\nDBSIZE\nPING\n", [("t", t)], self.server())
+        r = self.result(m, "t")
+        self.assertEqual([d["command"] for d in r["diffs"]], ["GET a", "DBSIZE"])
+        self.assertEqual(r["undocumented"], ["GET a", "DBSIZE"])
+        self.assertEqual(r["diffs"][1]["ref_kind"] + ">" + r["diffs"][1]["got_kind"], "integer>integer")
 
     def test_unsupported_detected(self):
         ref = self.server(FOO=lambda c: OK)
         t = self.server(FOO=lambda c: UNKNOWN)
         m = self.run_matrix("## strings | c\nFOO x\n", [("t", t)], ref)
         r = self.result(m, "t")
-        self.assertEqual((r["status"], r["command"]), ("unsupported", "FOO x"))
+        self.assertEqual((r["status"], r["diffs"][0]["command"]), ("unsupported", "FOO x"))
 
     def test_unknown_on_both_is_same_and_extra_is_not_a_difference(self):
         ref = self.server(FOO=lambda c: UNKNOWN)
@@ -124,18 +133,76 @@ class MatrixTest(unittest.TestCase):
         t = self.server(GET=lambda c: b"-ERR bad args\r\n")
         m = self.run_matrix("## strings | c\nGET\n", [("t", t)], ref)
         r = self.result(m, "t")
-        self.assertEqual((r["status"], r["error_text_differs"]), ("same", True))
+        self.assertEqual((r["status"], r["error_text"][0]["command"]), ("same", "GET"))
         t = self.server(GET=lambda c: b"-WRONGTYPE x\r\n")
         m = self.run_matrix("## strings | c\nGET\n", [("t", t)], ref)
         self.assertEqual(self.result(m, "t")["status"], "differs")
 
     def test_documented_label_kvrocks_only(self):
         t = self.server(GET=lambda c: b"$1\r\n2\r\n")
-        doc = "## kvrocks\nstrings | c | https://kvrocks.apache.org/docs/x | note\n"
+        doc = "## kvrocks\nstrings | c @GET | https://kvrocks.apache.org/docs/x | note\n"
         m = self.run_matrix("## strings | c\nSET a 1\nGET a\n", [("kvrocks", t), ("tideskv", t)], self.server(), doc)
         k, tk = self.result(m, "kvrocks"), self.result(m, "tideskv")
-        self.assertEqual((k["status"], k["documented"]["url"]), ("differs", "https://kvrocks.apache.org/docs/x"))
+        self.assertEqual((k["status"], k["documented"][0]["url"]), ("differs", "https://kvrocks.apache.org/docs/x"))
         self.assertIsNone(tk["documented"])
+        self.assertEqual(tk["undocumented"], ["GET a"])
+
+    def test_case_is_documented_only_if_every_difference_is(self):
+        t = self.server(GET=lambda c: b"$1\r\n2\r\n", DBSIZE=lambda c: b":9\r\n")
+        cases = "## strings | c\nSET a 1\nGET a\nDBSIZE\n"
+        both = "## kvrocks\nstrings | c @GET | https://kvrocks.apache.org/x | n\nstrings | c @dbsize | https://kvrocks.apache.org/x | n\n"
+        m = self.run_matrix(cases, [("kvrocks", t)], self.server(), both)
+        self.assertEqual(len(self.result(m, "kvrocks")["documented"]), 2)
+        m = self.run_matrix(cases, [("kvrocks", t)], self.server(), "## kvrocks\nstrings | c @GET | https://kvrocks.apache.org/x | n\n")
+        r = self.result(m, "kvrocks")
+        self.assertEqual((r["status"], r["documented"], r["undocumented"]), ("differs", None, ["DBSIZE"]))
+        self.assertIsNotNone(r["diffs"][0]["documented"])
+
+    def test_documented_file_requires_a_command(self):
+        with self.assertRaises(ValueError):
+            f1_matrix.parse_documented(self.write("d.txt", "## kvrocks\nstrings | c | https://x | n\n"))
+
+    def test_kvrocks_refusals_are_unknown(self):
+        for msg in ("ERR unknown command `TOUCH`, with args beginning with: `t`",
+                    "ERR Unknown SCRIPT subcommand or wrong number of arguments",
+                    "ERR Unknown LATENCY subcommand or wrong number of arguments",
+                    "ERR object subcommand must be dump",
+                    "ERR Command subcommand must be one of COUNT, GETKEYS, INFO",
+                    "ERR unknown subcommand or wrong number of arguments for 'TRACKING'. Try CLIENT HELP.",
+                    "ERR unknown command 'FUNCTION', with args beginning with: 'LIST' "):
+            self.assertTrue(f1_matrix.is_unknown(("e", msg)), msg)
+        for msg in ("ERR wrong number of arguments", "ERR numreplicas should be a positive integer",
+                    "ERR Invalid argument: WRONGTYPE Operation against a key holding the wrong kind of value",
+                    "ERR index not found", "ERR Cluster mode is not enabled", "ERR syntax error"):
+            self.assertFalse(f1_matrix.is_unknown(("e", msg)), msg)
+        self.assertFalse(f1_matrix.is_unknown(("b", b"unknown command")))
+
+    def test_client_listing_is_a_refusal_only_for_a_subcommand_it_does_not_list(self):
+        msg = ("e", "ERR Syntax error, try CLIENT LIST|INFO|KILL ip:port|GETNAME|SETNAME|SETINFO|REPLY|PAUSE|UNPAUSE")
+        self.assertTrue(f1_matrix.is_unknown(msg, [b"CLIENT", b"TRACKING", b"ON"]))
+        self.assertTrue(f1_matrix.is_unknown(msg, [b"client", b"nosuch"]))
+        self.assertFalse(f1_matrix.is_unknown(msg, [b"CLIENT", b"SETNAME"]))  # the same text for a wrong call of a listed one
+        self.assertFalse(f1_matrix.is_unknown(msg, [b"CLIENT", b"KILL", b"x"]))
+        self.assertFalse(f1_matrix.is_unknown(msg))  # no command known: not decided from the text alone
+
+    def test_kvrocks_client_tracking_is_unsupported(self):
+        listing = b"-ERR Syntax error, try CLIENT LIST|INFO|KILL ip:port|GETNAME|SETNAME|SETINFO|REPLY|PAUSE|UNPAUSE\r\n"
+        m = self.run_matrix("## tracking | c\nCLIENT TRACKING ON\n## server/info | d\nCLIENT SETNAME\n",
+                            [("t", self.server(CLIENT=lambda c: listing))], self.server(CLIENT=lambda c: b"+OK\r\n"))
+        self.assertEqual([self.result(m, "t", i)["status"] for i in (0, 1)], ["unsupported", "differs"])
+
+    def test_kvrocks_refusal_counts_as_unsupported(self):
+        ref = self.server(LATENCY=lambda c: b"*0\r\n")
+        t = self.server(LATENCY=lambda c: b"-ERR Unknown LATENCY subcommand or wrong number of arguments\r\n")
+        m = self.run_matrix("## server/info | c\nLATENCY LATEST\n", [("t", t)], ref)
+        self.assertEqual(self.result(m, "t")["status"], "unsupported")
+
+    def test_accepts_follows_the_first_command(self):
+        t = self.server(FOO=lambda c: UNKNOWN, BAR=lambda c: b":1\r\n")
+        ref = self.server(FOO=lambda c: OK, BAR=lambda c: b":2\r\n")
+        m = self.run_matrix("## geo | c\nFOO x\nBAR x\n## geo | d\nBAR x\nFOO x\n", [("t", t)], ref)
+        self.assertEqual([self.result(m, "t", i)["accepts"] for i in (0, 1)], [False, True])
+        self.assertEqual(self.result(m, "t", 1)["status"], "differs")
 
     def test_flushall_between_cases(self):
         t, ref = self.server(), self.server()
@@ -185,13 +252,14 @@ class CaseFileTest(unittest.TestCase):
         entries = f1_matrix.parse_documented(os.path.join(HERE, "f1_documented.txt"))
         cases = {(c["family"], c["case"]) for c in f1_matrix.parse_cases(os.path.join(HERE, "f1_cases.txt"))}
         self.assertTrue(entries)
-        for (target, fam, case), e in entries.items():
+        for (target, fam, case), lst in entries.items():
             self.assertIn((fam, case), cases)
-            self.assertTrue(e["note"])
-            if target == "kvrocks":
-                self.assertRegex(e["url"], r"^https://(kvrocks\.apache\.org|github\.com/apache/kvrocks)/")
-            else:
-                self.assertTrue(os.path.exists(os.path.join(ROOT, e["url"].split("#")[0])), e["url"])
+            for e in lst:
+                self.assertTrue(e["note"] and e["command"])
+                if target == "kvrocks":
+                    self.assertRegex(e["url"], r"^https://(kvrocks\.apache\.org|github\.com/apache/kvrocks)/")
+                else:
+                    self.assertTrue(os.path.exists(os.path.join(ROOT, e["url"].split("#")[0])), e["url"])
 
 
 if __name__ == "__main__":

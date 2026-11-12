@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uc_cells  # noqa: E402
 import uc_metrics  # noqa: E402
 import uc_report  # noqa: E402
+import uc_report_text  # noqa: E402
 
 
 def memtier(ops, p99=1.0, p999=2.0, sets=100, gets=900, set_rx=None, misses=0.0, rate=0, series=None, clients=10,
@@ -28,23 +29,40 @@ def memtier(ops, p99=1.0, p999=2.0, sets=100, gets=900, set_rx=None, misses=0.0,
             "ALL STATS": {"Sets": s_sec, "Gets": g_sec, "Totals": totals}}
 
 
-def _res(status, **kw):
-    return dict({"status": status, "documented": None, "error_text_differs": False}, **kw)
+DOC = {"url": "https://kvrocks.apache.org/x", "note": "lex ignores scores"}
+
+
+def dif(cmd, status="differs", rk="bulk", gk="bulk", doc=None, ref='"1"', got='"2"'):
+    return {"command": cmd, "status": status, "ref": ref, "got": got, "ref_kind": rk, "got_kind": gk, "documented": doc}
+
+
+def _res(status="same", diffs=(), accepts=True):
+    flagged = [d for d in diffs if d["status"] in ("differs", "unsupported")]
+    return {"status": status, "diffs": list(diffs), "accepts": accepts, "error_text": [],
+            "documented": [d["documented"] for d in flagged] if flagged and all(d["documented"] for d in flagged) else None,
+            "undocumented": [d["command"] for d in flagged if not d["documented"]]}
+
+
+def case(family, name, tides, kv, ref_accepts=True):
+    return {"family": family, "case": name, "ref_accepts": ref_accepts, "results": {"tideskv": tides, "kvrocks": kv}}
 
 
 F1_MATRIX = {
     "ref": "redis 7.2.5 at r:6379", "targets": ["tideskv", "kvrocks"],
     "cases": [
-        {"family": "strings", "case": "c1", "ref_accepts": True, "results": {"tideskv": _res("same"), "kvrocks": _res("same")}},
-        {"family": "strings", "case": "c2", "ref_accepts": True, "results": {
-            "tideskv": _res("same"), "kvrocks": _res("differs", command="GET a", ref='"1"', got='"2"')}},
-        {"family": "zset", "case": "lex", "ref_accepts": True, "results": {
-            "tideskv": _res("same"), "kvrocks": _res("differs", command="ZRANGEBYLEX z - +", ref="[]", got="[a]",
-                                                     documented={"url": "https://kvrocks.apache.org/x", "note": "lex ignores scores"})}},
-        {"family": "streams", "case": "xadd", "ref_accepts": True, "results": {
-            "tideskv": _res("same"), "kvrocks": _res("unsupported", command="XADD s 1-1 a 1", ref=":1", got="-ERR unknown command")}},
-        {"family": "json", "case": "json set", "ref_accepts": False, "results": {
-            "tideskv": _res("same"), "kvrocks": _res("extra", command="JSON.SET k", ref="-ERR unknown command", got="+OK")}},
+        case("strings", "c1", _res(), _res()),
+        case("strings", "c2", _res(), _res("differs", [dif("GET a")])),
+        case("strings", "touch", _res("unsupported", [dif("TOUCH a", "unsupported", "integer", "error ERR")]), _res()),
+        case("hash", "wrong type", _res(), _res("differs", [dif("HGET s f", rk="error WRONGTYPE", gk="error ERR")])),
+        case("list", "wrong type", _res(), _res("differs", [dif("LPUSH s a", rk="error WRONGTYPE", gk="error ERR")])),
+        case("set", "dump", _res("unsupported", [dif("DUMP k", "unsupported", "nil-bulk", "error ERR")]), _res()),
+        case("zset", "lex", _res(), _res("differs", [dif("ZRANGEBYLEX z - +", doc=DOC), dif("ZLEXCOUNT z - +", doc=DOC)])),
+        case("zset", "partly", _res(), _res("differs", [dif("ZRANGEBYLEX z - +", doc=DOC), dif("ZRANGE z 0 -1")])),
+        case("streams", "xadd", _res(), _res("unsupported", [dif("XADD s 1-1 a 1", "unsupported", "bulk", "error ERR", doc=DOC)], False)),
+        case("geo", "geoadd", _res("unsupported", [dif("GEOADD g", "unsupported", "integer", "error ERR", doc=DOC)], False),
+             _res("differs", [dif("GEODIST g a b")])),
+        case("scripting", "config", _res("differs", [dif("CONFIG SET x 1", rk="status", gk="error ERR")]), _res()),
+        case("json", "json set", _res(accepts=False), _res("extra", [dif("JSON.SET k $ 1", "extra")]), ref_accepts=False),
     ],
 }
 
@@ -292,26 +310,65 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("F1 not run", text)
         self.assertIn("| backup | x |", text)
         f1 = text.split("## F1")[1].split("## F2")[0]
-        self.assertIn("| strings | 2 | same 2 / differs 0 / unsupported 0 / documented 0 | same 1 / differs 1 / unsupported 0 / documented 0 |", f1)
-        self.assertIn("| zset | 1 | same 1 / differs 0 / unsupported 0 / documented 0 | same 0 / differs 1 / unsupported 0 / documented 1 |", f1)
+        self.assertIn("| strings | 3 | same 2 / differs 0 / unsupported 1 / documented 0 | same 2 / differs 1 / unsupported 0 / documented 0 |", f1)
+        self.assertIn("| zset | 2 | same 2 / differs 0 / unsupported 0 / documented 0 | same 0 / differs 2 / unsupported 0 / documented 1 |", f1)
         self.assertIn("| Streams | `xadd` | yes | yes | no |", f1)
         self.assertIn("| JSON | `json set` | no | no | yes |", f1)
         self.assertIn("| strings | c2 | Kvrocks | differs | `GET a` | \"1\" | \"2\" | undocumented |", f1)
+        self.assertIn("| zset | partly | Kvrocks | differs | `ZRANGE z 0 -1` | \"1\" | \"2\" | undocumented |", f1)
+        self.assertIn("| zset | lex | Kvrocks | differs | `ZLEXCOUNT z - +` |", f1)  # every differing command is listed
         self.assertIn("documented: [lex ignores scores](https://kvrocks.apache.org/x)", f1)
         self.assertIn("not a difference (Redis 7.2 lacks it)", f1)
+        self.assertIn("redis-databases 0", f1)
 
-    def test_f1_pros_and_cons_in_a_full_run(self):
+    def test_f1_error_text_appendix_is_collapsed(self):
+        m = json.loads(json.dumps(F1_MATRIX))
+        m["cases"][0]["results"]["kvrocks"]["error_text"] = [{"command": "GET", "ref": "-ERR a", "got": "-ERR b"}]
         run = Run(self)
         u4(run, 1000, 500)
-        run.write("F1/matrix.json", json.dumps(F1_MATRIX))
+        run.write("F1/matrix.json", json.dumps(m))
         _, text = run.report()
-        pros = text.split("## Pros and cons")[1].split("## Per-case")[0]
-        tides_pros = pros.split("**TidesKV pros**")[1].split("**TidesKV cons**")[0]
-        kv_pros = pros.split("**Kvrocks pros**")[1].split("**Kvrocks cons**")[0]
-        self.assertIn("F1 strings: TidesKV matches Redis 7.2 on all 2 cases", tides_pros)
-        self.assertIn("F1 type: TidesKV has Streams, Kvrocks does not", tides_pros)
-        self.assertNotIn("zset", tides_pros + kv_pros)  # Kvrocks' only difference there is documented
-        self.assertIn("F1 type: Kvrocks has JSON, TidesKV does not", kv_pros)
+        d = text.split("<details>")[1].split("</details>")[0]
+        self.assertIn("| strings | c1 | Kvrocks | `GET` | -ERR a | -ERR b |", d)
+
+    def test_f1_pros_and_cons_in_full_and_quick_runs(self):
+        for mode in ("full", "quick"):
+            run = Run(self, mode=mode, reps=1 if mode == "quick" else 2)
+            u4(run, 1000, 500)
+            run.write("F1/matrix.json", json.dumps(F1_MATRIX))
+            _, text = run.report()
+            pros = text.split("## Pros and cons")[1].split("## Per-case")[0]
+            part = lambda a, b: pros.split("**%s**" % a)[1].split("**%s**" % b)[0]
+            tp, tc, kp, kc = part("TidesKV pros", "TidesKV cons"), part("TidesKV cons", "Kvrocks pros"), \
+                part("Kvrocks pros", "Kvrocks cons"), pros.split("**Kvrocks cons**")[1].split("**Even")[0]
+            self.assertIn("F1 hash: TidesKV has no undocumented difference from Redis 7.2; Kvrocks has 1 case(s)", tp)
+            self.assertIn("F1 set: Kvrocks has no undocumented difference from Redis 7.2; TidesKV has 1 case(s)", kp)
+            self.assertIn("F1 type: TidesKV has Streams, Kvrocks does not", tp)
+            self.assertIn("F1 type: Kvrocks has JSON, TidesKV does not", kp)
+            # one item per root cause: WRONGTYPE replaced by ERR in two families is one Kvrocks con
+            wrong = [x for x in kc.splitlines() if "error WRONGTYPE replaced by error ERR" in x]
+            self.assertEqual(len(wrong), 1)
+            self.assertIn("hash, list", wrong[0])
+            self.assertIn("HGET, LPUSH", wrong[0])
+            # the TidesKV gaps that the other side does not have are cons too, grouped as one cause
+            self.assertTrue(any("TidesKV refuses commands Redis 7.2 accepts" in x and "TOUCH, DUMP" in x for x in tc.splitlines()), tc)
+            # a documented-missing type is no family pro for TidesKV, while Kvrocks' undocumented geo difference is a con
+            self.assertNotIn("F1 geo:", tp)
+            self.assertTrue(any("GEODIST" in x and "geo" in x for x in kc.splitlines()))
+            self.assertTrue(any("CONFIG SET" in x for x in tc.splitlines()), tc)  # container commands keep their subcommand
+            # documented-only differences are no con
+            self.assertFalse(any("ZLEXCOUNT" in x for x in kc.splitlines()))
+            self.assertTrue(any("ZRANGE" in x and "zset" in x for x in kc.splitlines()))  # the undocumented part of a partly documented case
+
+    def test_f1_items_are_symmetric(self):
+        swap = {"tideskv": "kvrocks", "kvrocks": "tideskv"}
+        flipped = json.loads(json.dumps(F1_MATRIX))
+        for c in flipped["cases"]:
+            c["results"] = {swap[k]: v for k, v in c["results"].items()}
+        a, b = uc_report_text.f1_items(F1_MATRIX), uc_report_text.f1_items(flipped)
+        for key in ("pros", "cons"):
+            self.assertEqual(sorted(x.replace("TidesKV", "A").replace("Kvrocks", "B") for x in a["tideskv_" + key]),
+                             sorted(x.replace("Kvrocks", "A").replace("TidesKV", "B") for x in b["kvrocks_" + key]))
 
 
 if __name__ == "__main__":

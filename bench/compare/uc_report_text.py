@@ -160,11 +160,11 @@ def _item(case, e):
 
 def _pros_cons(summary):
     out = ["## Pros and cons", ""]
-    if summary["quick"]:
-        return out + ["No verdicts in a quick run, so no pros and cons are drawn; see the per-case tables.", ""]
     lists = {k: [] for k in ("tideskv_pros", "tideskv_cons", "kvrocks_pros", "kvrocks_cons", "even")}
     skipped = 0
-    for case, cs in summary["cases"].items():
+    if summary["quick"]:  # no performance verdicts, but F1 is deterministic and counts
+        out += ["No verdicts in a quick run, so the performance cases draw no pros and cons; the F1 command results below do.", ""]
+    for case, cs in ([] if summary["quick"] else summary["cases"].items()):
         for e in cs["metrics"]:
             v = e["verdict"]
             if not v or not (e["headline"] or e["pros_cons"]):

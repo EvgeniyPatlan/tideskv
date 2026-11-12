@@ -8,10 +8,13 @@ Case file: blocks `## <family> | <case name>`, then one command per line (shell-
 A line may end in a directive: `#unordered` (arrays compared as sorted multisets), `#length` (only the array's length, for random
 picks: membership is then checked by later commands), `#shape` (only reply types and array lengths), `#fields=a,b` (a bulk INFO-style reply: only those `key:value` lines). `@sleep S` waits. Lines starting `# ` are comments.
 
-Per case per target: `same`, `differs` (first differing command, both replies), `unsupported` (the target answers
-"unknown command/subcommand" where Redis does not), or `extra` (Redis 7.2 answers unknown and the target does not: a
-command the reference lacks, not a difference). Error replies compare by their code word (ERR, WRONGTYPE, ...); a same-code
-difference in text is counted in `error_text_differs`. Stdlib only.
+Every command of a case is compared (a later command may differ because an earlier one did: the report says so). Per
+command: `same`, `differs`, `unsupported` (the target refuses the command or subcommand where Redis succeeds: see
+is_unknown) or `extra` (Redis 7.2 answers unknown command and the target answers anything else: a command the reference
+lacks, not a difference). Per case per target: `same` when every command is; else `differs` when any command differs or the
+differences are only partly documented, `unsupported` when all are refusals, `extra` when all are extras. Error replies
+compare by their code word (ERR, WRONGTYPE, ...); same-code differences in text are listed in `error_text`, not counted.
+Stdlib only.
 """
 import argparse
 import json
@@ -67,8 +70,8 @@ def _parse_command(line):
 
 
 def parse_documented(path):
-    """{(target section, family, case): {url, note, command}} from `## kvrocks` / `## tideskv` sections of
-    `family | case | url | note`. `case @CMD` limits the label to a first differing command CMD."""
+    """{(target section, family, case): [{url, note, command}]} from `## kvrocks` / `## tideskv` sections of lines
+    `family | case @CMD | url | note`. @CMD is mandatory: the label applies to a differing command CMD of that case."""
     out, section = {}, None
     with open(path) as f:
         for raw in f:
@@ -81,8 +84,11 @@ def parse_documented(path):
             parts = [p.strip() for p in line.split("|", 3)]
             if section is None or len(parts) != 4:
                 raise ValueError("%s: bad line %r" % (path, line))
-            name, _, only = parts[1].partition(" @")
-            out[(section, parts[0], name)] = {"url": parts[2], "note": parts[3], "command": only.upper() or None}
+            name, sep, cmd = parts[1].partition(" @")
+            if not sep or not cmd.strip():
+                raise ValueError("%s: line without @COMMAND: %r" % (path, line))
+            out.setdefault((section, parts[0], name), []).append(
+                {"url": parts[2], "note": parts[3], "command": cmd.strip().upper()})
     return out
 
 
@@ -143,8 +149,35 @@ def show(r, limit=160):
     return s if len(s) <= limit else s[:limit] + "..."
 
 
-def is_unknown(r):
-    return r[0] == "e" and ("unknown command" in r[1].lower() or "unknown subcommand" in r[1].lower())
+_REFUSAL = re.compile(r"unknown command|unknown subcommand|unknown \w+ subcommand|subcommand must be")
+_LISTING = re.compile(r"syntax error, try (\w+) ([\w |:]+)", re.I)
+
+
+def is_unknown(r, argv=None):
+    """The server refuses a command or subcommand it does not implement. Redis: `unknown command`, `unknown subcommand`.
+    Kvrocks: `Unknown SCRIPT subcommand or wrong number of arguments`, `object subcommand must be dump`, `Command
+    subcommand must be one of COUNT, GETKEYS, INFO`. Kvrocks' CLIENT answers every bad call, an unknown subcommand and
+    the wrong arguments of a supported one alike (checked by hand: `CLIENT TRACKING ON`, `CLIENT NOSUCH` and `CLIENT
+    SETNAME` all get `Syntax error, try CLIENT LIST|INFO|KILL ...`), so that text is a refusal only when argv's
+    subcommand is not among the ones the message lists itself. Arity errors are not refusals."""
+    if r[0] != "e":
+        return False
+    msg = r[1].lower()
+    if _REFUSAL.search(msg):
+        return True
+    m = _LISTING.search(r[1])
+    if m and argv and len(argv) > 1 and argv[0].upper() == m.group(1).upper().encode():
+        listed = {w.split(" ")[0].upper() for w in m.group(2).strip().split("|")}
+        return argv[1].decode("utf-8", "replace").upper() not in listed
+    return False
+
+
+def kind(r):
+    k, v = r
+    if k == "e":
+        return "error " + _code(v)
+    return {"s": "status", "i": "integer", "b": "nil-bulk" if v is None else "bulk",
+            "a": "nil-array" if v is None else "array"}[k]
 
 
 def _code(msg):
@@ -188,9 +221,9 @@ def judge(cmd, ref, got):
     """('same'|'differs'|'unsupported'|'extra', error_text_differs) for one command's replies. `unsupported`: the target
     does not know the command or subcommand where Redis succeeds. `extra`: Redis does not know the command and the target
     does. Two errors compare by code word (an unknown command on both is `same`)."""
-    if is_unknown(got) and ref[0] != "e":
+    if is_unknown(got, cmd["argv"]) and ref[0] != "e":
         return "unsupported", False
-    if ref[0] == "e" and "unknown command" in ref[1].lower() and not is_unknown(got):
+    if ref[0] == "e" and "unknown command" in ref[1].lower() and not is_unknown(got, cmd["argv"]):
         return "extra", False
     same = _prepare(ref, cmd["mode"]) == _prepare(got, cmd["mode"])
     return ("same" if same else "differs"), same and ref[0] == "e" and got[0] == "e" and ref[1] != got[1]
@@ -215,19 +248,53 @@ def _fresh(addr):
     return conn
 
 
+def _name(argv):
+    return " ".join(a.decode("utf-8", "replace") for a in argv)
+
+
 def _compare(commands, ref_replies, conn):
-    errs = False
+    """Every command of the case against the reference's recorded replies: {status, diffs, error_text, accepts}."""
+    diffs, texts, accepts = [], [], None
     for c, ref in zip(commands, ref_replies):
         if c["sleep"]:
             time.sleep(c["sleep"])
             continue
         got = conn.call(c["argv"])
+        if accepts is None:
+            accepts = not is_unknown(got, c["argv"])
         status, text = judge(c, ref, got)
-        errs = errs or text
+        if text:
+            texts.append({"command": _name(c["argv"]), "ref": show(ref), "got": show(got)})
         if status != "same":
-            return {"status": status, "command": " ".join(a.decode("utf-8", "replace") for a in c["argv"]),
-                    "ref": show(ref), "got": show(got), "error_text_differs": errs}
-    return {"status": "same", "error_text_differs": errs}
+            diffs.append({"command": _name(c["argv"]), "status": status, "ref": show(ref), "got": show(got),
+                          "ref_kind": kind(ref), "got_kind": kind(got), "documented": None})
+    return {"status": _overall(diffs), "diffs": diffs, "error_text": texts, "accepts": bool(accepts),
+            "documented": None, "undocumented": [d["command"] for d in diffs]}
+
+
+def _overall(diffs):
+    if not diffs:
+        return "same"
+    states = {d["status"] for d in diffs}
+    return "differs" if "differs" in states else sorted(states)[-1]  # unsupported, else extra
+
+
+def label(res, entries):
+    """Documented labels per differing command (`differs`/`unsupported` ones only; entries are the server's lines for
+    the case). The case is documented only when every one of its differences is; a partly documented one is `differs`
+    and names the undocumented commands."""
+    for d in res["diffs"]:
+        if d["status"] in ("differs", "unsupported"):
+            word = d["command"].split()[0].upper()
+            d["documented"] = next(({"url": e["url"], "note": e["note"]} for e in entries if e["command"] == word), None)
+    open_cmds = [d["command"] for d in res["diffs"] if d["status"] in ("differs", "unsupported") and not d["documented"]]
+    res["undocumented"] = open_cmds
+    flagged = [d for d in res["diffs"] if d["status"] in ("differs", "unsupported")]
+    if flagged and not open_cmds and len(flagged) == len(res["diffs"]):
+        res["documented"] = [d["documented"] for d in flagged]
+    elif flagged and len(open_cmds) < len(flagged):
+        res["status"] = "differs"  # partly documented
+    return res
 
 
 def _ref_version(addr):
@@ -256,10 +323,7 @@ def run(targets, ref_addr, cases_path, documented_path, out_path):
             conn = _fresh(addrs[name])
             res = _compare(case["commands"], replies, conn)
             conn.close()
-            doc = documented.get((name, case["family"], case["case"])) if res["status"] in ("differs", "unsupported") else None
-            if doc and doc["command"] and res["command"].split()[0].upper() != doc["command"]:
-                doc = None
-            res["documented"] = doc and {"url": doc["url"], "note": doc["note"]}
+            label(res, documented.get((name, case["family"], case["case"]), []))
             entry["results"][name] = res
         matrix["cases"].append(entry)
     with open(out_path, "w") as f:
