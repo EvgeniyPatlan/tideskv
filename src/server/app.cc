@@ -471,6 +471,8 @@ void App::FillStorageStats(ServerStats& s) const {
     s.storage_writes_throttled = st->writes_throttled;
     s.storage_writes_blocked = st->writes_blocked;
     s.storage_write_stall_us = st->write_stall_us;
+    s.storage_block_cache_bytes = st->block_cache_bytes;
+    s.storage_block_cache_entries = st->block_cache_entries;
   }
 }
 

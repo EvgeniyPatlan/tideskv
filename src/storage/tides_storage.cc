@@ -591,6 +591,11 @@ Result<StorageStats> TidesStorage::Stats() {
   out.writes_throttled = db.writes_throttled;
   out.writes_blocked = db.writes_blocked;
   out.write_stall_us = db.write_stall_us;
+  tidesdb_cache_stats_t cache{};
+  if (int rc = tidesdb_get_cache_stats(impl_->db, &cache); rc != TDB_SUCCESS)
+    return FromTdb(rc, "get_cache_stats");
+  out.block_cache_bytes = cache.enabled ? cache.total_bytes : 0;
+  out.block_cache_entries = cache.enabled ? cache.total_entries : 0;
   out.family_config_updates = impl_->family_config_updates;
   for (ColumnFamily cf : kAllColumnFamilies) {
     tidesdb_cf_stats_t st{};

@@ -90,6 +90,9 @@ struct ServerStats {
   uint64_t storage_writes_throttled = 0;
   uint64_t storage_writes_blocked = 0;
   uint64_t storage_write_stall_us = 0;
+  // Block cache: bytes charged for the nodes it holds, and how many.
+  uint64_t storage_block_cache_bytes = 0;
+  uint64_t storage_block_cache_entries = 0;
   // Per-column-family flush/compaction byte counters and level layout, in ColumnFamily order.
   struct CfIo {
     std::string name;

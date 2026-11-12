@@ -45,6 +45,8 @@ Fields PersistenceFields(const ServerStats& s) {
               {"storage_writes_throttled", std::to_string(s.storage_writes_throttled)},
               {"storage_writes_blocked", std::to_string(s.storage_writes_blocked)},
               {"storage_write_stall_us", std::to_string(s.storage_write_stall_us)},
+              {"storage_block_cache_bytes", std::to_string(s.storage_block_cache_bytes)},
+              {"storage_block_cache_entries", std::to_string(s.storage_block_cache_entries)},
               {"background_compactions", std::to_string(s.background_compactions)},
               {"background_compaction_failures", std::to_string(s.background_compaction_failures)}};
   for (const auto& io : s.storage_cf_io) {

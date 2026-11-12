@@ -395,6 +395,35 @@ TEST(TidesStorageMaint, L1FileCountTriggerAppliesToNewAndExistingFamilies) {
   for (const CfStats& cf : st->cf) EXPECT_EQ(cf.l1_file_count_trigger, 4);
 }
 
+// The stats carry the block cache's charged bytes and entries: none on a fresh store, some once a read
+// decodes a flushed node.
+TEST(TidesStorageMaint, StatsReportBlockCacheUse) {
+  TempDir dir;
+  auto s = MustOpen(OptionsFor(dir));
+  ASSERT_NE(s, nullptr);
+  auto before = s->Stats();
+  ASSERT_TRUE(before.ok());
+  EXPECT_EQ(before->block_cache_entries, 0u);
+  EXPECT_EQ(before->block_cache_bytes, 0u);
+  {
+    auto txn = s->BeginWrite();
+    ASSERT_TRUE(txn.ok());
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_TRUE((*txn)->Put(ColumnFamily::kMeta, "k" + std::to_string(i), std::string(100, 'v')).ok());
+    }
+    ASSERT_TRUE((*txn)->Commit().ok());
+  }
+  ASSERT_TRUE(s->Checkpoint().ok());
+  auto view = s->BeginRead();
+  ASSERT_TRUE(view.ok());
+  for (int i = 0; i < 1000; i += 97)
+    ASSERT_TRUE((*view)->Get(ColumnFamily::kMeta, "k" + std::to_string(i)).ok());
+  auto after = s->Stats();
+  ASSERT_TRUE(after.ok());
+  EXPECT_GT(after->block_cache_entries, 0u);
+  EXPECT_GT(after->block_cache_bytes, 0u);
+}
+
 // B10: the queued-memtable byte budget is raised to two memtables when set smaller, so a lone sealed
 // memtable never blocks writers by itself; 0 leaves only the count limit. The stats carry the queue's bytes.
 TEST(TidesStorageMaint, QueueBudgetIsClamped) {

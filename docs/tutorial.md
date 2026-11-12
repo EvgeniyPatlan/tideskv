@@ -441,7 +441,7 @@ Settings are read in this order, and later sources win:
 | `workers` | `0` (one per CPU) | no | Worker threads |
 | `sync-mode` | `interval` | no | `none`, `interval` or `full` |
 | `sync-interval-us` | `1000000` | no | fsync period for `interval` |
-| `block-cache-size` | `4gb` | no | TidesDB read cache |
+| `block-cache-size` | `4gb` | no | TidesDB read cache; what it charges for the nodes it holds, and how many, show in `INFO persistence` (`storage_block_cache_bytes`, `storage_block_cache_entries`) |
 | `memtable-size` | `256mb` | no | TidesDB write buffer |
 | `memtable-queue-max-memory` | `2gb` | no | Memory the queued (sealed, not yet flushed) memtables may hold: queued memtables throttle writes from 3/4 of either `l0-stall-threshold` memtables or `memtable-queue-max-memory` bytes and hold a commit up to 2 s at either. `0` = the count alone; a non-zero value below 2 x `memtable-size` is raised to that, so one sealed memtable never blocks writes on its own. The queue's bytes and the paced commits show in `INFO persistence` (`storage_memtable_queue_bytes`, `storage_writes_throttled`, `storage_writes_blocked`, `storage_write_stall_us`) |
 | `memtable-bloom` | `yes` | no | Give each memtable a whole-key bloom filter, so a point read (`GET`, the read before a write) skips the memtables that cannot hold its key instead of searching each one. Each filter takes 1/64 of `memtable-size` (4 MB at the default), at least 64 KB, on top of it; `no` searches every memtable |

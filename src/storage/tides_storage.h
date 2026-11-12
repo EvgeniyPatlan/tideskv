@@ -42,6 +42,8 @@ struct StorageStats {
   uint64_t writes_throttled = 0;        // commits L0 admission made dwell
   uint64_t writes_blocked = 0;          // commits L0 admission made wait for the queue to drain
   uint64_t write_stall_us = 0;          // total time commits were held in L0 admission
+  size_t block_cache_bytes = 0;         // what the block cache charges for the nodes it holds
+  size_t block_cache_entries = 0;       // nodes the block cache holds
   uint64_t family_config_updates = 0;   // config updates Open issued to existing families
 };
 
