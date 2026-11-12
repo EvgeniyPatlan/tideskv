@@ -34,6 +34,20 @@ func (g *Gen) num(n int) int {
 
 func (g *Gen) name(prefix string, n int) string { return prefix + strconv.Itoa(g.num(n)) }
 
+// distinct draws count different names via g.name, rejecting repeats.
+func (g *Gen) distinct(prefix string, n, count int) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, count)
+	for len(out) < count {
+		k := g.name(prefix, n)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func (g *Gen) fixed(n int) string {
 	b := make([]byte, n)
 	for i := range b {
@@ -88,8 +102,8 @@ func c2Next(g *Gen) ([]string, Norm) {
 		return []string{"HGETALL", k}, NormPairs
 	case 4, 5, 6:
 		cmd := []string{"HSET", k}
-		for n := 1 + g.r.Intn(3); n > 0; n-- {
-			cmd = append(cmd, "f"+strconv.Itoa(g.r.Intn(30)), g.value())
+		for _, i := range g.r.Perm(30)[:1+g.r.Intn(3)] {
+			cmd = append(cmd, "f"+strconv.Itoa(i), g.value())
 		}
 		return cmd, NormNone
 	case 7:
@@ -210,15 +224,11 @@ func c7Setup(g *Gen) [][]string {
 
 func c7Next(g *Gen) ([]string, Norm) {
 	if g.r.Intn(2) == 0 {
-		cmd := []string{"MGET"}
-		for i := 0; i < 20; i++ {
-			cmd = append(cmd, g.name("mk:", 500))
-		}
-		return cmd, NormNone
+		return append([]string{"MGET"}, g.distinct("mk:", 500, 20)...), NormNone
 	}
 	cmd := []string{"MSET"}
-	for i := 0; i < 10; i++ {
-		cmd = append(cmd, g.name("mk:", 500), g.value())
+	for _, k := range g.distinct("mk:", 500, 10) {
+		cmd = append(cmd, k, g.value())
 	}
 	return cmd, NormNone
 }

@@ -111,3 +111,33 @@ func TestC3Skew(t *testing.T) {
 		t.Fatalf("hot %d of %d < 70%%", hot, total)
 	}
 }
+
+func TestCaseCommandsHaveDistinctFieldsAndKeys(t *testing.T) {
+	cases := Cases()
+	for seed := int64(1); seed <= 3; seed++ {
+		g2, g7 := NewGen(seed), NewGen(seed)
+		for i := 0; i < 2000; i++ {
+			if cmd, _ := cases[1].Next(g2); cmd[0] == "HSET" {
+				assertDistinct(t, cmd, 2, 2)
+			}
+			cmd, _ := cases[6].Next(g7)
+			if cmd[0] == "MSET" {
+				assertDistinct(t, cmd, 1, 2)
+			} else {
+				assertDistinct(t, cmd, 1, 1)
+			}
+		}
+	}
+}
+
+// assertDistinct checks cmd[from], cmd[from+step], ... has no repeats.
+func assertDistinct(t *testing.T, cmd []string, from, step int) {
+	t.Helper()
+	seen := map[string]bool{}
+	for i := from; i < len(cmd); i += step {
+		if seen[cmd[i]] {
+			t.Fatalf("repeated %q in %q", cmd[i], cmd[0])
+		}
+		seen[cmd[i]] = true
+	}
+}
