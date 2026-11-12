@@ -276,17 +276,17 @@ index 0000000..e9553cd
 +    sstable_t *out[16];
 +    const int n = cp_outputs_at(&db, 2, out, 16);
 +    /* the outputs, key range of each, folded into one number the two runs compare */
-+    int sig = n;
++    unsigned sig = (unsigned)n;
 +    for (int i = 0; i < n; i++)
 +    {
-+        sig = sig * 31 + (int)out[i]->min_key[2] * 7 + (int)out[i]->min_key[1];
-+        sig = sig * 31 + (int)out[i]->max_key[2] * 7 + (int)out[i]->max_key[1];
++        sig = sig * 31u + (unsigned char)out[i]->min_key[2] * 7u + (unsigned char)out[i]->min_key[1];
++        sig = sig * 31u + (unsigned char)out[i]->max_key[2] * 7u + (unsigned char)out[i]->max_key[1];
 +        if (sstable_unref(out[i])) sstable_close(out[i]);
 +    }
 +    ce_assert_read(db.cf, 2, "k00", vals[0]);
 +    ce_assert_read(db.cf, 2, "k11", vals[11]);
 +    ce_db_close(&db);
-+    return sig;
++    return (int)(sig & 0x7fffffffu);
 +}
 +
 +void test_split_none_ignores_boundaries(void)
