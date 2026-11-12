@@ -2,7 +2,9 @@
 # Use-case suite runner helpers (spec 2026-11-12 §5). Sourced by usecases.sh and the tests; defines functions only.
 # Layout: $OUT/<CASE>/<server>/rep<N>/ holds one repetition's files; its `done` file is written last and holds `ok`
 # or the failure reason. case_<CASE> SERVER REP functions (Tasks 4-6, 9) run one repetition; set UC_FAIL_REASON
-# before returning non-zero to put a reason in `done`.
+# before returning non-zero to put a reason in `done`. The dispatcher runs a case with errexit disabled (it is called in
+# an `||` list), so every step of a case_<CASE> must be checked explicitly: `step || { UC_FAIL_REASON="..."; return 1; }`.
+# uc_cell returns 1 whenever the cell's .status is not `ok` (memtier failure, or the server stopped during the cell).
 # shellcheck disable=SC2034  # globals are read by the case functions and lib.sh
 HERE_RUN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE_RUN/../.." && pwd)}
@@ -33,6 +35,11 @@ uc_cell() {
   settle "$OUT/$name.settle" || { echo "could not read the server's cgroup to wait for it to settle" >"$OUT/$name.status"; return 1; }
   if ((warm > 0)); then memtier "$name.warmup" "$@" --test-time="$warm" || true; fi
   measure_memtier "$name" "$@" --test-time="$dur"
+  if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null) != true ]]; then
+    echo "server stopped during the run (OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' "$SERVER_CONTAINER" 2>/dev/null))" \
+      >"$OUT/$name.status"
+  fi
+  [[ $(head -1 "$OUT/$name.status") == ok ]]
 }
 
 # epoch_s,bytes,wal_archive_bytes every INTERVAL seconds until the shell exits; Kvrocks' archive/ WAL dir feeds the
@@ -93,27 +100,12 @@ uc_dispatch() {
   remove_data
 }
 
-# meta.json: run.sh's fields plus mode, reps, cases, cache_accounting and fio_fsync_status.
+# meta.json: the shared fields plus mode, reps, cases, cache_accounting and fio_fsync_status.
 uc_write_meta() {
-  local kv_digest sha
-  kv_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$KVROCKS_IMAGE" 2>/dev/null || echo "$KVROCKS_IMAGE")
-  sha=$(git -C "$ROOT" rev-parse --short HEAD)
-  if ((${DIRTY:-0})); then sha+=-dirty; fi
-  python3 - "$OUT/meta.json" \
-    "tideskv_sha=$sha" "kvrocks_image=$kv_digest" "tideskv_image=${TIDESKV_IMAGE:-}" "memtier_image=$MEMTIER_IMAGE" \
+  local common
+  mapfile -t common < <(meta_common_fields)
+  write_meta_kv "$OUT/meta.json" "${common[@]}" \
     "size=$UC_MODE" "mode=$UC_MODE" "#reps=$UC_REPS" "cases=$UC_CASES_RUN" "cache_accounting=$UC_CACHE_ACCOUNTING" \
     "fio_fsync_status=${FIO_FSYNC_STATUS:-not run}" "#warmup_s=$UC_WARMUP" "#duration_s=$UC_DURATION" \
-    "server_cpus=$SERVER_CPUS" "server_cores=$(server_cores)" "server_mem=$SERVER_MEM" "#server_nofile=$SERVER_NOFILE" \
-    "#threads=$UC_THREADS" "#clients=$UC_CLIENTS" "client_cpus=$CLIENT_CPUS" "memtier_run_flags=${MEMTIER_RUN_FLAGS[*]}" \
-    "#quiesce_window_s=$QUIESCE_WINDOW" "#quiesce_cpu_pct=$QUIESCE_CPU_PCT" \
-    "#quiesce_write_bytes=$QUIESCE_WRITE_BYTES" "#quiesce_max_s=${QUIESCE_MAX:-600}" \
-    "host=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)" "started_utc=${TS:-}" <<'PY'
-import json, sys
-meta = {}
-for arg in sys.argv[2:]:
-    key, value = arg.split("=", 1)
-    meta[key.lstrip("#")] = int(value) if key.startswith("#") else value
-with open(sys.argv[1], "w") as f:
-    json.dump(meta, f, indent=2)
-PY
+    "#threads=$UC_THREADS" "#clients=$UC_CLIENTS"
 }

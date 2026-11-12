@@ -408,3 +408,30 @@ measure_memtier() {
   if [[ ${CUR:-} == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
   stop_sampler "$stats_pid"
 }
+
+# Fields every run's meta.json carries, one key=value per line ("#key=value" is an integer); uses DIRTY, TS, QUIESCE_MAX.
+meta_common_fields() {
+  local kv_digest sha
+  kv_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$KVROCKS_IMAGE" 2>/dev/null || echo "$KVROCKS_IMAGE")
+  sha=$(git -C "$ROOT" rev-parse --short HEAD)
+  if ((${DIRTY:-0})); then sha+=-dirty; fi
+  printf '%s\n' "tideskv_sha=$sha" "kvrocks_image=$kv_digest" "tideskv_image=${TIDESKV_IMAGE:-}" "memtier_image=$MEMTIER_IMAGE" \
+    "server_cpus=$SERVER_CPUS" "server_cores=$(server_cores)" "server_mem=$SERVER_MEM" "#server_nofile=$SERVER_NOFILE" \
+    "client_cpus=$CLIENT_CPUS" "memtier_run_flags=${MEMTIER_RUN_FLAGS[*]}" \
+    "#quiesce_window_s=$QUIESCE_WINDOW" "#quiesce_cpu_pct=$QUIESCE_CPU_PCT" \
+    "#quiesce_write_bytes=$QUIESCE_WRITE_BYTES" "#quiesce_max_s=${QUIESCE_MAX:-600}" \
+    "host=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)" "started_utc=${TS:-}"
+}
+
+# write_meta_kv FILE key=value...: writes a flat JSON object; "#key=value" is an integer, other values are strings.
+write_meta_kv() {
+  python3 - "$@" <<'PY'
+import json, sys
+meta = {}
+for arg in sys.argv[2:]:
+    key, value = arg.split("=", 1)
+    meta[key.lstrip("#")] = int(value) if key.startswith("#") else value
+with open(sys.argv[1], "w") as f:
+    json.dump(meta, f, indent=2)
+PY
+}

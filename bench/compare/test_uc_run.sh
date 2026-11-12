@@ -17,11 +17,18 @@ settle() { CALLS+=("settle"); echo 0 >"$1"; }
 remove_data() { CALLS+=("remove_data"); }
 memtier() { CALLS+=("memtier $*"); mkdir -p "$(dirname "$OUT/$1")"; echo '{}' >"$OUT/$1.json"; }
 cli() { CALLS+=("cli $*"); }
-docker() { CALLS+=("docker $*"); }
+DOCKER_RUNNING=true
+docker() {
+  CALLS+=("docker $*")
+  case $* in
+    *State.Running*) echo "$DOCKER_RUNNING" ;;
+    *State.OOMKilled*) echo true ;;
+  esac
+}
 cg_sample() { echo "1000 2000"; }
 stop_server() { :; }
 }
-OUT=$TMP/run TS=test CUR=kvrocks UC_REPS=3
+OUT=$TMP/run TS=test SERVER_CONTAINER=none CUR=kvrocks UC_REPS=3
 
 uc_sizes full
 check rep-order-full "$(uc_rep_order U1 | tr '\n' ',')" "1 tideskv,1 kvrocks,2 tideskv,2 kvrocks,3 tideskv,3 kvrocks,"
@@ -91,6 +98,29 @@ check cell-cpu "$(cat "$OUT/U1/kvrocks/rep1/closed.cpu") $(cat "$OUT/U1/kvrocks/
 CALLS=() UC_CELL_WARMUP=0
 uc_cell "U1/kvrocks/rep1/nowarm" --ratio=1:0
 check cell-no-warmup "$(printf '%s\n' "${CALLS[@]}" | grep -c '^memtier')" 1
+
+uc_cell "U1/kvrocks/rep1/ok" --ratio=1:0 --test-time=1 && rc=0 || rc=$?
+check cell-ok-returns-0 "$rc" 0
+DOCKER_RUNNING=false
+uc_cell "U1/kvrocks/rep1/oom" --ratio=1:0 && rc=0 || rc=$?
+check cell-dead-server-rc "$rc" 1
+check cell-dead-server-status "$(cat "$OUT/U1/kvrocks/rep1/oom.status")" "server stopped during the run (OOM-killed: true)"
+DOCKER_RUNNING=true
+# a failing memtier makes the cell fail
+memtier() { CALLS+=("memtier $*"); mkdir -p "$(dirname "$OUT/$1")"; return 3; }
+uc_cell "U1/kvrocks/rep1/mtfail" --ratio=1:0 && rc=0 || rc=$?
+check cell-memtier-fail-rc "$rc" 1
+check cell-memtier-fail-status "$(head -c 14 "$OUT/U1/kvrocks/rep1/mtfail.status")" "memtier exited"
+# a case whose uc_cell fails ends with a done that is not ok
+# shellcheck disable=SC2317
+case_F1() { UC_CELL_WARMUP=0 UC_CELL_DURATION=1 uc_cell "F1/$1/rep$2/m" --ratio=1:0 || { UC_FAIL_REASON="cell m failed"; return 1; }; }
+uc_dispatch F1 2>/dev/null
+check case-cell-fail-done "$(cat "$OUT/F1/tideskv/rep1/done")" "cell m failed"
+# ...and without a reason it is still not ok
+# shellcheck disable=SC2317
+case_F1() { uc_cell "F1/$1/rep$2/m" --ratio=1:0; }
+rm -rf "$OUT/F1"; uc_dispatch F1 2>/dev/null
+check case-cell-fail-done-default "$([[ $(cat "$OUT/F1/tideskv/rep1/done") != ok ]] && echo y)" y
 
 # ---- du sampler ----
 mkdir -p "$TMP/d/sub/archive" "$TMP/d/sub/other"

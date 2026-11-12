@@ -77,31 +77,15 @@ disk_check() {
   if (( free < need )); then log "not enough disk: need $need bytes, $free free under $OUT"; return 1; fi
 }
 
-# meta.json: one key=value argument per field, "#key=value" for integers; META_EXTRA adds fields (W7's).
+# meta.json: the shared fields plus run.sh's own; META_EXTRA adds fields (W7's).
 META_EXTRA=()
 write_meta() {
-  local kv_digest sha
-  kv_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$KVROCKS_IMAGE" 2>/dev/null || echo "$KVROCKS_IMAGE")
-  sha=$(git -C "$ROOT" rev-parse --short HEAD)
-  if ((DIRTY)); then sha+=-dirty; fi
-  python3 - "$OUT/meta.json" \
-    "tideskv_sha=$sha" "kvrocks_image=$kv_digest" "tideskv_image=$TIDESKV_IMAGE" "memtier_image=$MEMTIER_IMAGE" \
+  local common
+  mapfile -t common < <(meta_common_fields)
+  write_meta_kv "$OUT/meta.json" "${common[@]}" \
     "size=$SIZE" "relaxed_mode=$RELAXED" "#warmup_s=$WARMUP" "#duration_s=$DURATION" \
-    "server_cpus=$SERVER_CPUS" "server_cores=$(server_cores)" "server_mem=$SERVER_MEM" "#server_nofile=$SERVER_NOFILE" \
-    "#threads=$THREADS" "#clients=$CLIENTS" "client_cpus=$CLIENT_CPUS" "memtier_run_flags=${MEMTIER_RUN_FLAGS[*]}" \
-    "#w6_del_target_per_s=$W6_DEL_RATE" "#w6_del_clients=$W6_DEL_CLIENTS" \
-    "#quiesce_window_s=$QUIESCE_WINDOW" "#quiesce_cpu_pct=$QUIESCE_CPU_PCT" \
-    "#quiesce_write_bytes=$QUIESCE_WRITE_BYTES" "#quiesce_max_s=$QUIESCE_MAX" \
-    "host=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), kernel $(uname -r)" "started_utc=$TS" \
-    "${META_EXTRA[@]}" <<'EOF'
-import json, sys
-meta = {}
-for arg in sys.argv[2:]:
-    key, value = arg.split("=", 1)
-    meta[key.lstrip("#")] = int(value) if key.startswith("#") else value
-with open(sys.argv[1], "w") as f:
-    json.dump(meta, f, indent=2)
-EOF
+    "#threads=$THREADS" "#clients=$CLIENTS" "#w6_del_target_per_s=$W6_DEL_RATE" "#w6_del_clients=$W6_DEL_CLIENTS" \
+    "${META_EXTRA[@]}"
 }
 
 # wl_load supplies its own --threads/--clients (ruling T2-R1)
