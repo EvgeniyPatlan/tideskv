@@ -7,6 +7,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=uc_run.sh
 source "$HERE/uc_run.sh"
+# shellcheck source-path=SCRIPTDIR source=uc_cases_run.sh
+source "$HERE/uc_cases_run.sh"
 
 UC_MODE=full DIRTY=0 OUT_ARG="" REQUESTED=()
 while (($#)); do

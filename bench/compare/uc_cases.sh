@@ -11,12 +11,15 @@
 #   UC_U3_CLOSED_S UC_U3_OPEN_S   U3 closed-loop and per-open-phase seconds
 #   UC_U6_S                       U6 seconds per connection-count phase
 #   UC_U7_TIMES UC_U7_SECS        U7 repeats per phase, and the space-separated write seconds before the kill
+#   UC_COMPACT_WAIT               longest wait in seconds for U1's Kvrocks COMPACT to finish
 # UC_RATE (set by the runner) is the per-connection --rate-limiting of the open-loop phases of U1 and U3.
 # shellcheck disable=SC2034  # globals are read by uc_run.sh and the test
 HERE_UC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=workloads.sh
 source "$HERE_UC/workloads.sh"
 
+# The relaxed level (U1-U5, U8): TidesKV sync-mode none, which lib.sh reads from RELAXED (run.sh's --relaxed-mode)
+RELAXED=none
 UC_THREADS=4
 UC_CLIENTS=50
 UC_GIB=$((1024 * 1024 * 1024))
@@ -30,14 +33,14 @@ uc_sizes() {
       U1_KEYS=40000000 U3_KEYS=20000000 U4_KEYS=5000000 U6_KEYS=1000000 U7_KEYS=2000000
       U2_RATE_PER_CONN=200 U2_EXPIRY=120-1200 UC_U2_WRITE_S=3600 UC_U2_IDLE_S=1800 UC_U2_DU_EVERY=60
       UC_U3_CLOSED_S=3600 UC_U3_OPEN_S=600 UC_U6_S=60 UC_U7_TIMES=5 UC_U7_SECS="10 60 120"
-      U5_KEYS_1K=16000000 U5_KEYS_4K=4000000 U5_KEYS_16K=1000000 ;;
+      U5_KEYS_1K=16000000 U5_KEYS_4K=4000000 U5_KEYS_16K=1000000 UC_COMPACT_WAIT=7200 ;;
     quick)
       UC_REPS=1 UC_WARMUP=10 UC_DURATION=30
       U1_KEYS=2000000 U3_KEYS=1000000 U4_KEYS=250000 U6_KEYS=1000000 U7_KEYS=200000
       U2_RATE_PER_CONN=50 U2_EXPIRY=30-300 UC_U2_WRITE_S=600 UC_U2_IDLE_S=300 UC_U2_DU_EVERY=15
       UC_U3_CLOSED_S=300 UC_U3_OPEN_S=60 UC_U6_S=15 UC_U7_TIMES=1 UC_U7_SECS="5 15"
       # 0.5 GiB logical per value size
-      U5_KEYS_1K=524288 U5_KEYS_4K=131072 U5_KEYS_16K=32768 ;;
+      U5_KEYS_1K=524288 U5_KEYS_4K=131072 U5_KEYS_16K=32768 UC_COMPACT_WAIT=600 ;;
     *) echo "uc_sizes: unknown mode $1" >&2; return 2 ;;
   esac
   UC_U2_CLIENTS=25
@@ -48,6 +51,16 @@ uc_sizes() {
 # and needs no extra line. "charged" goes into meta.json (cache_accounting).
 UC_CACHE_ACCOUNTING=charged
 UC_CACHE_LINES=()
+
+# Background-debt INFO fields (spec §4 U3) the report reads from each cell's .info0/.info1 (full INFO), as found in a
+# live INFO dump on 2026-11-12. Kvrocks 2.17 prints per-column-family fields as name[cf] (estimate_pending_compaction_
+# bytes[default], ...; the report sums them); is_compacting is yes only while a manual COMPACT runs. TidesKV has no
+# compaction or flush queue length and no vlog-garbage field: its debt shows as the memtable queue, write throttling
+# and stall time, and the background compaction counters.
+UC_DEBT_FIELDS_kvrocks=(estimate_pending_compaction_bytes compaction_pending num_running_compactions
+                        memtable_flush_pending num_running_flushes is_compacting)
+UC_DEBT_FIELDS_tideskv=(storage_memtable_queue_bytes storage_writes_throttled storage_writes_blocked
+                        storage_write_stall_us background_compactions background_compaction_failures)
 
 # Extra "key value" config lines of SERVER, one per line (the runner reads them into UC_EXTRA_CONF; lib.sh appends
 # them to the Kvrocks conf and to _parity_expect, skipping lines already there, so kvrocks-blob's lines, which
@@ -96,11 +109,12 @@ uc_u5_keys() {
   esac
 }
 
-# Logical bytes a case keeps on disk (key + per-entry overhead as in wl_logical_bytes). U8 reuses U1's files.
+# Logical bytes a case keeps on disk (key + per-entry overhead as in wl_logical_bytes). U8 starts no server: it reads
+# U1's and U3's files.
 _uc_logical() {
   local k v
   case $1 in
-    U1|U8) echo $((U1_KEYS * (1024 + 12))) ;;
+    U1) echo $((U1_KEYS * (1024 + 12))) ;;
     # live set of the churn: SET rate x mean TTL (SET is half of the ops)
     U2) local mean=${U2_EXPIRY%-*}
         mean=$(((mean + ${U2_EXPIRY#*-}) / 2))
@@ -113,15 +127,17 @@ _uc_logical() {
         echo "$max" ;;
     U6) echo $((U6_KEYS * (100 + 12))) ;;
     U7) echo $((U7_KEYS * (100 + 12))) ;;
-    F1) echo 0 ;;
+    U8|F1) echo 0 ;;
     *) echo "uc_disk_need: unknown case $1" >&2; return 2 ;;
   esac
 }
 
+# Bytes free a case needs: half its logical bytes (memtier random data compresses ~3x under LZ4, which every case uses;
+# /2 keeps a margin) plus the WAL archive allowance and slack (controller ruling R6).
 uc_disk_need() {
   local logical
   logical=$(_uc_logical "$1") || return
-  echo $((logical + UC_WAL_ALLOWANCE + UC_SLACK))
+  echo $((logical / 2 + UC_WAL_ALLOWANCE + UC_SLACK))
 }
 
 uc_phases() {

@@ -26,8 +26,15 @@ check servers-u1 "$(uc_servers U1)" "tideskv kvrocks"
 check level-u6 "$(uc_level U6)" strict
 check level-u7 "$(uc_level U7)" strict
 check level-u1 "$(uc_level U1)" relaxed
-check disk-u1 "$([[ $(uc_disk_need U1) -ge $((40000000 * 1024)) ]] && echo yes)" yes
-check disk-u1-allowance "$(( $(uc_disk_need U1) - 40000000 * 1036 ))" $((20 * 1024 * 1024 * 1024))
+# lib.sh writes and checks TidesKV's relaxed sync-mode from RELAXED: the suite's relaxed level is sync-mode none
+check relaxed-sync-mode "$(BLOCK_CACHE_MB=2048 SERVER_WORKERS=4 _parity_expect tideskv relaxed | grep '^sync-mode')" "sync-mode none"
+# R6: memtier random data compresses ~3x under LZ4, so half the logical bytes plus 16 GiB WAL archive and 4 GiB slack
+check disk-u1 "$(uc_disk_need U1)" $((40000000 * 1036 / 2 + 20 * 1024 * 1024 * 1024))
+check disk-u1-fits-62g "$([[ $(uc_disk_need U1) -lt $((62 * 1000 * 1000 * 1000)) ]] && echo yes)" yes
+check disk-u8-none "$(uc_disk_need U8)" $((20 * 1024 * 1024 * 1024))
+check disk-u5-half "$(uc_disk_need U5)" $((16000000 * 1024 / 2 + 20 * 1024 * 1024 * 1024))
+check debt-fields "$([[ -n ${UC_DEBT_FIELDS_tideskv[*]} && -n ${UC_DEBT_FIELDS_kvrocks[*]} ]] && echo yes)" yes
+check debt-kvrocks-pending "$(has "${UC_DEBT_FIELDS_kvrocks[*]}" estimate_pending_compaction_bytes)" yes
 check phases-u1 "$(uc_phases U1)" "closed-gauss closed-uniform open25 open50 open75"
 check phases-u2 "$(uc_phases U2)" "churn idle"
 check phases-u3 "$(uc_phases U3)" "age closed open25 open50 open75"

@@ -387,13 +387,16 @@ server_cores() {
 
 # The timed-run measurement shared by run.sh's run_workload and the use-case runner: starts the docker stats sampler,
 # samples the server cgroup around one memtier run (NAME is relative to $OUT, the rest are memtier arguments) and writes
-# NAME.{json,stats.jsonl,cpu,io,status}, plus .info0/.info1 (INFO persistence) when $CUR is tideskv.
+# NAME.{json,stats.jsonl,cpu,io,status}, plus .info0/.info1 (INFO persistence) when $CUR is tideskv. MEASURE_INFO (the
+# use-case suite sets "INFO") replaces that: those INFO arguments, on every server.
 measure_memtier() {
-  local base=$1 stats_pid cpu0 cpu1; shift
+  local base=$1 stats_pid cpu0 cpu1 info=(INFO persistence) want_info=0; shift
+  if [[ ${CUR:-} == tideskv ]]; then want_info=1; fi
+  if [[ -n ${MEASURE_INFO:-} ]]; then read -ra info <<<"$MEASURE_INFO"; want_info=1; fi
   # docker stats gives peak memory; CPU is the cgroup's usage_usec delta over exactly the timed run
   ( while kill -0 $$ 2>/dev/null; do docker stats --no-stream --format '{{json .}}' "$SERVER_CONTAINER"; sleep 2; done ) \
     >"$OUT/$base.stats.jsonl" 2>/dev/null & stats_pid=$!
-  if [[ ${CUR:-} == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info0" || true; fi
+  if ((want_info)); then cli "${info[@]}" 2>/dev/null | tr -d '\r' >"$OUT/$base.info0" || true; fi
   cpu0=$(cg_sample) || cpu0=""
   if memtier "$base" "$@"; then
     echo ok >"$OUT/$base.status"
@@ -405,7 +408,7 @@ measure_memtier() {
     echo $(( ${cpu1%% *} - ${cpu0%% *} )) >"$OUT/$base.cpu"
     echo $(( ${cpu1##* } - ${cpu0##* } )) >"$OUT/$base.io"
   fi
-  if [[ ${CUR:-} == tideskv ]]; then cli INFO persistence 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
+  if ((want_info)); then cli "${info[@]}" 2>/dev/null | tr -d '\r' >"$OUT/$base.info1" || true; fi
   stop_sampler "$stats_pid"
 }
 
