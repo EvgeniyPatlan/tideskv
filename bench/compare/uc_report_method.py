@@ -83,7 +83,9 @@ def methodology(summary):
         "3. **Open-loop latency.** For U1 and U3 the closed-loop run finds each server's maximum, then both run at 25%, "
         "50% and 75% of the lower server's maximum (memtier per-connection rate limit), so neither is measured "
         "saturated. Latency is only given a verdict from these equal-load cells, and withheld when a server did not "
-        "reach 95% of the offered rate (\"under target\").",
+        "reach 95% of the offered rate (\"under target\"). U2 churn p99.9 also gets a verdict: it runs at a fixed rate "
+        "that is identical for both servers, and it is withheld when under target. Closed-loop latency is shown, "
+        "never compared.",
         "4. **Equal resources.** Server on CPUs %s (%s), memory cap %s, open files %s; client on CPUs %s. %s Settings are "
         "read back from the running server before any cell is measured (a mismatch fails the cell)." % (
             meta.get("server_cpus", "?"), meta.get("server_cores", "?"), meta.get("server_mem", "?"),
@@ -92,8 +94,10 @@ def methodology(summary):
         "relaxed is not power-loss safe on either side. U6 and U7 run strict (fsync before every acknowledged write on "
         "both sides). TidesKV's interval mode is not compared with Kvrocks `sync yes`.",
         "6. **Data.** memtier's random data compresses about 3x under LZ4, which is on for both servers; disk and cache "
-        "numbers (U1, U2, U5, U8) depend on that. Disk figures are bytes on disk after the server went quiet and exclude "
-        "Kvrocks' WAL archive (default `wal_ttl_seconds 10800`), which is reported on its own line.",
+        "numbers (U1, U2, U5, U8) depend on that. Disk figures are allocated bytes (`du --block-size=1`) after the server went "
+        "quiet, excluding Kvrocks' WAL archive (default `wal_ttl_seconds 10800`), which is reported on its own line; "
+        "apparent size is shown beside them. Runs recorded before the allocated column existed fall back to apparent "
+        "size, and the tables label it as such.",
         "7. **Correctness.** Every cell's replies are checked: any error reply, or a GET hit rate under 99% after a "
         "load (U1, U3, U5), makes the cell ERR and it is shown as such, not as a number. U2 expects misses (keys expire) "
         "and reports the hit rate without a check. U4's check covers the integer replies of HSET and HDEL only.",
@@ -109,12 +113,11 @@ def methodology(summary):
               "was written, as read back:", ""]
     by_level, level_cases = _setting_lines(summary)
     for level in ("relaxed", "strict"):
-        if level not in by_level:
-            continue
-        lines += ["**%s** (%s)" % (level.capitalize(), ", ".join(level_cases[level])), ""]
-        lines += ["- %s: %s" % (server, ", ".join("`%s`" % x for x in sorted(ls)) or "defaults")
-                  for server, ls in sorted(by_level[level].items())] + [""]
-    lines.pop()
-    lines += ["", "### Not covered in v1", ""] + ["- " + x for x in NOT_COVERED]
+        if level in by_level:
+            lines += ["**%s** (%s)" % (level.capitalize(), ", ".join(level_cases[level])), ""]
+            lines += ["- %s: %s" % (server, ", ".join("`%s`" % x for x in sorted(ls)) or "defaults")
+                      for server, ls in sorted(by_level[level].items())]
+            lines.append("")
+    lines += ["### Not covered in v1", ""] + ["- " + x for x in NOT_COVERED]
     lines += ["", "### For Kvrocks maintainers", "", INVITATION, ""]
     return lines

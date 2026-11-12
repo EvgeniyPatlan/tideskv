@@ -284,15 +284,18 @@ def client_cpu_pct(rep_dir, phase, client_cpus):
         return None
 
 
-def ops_cv(series):
-    """Coefficient of variation of the per-second request counts of a memtier Time-Serie (0.0 when unknowable)."""
-    counts = [p.get("Count", 0) for p in series.values()]
-    mean = sum(counts) / len(counts) if counts else 0
-    return statistics.pstdev(counts) / mean if len(counts) > 1 and mean > 0 else 0.0
+def ops_cv(series, min_buckets=5):
+    """Coefficient of variation of the per-second request counts of a memtier Time-Serie, without its last bucket (a
+    partial second). None when fewer than min_buckets buckets remain: too short to judge."""
+    counts = [series[k].get("Count", 0) for k in sorted(series, key=int)][:-1]
+    if len(counts) < min_buckets:
+        return None
+    mean = sum(counts) / len(counts)
+    return statistics.pstdev(counts) / mean if mean > 0 else 0.0
 
 
 def cell_flags(rep_dir, phase, client_cpus):
-    """{'client_bound': pct, 'under_target': (achieved, target), 'unstable': cv (U6 only)} for what applies to a cell."""
+    """{'client_bound': pct, 'under_target': (achieved, target), 'unstable': cv, 'stability_unknown': True (U6 only)} for what applies to a cell."""
     out = {}
     pct_used = client_cpu_pct(rep_dir, phase, client_cpus) if client_cpus else None
     if pct_used is not None and pct_used > CLIENT_BOUND_PCT:
@@ -303,8 +306,12 @@ def cell_flags(rep_dir, phase, client_cpus):
         target = conf["rate_limit"] * conf["clients"] * conf["threads"]
         if target > 0 and uc_verdict.flag_under_target(achieved, target):
             out["under_target"] = (achieved, float(target))
-        if case_of(rep_dir) == "U6" and ops_cv(d["ALL STATS"]["Totals"]["Time-Serie"]) > UNSTABLE_CV:
-            out["unstable"] = ops_cv(d["ALL STATS"]["Totals"]["Time-Serie"])
+        if case_of(rep_dir) == "U6":
+            cv = ops_cv(d["ALL STATS"]["Totals"]["Time-Serie"])
+            if cv is None:
+                out["stability_unknown"] = True
+            elif cv > UNSTABLE_CV:
+                out["unstable"] = cv
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return out
@@ -341,3 +348,12 @@ def fio_baselines(run_dir):
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return out
+
+
+def fio_status(fio_dir):
+    """Why a per-server fio fsync result is missing: the last line of its log, else that nothing was written."""
+    try:
+        lines = read_text(os.path.join(fio_dir, "fsync.log")).splitlines()
+        return lines[-1] if lines else "empty fio log"
+    except OSError:
+        return "no fio/fsync.json and no log"

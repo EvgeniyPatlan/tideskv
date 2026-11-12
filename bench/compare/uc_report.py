@@ -134,14 +134,23 @@ def _at_floor(metric, sums, meta):
 
 
 def _basis(metric, servers, reps, case_dir):
-    """'allocated' when every du source of the metric has allocated bytes, else 'apparent size'."""
-    found = {uc_cells.disk_basis(os.path.join(case_dir, s, "rep%d" % r), metric.disk_src) for s in servers for r in reps}
-    return "allocated" if found == {"allocated"} else "apparent size"
+    """'allocated' when every du source of the metric has allocated bytes, 'apparent size' when none has, else
+    'mixed: apparent size for <which>'."""
+    got = {}
+    for s in servers:
+        for r in reps:
+            b = uc_cells.disk_basis(os.path.join(case_dir, s, "rep%d" % r), metric.disk_src)
+            if b:
+                got["%s rep%d" % (NAMES[s], r)] = b
+    old = [k for k, b in got.items() if b != "allocated"]
+    if not old:
+        return "allocated"
+    return "apparent size" if len(old) == len(got) else "mixed: apparent size for " + ", ".join(old)
 
 
 def _metric_entry(metric, sums, verdict, best, rng, flags, title, floor):
     why = _withhold(metric, flags)
-    return {"key": metric.key, "title": title, "floor": floor, "unit": metric.unit, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
+    return {"key": metric.key, "title": title, "floor": floor, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
             "headline": metric.headline, "info": metric.info, "pros_cons": metric.pros_cons, "note": metric.note,
             "phase": metric.phase, "withheld": why,
             "configs": {s: None if x is None else {"median": x.median, "lo": x.lo, "hi": x.hi, "n": x.n,
@@ -234,10 +243,15 @@ def _extras(case, case_dir, servers, reps):
             try:
                 if case == "U2":
                     state = uc_cells.u2_end_state(rep_dir)
-                    state["du_end"] = uc_cells.du_rows(os.path.join(rep_dir, "du-end"))[-1][1]
+                    last = uc_cells.du_rows(os.path.join(rep_dir, "du-end"))[-1]
+                    state["du_end"], state["basis"] = last[1], last[5]
                     out.setdefault("end_state", {}).setdefault(s, {})[r] = state
                 elif case == "U6":
-                    out.setdefault("fio", {}).setdefault(s, {})[r] = uc_cells.fio_job(os.path.join(rep_dir, "fio", "fsync.json"), "write")
+                    try:
+                        res = uc_cells.fio_job(os.path.join(rep_dir, "fio", "fsync.json"), "write")
+                    except (OSError, ValueError, KeyError, IndexError, TypeError):
+                        res = {"missing": uc_cells.fio_status(os.path.join(rep_dir, "fio"))}
+                    out.setdefault("fio", {}).setdefault(s, {})[r] = res
                 elif case == "U3":
                     kind = "tideskv" if s == "tideskv" else "kvrocks"
                     out.setdefault("debt", {}).setdefault(s, {})[r] = uc_cells.debt_values(rep_dir, "closed", kind)
@@ -269,7 +283,7 @@ def _build_case(case, run_dir, meta, quick):
         if m.disk_src:
             bases[m.key] = _basis(m, servers, reps, case_dir)
             title = title.replace("{basis}", bases[m.key])
-        elif m.twin_of and bases.get(m.twin_of) != "allocated":
+        elif m.twin_of and bases.get(m.twin_of) == "apparent size":
             continue  # the main figure is apparent size already
         v, best, rng = _decide(m, sums, flags, quick, floor)
         entries.append(_metric_entry(m, sums, v, best, rng, flags, title, floor))

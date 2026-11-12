@@ -207,6 +207,92 @@ class FixTest(unittest.TestCase):
         _, text = run.report()
         self.assertIn("fio random-read baseline: not run", text)
 
+    # ---- fix round 2 ----
+
+    def test_ops_cv_ignores_trailing_partial_bucket(self):
+        series = {str(i): {"Count": 1000 + (i % 2) * 20} for i in range(20)}
+        series["20"] = {"Count": 8}  # memtier's last, partial second
+        self.assertLess(uc_cells.ops_cv(series), 0.05)
+        series["3"]["Count"] = 6000  # a real swing earlier in the run still counts
+        self.assertGreater(uc_cells.ops_cv(series), 0.25)
+
+    def test_ops_cv_too_short_is_none_and_noted(self):
+        short = {str(i): {"Count": 1000 if i % 2 else 100} for i in range(5)}  # 4 buckets once the last is dropped
+        self.assertIsNone(uc_cells.ops_cv(short))
+        run = Run(self)
+        for rep in (1, 2):
+            run.cell("U6", "tideskv", rep, "c64", memtier(4000, sets=100, gets=0, series=short))
+            run.cell("U6", "kvrocks", rep, "c64", memtier(1000, sets=100, gets=0, series=short))
+            run.done("U6", "tideskv", rep); run.done("U6", "kvrocks", rep)
+        s, text = run.report()
+        self.assertEqual(entry(s, "U6", "c64_ops")["verdict"]["label"], "TidesKV better")
+        self.assertIn("too short to judge stability", text)
+
+    def test_missing_fio_is_stated_per_server(self):
+        run = Run(self)
+        fio = {"jobs": [{"write": {"bw_bytes": 1, "iops": 1500.0, "lat_ns": {"mean": 1.0}, "clat_ns": {"percentile": {}}}}]}
+        run.write("U6/tideskv/rep1/fio/fsync.json", json.dumps(fio))
+        run.write("U6/kvrocks/rep1/fio/fsync.log", "fio: error\nfio: pid=1 failed")
+        for srv in ("tideskv", "kvrocks"):
+            run.cell("U6", srv, 1, "c64", memtier(10, sets=100, gets=0))
+            run.done("U6", srv, 1)
+        _, text = run.report()
+        u6 = text.split("### U6")[1].split("## F1")[0]
+        self.assertIn("fsync floor before Kvrocks's sweep: not measured (", u6)
+        self.assertIn("fio: pid=1 failed", u6)
+        self.assertIn("1500 writes/s", u6)
+        run2 = Run(self)
+        for srv in ("tideskv", "kvrocks"):
+            run2.cell("U6", srv, 1, "c64", memtier(10, sets=100, gets=0))
+            run2.done("U6", srv, 1)
+        _, text2 = run2.report()
+        self.assertNotIn("was measured right before", text2)
+        self.assertIn("fsync floor before TidesKV's sweep: not measured", text2)
+
+    def test_mixed_disk_basis_is_named(self):
+        run = Run(self)
+        for rep in (1, 2):
+            self.du5(run, "tideskv", rep, "du-end", 6400, 0, 3000, 0)
+            run.du("U2", "kvrocks", rep, "du-end", 6400, 0)
+            for srv in ("tideskv", "kvrocks"):
+                run.write("U2/%s/rep%d/du.csv" % (srv, rep), run.read("U2/%s/rep%d/du-end" % (srv, rep)))
+                run.write("U2/%s/rep%d/dbsize-end" % (srv, rep), "10")
+                run.done("U2", srv, rep)
+        s, text = run.report()
+        title = entry(s, "U2", "du_end")["title"]
+        self.assertIn("mixed: apparent size for Kvrocks", title)
+        self.assertIn("du_end_apparent", [x["key"] for x in s["cases"]["U2"]["metrics"]])
+
+    def test_u2_end_state_labels_disk_basis(self):
+        run = Run(self)
+        self.u2_fixture(run, True)
+        _, text = run.report()
+        self.assertIn("| disk at end (allocated) |", text)
+
+    def test_methodology_wording(self):
+        run = Run(self)
+        u4(run, 1000, 500)
+        _, text = run.report()
+        meth = text.split("## Methodology")[1]
+        self.assertIn("allocated bytes (`du --block-size=1`)", meth)
+        self.assertIn("apparent size", meth.split("**Correctness")[0].split("**Data.**")[1])
+        item3 = meth.split("**Open-loop latency.**")[1].split("**Equal resources")[0]
+        self.assertIn("U2 churn p99.9", item3)
+        self.assertIn("fixed rate", item3)
+
+    def test_settings_levels_all_printed(self):
+        run = Run(self)
+        for case, ph in (("U4", "mix"), ("U6", "c64")):
+            for srv in ("tideskv", "kvrocks"):
+                run.write("%s/config.txt" % srv, "# relaxed\nsync-mode none\n# strict\nsync-mode full\n")
+                run.cell(case, srv, 1, ph, with_hashes(memtier(10)) if case == "U4" else memtier(10, sets=100, gets=0))
+                run.done(case, srv, 1)
+        _, text = run.report()
+        sect = text.split("### Settings on each side")[1].split("### Not covered")[0]
+        self.assertEqual(sect.count("- kvrocks:"), 2)
+        self.assertEqual(sect.count("- tideskv:"), 2)
+        self.assertTrue(sect.endswith("\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

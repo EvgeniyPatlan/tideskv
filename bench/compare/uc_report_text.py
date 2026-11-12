@@ -47,8 +47,7 @@ OTHER_NOTES = {
            "HSET and HDEL only.",
            "Per-command ops/s follow the mix ops/s (the command ratio is fixed) and are not counted separately."],
     "U5": ["Both Kvrocks configurations are shown so that neither blob threshold is cherry-picked."],
-    "U6": ["Strict durability on both sides. The disk's fsync floor was measured right before each server's sweep "
-           "(below), because it drifts.",
+    "U6": ["Strict durability on both sides.",
            "Writes per fsync: not observable. The INFO of neither server reports an fsync count (its sync_* fields are "
            "replication counters), so group-commit batch size cannot be read.",
            "A cell whose per-second ops vary by more than a quarter (coefficient of variation above 0.25) is flagged "
@@ -255,6 +254,7 @@ def _notes(cs):
         seen.add(key)
         d = f["detail"]
         text = ("client-bound: memtier used %.0f%% of the client CPUs, no verdict for this cell" % d if f["kind"] == "client_bound"
+                else "too short to judge stability (fewer than 5 full seconds), so no stability flag" if f["kind"] == "stability_unknown"
                 else "unstable: ops/s per second varied with a coefficient of variation of %.2f (limit %.2f), no verdict for this cell"
                 % (d, uc_cells.UNSTABLE_CV) if f["kind"] == "unstable"
                 else "under target: achieved %s of %s ops/s offered, latency verdict withheld" % (fmt(d[0], "ops/s"), fmt(d[1], "ops/s")))
@@ -285,8 +285,10 @@ def _timelines(case, cs):
 def _extras(case, cs, summary):
     ex, out = cs["extras"], []
     if case == "U2" and ex.get("end_state"):
+        basis = " / ".join(sorted({st["basis"] for reps in ex["end_state"].values() for st in reps.values()}))
         out += ["**End state** (live bytes is an estimate: keys left x value size, not a measurement):", "",
-                "| Config | rep | keys at end | value size | live bytes (estimate) | disk at end | disk / live |", "|---|---|---|---|---|---|---|"]
+                "| Config | rep | keys at end | value size | live bytes (estimate) | disk at end (%s) | disk / live |" % basis,
+                "|---|---|---|---|---|---|---|"]
         for s, reps in ex["end_state"].items():
             for r, st in reps.items():
                 live = st["live_estimate"]
@@ -307,15 +309,24 @@ def _extras(case, cs, summary):
                 "the ones counted in the case label and the pros and cons. A server that never recovered shows ERR with "
                 "the cause.", ""]
     if case == "U6":
-        floors = [("%s rep%d" % (NAMES[s], r), fs) for s, reps in (ex.get("fio") or {}).items() for r, fs in reps.items()]
-        start = (summary.get("fio") or {}).get("fsync")
-        if start:
-            floors.insert(0, ("start of run", start))
-        if floors:
-            out += ["**Disk floor** (fio, 4 KiB writes with an fsync each, queue depth 1), measured right before each "
-                    "server's sweep:", ""]
-            out += ["- %s: %.0f writes/s%s" % (who, fs["iops"], _fsync_lat(fs)) for who, fs in floors] + [""]
+        out += _u6_floor(ex.get("fio") or {}, (summary.get("fio") or {}).get("fsync"))
     return out
+
+
+def _u6_floor(fio, start):
+    """Lines for each server's fsync floor measured before its sweep (or why it was not), plus the run-start one."""
+    out = []
+    if start:
+        out.append("- start of run: %.0f writes/s%s" % (start["iops"], _fsync_lat(start)))
+    for s, reps in fio.items():
+        for r, fs in reps.items():
+            if "missing" in fs:
+                out.append("- fsync floor before %s's sweep: not measured (%s)" % (NAMES[s], fs["missing"]))
+            else:
+                out.append("- %s rep%d: %.0f writes/s%s" % (NAMES[s], r, fs["iops"], _fsync_lat(fs)))
+    if not out:
+        return []
+    return ["**Disk floor** (fio, 4 KiB writes with an fsync each, queue depth 1), right before each server's sweep:", ""] + out + [""]
 
 
 def _fsync_lat(fs):
@@ -335,7 +346,13 @@ def _case_section(case, cs, summary):
     out += ["**Results** (median [min–max] over repetitions; ratio above 1 means TidesKV is better):", ""]
     out += _results(cs) + [""] + _notes(cs)
     out += _extras(case, cs, summary) + _timelines(case, cs)
-    out += ["**Caveats.**", ""] + ["- " + n for n in OTHER_NOTES.get(case, [])]
+    notes = list(OTHER_NOTES.get(case, []))
+    if case == "U6":
+        measured = any("missing" not in fs for reps in cs["extras"].get("fio", {}).values() for fs in reps.values())
+        notes.insert(1 if notes else 0, "The disk's fsync floor drifts, so it was measured right before each server's sweep "
+                     "(above)." if measured else "The disk's fsync floor was not measured before the sweeps (see above), so "
+                     "the disk's drift cannot be read from this run.")
+    out += ["**Caveats.**", ""] + ["- " + n for n in notes]
     if case in ("U1", "U2", "U5", "U8"):
         out.append("- Disk numbers exclude Kvrocks' WAL archive.")
     return out + [""]
