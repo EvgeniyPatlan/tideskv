@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Use-case suite case definitions U1-U8 and F1 (spec 2026-11-12 §4). Sourced by uc_run.sh; pure functions, no Docker.
+# Callbacks receive memtier arguments as separate words. The runner appends --test-time (UC_WARMUP / UC_DURATION, or
+# the phase-specific globals below), so phase arguments carry traffic shape only.
+# Globals set by uc_sizes (read by the runner):
+#   UC_REPS                       repetitions per phase (3 full, 1 quick)
+#   UC_WARMUP UC_DURATION         closed-loop warm-up / timed seconds (60/180, quick 10/30)
+#   U1_KEYS U3_KEYS U4_KEYS U6_KEYS U7_KEYS   key counts; U5 keys per size come from uc_u5_keys
+#   U2_RATE_PER_CONN U2_EXPIRY    U2 per-connection SET/GET rate and --expiry-range value
+#   UC_U2_WRITE_S UC_U2_IDLE_S UC_U2_DU_EVERY   U2 churn seconds, idle seconds, du sampling interval
+#   UC_U3_CLOSED_S UC_U3_OPEN_S   U3 closed-loop and per-open-phase seconds
+#   UC_U6_S                       U6 seconds per connection-count phase
+#   UC_U7_TIMES UC_U7_SECS        U7 repeats per phase, and the space-separated write seconds before the kill
+# UC_RATE (set by the runner) is the per-connection --rate-limiting of the open-loop phases of U1 and U3.
+# shellcheck disable=SC2034  # globals are read by uc_run.sh and the test
+HERE_UC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=workloads.sh
+source "$HERE_UC/workloads.sh"
+
+UC_THREADS=4
+UC_CLIENTS=50
+UC_GIB=$((1024 * 1024 * 1024))
+UC_WAL_ALLOWANCE=$((16 * UC_GIB))
+UC_SLACK=$((4 * UC_GIB))
+
+uc_sizes() {
+  case $1 in
+    full)
+      UC_REPS=3 UC_WARMUP=60 UC_DURATION=180
+      U1_KEYS=40000000 U3_KEYS=20000000 U4_KEYS=5000000 U6_KEYS=1000000 U7_KEYS=2000000
+      U2_RATE_PER_CONN=200 U2_EXPIRY=120-1200 UC_U2_WRITE_S=3600 UC_U2_IDLE_S=1800 UC_U2_DU_EVERY=60
+      UC_U3_CLOSED_S=3600 UC_U3_OPEN_S=600 UC_U6_S=60 UC_U7_TIMES=5 UC_U7_SECS="10 60 120"
+      U5_KEYS_1K=16000000 U5_KEYS_4K=4000000 U5_KEYS_16K=1000000 ;;
+    quick)
+      UC_REPS=1 UC_WARMUP=10 UC_DURATION=30
+      U1_KEYS=2000000 U3_KEYS=1000000 U4_KEYS=250000 U6_KEYS=1000000 U7_KEYS=200000
+      U2_RATE_PER_CONN=50 U2_EXPIRY=30-300 UC_U2_WRITE_S=600 UC_U2_IDLE_S=300 UC_U2_DU_EVERY=15
+      UC_U3_CLOSED_S=300 UC_U3_OPEN_S=60 UC_U6_S=15 UC_U7_TIMES=1 UC_U7_SECS="5 15"
+      # 0.5 GiB logical per value size
+      U5_KEYS_1K=524288 U5_KEYS_4K=131072 U5_KEYS_16K=32768 ;;
+    *) echo "uc_sizes: unknown mode $1" >&2; return 2 ;;
+  esac
+  UC_U2_CLIENTS=25
+}
+
+uc_cases() { echo "U1 U2 U3 U4 U5 U6 U7 U8 F1"; }
+
+uc_servers() {
+  case $1 in
+    U2) echo "tideskv kvrocks kvrocks-cron" ;;
+    U5) echo "tideskv kvrocks kvrocks-blob" ;;
+    U1|U3|U4|U6|U7|U8|F1) echo "tideskv kvrocks" ;;
+    *) echo "uc_servers: unknown case $1" >&2; return 2 ;;
+  esac
+}
+
+uc_level() {
+  case $1 in
+    U6|U7) echo strict ;;
+    U1|U2|U3|U4|U5|U8|F1) echo relaxed ;;
+    *) echo "uc_level: unknown case $1" >&2; return 2 ;;
+  esac
+}
+
+# Keys and value size of one U5 phase (v1k, v4k, v16k).
+uc_u5_keys() {
+  case $1 in
+    v1k) echo "$U5_KEYS_1K 1024" ;;
+    v4k) echo "$U5_KEYS_4K 4096" ;;
+    v16k) echo "$U5_KEYS_16K 16384" ;;
+    *) echo "uc_u5_keys: unknown phase $1" >&2; return 2 ;;
+  esac
+}
+
+# Logical bytes a case keeps on disk (key + per-entry overhead as in wl_logical_bytes). U8 reuses U1's files.
+_uc_logical() {
+  local k v
+  case $1 in
+    U1|U8) echo $((U1_KEYS * (1024 + 12))) ;;
+    # live set of the churn: SET rate x mean TTL (SET is half of the ops)
+    U2) local mean=${U2_EXPIRY%-*}
+        mean=$(((mean + ${U2_EXPIRY#*-}) / 2))
+        echo $((UC_THREADS * UC_U2_CLIENTS * U2_RATE_PER_CONN * mean * (1024 + 12) / 2)) ;;
+    U3) echo $((U3_KEYS * (200 + 12))) ;;
+    U4) echo $((U4_KEYS * 20 * (50 + 10))) ;;
+    # each size is loaded and removed in turn, so the largest one counts
+    U5) local p max=0
+        for p in v1k v4k v16k; do read -r k v <<<"$(uc_u5_keys "$p")"; ((k * v > max)) && max=$((k * v)); done
+        echo "$max" ;;
+    U6) echo $((U6_KEYS * (100 + 12))) ;;
+    U7) echo $((U7_KEYS * (100 + 12))) ;;
+    F1) echo 0 ;;
+    *) echo "uc_disk_need: unknown case $1" >&2; return 2 ;;
+  esac
+}
+
+uc_disk_need() {
+  local logical
+  logical=$(_uc_logical "$1") || return
+  echo $((logical + UC_WAL_ALLOWANCE + UC_SLACK))
+}
+
+uc_phases() {
+  local t
+  case $1 in
+    U1) echo "closed-gauss closed-uniform open25 open50 open75" ;;
+    U2) echo "churn idle" ;;
+    U3) echo "age closed open25 open50 open75" ;;
+    U4) echo "mix" ;;
+    U5) echo "v1k v4k v16k" ;;
+    U6) echo "c1 c8 c64 c256" ;;
+    U7) local out=()
+        for t in $UC_U7_SECS; do out+=("term-$t" "kill-$t"); done
+        echo "${out[*]}" ;;
+    U8) echo "report-only" ;;
+    F1) echo "matrix" ;;
+    *) echo "uc_phases: unknown case $1" >&2; return 2 ;;
+  esac
+}
+
+# Closed-loop shape: 4 threads x 50 clients, pipeline 1, distinct seeds.
+_uc_conns() { echo "--threads=$UC_THREADS" "--clients=$UC_CLIENTS" "--pipeline=1" "${MEMTIER_RUN_FLAGS[@]}"; }
+
+# String load of N keys of SIZE bytes under PREFIX (same _seq pattern as wl_load).
+_uc_str_load() {
+  local cb=$1 prefix=$2 keys=$3 size=$4
+  # shellcheck disable=SC2046
+  "$cb" "--ratio=1:0" "--data-size=$size" "--random-data" "--key-prefix=$prefix" $(_seq "$keys")
+}
+
+# Load CASE through CB. U5 takes an optional PHASE (v1k|v4k|v16k) and loads all three sizes in turn without one.
+uc_load() {
+  local c=$1 cb=$2 p k v args=() f
+  case $c in
+    U1) _uc_str_load "$cb" "u1:" "$U1_KEYS" 1024 ;;
+    U3) _uc_str_load "$cb" "u3:" "$U3_KEYS" 200 ;;
+    U4)
+      for ((f = 1; f <= 20; f++)); do args+=("f$f" "__data__"); done
+      # shellcheck disable=SC2046
+      "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=50" "--random-data" "--key-prefix=u4:" \
+        $(_cseq "$U4_KEYS") ;;
+    U5)
+      for p in ${3:-v1k v4k v16k}; do
+        read -r k v <<<"$(uc_u5_keys "$p")" || return
+        _uc_str_load "$cb" "u5:" "$k" "$v" || return
+      done ;;
+    U6) _uc_str_load "$cb" "u6:" "$U6_KEYS" 100 ;;
+    U7) _uc_str_load "$cb" "u7:" "$U7_KEYS" 100 ;;
+    U2|U8|F1) ;;
+    *) echo "uc_load: unknown case $c" >&2; return 2 ;;
+  esac
+}
+
+# Gaussian over [1, keys]: median keys/2, stddev keys/20.
+_uc_gauss() { echo "--key-pattern=G:G" "--key-minimum=1" "--key-maximum=$1" "--key-median=$(($1 / 2))" \
+  "--key-stddev=$(($1 / 20))"; }
+
+_uc_u1() {
+  local ph=$1 cb=$2
+  # shellcheck disable=SC2046
+  case $ph in
+    closed-gauss)
+      "$cb" "--ratio=1:10" "--data-size=1024" "--random-data" "--key-prefix=u1:" $(_uc_gauss "$U1_KEYS") $(_uc_conns) ;;
+    closed-uniform)
+      "$cb" "--ratio=1:10" "--data-size=1024" "--random-data" "--key-prefix=u1:" "--key-pattern=R:R" \
+        $(_random "$U1_KEYS") $(_uc_conns) ;;
+    open25|open50|open75)
+      "$cb" "--ratio=1:10" "--data-size=1024" "--random-data" "--key-prefix=u1:" $(_uc_gauss "$U1_KEYS") $(_uc_conns) \
+        "--rate-limiting=$UC_RATE" ;;
+    *) echo "uc_phase: unknown U1 phase $ph" >&2; return 2 ;;
+  esac
+}
+
+_uc_u3() {
+  local ph=$1 cb=$2
+  # shellcheck disable=SC2046
+  case $ph in
+    # two overwrites of the loaded set: 2 x U3_KEYS random pipelined SETs split over 4 x 8 clients
+    age)
+      "$cb" "--ratio=1:0" "--data-size=200" "--random-data" "--key-prefix=u3:" "--key-pattern=R:R" \
+        $(_random "$U3_KEYS") "--requests=$((2 * U3_KEYS / 32))" "--pipeline=32" "--threads=4" "--clients=8" \
+        "${MEMTIER_RUN_FLAGS[@]}" ;;
+    closed)
+      "$cb" "--ratio=4:1" "--data-size=200" "--random-data" "--key-prefix=u3:" "--key-pattern=R:R" \
+        $(_random "$U3_KEYS") $(_uc_conns) ;;
+    open25|open50|open75)
+      "$cb" "--ratio=4:1" "--data-size=200" "--random-data" "--key-prefix=u3:" "--key-pattern=R:R" \
+        $(_random "$U3_KEYS") $(_uc_conns) "--rate-limiting=$UC_RATE" ;;
+    *) echo "uc_phase: unknown U3 phase $ph" >&2; return 2 ;;
+  esac
+}
+
+_uc_u4() {
+  # shellcheck disable=SC2046
+  "$2" "--command=HGET __key__ f1" "--command-ratio=10" "--command-key-pattern=R" \
+    "--command=HSET __key__ f1 __data__" "--command-ratio=6" "--command-key-pattern=R" \
+    "--command=HGETALL __key__" "--command-ratio=3" "--command-key-pattern=R" \
+    "--command=HDEL __key__ f1" "--command-ratio=1" "--command-key-pattern=R" \
+    "--data-size=50" "--random-data" "--key-prefix=u4:" $(_random "$U4_KEYS") $(_uc_conns)
+}
+
+_uc_u6() {
+  local th cl
+  case $1 in
+    c1) th=1 cl=1 ;;
+    c8) th=1 cl=8 ;;
+    c64) th=4 cl=16 ;;
+    c256) th=4 cl=64 ;;
+    *) echo "uc_phase: unknown U6 phase $1" >&2; return 2 ;;
+  esac
+  # shellcheck disable=SC2046
+  "$2" "--ratio=1:0" "--data-size=100" "--random-data" "--key-prefix=u6:" "--key-pattern=R:R" $(_random "$U6_KEYS") \
+    "--threads=$th" "--clients=$cl" "--pipeline=1" "${MEMTIER_RUN_FLAGS[@]}"
+}
+
+# Memtier arguments of one phase through CB. Phases without memtier traffic (U2 idle, U7, U8, F1) call nothing.
+uc_phase() {
+  local c=$1 ph=$2 cb=$3 k v
+  case $c in
+    U1) _uc_u1 "$ph" "$cb" ;;
+    U2)
+      case $ph in
+        churn)
+          # shellcheck disable=SC2046
+          "$cb" "--ratio=1:1" "--data-size=1024" "--random-data" "--key-prefix=u2:" "--key-pattern=R:R" \
+            "--key-minimum=1" "--key-maximum=1000000000" "--expiry-range=$U2_EXPIRY" "--threads=$UC_THREADS" \
+            "--clients=$UC_U2_CLIENTS" "--pipeline=1" "--rate-limiting=$U2_RATE_PER_CONN" "${MEMTIER_RUN_FLAGS[@]}" ;;
+        idle) ;;
+        *) echo "uc_phase: unknown U2 phase $ph" >&2; return 2 ;;
+      esac ;;
+    U3) _uc_u3 "$ph" "$cb" ;;
+    U4) [[ $ph == mix ]] || { echo "uc_phase: unknown U4 phase $ph" >&2; return 2; }; _uc_u4 "$ph" "$cb" ;;
+    U5)
+      read -r k v <<<"$(uc_u5_keys "$ph")" || return
+      # shellcheck disable=SC2046
+      "$cb" "--ratio=1:4" "--data-size=$v" "--random-data" "--key-prefix=u5:" "--key-pattern=R:R" $(_random "$k") \
+        $(_uc_conns) ;;
+    U6) _uc_u6 "$ph" "$cb" ;;
+    # the ack-writer is a separate tool: U7's per-phase logic lives in the runner
+    U7|U8|F1) ;;
+    *) echo "uc_phase: unknown case $c" >&2; return 2 ;;
+  esac
+}
