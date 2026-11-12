@@ -9,8 +9,9 @@ import (
 
 const maxDiffLines = 10
 
-// DumpState returns a canonical, server-independent view of the whole dataset: key ->
-// "type|ttl|" + %q of the canonical elements joined by NUL. TTL is "-1" or "+" (positive).
+// DumpState returns a canonical, server-independent view of the whole dataset (RESP2 connections
+// only): key -> "type|ttl|" + the canonical elements, each %q-quoted and space-joined. TTL is "-1"
+// or "+" (any TTL >= 0).
 // SCAN cursors are opaque; the result does not depend on SCAN order.
 func DumpState(c *Conn) (map[string]string, error) {
 	keys, err := scanAll(c)
