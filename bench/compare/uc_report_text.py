@@ -1,9 +1,9 @@
 """Markdown rendering of the use-case suite report (stdlib only); render(summary) -> str, in spec section 6's order."""
-import json
 import math
 
 import uc_cells
 import uc_report_method
+from uc_report_f1 import f1_items, render_f1
 
 CASES = ("U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "F1")
 NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks", "kvrocks-blob": "Kvrocks+BlobDB", "kvrocks-cron": "Kvrocks+cron"}
@@ -156,12 +156,6 @@ def _matrix(summary):
 def _item(case, e):
     v = e["verdict"]
     return "%s (%s), ratio %s, vs %s" % (e["title"], case, fmt_ratio(v), vs_name(e, case))
-
-
-def f1_items(matrix):
-    """Hook for F1: ({'tideskv_pros': [...], 'tideskv_cons': [...], 'kvrocks_pros': [...], 'kvrocks_cons': [...]}).
-    Task 9 fills this from the parsed matrix."""
-    return {}
 
 
 def _pros_cons(summary):
@@ -356,11 +350,6 @@ def _case_section(case, cs, summary):
     if case in ("U1", "U2", "U5", "U8"):
         out.append("- Disk numbers exclude Kvrocks' WAL archive.")
     return out + [""]
-
-
-def render_f1(matrix):
-    """Hook for F1: lines for the parsed F1/matrix.json. Task 9 replaces the fallback with the family table."""
-    return ["```json", json.dumps(matrix, indent=2, sort_keys=True), "```"]
 
 
 def render(summary):

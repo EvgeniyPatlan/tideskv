@@ -9,7 +9,9 @@
     srv.restart(startup_delay=0.1)    # same port, same (surviving) data
     srv.stop()                        # kill() without dropping anything
 
-Commands: PING, SET key value, GET key, MGET key..., DBSIZE; anything else gets an error reply.
+Commands: PING, SET key value, GET key, MGET key..., DBSIZE, FLUSHALL; anything else gets an error reply.
+`handlers` ({"OP" or b"OP": fn(cmd) -> raw reply bytes or None}) is consulted first: scripted replies, such as a canned
+"-ERR unknown command" or an array for a command the fake does not implement.
 `store` is the dict (bytes -> bytes). `acked` is the keys of acknowledged SETs in order, `unacked` the keys of
 SETs whose connection was closed before the reply (close_before_reply_key). Options (constructor):
   startup_delay        seconds after start()/restart() before the first connection is accepted; connects fail
@@ -63,8 +65,9 @@ class _Server(socketserver.ThreadingTCPServer):
 
 
 class FakeResp:
-    def __init__(self, host="127.0.0.1", startup_delay=0.0, drop_last=0, close_before_reply_key=None):
+    def __init__(self, host="127.0.0.1", startup_delay=0.0, drop_last=0, close_before_reply_key=None, handlers=None):
         self.host = host
+        self.handlers = {(k.encode() if isinstance(k, str) else k).upper(): v for k, v in (handlers or {}).items()}
         self.startup_delay = startup_delay
         self.drop_last = drop_last
         self.close_before_reply_key = close_before_reply_key.encode() if close_before_reply_key else None
@@ -150,6 +153,8 @@ class FakeResp:
     def _execute(self, cmd):
         op = cmd[0].upper()
         with self._lock:
+            if op in self.handlers:
+                return self.handlers[op](cmd)
             if op == b"PING":
                 return b"+PONG\r\n"
             if op == b"SET" and len(cmd) >= 3:
@@ -165,6 +170,9 @@ class FakeResp:
                 return b"*%d\r\n" % (len(cmd) - 1) + b"".join(self._bulk(self.store.get(k)) for k in cmd[1:])
             if op == b"DBSIZE":
                 return b":%d\r\n" % len(self.store)
+            if op == b"FLUSHALL":
+                self.store.clear()
+                return b"+OK\r\n"
         return b"-ERR unknown command\r\n"
 
     @staticmethod

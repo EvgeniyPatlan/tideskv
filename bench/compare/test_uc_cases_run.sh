@@ -298,6 +298,46 @@ check u7-writer-fail "$(cut -c1-21 "$OUT/U7/tideskv/rep1/done")" "the writer exi
 WRITER_RC=0
 unset -f sleep
 
+# ---- F1: Redis 7.2 reference started the tracked way, the tool run per server, matrices merged ----
+OUT=$TMP/f1 F1_LOG=$TMP/f1.log
+: >"$F1_LOG"
+# shellcheck disable=SC2317
+{
+docker() {
+  echo "docker $*" >>"$F1_LOG"
+  case $* in
+    *"redis-cli PING"*) echo PONG ;;
+    *State.Running*) echo true ;;
+  esac
+  return 0
+}
+_uc_f1_tool() {  # writes the per-server matrix the real tool would
+  local s=${4%%=*}
+  echo "tool $*" >>"$F1_LOG"
+  [[ $F1_TOOL_RC == 0 ]] && python3 - "$s" >"$OUT/$1/matrix.json" <<'PY'
+import json, sys
+s = sys.argv[1]
+print(json.dumps({"ref": "r", "targets": [s], "cases": [{"family": "strings", "case": "c", "ref_accepts": True,
+                                                       "results": {s: {"status": "same"}}}]}))
+PY
+  echo "boom line" >&2
+  return "$F1_TOOL_RC"
+}
+}
+F1_TOOL_RC=0
+uc_dispatch F1 2>/dev/null
+check f1-done "$(cat "$OUT/F1/tideskv/rep1/done") $(cat "$OUT/F1/kvrocks/rep1/done")" "ok ok"
+check f1-redis-no-persistence "$(grep -c 'run -d --name tideskv-bench-redis-test-.* redis-server --save  --appendonly no' "$F1_LOG")" 2
+check f1-redis-removed "$(grep -c 'rm -f tideskv-bench-redis-test-' "$F1_LOG")" 2
+check f1-tool-args "$(grep -c -e '--target tideskv=c-tideskv:6379 --ref tideskv-bench-redis-test-[0-9]*:6379 --cases /f1/f1_cases.txt' "$F1_LOG")" 1
+check f1-merged-targets "$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["targets"]))' "$OUT/F1/matrix.json")" "kvrocks tideskv"
+check f1-levels "$(printf '%s ' "${START_LEVELS[@]}" | grep -c 'tideskv:relaxed kvrocks:relaxed')" 1
+OUT=$TMP/f1f F1_TOOL_RC=1
+uc_dispatch F1 2>/dev/null
+check f1-tool-fail "$(cat "$OUT/F1/tideskv/rep1/done")" "f1_matrix.py failed: boom line"
+check f1-ref-removed-on-failure "$(grep -c 'rm -f tideskv-bench-redis-test-' "$F1_LOG")" 4
+unset -f docker _uc_f1_tool
+
 # ---- start_server's restart timestamps: t0 after docker run, with docker run's duration recorded apart ----
 (
   source "$HERE/lib.sh"

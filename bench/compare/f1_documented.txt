@@ -1,0 +1,38 @@
+# Differences the servers' own documentation describes. A differs/unsupported result on a listed case is shown as
+# "documented". Format: family | case | source | one-line note. Sections: `## kvrocks` (Kvrocks docs or issue tracker URL)
+# and `## tideskv`; `case @CMD` limits a line to results whose first differing command is CMD (a path in this repository). The label is per server: a line under one section never labels the other.
+
+## kvrocks
+zset | zrangebylex with mixed scores | https://kvrocks.apache.org/docs/supported-commands | ZRANGEBYLEX/ZREVRANGEBYLEX/ZREMRANGEBYLEX order by member and disregard scores
+set | spop with count | https://kvrocks.apache.org/docs/supported-commands | SPOP pops in key order, not at random
+set | spop single and missing | https://kvrocks.apache.org/docs/supported-commands | SPOP pops in key order, not at random
+set | srandmember with count | https://kvrocks.apache.org/docs/supported-commands | SRANDMEMBER returns the first N members
+keyspace | dbsize after writes and deletes @DBSIZE | https://kvrocks.apache.org/docs/supported-commands | DBSIZE is updated asynchronously after DBSIZE SCAN
+keyspace | randomkey dbsize @DBSIZE | https://kvrocks.apache.org/docs/supported-commands | DBSIZE is updated asynchronously after DBSIZE SCAN
+keyspace | unlink touch @DBSIZE | https://kvrocks.apache.org/docs/supported-commands | DBSIZE is updated asynchronously after DBSIZE SCAN
+server/info | dbsize and time shape @DBSIZE | https://kvrocks.apache.org/docs/supported-commands | DBSIZE is updated asynchronously after DBSIZE SCAN
+server/info | cluster commands outside cluster mode | https://kvrocks.apache.org/docs/supported-commands | the CLUSTER command is renamed CLUSTERX for changes; CLUSTER only reads topology
+server/info | cluster x commands outside cluster mode | https://kvrocks.apache.org/docs/supported-commands | topology is managed through CLUSTERX
+tracking | client tracking on | https://kvrocks.apache.org/docs/supported-commands | CLIENT TRACKING is marked unsupported
+scripting | script kill with no script running | https://kvrocks.apache.org/docs/supported-commands | SCRIPT KILL is marked unsupported
+list | brpoplpush | https://kvrocks.apache.org/docs/supported-commands | BRPOPLPUSH is marked unsupported (deprecated)
+object | object encoding | https://kvrocks.apache.org/docs/supported-commands | OBJECT ENCODING, FREQ, IDLETIME and REFCOUNT are unsupported
+notifications | keyspace events config | https://github.com/apache/kvrocks/discussions/3533 | keyspace notifications are a design proposal, not built
+keyspace | select database | https://kvrocks.apache.org/docs/namespace | SELECT only switches databases when redis-databases is above 0; namespaces are the isolation feature
+keyspace | select out of range | https://kvrocks.apache.org/docs/namespace | SELECT only switches databases when redis-databases is above 0; namespaces are the isolation feature
+transactions | multi select | https://kvrocks.apache.org/docs/namespace | SELECT only switches databases when redis-databases is above 0; namespaces are the isolation feature
+keyspace | flushdb isolation | https://kvrocks.apache.org/docs/namespace | SELECT only switches databases when redis-databases is above 0; namespaces are the isolation feature
+
+## tideskv
+streams | xadd xlen | docs/tutorial.md#differences-from-redis | Streams are listed as not supported yet
+bitmaps | setbit getbit bitcount | docs/tutorial.md#differences-from-redis | Bitmaps are listed as not supported yet
+hyperloglog | pfadd pfcount | docs/tutorial.md#differences-from-redis | HyperLogLog is listed as not supported yet
+geo | geoadd geodist | docs/tutorial.md#differences-from-redis | Geo is listed as not supported yet
+pubsub | publish | docs/tutorial.md#differences-from-redis | Pub/Sub is listed as not supported yet
+json | json set get | docs/tutorial.md#differences-from-redis | JSON is listed as not supported yet
+search | ft info | docs/tutorial.md#differences-from-redis | Search is listed as not supported yet
+keyspace | copy | docs/tutorial.md#differences-from-redis | COPY is listed as not supported yet
+keyspace | move | docs/tutorial.md#differences-from-redis | MOVE is listed as not supported yet
+keyspace | swapdb | docs/tutorial.md#differences-from-redis | SWAPDB is listed as not supported yet
+object | object encoding | docs/tutorial.md#differences-from-redis | OBJECT is listed as not supported yet
+server/info | client list | docs/tutorial.md#differences-from-redis | CLIENT LIST is listed as not supported yet

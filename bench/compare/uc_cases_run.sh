@@ -22,6 +22,7 @@
 #       the probe container is started before the kill and waits for restart.epoch_ms) and verify.json (acked, lost,
 #       lost_sample, corrupt, corrupt_sample)
 #   U8: summary.json (no server)
+#   F1: matrix.json per server (this server against Redis 7.2, run.log) and, merged over the servers done so far, F1/matrix.json
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes,allocated_bytes,
 # wal_archive_allocated_bytes: columns 2-3 apparent size, 4-5 allocated bytes).
 #   U6 also: fio/fsync.json (+ .log) per server, measured right before that server's sweep
@@ -400,4 +401,47 @@ case_U7() {
       _uc_u7_point "$d" "${sig^^}" "$t" "ack-r$2-$sig-$t-$i-" || return 1
     done
   done
+}
+
+# ---- F1: command matrix against Redis 7.2 (f1_matrix.py, run in PY_IMAGE) ----
+
+# _uc_f1_tool REPDIR ARGS...: f1_matrix.py in a PY_IMAGE container on the bench network, files read-only, REPDIR as /out.
+_uc_f1_tool() {
+  local dir=$1 c=tideskv-bench-f1-$TS-$RANDOM; shift
+  _track "$c"
+  docker run --rm --name "$c" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" -v "$OUT/$dir:/out" \
+    -v "$HERE_RUN/f1_matrix.py:/f1/f1_matrix.py:ro" -v "$HERE_RUN/f1_cases.txt:/f1/f1_cases.txt:ro" \
+    -v "$HERE_RUN/f1_documented.txt:/f1/f1_documented.txt:ro" "$PY_IMAGE" python -I /f1/f1_matrix.py "$@"
+}
+
+# The Redis 7.2 reference (CLI_IMAGE): no persistence, on the server's CPUs. Waits up to 30 s for PING.
+_uc_f1_ref_start() {
+  local i
+  _track "$1"
+  docker run -d --name "$1" --network "$NET" --cpuset-cpus "$SERVER_CPUS" --memory "$SERVER_MEM" "$CLI_IMAGE" \
+    redis-server --save "" --appendonly no >/dev/null || return 1
+  for ((i = 0; i < 30; i++)); do
+    [[ $(docker exec "$1" redis-cli PING 2>/dev/null) == PONG ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# F1: this server (relaxed) and a fresh Redis 7.2 get the same commands (f1_cases.txt); one run is deterministic.
+# Every server's matrix lands in F1/<server>/rep1/matrix.json; F1/matrix.json merges the servers done so far.
+case_F1() {
+  local s=$1 rep=F1/$1/rep$2 ref=tideskv-bench-redis-$TS-$RANDOM rc=0 merged=() f
+  _uc_up "$s" F1 || return 1
+  if _uc_f1_ref_start "$ref"; then
+    _uc_f1_tool "$rep" run --target "$s=$SERVER_CONTAINER:$SERVER_PORT" --ref "$ref:6379" --cases /f1/f1_cases.txt \
+      --documented /f1/f1_documented.txt --out /out/matrix.json >"$OUT/$rep/run.log" 2>&1 || rc=1
+  else
+    rc=2
+  fi
+  docker rm -f "$ref" >/dev/null 2>&1 || true
+  ((rc != 2)) || { _uc_fail "the Redis 7.2 reference did not answer PING"; return 1; }
+  ((rc == 0)) || { _uc_fail "f1_matrix.py failed: $(tail -1 "$OUT/$rep/run.log")"; return 1; }
+  for f in "$OUT"/F1/*/rep*/matrix.json; do merged+=("$f"); done
+  python3 "$HERE_RUN/f1_matrix.py" merge "${merged[@]}" --out "$OUT/F1/matrix.json" \
+    || { _uc_fail "could not merge the F1 matrices"; return 1; }
 }

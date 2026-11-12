@@ -1,0 +1,927 @@
+# F1 command cases: `## <family> | <case>` then one command per line, run on a FLUSHALLed db against Redis 7.2 (the
+# reference) and each server. Directives at the end of a line: #unordered #shape #fields=a,b. `@sleep S` waits.
+# See f1_matrix.py for how replies are compared.
+
+## strings | set get overwrite
+SET a 1
+GET a
+SET a 2
+GET a
+GET missing
+## strings | set nx xx
+SET a 1 NX
+SET a 2 NX
+SET b 1 XX
+SET a 3 XX
+GET a
+## strings | set get option
+SET a 1
+SET a 2 GET
+SET missing 2 GET
+## strings | set keepttl
+SET a 1 EX 1000
+SET a 2 KEEPTTL
+TTL a
+SET a 3
+TTL a
+## strings | set syntax errors
+SET a 1 EX 0
+SET a 1 EX 10 PX 10000
+SET a 1 NX XX
+SET a
+## strings | setex psetex setnx
+SETEX a 1000 v
+GET a
+PSETEX b 100000 v
+GET b
+SETNX c 1
+SETNX c 2
+SETEX d 0 v
+## strings | mset mget msetnx
+MSET a 1 b 2 c 3
+MGET a b missing c
+MSETNX a 9 z 9
+MSETNX x 1 y 2
+MGET x y z
+MSET odd
+## strings | incr decr family
+SET n 10
+INCR n
+DECR n
+INCRBY n 5
+DECRBY n 20
+GET n
+INCR fresh
+## strings | incr errors
+SET s abc
+INCR s
+SET big 9223372036854775807
+INCR big
+SET f 1.5
+INCR f
+INCRBY n notanumber
+## strings | incrbyfloat
+SET f 1.5
+INCRBYFLOAT f 2.25
+INCRBYFLOAT f -0.75
+INCRBYFLOAT new 3
+SET s abc
+INCRBYFLOAT s 1
+## strings | append strlen
+APPEND a hello
+APPEND a " world"
+STRLEN a
+STRLEN missing
+GET a
+## strings | getrange setrange
+SET a "hello world"
+GETRANGE a 0 4
+GETRANGE a -5 -1
+GETRANGE a 5 100
+SETRANGE a 6 redis
+GET a
+SETRANGE pad 3 x
+GET pad
+## strings | getset getdel
+SET a 1
+GETSET a 2
+GETDEL a
+GETDEL a
+GETSET new x
+## strings | getex
+SET a v
+GETEX a EX 1000
+TTL a
+GETEX a PERSIST
+TTL a
+GETEX missing
+## strings | lcs
+SET k1 ohmytext
+SET k2 mynewtext
+LCS k1 k2
+LCS k1 k2 LEN
+## strings | wrong type on string commands
+LPUSH l x
+GET l
+APPEND l x
+INCR l
+STRLEN l
+## strings | binary and empty values
+SET e ""
+GET e
+STRLEN e
+SET bin "a\x00b"
+STRLEN bin
+## strings | large integer and negative range
+SET a 123456789012345678
+INCRBY a 1
+GETRANGE a -3 -1
+SUBSTR a 0 2
+
+## keyspace | del exists multi
+SET a 1
+SET b 2
+EXISTS a b missing a
+DEL a b missing
+EXISTS a
+## keyspace | type of every type
+SET s 1
+LPUSH l 1
+SADD st 1
+ZADD z 1 a
+HSET h f v
+TYPE s
+TYPE l
+TYPE st
+TYPE z
+TYPE h
+TYPE missing
+## keyspace | rename
+SET a 1
+RENAME a b
+GET a
+GET b
+RENAME missing x
+SET c 2
+RENAMENX b c
+RENAMENX b d
+## keyspace | rename keeps ttl
+SET a 1 EX 1000
+RENAME a b
+TTL b
+## keyspace | keys pattern
+MSET user:1 a user:2 b order:1 c
+KEYS user:* #unordered
+KEYS *:1 #unordered
+KEYS user:? #unordered
+KEYS nomatch*
+## keyspace | scan match count
+MSET k1 a k2 b k3 c other d
+SCAN 0 MATCH k* COUNT 100 #unordered
+SCAN 0 COUNT 1000 TYPE string #unordered
+## keyspace | scan bad cursor
+SCAN abc
+SCAN 0 COUNT 0
+## keyspace | randomkey dbsize
+RANDOMKEY
+SET a 1
+RANDOMKEY
+DBSIZE
+## keyspace | unlink touch
+MSET a 1 b 2
+TOUCH a b missing
+UNLINK a b missing
+DBSIZE
+## keyspace | select database
+SET a 1
+SELECT 1
+GET a
+SET a 2
+SELECT 0
+GET a
+## keyspace | select out of range
+SELECT 99
+SELECT abc
+## keyspace | flushdb isolation
+SET a 1
+SELECT 1
+SET b 2
+FLUSHDB
+DBSIZE
+SELECT 0
+DBSIZE
+## keyspace | dbsize after writes and deletes
+MSET a 1 b 2 c 3
+DBSIZE
+DEL a
+DBSIZE
+## keyspace | copy
+SET a 1
+COPY a b
+GET b
+COPY a b
+COPY a b REPLACE
+## keyspace | move
+SET a 1
+MOVE a 1
+EXISTS a
+## keyspace | swapdb
+SET a 1
+SWAPDB 0 1
+DBSIZE
+SWAPDB 0 1
+## keyspace | dump restore
+SET a hello
+DUMP missing
+RESTORE b 0 "\x00\x05hello\x0b\x00\xe1\x01\x00\x00\x00\x00\x00\x00"
+## keyspace | sort
+RPUSH l 3 1 2
+SORT l
+SORT l DESC
+SORT l LIMIT 0 2
+RPUSH w b a
+SORT w ALPHA
+
+## expire | expire ttl persist
+SET a 1
+TTL a
+EXPIRE a 1000
+TTL a
+PERSIST a
+TTL a
+PERSIST a
+TTL missing
+EXPIRE missing 10
+## expire | pexpire pttl
+SET a 1
+PEXPIRE a 100000
+PTTL a #shape
+PTTL missing
+PTTL a
+## expire | expire options
+SET a 1
+EXPIRE a 100 NX
+EXPIRE a 200 NX
+EXPIRE a 300 XX
+EXPIRE a 100 GT
+EXPIRE a 100 LT
+TTL a
+## expire | expire option errors
+SET a 1
+EXPIRE a 100 NX XX
+EXPIRE a 100 GT LT
+EXPIRE a abc
+## expire | expireat in the past deletes
+SET a 1
+EXPIREAT a 1
+EXISTS a
+SET b 1
+PEXPIREAT b 1000
+GET b
+## expire | expiretime exact
+SET a 1
+EXPIREAT a 4102444800
+EXPIRETIME a
+PEXPIRETIME a
+PEXPIREAT a 4102444800123
+PEXPIRETIME a
+EXPIRETIME missing
+SET b 1
+EXPIRETIME b
+## expire | set with px and lazy expiry
+SET a 1 PX 150
+GET a
+@sleep 0.4
+GET a
+EXISTS a
+TTL a
+## expire | set ex keeps value until expiry
+SET a 1 EX 1000
+GET a
+TTL a
+SET a 2
+TTL a
+## expire | expire on collection
+RPUSH l 1 2
+EXPIRE l 1000
+TTL l
+LRANGE l 0 -1
+## expire | expire negative and zero deletes
+SET a 1
+EXPIRE a -1
+EXISTS a
+SET b 1
+EXPIRE b 0
+GET b
+## expire | setex then persist
+SETEX a 1000 v
+PERSIST a
+TTL a
+## expire | ttl after expiry of hash
+HSET h f v
+PEXPIRE h 100
+@sleep 0.4
+HGET h f
+EXISTS h
+TTL h
+
+## hash | hset hget hgetall
+HSET h f1 v1 f2 v2
+HSET h f1 v9
+HGET h f1
+HGET h nope
+HGETALL h #unordered
+HLEN h
+## hash | hmset hmget
+HMSET h a 1 b 2
+HMGET h a nope b
+HSET h
+## hash | hdel hexists
+HSET h a 1 b 2
+HEXISTS h a
+HDEL h a nope
+HEXISTS h a
+HDEL h b
+EXISTS h
+## hash | hkeys hvals
+HSET h a 1 b 2 c 3
+HKEYS h #unordered
+HVALS h #unordered
+HKEYS missing
+## hash | hincrby hincrbyfloat
+HINCRBY h n 5
+HINCRBY h n -2
+HINCRBYFLOAT h f 1.5
+HINCRBYFLOAT h f 0.25
+HSET h s abc
+HINCRBY h s 1
+## hash | hsetnx hstrlen
+HSETNX h a 1
+HSETNX h a 2
+HGET h a
+HSTRLEN h a
+HSTRLEN h nope
+## hash | hrandfield
+HSET h a 1 b 2 c 3
+HRANDFIELD h 3 #unordered
+HRANDFIELD h 10 #unordered
+HRANDFIELD missing
+HRANDFIELD h 0
+## hash | hscan
+HSET h a 1 b 2 c 3
+HSCAN h 0 COUNT 100 #unordered
+HSCAN h 0 MATCH a* COUNT 100 #unordered
+## hash | wrong type
+SET s 1
+HGET s f
+HSET s f v
+HLEN s
+## hash | binary field and empty value
+HSET h "" empty
+HSET h f ""
+HGET h ""
+HGET h f
+HLEN h
+## hash | large hash
+HSET h a 1 b 2 c 3 d 4 e 5 f 6 g 7 h 8 i 9 j 10
+HLEN h
+HGET h j
+HMGET h a e j z
+
+## list | push pop range
+RPUSH l a b c
+LPUSH l z
+LRANGE l 0 -1
+LPOP l
+RPOP l
+LRANGE l 0 -1
+LLEN l
+## list | pop with count
+RPUSH l a b c d
+LPOP l 2
+RPOP l 5
+LPOP l 1
+EXISTS l
+LPOP l 0
+## list | lindex lset
+RPUSH l a b c
+LINDEX l 0
+LINDEX l -1
+LINDEX l 10
+LSET l 1 X
+LRANGE l 0 -1
+LSET l 10 X
+LSET missing 0 X
+## list | linsert
+RPUSH l a b c
+LINSERT l BEFORE b X
+LINSERT l AFTER c Y
+LINSERT l BEFORE nope Z
+LINSERT missing BEFORE a x
+LRANGE l 0 -1
+## list | lrem ltrim
+RPUSH l a b a c a
+LREM l 2 a
+LRANGE l 0 -1
+LREM l -1 c
+LTRIM l 0 0
+LRANGE l 0 -1
+## list | lpushx rpushx
+LPUSHX l a
+RPUSH l a
+LPUSHX l b
+RPUSHX l c
+LRANGE l 0 -1
+## list | lpos
+RPUSH l a b c b
+LPOS l b
+LPOS l b RANK 2
+LPOS l b COUNT 0
+LPOS l z
+## list | lmove rpoplpush
+RPUSH src a b c
+LMOVE src dst LEFT RIGHT
+RPOPLPUSH src dst
+LRANGE dst 0 -1
+LRANGE src 0 -1
+LMOVE src dst UP DOWN
+## list | brpoplpush
+RPUSH src a
+BRPOPLPUSH src dst 1
+LRANGE dst 0 -1
+BRPOPLPUSH src dst 0.1
+## list | blpop brpop immediate and timeout
+RPUSH l a b
+BLPOP l 1
+BRPOP l 1
+BLPOP l 0.1
+BLPOP missing other 0.1
+## list | lmpop blmpop
+RPUSH l a b c
+LMPOP 1 l LEFT COUNT 2
+LMPOP 2 missing l RIGHT
+LMPOP 1 missing LEFT
+BLMPOP 0.1 1 missing LEFT
+## list | wrong type
+SET s 1
+LPUSH s a
+LRANGE s 0 -1
+LLEN s
+## list | long list and negative ranges
+RPUSH l 1 2 3 4 5 6 7 8 9 10
+LRANGE l -3 -1
+LRANGE l 3 100
+LRANGE l 5 2
+LTRIM l 2 -3
+LRANGE l 0 -1
+
+## set | sadd smembers scard
+SADD s a b c
+SADD s c d
+SMEMBERS s #unordered
+SCARD s
+SCARD missing
+## set | srem sismember smismember
+SADD s a b c
+SREM s a nope
+SISMEMBER s a
+SISMEMBER s b
+SMISMEMBER s a b nope
+## set | set algebra
+SADD a 1 2 3
+SADD b 2 3 4
+SINTER a b #unordered
+SUNION a b #unordered
+SDIFF a b #unordered
+SINTER a missing
+SDIFF a missing #unordered
+## set | set algebra store
+SADD a 1 2 3
+SADD b 2 3 4
+SINTERSTORE d a b
+SUNIONSTORE u a b
+SDIFFSTORE f a b
+SMEMBERS d #unordered
+SCARD u
+SMEMBERS f #unordered
+## set | smove
+SADD a 1 2
+SADD b 3
+SMOVE a b 1
+SMOVE a b nope
+SMEMBERS b #unordered
+## set | spop with count
+SADD s a b c
+SADD o a b c
+SPOP s 2 #length
+SCARD s
+SDIFF s o
+SPOP s 10 #length
+EXISTS s
+SPOP s
+## set | spop single and missing
+SADD s only
+SPOP s
+SPOP s
+SPOP s 0
+## set | srandmember with count
+SADD s a b c
+SRANDMEMBER s 3 #unordered
+SRANDMEMBER s 10 #unordered
+SRANDMEMBER missing
+SRANDMEMBER missing 5
+SRANDMEMBER s 0
+## set | sintercard
+SADD a 1 2 3
+SADD b 2 3 4
+SINTERCARD 2 a b
+SINTERCARD 2 a b LIMIT 1
+SINTERCARD 0 a
+## set | sscan
+SADD s a b c d
+SSCAN s 0 COUNT 100 #unordered
+SSCAN s 0 MATCH a COUNT 100 #unordered
+## set | wrong type
+SET s 1
+SADD s a
+SMEMBERS s
+SCARD s
+SADD l x
+SINTER l s
+## set | integers and strings mixed
+SADD s 1 2 a 10 b
+SMEMBERS s #unordered
+SISMEMBER s 10
+SISMEMBER s 010
+
+## zset | zadd zrange withscores
+ZADD z 1 a 2 b 3 c
+ZADD z 2 a
+ZRANGE z 0 -1 WITHSCORES
+ZRANGE z 0 -1
+ZCARD z
+## zset | zadd flags
+ZADD z 1 a
+ZADD z NX 2 a
+ZADD z XX 2 b
+ZADD z XX CH 5 a
+ZADD z GT CH 3 a
+ZADD z LT CH 3 a
+ZADD z INCR 1 a
+ZRANGE z 0 -1 WITHSCORES
+## zset | zadd errors
+ZADD z NX XX 1 a
+ZADD z abc a
+ZADD z 1
+ZADD z NX GT 1 a
+## zset | zrange byscore rev limit
+ZADD z 1 a 2 b 3 c 4 d
+ZRANGE z 2 3 BYSCORE
+ZRANGE z 3 2 BYSCORE REV
+ZRANGE z -inf +inf BYSCORE LIMIT 1 2
+ZRANGE z (1 (4 BYSCORE
+ZRANGE z 0 -1 REV
+## zset | zrangebyscore zrevrange family
+ZADD z 1 a 2 b 3 c
+ZRANGEBYSCORE z 1 2 WITHSCORES
+ZRANGEBYSCORE z (1 +inf
+ZREVRANGEBYSCORE z 3 2
+ZREVRANGE z 0 -1 WITHSCORES
+ZRANGEBYSCORE z 1 3 LIMIT 1 1
+## zset | zrank zscore zmscore
+ZADD z 1 a 2 b 3 c
+ZRANK z b
+ZREVRANK z b
+ZRANK z nope
+ZSCORE z c
+ZSCORE z nope
+ZMSCORE z a nope c
+ZRANK z b WITHSCORE
+## zset | zincrby zcount
+ZINCRBY z 5 a
+ZINCRBY z -2.5 a
+ZADD z 1 b 2 c
+ZCOUNT z -inf +inf
+ZCOUNT z (1 2
+ZSCORE z a
+## zset | zrem and range removals
+ZADD z 1 a 2 b 3 c 4 d 5 e
+ZREM z a nope
+ZREMRANGEBYRANK z 0 0
+ZREMRANGEBYSCORE z 3 4
+ZRANGE z 0 -1
+ZREMRANGEBYLEX z - +
+EXISTS z
+## zset | zunionstore zinterstore
+ZADD a 1 x 2 y
+ZADD b 10 y 20 z
+ZUNIONSTORE u 2 a b
+ZRANGE u 0 -1 WITHSCORES
+ZINTERSTORE i 2 a b WEIGHTS 2 3 AGGREGATE MAX
+ZRANGE i 0 -1 WITHSCORES
+ZUNIONSTORE m 2 a b AGGREGATE MIN
+ZRANGE m 0 -1 WITHSCORES
+## zset | zdiff zunion zinter
+ZADD a 1 x 2 y
+ZADD b 10 y 20 z
+ZDIFF 2 a b
+ZUNION 2 a b WITHSCORES
+ZINTER 2 a b WITHSCORES
+## zset | zpopmin zpopmax
+ZADD z 1 a 2 b 3 c
+ZPOPMIN z
+ZPOPMAX z 5
+ZPOPMIN z
+ZPOPMAX z 0
+## zset | bzpopmin and zmpop
+ZADD z 1 a 2 b
+BZPOPMIN z 1
+BZPOPMAX missing 0.1
+ZMPOP 1 z MIN COUNT 5
+ZMPOP 1 missing MAX
+## zset | zrandmember
+ZADD z 1 a 2 b 3 c
+ZRANDMEMBER z 3 #unordered
+ZRANDMEMBER z 10 WITHSCORES #unordered
+ZRANDMEMBER missing
+## zset | lex range with equal scores
+ZADD z 0 a 0 b 0 c 0 d
+ZRANGEBYLEX z - +
+ZRANGEBYLEX z [b (d
+ZLEXCOUNT z [a [c
+ZREVRANGEBYLEX z + -
+ZRANGEBYLEX z - + LIMIT 1 2
+## zset | zrangebylex with mixed scores
+ZADD z 3 a 1 b 2 c 0 d
+ZRANGEBYLEX z - +
+ZRANGEBYLEX z [b [c
+ZLEXCOUNT z - +
+ZREMRANGEBYLEX z [a [b
+ZRANGE z 0 -1 WITHSCORES
+## zset | infinite and float scores
+ZADD z inf a -inf b 1.5 c
+ZRANGE z 0 -1 WITHSCORES
+ZSCORE z a
+ZINCRBY z 1 c
+ZADD z nan d
+## zset | zrangestore
+ZADD z 1 a 2 b 3 c
+ZRANGESTORE d z 0 1
+ZRANGE d 0 -1 WITHSCORES
+ZRANGESTORE e z 5 10
+EXISTS e
+## zset | wrong type
+SET s 1
+ZADD s 1 a
+ZRANGE s 0 -1
+ZCARD s
+## zset | zscan
+ZADD z 1 a 2 b 3 c
+ZSCAN z 0 COUNT 100 #unordered
+ZSCAN z 0 MATCH b COUNT 100 #unordered
+
+## transactions | multi exec
+MULTI
+SET a 1
+INCR a
+GET a
+EXEC
+## transactions | discard
+MULTI
+SET a 1
+DISCARD
+GET a
+DISCARD
+## transactions | exec without multi
+EXEC
+## transactions | nested multi
+MULTI
+MULTI
+DISCARD
+## transactions | queue error aborts exec
+MULTI
+SET a 1
+BADCOMMAND
+SET b 2
+EXEC
+GET a
+## transactions | wrong arity in queue aborts exec
+MULTI
+SET a
+EXEC
+## transactions | runtime error inside exec
+SET s abc
+MULTI
+INCR s
+SET b 2
+EXEC
+GET b
+## transactions | watch unchanged then exec
+SET a 1
+WATCH a
+MULTI
+SET a 2
+EXEC
+GET a
+## transactions | watch then unwatch
+WATCH a
+UNWATCH
+MULTI
+SET a 1
+EXEC
+## transactions | watch inside multi
+MULTI
+WATCH a
+DISCARD
+## transactions | multi with expire and multi key
+MULTI
+MSET a 1 b 2
+EXPIRE a 1000
+TTL a
+EXEC
+## transactions | exec returns nested types
+MULTI
+RPUSH l a b
+LRANGE l 0 -1
+HSET h f v
+HGETALL h
+ZADD z 1 m
+ZRANGE z 0 -1 WITHSCORES
+EXEC
+## transactions | blocking command inside multi
+MULTI
+BLPOP l 0
+EXEC
+## transactions | multi select
+MULTI
+SELECT 1
+SET a 1
+EXEC
+SELECT 0
+GET a
+
+## scripting | eval return types
+EVAL "return 1" 0
+EVAL "return 'x'" 0
+EVAL "return {1,2,'a'}" 0
+EVAL "return nil" 0
+EVAL "return true" 0
+EVAL "return false" 0
+EVAL "return {ok='fine'}" 0
+## scripting | eval keys and argv
+EVAL "return {KEYS[1], ARGV[1], ARGV[2]}" 1 k a b
+EVAL "return #KEYS" 0
+EVAL "return KEYS[1]" 1
+## scripting | redis call get set
+EVAL "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])" 1 k v
+GET k
+## scripting | redis call error and pcall
+SET s abc
+EVAL "return redis.call('INCR', KEYS[1])" 1 s
+EVAL "return redis.pcall('INCR', KEYS[1])" 1 s
+EVAL "return redis.call('NOSUCHCMD')" 0
+## scripting | number conversion
+EVAL "return 3.99" 0
+EVAL "return -3.99" 0
+EVAL "return {1.5, 2}" 0
+EVAL "return 2^53" 0
+## scripting | evalsha script load exists flush
+SCRIPT LOAD "return 42"
+EVALSHA 1fa00e76656cc152ad327c13fe365858fd7be306 0
+SCRIPT EXISTS 1fa00e76656cc152ad327c13fe365858fd7be306 0000000000000000000000000000000000000000
+SCRIPT FLUSH
+EVALSHA 1fa00e76656cc152ad327c13fe365858fd7be306 0
+## scripting | evalsha unknown
+EVALSHA ffffffffffffffffffffffffffffffffffffffff 0
+## scripting | eval ro
+EVAL_RO "return redis.call('GET', KEYS[1])" 1 k
+EVAL_RO "return redis.call('SET', KEYS[1], 1)" 1 k
+## scripting | helper functions
+EVAL "return redis.sha1hex('abc')" 0
+EVAL "return redis.error_reply('MYERR boom')" 0
+EVAL "return redis.status_reply('FINE')" 0
+EVAL "return type(redis.REDIS_VERSION)" 0
+## scripting | stdlib in sandbox
+EVAL "return cjson.encode({1,2,3})" 0
+EVAL "return cjson.decode('[1,2]')[2]" 0
+EVAL "return bit.band(7, 3)" 0
+EVAL "return cmsgpack.pack(1)" 0
+## scripting | globals are protected
+EVAL "x = 1; return x" 0
+EVAL "return os.time()" 0
+EVAL "return loadstring('return 1')()" 0
+## scripting | script syntax error
+EVAL "return +" 0
+EVAL "error('boom')" 0
+## scripting | eval negative numkeys
+EVAL "return 1" -1
+EVAL "return 1" 5 a
+## scripting | script kill with no script running
+SCRIPT KILL
+## scripting | function list and fcall
+FUNCTION LIST
+FCALL nosuchfn 0
+## scripting | script debug and unknown subcommand
+SCRIPT NOSUCH
+
+## server/info | ping echo
+PING
+PING hello
+ECHO hello
+ECHO
+## server/info | dbsize and time shape
+DBSIZE
+TIME #shape
+## server/info | info replication fields
+INFO replication #fields=role,connected_slaves
+## server/info | info sections exist
+INFO server #shape
+INFO nosuchsection
+## server/info | config get databases
+CONFIG GET databases
+CONFIG GET nosuchparam
+## server/info | config set and get a shared parameter
+CONFIG SET maxclients 5000
+CONFIG GET maxclients
+## server/info | config set errors
+CONFIG SET nosuchparam 1
+CONFIG SET maxclients abc
+## server/info | client setname getname
+CLIENT SETNAME myconn
+CLIENT GETNAME
+CLIENT GETNAME
+## server/info | client id shape
+CLIENT ID #shape
+## server/info | client info
+CLIENT INFO #shape
+## server/info | client list
+CLIENT LIST #shape
+## server/info | client unknown subcommand
+CLIENT NOSUCH
+## server/info | hello 2
+HELLO 2 #shape
+## server/info | role
+ROLE #shape
+## server/info | command count and info
+COMMAND COUNT #shape
+COMMAND INFO get #shape
+COMMAND GETKEYS SET a 1
+## server/info | command docs
+COMMAND DOCS get #shape
+## server/info | slowlog
+SLOWLOG LEN
+SLOWLOG RESET
+SLOWLOG GET 1
+## server/info | latency and memory
+MEMORY USAGE missing
+MEMORY USAGE nosuch
+LATENCY LATEST
+## server/info | reset and quit
+RESET
+QUIT
+## server/info | auth without password
+AUTH secret
+AUTH user secret
+## server/info | wait
+WAIT 0 0
+## server/info | cluster commands outside cluster mode
+CLUSTER INFO
+CLUSTER MYID
+## server/info | cluster x commands outside cluster mode
+CLUSTERX VERSION
+## server/info | debug and lolwut
+DEBUG NOSUCH
+## server/info | unknown command and arity
+NOSUCHCOMMAND
+GET
+GET a b
+## server/info | lastsave and bgsave
+LASTSAVE #shape
+BGSAVE #shape
+## server/info | flushall flushdb async
+SET a 1
+FLUSHDB ASYNC
+DBSIZE
+SET a 1
+FLUSHALL SYNC
+DBSIZE
+
+## streams | xadd xlen
+XADD s 1-1 a 1
+XLEN s
+XRANGE s - +
+## bitmaps | setbit getbit bitcount
+SETBIT b 7 1
+GETBIT b 7
+BITCOUNT b
+## hyperloglog | pfadd pfcount
+PFADD h a b c
+PFCOUNT h
+## geo | geoadd geodist
+GEOADD g 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+GEODIST g Palermo Catania km
+## pubsub | publish
+PUBLISH ch hello
+PUBSUB NUMSUB ch
+## json | json set get
+JSON.SET k $ '{"a":1}'
+JSON.GET k
+## search | ft info
+FT.INFO idx
+## bloom | bf add
+BF.ADD bf a
+BF.EXISTS bf a
+
+## notifications | keyspace events config
+CONFIG SET notify-keyspace-events KEA
+CONFIG GET notify-keyspace-events
+## tracking | client tracking on
+CLIENT TRACKING ON
+CLIENT TRACKING OFF
+## object | object encoding
+SET a 1
+OBJECT ENCODING a
+RPUSH l a
+OBJECT ENCODING l
+SADD s 1
+OBJECT ENCODING s

@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uc_cells  # noqa: E402
@@ -25,6 +26,27 @@ def memtier(ops, p99=1.0, p999=2.0, sets=100, gets=900, set_rx=None, misses=0.0,
     return {"configuration": {"rate_limit": rate, "clients": clients, "threads": threads, "ratio": "1:9", "data_size": 1024,
                               "key_pattern": "R:R", "key_maximum": 1000, "pipeline": 1, "test_time": 30, "expiry_range": "0:0"},
             "ALL STATS": {"Sets": s_sec, "Gets": g_sec, "Totals": totals}}
+
+
+def _res(status, **kw):
+    return dict({"status": status, "documented": None, "error_text_differs": False}, **kw)
+
+
+F1_MATRIX = {
+    "ref": "redis 7.2.5 at r:6379", "targets": ["tideskv", "kvrocks"],
+    "cases": [
+        {"family": "strings", "case": "c1", "ref_accepts": True, "results": {"tideskv": _res("same"), "kvrocks": _res("same")}},
+        {"family": "strings", "case": "c2", "ref_accepts": True, "results": {
+            "tideskv": _res("same"), "kvrocks": _res("differs", command="GET a", ref='"1"', got='"2"')}},
+        {"family": "zset", "case": "lex", "ref_accepts": True, "results": {
+            "tideskv": _res("same"), "kvrocks": _res("differs", command="ZRANGEBYLEX z - +", ref="[]", got="[a]",
+                                                     documented={"url": "https://kvrocks.apache.org/x", "note": "lex ignores scores"})}},
+        {"family": "streams", "case": "xadd", "ref_accepts": True, "results": {
+            "tideskv": _res("same"), "kvrocks": _res("unsupported", command="XADD s 1-1 a 1", ref=":1", got="-ERR unknown command")}},
+        {"family": "json", "case": "json set", "ref_accepts": False, "results": {
+            "tideskv": _res("same"), "kvrocks": _res("extra", command="JSON.SET k", ref="-ERR unknown command", got="+OK")}},
+    ],
+}
 
 
 class Run:
@@ -136,11 +158,19 @@ class ReportTest(unittest.TestCase):
         for rep in (1, 2):
             run.cell("U6", "tideskv", rep, "c64", memtier(10, sets=100, gets=0)); run.cell("U6", "kvrocks", rep, "c64", memtier(9, sets=100, gets=0))
             run.done("U6", "tideskv", rep); run.done("U6", "kvrocks", rep)
-        s, text = run.report()
+        with tempfile.TemporaryDirectory() as empty, mock.patch.object(uc_report, "HERE", empty):  # no f2_operations.md anywhere
+            s, text = run.report()
         rows = [l for l in text.split("## Summary")[1].split("## Pros")[0].splitlines() if l.startswith("| U")]
         self.assertEqual([r.split(" | ")[0] for r in rows], ["| U4", "| U6"])
         self.assertIn("F1 not run", text)
         self.assertIn("F2 not run", text)
+
+    def test_f2_defaults_to_the_file_next_to_the_tool(self):
+        run = Run(self)
+        u4(run, 1000, 500)
+        _, text = run.report()
+        self.assertIn("| Backup and restore |", text.split("## F2")[1])
+        self.assertIn("pre-1.0", text.split("## F2")[1])
 
     def test_verdict_uses_best_kvrocks(self):
         run = Run(self)
@@ -256,11 +286,32 @@ class ReportTest(unittest.TestCase):
     def test_f1_f2_sections_when_present(self):
         run = Run(self)
         u4(run, 1000, 500)
-        run.write("F1/matrix.json", json.dumps({"families": {"strings": "ok"}}))
+        run.write("F1/matrix.json", json.dumps(F1_MATRIX))
         run.write("f2_operations.md", "| Topic | TidesKV |\n|---|---|\n| backup | x |")
         _, text = run.report()
         self.assertNotIn("F1 not run", text)
         self.assertIn("| backup | x |", text)
+        f1 = text.split("## F1")[1].split("## F2")[0]
+        self.assertIn("| strings | 2 | same 2 / differs 0 / unsupported 0 / documented 0 | same 1 / differs 1 / unsupported 0 / documented 0 |", f1)
+        self.assertIn("| zset | 1 | same 1 / differs 0 / unsupported 0 / documented 0 | same 0 / differs 1 / unsupported 0 / documented 1 |", f1)
+        self.assertIn("| Streams | `xadd` | yes | yes | no |", f1)
+        self.assertIn("| JSON | `json set` | no | no | yes |", f1)
+        self.assertIn("| strings | c2 | Kvrocks | differs | `GET a` | \"1\" | \"2\" | undocumented |", f1)
+        self.assertIn("documented: [lex ignores scores](https://kvrocks.apache.org/x)", f1)
+        self.assertIn("not a difference (Redis 7.2 lacks it)", f1)
+
+    def test_f1_pros_and_cons_in_a_full_run(self):
+        run = Run(self)
+        u4(run, 1000, 500)
+        run.write("F1/matrix.json", json.dumps(F1_MATRIX))
+        _, text = run.report()
+        pros = text.split("## Pros and cons")[1].split("## Per-case")[0]
+        tides_pros = pros.split("**TidesKV pros**")[1].split("**TidesKV cons**")[0]
+        kv_pros = pros.split("**Kvrocks pros**")[1].split("**Kvrocks cons**")[0]
+        self.assertIn("F1 strings: TidesKV matches Redis 7.2 on all 2 cases", tides_pros)
+        self.assertIn("F1 type: TidesKV has Streams, Kvrocks does not", tides_pros)
+        self.assertNotIn("zset", tides_pros + kv_pros)  # Kvrocks' only difference there is documented
+        self.assertIn("F1 type: Kvrocks has JSON, TidesKV does not", kv_pros)
 
 
 if __name__ == "__main__":
