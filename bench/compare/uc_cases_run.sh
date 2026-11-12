@@ -22,7 +22,9 @@
 #       the probe container is started before the kill and waits for restart.epoch_ms) and verify.json (acked, lost,
 #       lost_sample, corrupt, corrupt_sample)
 #   U8: summary.json (no server)
-# du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes).
+# du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes,allocated_bytes,
+# wal_archive_allocated_bytes: columns 2-3 apparent size, 4-5 allocated bytes).
+#   U6 also: fio/fsync.json (+ .log) per server, measured right before that server's sweep
 # shellcheck disable=SC2034  # UC_RATE is read by uc_phase
 
 _uc_fail() { UC_FAIL_REASON=$1; log "${CUR:-}: $1"; return 1; }
@@ -228,12 +230,14 @@ case_U2() {
   _uc_dbsize_end "$rep"
 }
 
-# U6: strict durability, fixed preload, closed-loop connection sweep with at most 10 s of warm-up per cell.
+# U6: strict durability, fixed preload, a fio fsync floor per server, closed-loop connection sweep with at most 10 s of warm-up per cell.
 case_U6() {
   local rep=U6/$1/rep$2 ph
   _uc_up "$1" U6 || return 1
   _uc_load U6 "$rep" load "$U6_KEYS" || return 1
   _uc_settle_du "$rep" load || return 1
+  # the disk's fsync floor drifts (R24): measure it right before this server's sweep, into the rep dir
+  run_fio_fsync "$OUT/$rep/fio"
   for ph in $(uc_phases U6); do
     UC_CELL_WARMUP=$((UC_WARMUP < 10 ? UC_WARMUP : 10)) UC_CELL_DURATION=$UC_U6_S _uc_cell U6 "$rep" "$ph" || return 1
   done
@@ -262,8 +266,11 @@ def text(path):
 def du(path):
     if not os.path.exists(path):
         return None
-    _, total, wal = text(path).splitlines()[1].split(",")
-    return {"bytes": int(total), "wal_archive_bytes": int(wal)}
+    row = [int(x) for x in text(path).splitlines()[1].split(",")]
+    out = {"bytes": row[1], "wal_archive_bytes": row[2]}
+    if len(row) >= 5:  # allocated bytes, appended last by the du sampler
+        out.update(allocated_bytes=row[3], wal_archive_allocated_bytes=row[4])
+    return out
 
 secs = float(text(os.path.join(u1, "load.seconds")))
 settle = text(os.path.join(u1, "settle-load")).split()

@@ -58,28 +58,34 @@ uc_cell() {
   [[ $(head -1 "$OUT/$name.status") == ok ]]
 }
 
-# epoch_s,bytes,wal_archive_bytes every INTERVAL seconds until the shell exits; Kvrocks' archive/ WAL dir feeds the
-# third column (no such dir under TidesKV: 0).
+# DU_HEADER every INTERVAL seconds until the shell exits. Columns 2 and 3 are apparent sizes (du -sb); Kvrocks' archive/
+# WAL dir feeds column 3 (no such dir under TidesKV: 0). Columns 4 and 5 are the same two figures as allocated bytes
+# (du --block-size=1: what the filesystem really holds, since TidesKV's files are preallocated) and were appended last
+# so that older readers keep their column indexes.
+DU_HEADER="epoch_s,bytes,wal_archive_bytes,allocated_bytes,wal_archive_allocated_bytes"
 uc_du_sampler() {
   local dir=$1 every=$2 csv=$3
-  echo "epoch_s,bytes,wal_archive_bytes" >"$csv"
+  echo "$DU_HEADER" >"$csv"
   while kill -0 $$ 2>/dev/null; do
     uc_du_row "$dir" >>"$csv"
     sleep "$every"
   done
 }
 
-# One "epoch_s,bytes,wal_archive_bytes" row for DIR now.
+# One DU_HEADER row for DIR now.
 uc_du_row() {
-  local dir=$1 total wal=0 a
+  local dir=$1 total alloc wal=0 wal_alloc=0 a
   total=$(du -sb "$dir" 2>/dev/null | cut -f1) || total=0
-  while read -r a; do wal=$((wal + $(du -sb "$a" 2>/dev/null | cut -f1))); done \
-    < <(find "$dir" -maxdepth 4 -type d -name archive 2>/dev/null)
-  echo "$(date +%s),${total:-0},$wal"
+  alloc=$(du -s --block-size=1 "$dir" 2>/dev/null | cut -f1) || alloc=0
+  while read -r a; do
+    wal=$((wal + $(du -sb "$a" 2>/dev/null | cut -f1)))
+    wal_alloc=$((wal_alloc + $(du -s --block-size=1 "$a" 2>/dev/null | cut -f1)))
+  done < <(find "$dir" -maxdepth 4 -type d -name archive 2>/dev/null)
+  echo "$(date +%s),${total:-0},$wal,${alloc:-0},$wal_alloc"
 }
 
 # The sampler's header and one row: the du-after-* files of the cases.
-uc_du_snapshot() { echo "epoch_s,bytes,wal_archive_bytes"; uc_du_row "$1"; }
+uc_du_snapshot() { echo "$DU_HEADER"; uc_du_row "$1"; }
 
 # _uc_mark_done REPDIR TEXT [FILE]: FILE (default done) in $OUT/REPDIR holds TEXT.
 _uc_mark_done() { echo "$2" >"$OUT/$1/${3:-done}"; }

@@ -128,9 +128,12 @@ head -c 4096 /dev/zero >"$TMP/d/sub/archive/w"
 head -c 8192 /dev/zero >"$TMP/d/sub/other/f"
 uc_du_sampler "$TMP/d" 0.2 "$TMP/du.csv" & dpid=$!
 sleep 0.7; kill "$dpid" 2>/dev/null || true; wait "$dpid" 2>/dev/null || true
-check du-header "$(head -1 "$TMP/du.csv")" "epoch_s,bytes,wal_archive_bytes"
+check du-header "$(head -1 "$TMP/du.csv")" "epoch_s,bytes,wal_archive_bytes,allocated_bytes,wal_archive_allocated_bytes"
 last=$(tail -1 "$TMP/du.csv")
-check du-row "$([[ $last =~ ^[0-9]+,[0-9]+,4096$ ]] && echo y)" y
+# columns 1-3 keep their meaning (apparent size); the allocated twins are appended (R22)
+check du-row "$([[ $last =~ ^[0-9]+,[0-9]+,4096,[0-9]+,[0-9]+$ ]] && echo y)" y
+IFS=, read -r _ apparent _ alloc wal_alloc <<<"$last"
+check du-allocated-is-blocks "$((alloc % 512 == 0 && alloc >= apparent && wal_alloc >= 4096 && wal_alloc <= alloc)) $(( ${#alloc} > 0 ))" "1 1"
 mkdir -p "$TMP/t"
 uc_du_sampler "$TMP/t" 0.2 "$TMP/du2.csv" & dpid=$!
 sleep 0.5; kill "$dpid" 2>/dev/null || true; wait "$dpid" 2>/dev/null || true

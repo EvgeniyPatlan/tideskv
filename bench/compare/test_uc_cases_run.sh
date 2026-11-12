@@ -85,7 +85,7 @@ check u3-done "$(cat "$OUT/U3/tideskv/rep1/done") $(cat "$OUT/U3/kvrocks/rep1/do
 check u3-closed-done "$(cat "$OUT/U3/kvrocks/rep1/closed.done")" ok
 check u3-rates-file "$(cat "$OUT/U3/kvrocks/rep1/open.rates")" "100 200 300"
 check u3-open-rate-arg "$(printf '%s\n' "${MT_LOG[@]}" | grep -c '^tideskv:open50 .*--rate-limiting=200')" 1
-check u3-age-du "$(head -1 "$OUT/U3/tideskv/rep1/du-after-age")" "epoch_s,bytes,wal_archive_bytes"
+check u3-age-du "$(head -1 "$OUT/U3/tideskv/rep1/du-after-age")" "epoch_s,bytes,wal_archive_bytes,allocated_bytes,wal_archive_allocated_bytes"
 check u3-files "$(count_files "$OUT/U3/tideskv/rep1" load.seconds reload.seconds settle-load settle-age du-after-load \
   load reload age.json reload-age.json age.seconds)" 10
 check u3-closed-seconds "$(printf '%s\n' "${MT_LOG[@]}" | grep '^kvrocks:closed ' | grep -o -- '--test-time=[0-9]*')" \
@@ -143,7 +143,7 @@ import json
 t = json.load(open('$OUT/U8/tideskv/rep1/summary.json'))
 k = json.load(open('$OUT/U8/kvrocks/rep1/summary.json'))
 print(t['load_ops_per_s'], t['load_keys'], t['settle_load_s'], t['kvrocks_after_compact'], k['kvrocks_after_compact'] is not None,
-      sorted(t['du_after_age']), t['du_after_load']['bytes'] >= 0)")" "250 1000 0 None True ['bytes', 'wal_archive_bytes'] True"
+      sorted(t['du_after_age']), t['du_after_load']['bytes'] >= 0)")" "250 1000 0 None True ['allocated_bytes', 'bytes', 'wal_archive_allocated_bytes', 'wal_archive_bytes'] True"
 rm -rf "$OUT/U8"
 mv "$OUT/U3" "$OUT/U3.away"
 uc_dispatch U8 2>/dev/null
@@ -210,10 +210,14 @@ check u2-dbsize-recorded "$(cat "$OUT/U2/kvrocks/rep1/dbsize-end") $(cat "$OUT/U
 check u2-value-size "$(cat "$OUT/U2/kvrocks/rep1/value-size")" 1024
 unset -f sleep
 SCAN_TRACK=""; rm -f "$TMP/scanwait"
-EV=() START_LEVELS=()
+EV=() START_LEVELS=() FIO_DIRS=()
 OUT=$TMP/u6
+# R24: the fsync floor is measured before each server's sweep, into that server's rep dir
+# shellcheck disable=SC2317
+run_fio_fsync() { FIO_DIRS+=("${1#"$OUT"/}"); EV+=("$CUR:fio"); }
 uc_dispatch U6 2>/dev/null
-check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
+check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:fio tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:fio kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
+check u6-fio-dirs "${FIO_DIRS[*]}" "U6/tideskv/rep1/fio U6/kvrocks/rep1/fio"
 check u6-strict "${START_LEVELS[*]}" "tideskv:strict kvrocks:strict"
 check u6-done "$(cat "$OUT/U6/tideskv/rep1/done")" ok
 check u6-load-pipeline-recorded "$(cat "$OUT/U6/tideskv/rep1/load.pipeline")" 32
