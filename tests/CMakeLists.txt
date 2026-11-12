@@ -190,6 +190,10 @@ add_test(NAME bench_workloads
   COMMAND bash bench/compare/test_workloads.sh
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
+add_test(NAME bench_workloads_cases
+  COMMAND bash bench/compare/test_workloads_cases.sh
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
 option(TIDESKV_COMPAT "Run the Go compatibility suites (needs Go >= 1.22; first run downloads modules)" OFF)
 find_program(GO_EXECUTABLE go)
 if(TIDESKV_COMPAT AND NOT GO_EXECUTABLE)
