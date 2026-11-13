@@ -224,25 +224,29 @@ Measured on the dev host (i9-12900HK, NVMe) in quick mode:
 | U8, F1 | under 1 min |
 | Whole run | 2 h 23 min (22:19 to 00:42 UTC, including the fio baselines and image checks) |
 
+A later quick check of U1, U3, U5, U7 and U8 alone, after the U7 load-point change, took: fio random-read baseline 35 s,
+U1 4 min, U3 11 min, U5 9 min, U7 13 min (TidesKV 4.5 min, Kvrocks 8 min), U8 under 1 s; each U6 server adds about 1 min
+for its two fio jobs at full-mode settings.
+
 The quick run is a check of the suite, not a measurement: its data fits in the page cache.
 
-A full run is estimated at about 50 h (roughly 2 days); the first full run measures it. The estimate is rough, +-20%,
+A full run is estimated at about 46 h (roughly 2 days); the first full run measures it. The estimate is rough, +-20%,
 and built from these components. "Derived" means computed from the full-mode constants in `uc_cases.sh`;
 "extrapolated" means scaled from the quick run's timings.
 
 | Case | Estimate | Basis |
 |---|---|---|
-| U1 | 3.2 h | extrapolated: per server and repetition about 32 min (two closed phases of 4 min, three open phases of 4 min, two loads of 40M keys, settles), 6 server-repetitions |
+| U1 | 2.6 h | extrapolated: per server and repetition about 25 min (two closed phases of 4 min, three open phases of 4 min, two loads of 20M keys at 1-2 min each from the quick run's 6.5-11.6 s per 2M keys, settles), 6 server-repetitions, plus 4 min for the fio random-read baseline |
 | U2 | 13.5 h | derived: (3600 s churn + 1800 s idle) x 3 configurations x 3 repetitions; excludes load and settle time |
 | U3 | 12 h | derived and extrapolated: 3600 s closed + 3 x 600 s open = 90 min per server and repetition, plus about 30 min of loads and aging, 6 server-repetitions |
 | U4 | 1 h | extrapolated: about 10 min per server and repetition |
 | U5 | 5 h | extrapolated: three value sizes, each loaded and run for 4 min, 9 server-repetitions |
-| U6 | 3 h | extrapolated: the quick run's strict preload of 1M keys took 21 min (TidesKV) and 38 min (Kvrocks), times 3 repetitions, plus 4 sweep steps of 60 s |
-| U7 | 12 h | extrapolated: the 2M-key strict preload is twice U6's, about 42 and 76 min per repetition (5.9 h in all); derived: 30 kill runs per server and repetition (writes of 10, 60 and 120 s, SIGTERM and SIGKILL, 5 times each) add about 6 h |
+| U6 | 3.1 h | extrapolated: the quick run's strict preload of 1M keys took 21 min (TidesKV) and 38 min (Kvrocks), times 3 repetitions, plus 4 sweep steps of 60 s and 1 min of fio per server and repetition |
+| U7 | 9 h (5-11 h) | extrapolated: the quick U7 preload of 200k strict keys took 372 s (TidesKV) and 154 s (Kvrocks), so 2M keys take about 62 and 26 min per repetition (4.4 h in all); derived: 30 points per server and repetition need 1.9M acknowledged writes, 32 min at 1000/s (the quick run saw 430-3700/s), plus about 20 s per point for the baseline probe, restart and verify, about 4.2 h in all |
 | U8, F1 | under 5 min | measured |
-| Total | about 50 h | sum of the rows |
+| Total | about 46 h | sum of the rows |
 
-U1 can be longer: Kvrocks' COMPACT after the load may run up to the 7200 s cap per repetition (up to 6 h more over three
+U1 can be longer: Kvrocks' COMPACT after the closed-loop phases may run up to the 7200 s cap per repetition (up to 6 h more over three
 repetitions); the quick run's COMPACT is not representative. The run is resumable, so it can be done in pieces (for
 example U6 and U7 alone, or one case per night). Do not start it on a host that runs anything else: server and client are
 pinned to cores and the cases measure latency.
