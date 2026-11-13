@@ -192,7 +192,7 @@ tools (U7's ack-writer and F1) run from the pinned `PY_IMAGE` in `lib.sh`.
 Resume: running `usecases.sh` again with the same `--out` skips every repetition that has a `done` file and redoes the
 rest from an empty data directory, so an interrupted run (Ctrl-C, a crashed host) never mixes partial files. It refuses
 (exit 2, naming the fields) when the run directory's `meta.json` has another mode, TidesKV image (tag or id), Kvrocks
-image digest, `SERVER_CPUS`, `SERVER_MEM` or `CLIENT_CPUS`, so one report never mixes two configurations; each rep dir
+image digest, memtier image, `SERVER_CPUS`, `SERVER_MEM`, `CLIENT_CPUS` or `QUIESCE_MAX`, so one report never mixes two configurations; each rep dir
 also gets the images it ran with (`images.done`, and `images.closed` for pass A). U1 and U3 run in two passes (see
 "Method"); a repetition whose pass A is missing redoes pass A and then pass B for every server, and a redone U1 or U3
 pass A makes U8 recompute that server's repetition. A repetition whose data directory cannot be emptied first is

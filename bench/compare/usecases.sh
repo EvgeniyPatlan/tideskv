@@ -2,7 +2,8 @@
 # Use-case suite runner.
 # Usage: bench/compare/usecases.sh [--quick] [--dirty] [--out DIR] [CASE ...]   (CASE: U1..U8, F1; default all)
 #   --out of an existing run resumes it: repetitions with a `done` file are skipped, the rest are redone; it exits 2
-#   when that run's meta.json has another mode, TidesKV or Kvrocks image, SERVER_CPUS, SERVER_MEM or CLIENT_CPUS
+#   when that run's meta.json has another mode, TidesKV, Kvrocks or memtier image, SERVER_CPUS, SERVER_MEM, CLIENT_CPUS
+#   or QUIESCE_MAX
 #   at the end it writes <out>/report.md (uc_report.py) and exits with the report's status (1: a cell failed)
 #   env: SERVER_CPUS 0-3, SERVER_MEM 8g, CLIENT_CPUS 8-15, QUIESCE_MAX 600 (quick 60), as for run.sh
 set -euo pipefail
