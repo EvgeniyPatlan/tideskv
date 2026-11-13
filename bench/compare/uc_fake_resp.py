@@ -79,14 +79,20 @@ class FakeResp:
         self._server = None
         self._thread = None
         self._stopping = threading.Event()
+        self._listening = threading.Event()
         with socket.socket() as s:  # reserve a port for the server's whole life
             s.bind((host, 0))
             self.port = s.getsockname()[1]
 
     def start(self):
+        """Serve in a thread. With no startup_delay, return only once the port is listening, so a client that
+        connects right away is never refused (it was, on loaded CI runners, when the thread had not bound yet)."""
         self._stopping.clear()
+        self._listening.clear()
         self._thread = threading.Thread(target=self._serve, args=(self.startup_delay,), daemon=True)
         self._thread.start()
+        if not self.startup_delay and not self._listening.wait(5):
+            raise RuntimeError("fake RESP server did not start listening on port %d" % self.port)
         return self
 
     def restart(self, startup_delay=None):
@@ -101,6 +107,7 @@ class FakeResp:
         server = _Server((self.host, self.port), _Handler)
         server.fake = self
         self._server = server
+        self._listening.set()
         server.serve_forever(poll_interval=0.02)
 
     def kill(self, drop_last=None):
