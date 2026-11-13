@@ -147,7 +147,59 @@ uc_write_meta 2>/dev/null
 check meta-fields "$(python3 -c "
 import json,sys
 m=json.load(open('$OUT/meta.json'))
-print(m['mode'], m['reps'], m['cases'], m['cache_accounting'], m['fio_fsync_status'], 'size' in m, 'started_utc' in m)")" "quick 1 U1 U2 charged ok True True"
+print(m['mode'], m['reps'], m['cases'], m['cache_accounting'], m['fio_fsync_status'], 'size' in m, 'started_utc' in m,
+      m['fio_append_status'], m['fio_status'], 'tideskv_image_id' in m)")" "quick 1 U1 U2 charged ok True True not run not run True"
+# shellcheck disable=SC2016  # the pattern matches the literal script text
+check usecases-runs-report "$(grep -c '^python3 "$HERE/uc_report.py" "$OUT" || rc=$?$' "$HERE/usecases.sh")" 1
+
+
+# ---- F4: resume refuses a run directory written with other images or resources ----
+OUT=$TMP/resume; mkdir -p "$OUT"
+# shellcheck disable=SC2317
+uc_identity() { printf '%s\n' "mode=quick" "tideskv_image=t:1" "tideskv_image_id=sha256:aa" "kvrocks_image=k@sha256:bb" \
+  "server_cpus=0-3" "server_mem=8g" "client_cpus=8-15"; }
+rc=0; uc_check_resume >/dev/null 2>&1 || rc=$?
+check resume-no-meta "$rc" 0
+mapfile -t ID < <(uc_identity)
+write_meta_kv "$OUT/meta.json" "${ID[@]}" "started_utc=x"
+rc=0; uc_check_resume >/dev/null 2>&1 || rc=$?
+check resume-same "$rc" 0
+mapfile -t ID2 < <(printf '%s\n' "${ID[@]}" | sed -e 's/^server_cpus=.*/server_cpus=0-7/' -e '/tideskv_image_id/d')
+write_meta_kv "$OUT/meta.json" "${ID2[@]}"
+rc=0; msg=$(uc_check_resume 2>&1) || rc=$?
+check resume-mismatch-rc "$rc" 2
+check resume-mismatch-says "$([[ $msg == *"server_cpus: run directory 0-7, this run 0-3"* ]] && echo y)" y
+# an older meta.json without the image id is compared on the other fields only
+check resume-mismatch-only-cpus "$(grep -c '^cannot resume' <<<"$msg")" 1
+mapfile -t ID2 < <(printf '%s\n' "${ID[@]}" | sed -e 's/^mode=.*/mode=full/')
+write_meta_kv "$OUT/meta.json" "${ID2[@]}"
+rc=0; uc_check_resume >/dev/null 2>&1 || rc=$?
+check resume-mode-mismatch "$rc" 2
+unset -f uc_identity
+
+# ---- image stamp per rep, remove_data failure, U8 invalidated by a redone U1/U3 ----
+OUT=$TMP/stamp UC_REPS=1 UC_MODE=quick UC_IMAGE_STAMP=("tideskv_image=t:1" "kvrocks_image=k@sha256:bb")
+# shellcheck disable=SC2317
+case_U4() { return 0; }
+uc_dispatch U4 2>/dev/null
+check image-stamp "$(cat "$OUT/U4/kvrocks/rep1/images.done")" "$(printf '%s\n' "${UC_IMAGE_STAMP[@]}")"
+# shellcheck disable=SC2317
+remove_data() { CALLS+=("remove_data"); return 1; }
+RAN=()
+# shellcheck disable=SC2317
+case_U2() { RAN+=("$1"); }
+uc_dispatch U2 2>/dev/null
+check remove-data-fail-not-run "${RAN[*]:-}" ""
+check remove-data-fail-done "$(cat "$OUT/U2/tideskv/rep1/done")" "could not empty $OUT/data before the repetition"
+# shellcheck disable=SC2317
+remove_data() { CALLS+=("remove_data"); }
+mkdir -p "$OUT/U8/tideskv/rep1" "$OUT/U8/kvrocks/rep1"
+echo ok >"$OUT/U8/tideskv/rep1/done"; echo ok >"$OUT/U8/kvrocks/rep1/done"
+# shellcheck disable=SC2317
+case_U3() { return 0; }
+mkdir -p "$OUT/U3/kvrocks/rep1"; echo ok >"$OUT/U3/kvrocks/rep1/done"  # only TidesKV's U3 is redone
+uc_dispatch U3 2>/dev/null
+check u8-invalidated "$([[ -e $OUT/U8/tideskv/rep1/done ]] && echo kept || echo gone) $([[ -e $OUT/U8/kvrocks/rep1/done ]] && echo kept || echo gone)" "gone kept"
 
 # ---- usecases.sh CLI (no Docker reached: argument errors exit before bench_init) ----
 rc=0; bash "$HERE/usecases.sh" NOPE >/dev/null 2>&1 || rc=$?

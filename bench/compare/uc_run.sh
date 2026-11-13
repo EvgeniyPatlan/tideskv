@@ -22,6 +22,9 @@ source "$HERE_RUN/uc_cases.sh"
 # Unlike lib.sh's: a non-empty data/ is what a resumed run has; usecases.sh empties it with remove_data.
 resolve_out() { realpath -m -- "$1"; }
 
+# key=value lines of the images in use, written into every rep dir (uc_image_stamp sets it)
+UC_IMAGE_STAMP=()
+
 # "rep server" lines in run order: all servers of repetition 1, then of repetition 2, ...
 uc_rep_order() {
   local r s
@@ -106,11 +109,19 @@ _uc_disk_ok() {
 }
 
 # _uc_run CASE REP SERVER FUNC MARK: FUNC SERVER REP on an empty data dir, then MARK (ok or the reason) in the rep dir.
-# The server is stopped afterwards only if FUNC left one running (start_server sets SERVER_CONTAINER).
+# The server is stopped afterwards only if FUNC left one running (start_server sets SERVER_CONTAINER). The rep dir gets
+# images.<mark> (UC_IMAGE_STAMP: the images this pass ran with). A data dir that cannot be emptied fails the pass
+# without running it. Pass A of U1 or U3 (re)run for a server deletes that server's U8 done of the repetition, since
+# U8 reads those files.
 _uc_run() {
   local c=$1 r=$2 s=$3 fn=$4 mark=$5 rc=0
   CUR=$s UC_FAIL_REASON="" SERVER_CONTAINER="" UC_REP_DIR=$c/$s/rep$r
-  remove_data
+  if ((${#UC_IMAGE_STAMP[@]})); then printf '%s\n' "${UC_IMAGE_STAMP[@]}" >"$OUT/$c/$s/rep$r/images.${mark%.done}"; fi
+  if [[ $fn == case_U1 || $fn == case_U3 ]]; then rm -f "${OUT:?}/U8/${s:?}/rep${r:?}/done"; fi
+  if ! remove_data; then
+    _uc_mark_done "$c/$s/rep$r" "could not empty $OUT/data before the repetition" "$mark"
+    return 0
+  fi
   mapfile -t UC_EXTRA_CONF < <(uc_conf_lines "$s")
   log "$c $s rep$r$([[ $fn == *_open ]] && echo " open phases")"
   "$fn" "$s" "$r" || rc=$?
@@ -180,7 +191,7 @@ uc_dispatch() {
       _uc_rep "$c" "$r" "$s"
     done < <(uc_rep_order "$c")
   fi
-  remove_data
+  remove_data || true  # the next repetition checks it again before it starts
 }
 
 # Per-connection --rate-limiting values of CASE's open25/50/75 phases in repetition REP: 25/50/75% of the lower of the
@@ -210,12 +221,53 @@ print(" ".join(str(max(1, int(low * pct / 100 / conns))) for pct in (25, 50, 75)
 PY
 }
 
-# meta.json: the shared fields plus mode, reps, cases, cache_accounting and fio_fsync_status.
+# The TidesKV image's docker id (its tag is a content hash of the sources; the id also changes with a rebuild).
+uc_tideskv_image_id() { docker image inspect -f '{{.Id}}' "${TIDESKV_IMAGE:-}" 2>/dev/null || echo unknown; }
+
+# meta.json: the shared fields plus mode, reps, cases, cache_accounting, the fio statuses and the TidesKV image id.
 uc_write_meta() {
   local common
   mapfile -t common < <(meta_common_fields)
   write_meta_kv "$OUT/meta.json" "${common[@]}" \
     "size=$UC_MODE" "mode=$UC_MODE" "#reps=$UC_REPS" "cases=$UC_CASES_RUN" "cache_accounting=$UC_CACHE_ACCOUNTING" \
-    "fio_fsync_status=${FIO_FSYNC_STATUS:-not run}" "#warmup_s=$UC_WARMUP" "#duration_s=$UC_DURATION" \
-    "#threads=$UC_THREADS" "#clients=$UC_CLIENTS"
+    "fio_fsync_status=${FIO_FSYNC_STATUS:-not run}" "fio_append_status=${FIO_APPEND_STATUS:-not run}" \
+    "fio_status=${FIO_STATUS:-not run}" "tideskv_image_id=$(uc_tideskv_image_id)" "#warmup_s=$UC_WARMUP" \
+    "#duration_s=$UC_DURATION" "#threads=$UC_THREADS" "#clients=$UC_CLIENTS"
+}
+
+# Fields a resumed run must share with the run directory's meta.json (ruling F4), as key=value lines for this run.
+UC_RESUME_KEYS="mode tideskv_image tideskv_image_id kvrocks_image server_cpus server_mem client_cpus"
+uc_identity() {
+  local k
+  echo "mode=$UC_MODE"
+  echo "tideskv_image_id=$(uc_tideskv_image_id)"
+  meta_common_fields | while IFS= read -r k; do
+    [[ " $UC_RESUME_KEYS " == *" ${k%%=*} "* ]] && echo "$k"
+  done
+  return 0
+}
+
+# The images this run uses, stamped into each rep dir by _uc_run.
+uc_image_stamp() {
+  mapfile -t UC_IMAGE_STAMP < <(uc_identity | grep -e '^tideskv_image' -e '^kvrocks_image'; echo "memtier_image=$MEMTIER_IMAGE")
+}
+
+# Resuming into a run directory written with other images, mode or resources would mix their results: when
+# $OUT/meta.json exists and differs from this run in a UC_RESUME_KEYS field, print what differs and return 2. A field
+# the old meta.json does not have is not compared (tideskv_image_id is newer than the first runs).
+uc_check_resume() {
+  [[ -e $OUT/meta.json ]] || return 0
+  uc_identity | python3 -c '
+import json, sys
+old = json.load(open(sys.argv[1]))
+bad = []
+for line in sys.stdin:
+    k, _, v = line.rstrip("\n").partition("=")
+    if k in old and str(old[k]) != v:
+        bad.append("%s: run directory %s, this run %s" % (k, old[k], v))
+for b in bad:
+    print("cannot resume: " + b, file=sys.stderr)
+if bad:
+    print("use another --out, or the same images and settings as the run directory", file=sys.stderr)
+sys.exit(2 if bad else 0)' "$OUT/meta.json"
 }

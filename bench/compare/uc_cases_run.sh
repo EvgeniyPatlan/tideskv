@@ -30,7 +30,7 @@
 #   F1: matrix.json per server (this server against Redis 7.2, run.log) and, merged over the servers done so far, F1/matrix.json
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes,allocated_bytes,
 # wal_archive_allocated_bytes: columns 2-3 apparent size, 4-5 allocated bytes).
-#   U6 also: fio/fsync.json (+ .log) per server, measured right before that server's sweep
+#   U6 also: fio/fsync.json and fio/append.json (+ .log) per server, measured right before that server's sweep
 # shellcheck disable=SC2034  # UC_RATE is read by uc_phase
 
 _uc_fail() { UC_FAIL_REASON=$1; log "${CUR:-}: $1"; return 1; }
@@ -198,7 +198,7 @@ case_U5() {
     _uc_settle_du "$rep" "load-$p" || return 1
     _uc_cell U5 "$rep" "$p" || return 1
     _uc_down
-    remove_data
+    remove_data || { _uc_fail "could not empty the data dir after $p"; return 1; }
   done
 }
 
@@ -246,14 +246,15 @@ case_U2() {
   _uc_dbsize_end "$rep"
 }
 
-# U6: strict durability, fixed preload, a fio fsync floor per server, closed-loop connection sweep with at most 10 s of warm-up per cell.
+# U6: strict durability, fixed preload, the two fio floors per server, closed-loop connection sweep with at most 10 s of warm-up per cell.
 case_U6() {
   local rep=U6/$1/rep$2 ph
   _uc_up "$1" U6 || return 1
   _uc_load U6 "$rep" load "$U6_KEYS" || return 1
   _uc_settle_du "$rep" load || return 1
   # the disk's fsync floor drifts (R24): measure it right before this server's sweep, into the rep dir
-  run_fio_fsync "$OUT/$rep/fio"
+  run_fio_fsync "$OUT/$rep/fio"   # fio reference: 4 KiB random write + fsync
+  run_fio_append "$OUT/$rep/fio"  # durable-append floor: 4 KiB sequential write + fdatasync
   for ph in $(uc_phases U6); do
     UC_CELL_WARMUP=$((UC_WARMUP < 10 ? UC_WARMUP : 10)) UC_CELL_DURATION=$UC_U6_S _uc_cell U6 "$rep" "$ph" || return 1
   done

@@ -167,6 +167,15 @@ case_U5 tideskv 1
 check u5-removes-between-sizes "$(printf '%s\n' "${EV[@]}" | sed -E 's#/[0-9]+$##' | grep -v '\.warmup$' | tr '\n' ' ')" \
   "tideskv:start tideskv:load-v1k tideskv:v1k remove_data tideskv:start tideskv:load-v4k tideskv:v4k remove_data tideskv:start tideskv:load-v16k tideskv:v16k remove_data "
 check u5-files "$(count_files "$OUT/U5/tideskv/rep1" load-v4k.seconds settle-load-v4k du-after-load-v4k v4k.json)" 4
+# a data dir that cannot be emptied between sizes fails the repetition instead of loading on top of the old data
+# shellcheck disable=SC2317
+remove_data() { EV+=("remove_data"); return 1; }
+EV=() UC_FAIL_REASON=""
+rc=0; case_U5 tideskv 2 2>/dev/null || rc=$?
+check u5-remove-fail "$rc ${UC_FAIL_REASON}" "1 could not empty the data dir after v1k"
+check u5-remove-fail-stops "$(printf '%s\n' "${EV[@]}" | grep -c ':load-v4k')" 0
+# shellcheck disable=SC2317
+remove_data() { EV+=("remove_data"); }
 
 # ---- U4 and the load check ----
 EV=()
@@ -215,9 +224,11 @@ OUT=$TMP/u6
 # R24: the fsync floor is measured before each server's sweep, into that server's rep dir
 # shellcheck disable=SC2317
 run_fio_fsync() { FIO_DIRS+=("${1#"$OUT"/}"); EV+=("$CUR:fio"); }
+# shellcheck disable=SC2317
+run_fio_append() { FIO_DIRS+=("append:${1#"$OUT"/}"); EV+=("$CUR:fio-append"); }
 uc_dispatch U6 2>/dev/null
-check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:fio tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:fio kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
-check u6-fio-dirs "${FIO_DIRS[*]}" "U6/tideskv/rep1/fio U6/kvrocks/rep1/fio"
+check u6-cells "$(evs)" "tideskv:start tideskv:load tideskv:fio tideskv:fio-append tideskv:c1 tideskv:c8 tideskv:c64 tideskv:c256 kvrocks:start kvrocks:load kvrocks:fio kvrocks:fio-append kvrocks:c1 kvrocks:c8 kvrocks:c64 kvrocks:c256"
+check u6-fio-dirs "${FIO_DIRS[*]}" "U6/tideskv/rep1/fio append:U6/tideskv/rep1/fio U6/kvrocks/rep1/fio append:U6/kvrocks/rep1/fio"
 check u6-strict "${START_LEVELS[*]}" "tideskv:strict kvrocks:strict"
 check u6-done "$(cat "$OUT/U6/tideskv/rep1/done")" ok
 check u6-load-pipeline-recorded "$(cat "$OUT/U6/tideskv/rep1/load.pipeline")" 32

@@ -192,7 +192,7 @@ run_full() {
   local server
   for server in tideskv kvrocks; do
     run_server "$server" || log "$server: run failed, continuing"
-    remove_data  # one server's data at a time; disk.json already holds its sizes
+    remove_data || true  # one server's data at a time; disk.json already holds its sizes
   done
   local rc=0
   python3 "$HERE/report.py" "$OUT" || rc=$?
@@ -304,7 +304,7 @@ run_large() {
   local server
   for server in $W7_SERVERS; do
     run_server_large "$server" || log "$server: run failed, continuing"
-    remove_data  # one server's data at a time
+    remove_data || true  # one server's data at a time
   done
   local rc=0
   python3 "$HERE/report.py" "$OUT" || rc=$?

@@ -351,24 +351,43 @@ run_fio() {
   if ((rc)); then FIO_STATUS="failed at QD $qd (exit $rc)"; else FIO_STATUS=ok; fi
 }
 
-# fio 4 KiB random writes with an fsync after each (queue depth 1, the durable-commit latency floor of U6): FIO_FSYNC_RUNTIME s
-# on a FIO_FSYNC_SIZE file under DIR (default $OUT/fio). Writes DIR/fsync.json and sets FIO_FSYNC_STATUS (ok, skipped: ..., failed ...).
-run_fio_fsync() {
-  local dir=${1:-$OUT/fio} c=tideskv-bench-fio-$TS-fsync-$RANDOM rc=0
+# _fio_flush_job DIR NAME ARGS...: one fio job of 4 KiB buffered writes at queue depth 1 with a flush after each (ARGS
+# give --rw and the flush), FIO_FSYNC_RUNTIME s on a FIO_FSYNC_SIZE file under DIR. Writes DIR/NAME.json (+ .log) and
+# deletes its file; returns fio's exit status, or 3 when the fio image cannot be pulled.
+_fio_flush_job() {
+  local dir=$1 name=$2 c=tideskv-bench-fio-$TS-$2-$RANDOM rc=0; shift 2
   if ! docker image inspect "$FIO_IMAGE" >/dev/null 2>&1 && ! docker pull -q "$FIO_IMAGE" >/dev/null 2>&1; then
-    log "fio: cannot pull $FIO_IMAGE; skipping the fsync latency probe"
-    FIO_FSYNC_STATUS="skipped: cannot pull $FIO_IMAGE"; return 0
+    log "fio: cannot pull $FIO_IMAGE; skipping the $name job"
+    return 3
   fi
   mkdir -p "$dir"; chmod 0777 "$dir"
   _track "$c"
-  log "fio fsync"
+  log "fio $name"
   docker run --rm --name "$c" --network none --cpuset-cpus "$CLIENT_CPUS" -v "$dir:/f" --entrypoint fio "$FIO_IMAGE" \
-    --name=fsync --filename=/f/fio-fsync.dat --size="${FIO_FSYNC_SIZE:-1g}" --rw=randwrite --bs=4k --fsync=1 --direct=0 \
-    --ioengine=sync --iodepth=1 --numjobs=1 --runtime="${FIO_FSYNC_RUNTIME:-30}" --time_based --output-format=json \
-    --output=/f/fsync.json >"$dir/fsync.log" 2>&1 || { rc=$?; log "fio fsync failed ($rc); see fio/fsync.log"; }
+    --name="$name" --filename="/f/fio-$name.dat" --size="${FIO_FSYNC_SIZE:-1g}" --bs=4k --direct=0 --ioengine=sync \
+    --iodepth=1 --numjobs=1 --runtime="${FIO_FSYNC_RUNTIME:-30}" --time_based --output-format=json \
+    --output="/f/$name.json" "$@" >"$dir/$name.log" 2>&1 || { rc=$?; log "fio $name failed ($rc); see fio/$name.log"; }
   docker run --rm --name "${c/bench-fio/bench-clean-fio}" --network none -v "$dir:/f" --entrypoint rm "$CLI_IMAGE" \
-    -f /f/fio-fsync.dat >/dev/null 2>&1 || log "could not delete $dir/fio-fsync.dat"
-  if ((rc)); then FIO_FSYNC_STATUS="failed (exit $rc)"; else FIO_FSYNC_STATUS=ok; fi
+    -f "/f/fio-$name.dat" >/dev/null 2>&1 || log "could not delete $dir/fio-$name.dat"
+  return "$rc"
+}
+
+_fio_status() { case $1 in 0) echo ok ;; 3) echo "skipped: cannot pull $FIO_IMAGE" ;; *) echo "failed (exit $1)" ;; esac; }
+
+# The fio reference of U6: 4 KiB random writes with an fsync after each (queue depth 1), under DIR (default $OUT/fio).
+# Writes DIR/fsync.json and sets FIO_FSYNC_STATUS (ok, skipped: ..., failed ...).
+run_fio_fsync() {
+  local rc=0
+  _fio_flush_job "${1:-$OUT/fio}" fsync --rw=randwrite --fsync=1 || rc=$?
+  FIO_FSYNC_STATUS=$(_fio_status "$rc")
+}
+
+# The durable-append floor of U6: 4 KiB sequential writes with an fdatasync after each (queue depth 1), the pattern of a
+# write-ahead log. Writes DIR/append.json and sets FIO_APPEND_STATUS.
+run_fio_append() {
+  local rc=0
+  _fio_flush_job "${1:-$OUT/fio}" append --rw=write --fdatasync=1 || rc=$?
+  FIO_APPEND_STATUS=$(_fio_status "$rc")
 }
 
 # ---- shared by run.sh and the use-case runner ----
@@ -400,10 +419,11 @@ stop_sampler() {
 _du() { du -sb "$1" | cut -f1; }
 
 # The servers write the data dirs as other uids, so the host user cannot delete them: empty them from a container.
+# Returns 1 when that failed (run.sh ignores it, as before; the use-case runner records it).
 remove_data() {
   [[ -d $OUT/data ]] || return 0
   docker run --rm --name "tideskv-bench-clean-$TS" -v "$OUT/data:/d" --entrypoint find "$CLI_IMAGE" \
-    /d -mindepth 1 -delete >/dev/null 2>&1 || log "could not empty $OUT/data"
+    /d -mindepth 1 -delete >/dev/null 2>&1 || { log "could not empty $OUT/data"; return 1; }
 }
 
 # "N logical CPUs on M physical cores" for SERVER_CPUS (on this host 0-3 is 2 cores with SMT).

@@ -122,7 +122,7 @@ run_profile() {
     for w in "${PWLS[@]}"; do prof_wl strict "$w"; done
   fi
   stop_server
-  remove_data
+  remove_data || true
   log "profiles: $OUT/perf"
 }
 
