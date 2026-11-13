@@ -291,9 +291,11 @@ seq_of() { printf '%s\n' "${EV[@]}" | grep "^$1:" | grep -v -e ':load' -e 'exit-
 check u7-sequence-tideskv "$(seq_of tideskv)" \
   "start probe probe-up writer writing signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify stop "
 # F3: the signal goes once N writes are acked; the count and the target are recorded, the same N on both servers
-check u7-acked-files "$(cat "$OUT/U7/kvrocks/rep1/kill-50/acked-target" "$OUT/U7/kvrocks/rep1/kill-50/acked-at-signal" "$OUT/U7/kvrocks/rep1/kill-50/ack.status" | tr '\n' ' ')" "50 100 ok "
+check u7-acked-files "$(cat "$OUT/U7/kvrocks/rep1/kill-50/acked-target" "$OUT/U7/kvrocks/rep1/kill-50/acked-at-signal" "$OUT/U7/kvrocks/rep1/kill-50/acked.status" | tr '\n' ' ')" "50 100 ok "
 check u7-same-n "$(cat "$OUT/U7/tideskv/rep1/term-20/acked-target") $(cat "$OUT/U7/kvrocks/rep1/term-20/acked-target")" "20 20"
 check u7-verify-value-size "$(printf '%s\n' "${PY_ARGS[@]}" | grep -m1 '^verify ' | grep -o -- '--value-size 2048')" "--value-size 2048"
+# nothing but the writer's ack.<thread> logs may match ack.*: verify reads that glob as acknowledged keys
+check u7-ack-glob-only-logs "$(cd "$OUT/U7/kvrocks/rep1/kill-50" && printf '%s ' ack.*)" "ack.0 "
 check u7-no-evict-note "$(find "$OUT/U7" -name evict-failed | wc -l)" 0
 check u7-point-files "$(count_files "$OUT/U7/kvrocks/rep1/kill-50" baseline.json until-p99-ms verify.json signal.epoch_ms writer.out writer.status probe.status)" 7
 check u7-term-seconds "$([[ -s $OUT/U7/kvrocks/rep1/term-20/term.seconds && ! -e $OUT/U7/kvrocks/rep1/kill-20/term.seconds ]] && echo y)" y
@@ -313,7 +315,7 @@ check u7-times-dirs "$(cd "$OUT/U7/tideskv/rep1" && printf '%s ' term-5/run* kil
 OUT=$TMP/u7slow UC_U7_ACKS="30" UC_U7_TIMES=1 U7_STUB_ACKS=7 UC_U7_ACK_TIMEOUT=0 STUB_EVICT=1
 EV=()
 uc_dispatch U7 2>/dev/null
-check u7-timeout-status "$(cat "$OUT/U7/tideskv/rep1/term-30/ack.status")" "load point not reached: 7 of 30 acknowledged writes in 0 s"
+check u7-timeout-status "$(cat "$OUT/U7/tideskv/rep1/term-30/acked.status")" "load point not reached: 7 of 30 acknowledged writes in 0 s"
 check u7-timeout-signalled "$(cat "$OUT/U7/tideskv/rep1/term-30/acked-at-signal") $([[ -e $OUT/U7/tideskv/rep1/term-30/verify.json ]] && echo verified) $(cat "$OUT/U7/tideskv/rep1/done")" "7 verified ok"
 # R-minor 10: a failed page-cache eviction is noted in the rep dir (first start) and in the point dir (restart)
 check u7-evict-noted "$(cat "$OUT/U7/kvrocks/rep1/evict-failed") / $(cat "$OUT/U7/kvrocks/rep1/term-30/evict-failed")" \

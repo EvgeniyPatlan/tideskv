@@ -271,6 +271,17 @@ class AckWriterTest(unittest.TestCase):
         with open(out) as f:
             self.assertEqual(json.load(f)["corrupt_sample"], [keys[0]])
 
+    def test_verify_reads_only_the_thread_logs(self):
+        """Other files next to the logs (the runner's own status files) are not acked keys."""
+        self.serve()
+        with open(self.log + ".0", "w") as f:
+            f.write("k0:0\n")
+        with open(self.log + ".status", "w") as f:
+            f.write("ok\n")
+        self.fake.store[b"k0:0"] = b"0"
+        v = self.verify()
+        self.assertEqual((v["acked"], v["lost"]), (1, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

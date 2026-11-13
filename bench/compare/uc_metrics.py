@@ -128,12 +128,12 @@ def u7_points(rep_dir):
 
 
 def _u7_load_point(d):
-    """CellError when the point was signalled before its acked-write target (ack.status not ok; older runs have none)."""
-    path = os.path.join(d, "ack.status")
+    """CellError when the point was signalled before its acked-write target (acked.status not ok; older runs have none)."""
+    path = os.path.join(d, "acked.status")
     if os.path.exists(path):
-        status = _reads(d, "ack.status").splitlines()[0:1]
+        status = _reads(d, "acked.status").splitlines()[0:1]
         if status != ["ok"]:
-            raise CellError(status[0] if status else "empty ack.status")
+            raise CellError(status[0] if status else "empty acked.status")
 
 
 def _u7_value(d, field_name):

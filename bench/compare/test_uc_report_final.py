@@ -18,7 +18,7 @@ def u7_point(run, srv, pt, lost=0, acked=None, status=None, until=0.1):
         run.write(d + "acked-at-signal", str(acked))
         run.write(d + "acked-target", pt.split("-")[1])
     if status is not None:
-        run.write(d + "ack.status", status)
+        run.write(d + "acked.status", status)
 
 
 class U7LoadPointTest(unittest.TestCase):

@@ -8,7 +8,7 @@
       whose reply never came is not logged) or when the server answers with an error. Prints `acked <total>` and
       exits 0, or exits 2 if any thread stopped on an error reply or could not connect. --command is a test hook.
   verify --host H --port P --log FILE --out JSON [--value-size B]
-      Reads every FILE.* (a last line without its newline is skipped), MGETs the keys in batches of 1000 and writes
+      Reads every FILE.<thread> (a last line without its newline is skipped), MGETs the keys in batches of 1000 and writes
       {"acked", "lost", "lost_sample", "corrupt", "corrupt_sample"} (samples: first 10). A key is lost when MGET
       returns nil, corrupt when its value is not the one the writer sent for the key's seq (the suffix after the last
       ':'), with the same --value-size. Retries
@@ -149,7 +149,8 @@ def cmd_write(a):
 # ---- verify ----
 
 def _log_keys(log_path):
-    for path in sorted(glob.glob(log_path + ".*")):
+    # FILE.<thread> only: other files next to the logs are not acknowledgements
+    for path in sorted(p for p in glob.glob(log_path + ".*") if p[len(log_path) + 1:].isdigit()):
         with open(path) as f:
             for line in f:
                 if line.endswith("\n") and line.strip():  # a last line cut off by the kill is not a whole ack

@@ -186,16 +186,27 @@ bench/compare/uc_report.py build/bench/uc-full                 # rebuild report.
 
 Options: `--quick`, `--dirty` (build TidesKV from the working tree), `--out DIR`, and any number of case names.
 `SERVER_CPUS`, `SERVER_MEM`, `CLIENT_CPUS` and `QUIESCE_MAX` (default 600 s, quick 60 s) work as for `run.sh`.
-`uc_report.py` exits 1 when any cell failed. The host needs Docker, `fio` is run from its pinned image, and Python
+`usecases.sh` runs `uc_report.py` at the end and exits with its status; `uc_report.py` exits 1 when any cell failed. The host needs Docker, `fio` is run from its pinned image, and Python
 tools (U7's ack-writer and F1) run from the pinned `PY_IMAGE` in `lib.sh`.
 
 Resume: running `usecases.sh` again with the same `--out` skips every repetition that has a `done` file and redoes the
-rest from an empty data directory, so an interrupted run (Ctrl-C, a crashed host) never mixes partial files. U1 and U3
-run in two passes (see "Method"); a repetition whose pass A is missing redoes pass A and then pass B for every server.
-Before each case loads, the suite checks the free disk against that case's need: half the case's logical bytes (the 1/2 assumes about 3x LZ4
-compression of memtier's random data, with a margin), plus a 16 GiB WAL-archive allowance and 4 GiB of slack. The
-allowance and slack apply to every case whatever the server, so even U8 and F1 need 20 GiB. A case that does not fit is
-skipped, and its repetitions say why.
+rest from an empty data directory, so an interrupted run (Ctrl-C, a crashed host) never mixes partial files. It refuses
+(exit 2, naming the fields) when the run directory's `meta.json` has another mode, TidesKV image (tag or id), Kvrocks
+image digest, `SERVER_CPUS`, `SERVER_MEM` or `CLIENT_CPUS`, so one report never mixes two configurations; each rep dir
+also gets the images it ran with (`images.done`, and `images.closed` for pass A). U1 and U3 run in two passes (see
+"Method"); a repetition whose pass A is missing redoes pass A and then pass B for every server, and a redone U1 or U3
+pass A makes U8 recompute that server's repetition. A repetition whose data directory cannot be emptied first is
+recorded as failed, not run on top of old data (U5 checks the same between value sizes).
+
+Before each case loads, the suite checks the free disk against that case's need: `logical x 1.4 + 16 GiB + logical / 2
++ 4 GiB`. memtier's random values do not compress: after U1's load in the quick run TidesKV held 1.33x and Kvrocks 1.05x
+of the logical bytes (keys x (value + 12)), so 1.4 covers the data; 16 GiB is Kvrocks' WAL archive at its stock
+`wal_size_limit_mb 16384`; `logical / 2` is the transient space of Kvrocks' full COMPACT in U1; 4 GiB is slack. The
+formula applies to every case whatever the server, so even U8 and F1 need 20 GiB. Full-size needs: U1 56.7 GiB (the
+largest; 60.8 GB), U5 49.3 GiB, U2 32.1 GiB, U4 30.6 GiB, U7 27.5 GiB (its preload plus every point's acknowledged writes, since the
+data dir is kept), U3 27.5 GiB, U6 20.2 GiB, U8 and F1 20 GiB. The
+fio files (8 GiB for the random-read baseline before U1 in full mode, 1 GiB for each U6 job) are deleted before any
+server loads. A case that does not fit is skipped, and its repetitions say why.
 
 ### Time
 
@@ -240,19 +251,20 @@ pinned to cores and the cases measure latency.
 
 | Case | What runs | Servers | Durability | Headline metrics |
 |---|---|---|---|---|
-| U1 Cache bigger than RAM | 40M keys x 1 KB (about 40 GB), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. Kvrocks gets a full COMPACT after the load | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
+| U1 Cache bigger than RAM | 20M keys x 1 KB (about 20 GB, 2.5x `SERVER_MEM`), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. Kvrocks gets a full COMPACT after the closed-loop phases (for U8). fio's random-read curve is measured before U1 | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
 | U2 TTL churn and space reclaim | SET with random TTLs 120-1200 s, 1:1 GET (negative lookups over a 1e9-key space) at a fixed rate for 60 min, then 30 min idle; `du` every 60 s | TidesKV, Kvrocks, Kvrocks+cron (`compaction-checker-cron * * * * *`) | relaxed | disk bytes over time and at the end; p99.9 at the fixed rate; end-of-run key count |
-| U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk B/op |
+| U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk write bytes per op (cgroup write bytes / requests of the closed run) |
 | U4 Hashes as records | 5M hashes x 20 fields x 50 B; HGET/HSET/HGETALL/HDEL mix 10:6:3:1 | TidesKV, Kvrocks | relaxed | ops/s; p99 |
-| U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk B/op; on-disk size |
-| U6 Durable writes | SET 100 B at 1, 8, 64 and 256 connections, pipeline 1; fio measures the disk's fsync floor before each server's sweep | TidesKV, Kvrocks | strict | writes/s; p99; ratio to the fsync floor |
-| U7 Restart and crash recovery | writer with an acknowledgement log; SIGTERM and SIGKILL after 10, 60 and 120 s of writes, 5 times each; restart, then verify every acknowledged key | TidesKV, Kvrocks | strict | acknowledged writes lost, corrupt, restart misses; time to PONG; time to recovered p99 |
-| U8 Bulk load and footprint | no server of its own: reads U1's load and U3's aging | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet; disk after load, after aging, after COMPACT (Kvrocks only) |
+| U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk write bytes per op; on-disk size |
+| U6 Durable writes | SET 100 B at 1, 8, 64 and 256 connections, pipeline 1; before each server's sweep fio measures the durable-append floor (4 KiB sequential write + fdatasync) and a reference (4 KiB random write + fsync) | TidesKV, Kvrocks | strict | writes/s; p99; ops/s over the durable-append floor (information) |
+| U7 Restart and crash recovery | writer with an acknowledgement log (2 KiB values); SIGTERM and SIGKILL once 12710, 63550 and 114390 writes are acknowledged (about 10, 50 and 90% of the 256 MiB memtable), the same counts on both servers, 5 times each; restart, then verify every acknowledged key | TidesKV, Kvrocks | strict | acknowledged writes lost, corrupt, restart misses; time to PONG; time to recovered p99 (with each server's absolute threshold and the acked count at the signal) |
+| U8 Bulk load and footprint | no server of its own: reads U1's load and U3's aging | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet (censored at `QUIESCE_MAX`: "≥ cap"); disk after load, after aging, after COMPACT (Kvrocks only) |
 | F1 Command coverage | a command matrix against Redis 7.2 | TidesKV, Kvrocks | relaxed | same / differs / unsupported / documented / extra per command and case |
 | F2 Operations facts | a hand-written, sourced table (`f2_operations.md`) | | | facts with links |
 
 Quick mode shrinks the data (U1 2M keys, U3 1M, U4 250k, U5 0.5 GiB per size, U7 200k) and the time (U2 10 min of
-writes and 5 idle, U3 5 min, U6 15 s per step, U7 kills after 5 and 15 s, once). U6 keeps its 1M-key preload.
+writes and 5 idle, U3 5 min, U6 15 s per step, U7 signals after 1271, 6355 and 11439 acknowledged writes, once). U6
+keeps its 1M-key preload.
 
 ### Method
 
@@ -275,6 +287,19 @@ writes and 5 idle, U3 5 min, U6 15 s per step, U7 kills after 5 and 15 s, once).
   taken after the server went quiet, excluding Kvrocks' WAL archive (`wal_ttl_seconds` default 10800), which is
   reported on its own line. Apparent size is shown beside them. Older runs that recorded only apparent size fall back
   to it, and the report labels that.
+- **Correctness.** memtier's byte counts check that every SET reply is `+OK` (U1, U2, U3, U5, U6) and every HSET and
+  HDEL reply an integer (U4); GETs must hit 99% after a load (U1, U3, U5). U2's GETs (negative lookups by design) and
+  U4's HGET and HGETALL replies are not checked. A failed check makes the cell ERR.
+- **Data.** LZ4 is on for both servers. memtier's random values are not assumed to compress: the report prints the
+  observed on-disk / logical ratio per server and case (U1, U2, U3, U5).
+- **U3 and U5 disk writes per op** are the server cgroup's bytes written during the timed run over its requests (lower
+  is better, with a verdict).
+- **U4.** memtier picks each command by weight (HGET 10, HSET 6, HGETALL 3, HDEL 1), so HDEL runs without a paired
+  HSET, the same on both servers. The report shows the weights, not memtier's unused `--ratio`.
+- **U8 time to quiet** is censored at `QUIESCE_MAX`: a wait that reached it is shown as "≥ cap", not as an error. It
+  gets a verdict only when the other side went quiet below the cap by more than the band; when both reached it, none.
+- **Page cache.** When the data dir cannot be dropped from the page cache before a server start, the rep dir (or U7
+  point dir) gets an `evict-failed` note and the report shows it as a caveat.
 - **U2.** GETs are negative lookups over a 1e9-key space, so the live set follows the SET rate times the mean TTL.
   Neither Kvrocks config gets a manual COMPACT. Kvrocks' end-of-run key count needs `DBSIZE SCAN` and may read
   "unverified" when the scan does not finish.
@@ -282,13 +307,24 @@ writes and 5 idle, U3 5 min, U6 15 s per step, U7 kills after 5 and 15 s, once).
 - **U6.** The 1M-key strict preload is fsync-bound: in one quick run it took 21 minutes for TidesKV and 38 minutes for
   Kvrocks. The host disk's fsync rate is not steady. An earlier quick run saw it shift between about 1.5k and 6.8k per
   second; in the quick run above, fio measured 1720 writes/s at the start and 216 and 237 writes/s right before the two
-  servers' sweeps. A single-repetition U6 result is therefore not trustworthy. Before each server's sweep fio measures
-  4 KiB random writes with an fsync after each at queue depth 1 (the disk's durable-write floor); it is shown beside the
-  results. A U6 cell whose per-second ops have a coefficient of variation above 0.25 is flagged unstable and gets no
+  servers' sweeps. A single-repetition U6 result is therefore not trustworthy. Before each server's sweep fio runs two
+  jobs at queue depth 1: the durable-append floor, 4 KiB sequential writes with an fdatasync after each (the pattern of
+  a write-ahead log), and a reference, 4 KiB random writes with an fsync after each. Both are shown beside the results,
+  and each cell's ops/s over its server's durable-append floor is shown as information. Strict mode is configured and
+  read back on both servers, but per-ack fsync is not observed by the suite: a server above the floor batches its
+  flushes (group commit), and neither server reports an fsync count. A U6 cell whose per-second ops have a coefficient of variation above 0.25 is flagged unstable and gets no
   verdict; one with too few seconds to judge (under 5 after dropping the partial last one) is flagged "stability unknown".
   The rule is applied to U6 cells only.
-- **U7.** A process kill (SIGTERM or SIGKILL), not an OS crash or power loss. Each kill point uses a unique key prefix
-  and keeps the data dir. Before the restart the page cache of the data dir is dropped. After the restart every
+- **U7.** A process kill (SIGTERM or SIGKILL), not an OS crash or power loss. Every point signals after the same
+  number of acknowledged writes on both servers (spec: "kill at the same load point for both"): the runner polls the
+  writer's acknowledgement logs every 50 ms and sends the signal once the count reaches N. N is 10, 50 and 90% of the
+  256 MiB memtable at 2112 bytes per entry (2 KiB values plus 64 B for the key and the engines' per-entry overhead):
+  12710, 63550 and 114390, a tenth of that in quick mode. With values of a few bytes the 90% point would take millions
+  of strict writes, so the values are 2 KiB on both servers. The fill counts the writer's writes only, not the preload
+  or what a restart's WAL replay leaves in the memtable. A point that does not reach N within `UC_U7_ACK_TIMEOUT`
+  (900 s, quick 300 s) is still signalled and verified but shown as ERR. The U7 table shows each point's acked count
+  at the signal and each server's absolute recovery threshold (2x its own warm p99). Each point uses a unique key
+  prefix and keeps the data dir. Before the restart the page cache of the data dir is dropped. After the restart every
   acknowledged key is read back: `lost` (missing), `corrupt` (wrong value) and `restart_misses` (preload keys not
   found by the probe, reported, not a failure). Timings are measured from the moment `docker run` returned
   (docker's own time is shown separately). Recovery is the start of the first 3 consecutive 100 ms windows whose p99 is
@@ -315,7 +351,8 @@ and 0.05. Inside the band the verdict is "tie"; outside it, "TidesKV better" or 
 - The comparison is against the best valid Kvrocks configuration for that metric, so TidesKV is never compared with a
   weaker Kvrocks setting. Errored configurations stay visible in the table.
 - A case row says "mixed" when TidesKV wins one metric and Kvrocks wins another; otherwise the row takes the label of
-  its headline metric (the first listed). There is no weighting across metrics.
+  its headline metric (the first listed), so a tie headline with a win for one side elsewhere stays "tie". The row's
+  Reason lists every metric with a non-tie verdict, so such a win is never hidden. There is no weighting across metrics.
 - Latency verdicts are given only at equal offered load: the open-loop cells of U1 and U3, and U2's churn, which runs at a
   fixed rate identical for both servers. Closed-loop latency is shown as information and never compared. A cell
   that reached under 95% of its target rate ("under target"), or whose memtier used over 85% of the client CPUs

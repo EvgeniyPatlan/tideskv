@@ -17,7 +17,7 @@
 #       when that is above 1, holding: baseline.json (probe of the preload keys in 100 ms windows, 10 s before the writer:
 #       p99_ms, requests, hits), until-p99-ms (2 x its p99), ack.<thread> (the writer's acked-key logs; keys are
 #       ack-r<rep>-<sig>-<n>-<run>-<thread>:<seq>, unique per point because the data dir is kept; values UC_U7_VALUE
-#       bytes), acked-target (n), acked-at-signal (acked writes counted right before the signal), ack.status (ok, or why
+#       bytes), acked-target (n), acked-at-signal (acked writes counted right before the signal), acked.status (ok, or why
 #       n was not reached within UC_U7_ACK_TIMEOUT: the point is ERR in the report, but still signalled and verified),
 #       writer.out, writer.status (exit code; probe.status likewise), signal.epoch_ms, term.seconds (TERM only: signal to
 #       exit), restart.epoch_ms (t0: written by start_server right after the restart's docker run returned),
@@ -337,10 +337,10 @@ _uc_u7_wait_writing() {
 }
 
 # Acknowledged writes logged so far under DIR: complete lines of every ack.<thread> (a line is written after the +OK).
-_uc_u7_acked() { cat "$OUT/$1"/ack.* 2>/dev/null | wc -l; }
+_uc_u7_acked() { cat "$OUT/$1"/ack.[0-9]* 2>/dev/null | wc -l; }
 
 # _uc_u7_wait_acked DIR N SECS: polls the writer's ack logs every 50 ms until N writes are acknowledged or SECS pass.
-# Writes acked-target, acked-at-signal (the count of the last poll, right before the signal) and ack.status.
+# Writes acked-target, acked-at-signal (the count of the last poll, right before the signal) and acked.status.
 _uc_u7_wait_acked() {
   local d=$1 n=$2 secs=$3 got=0 start
   echo "$n" >"$OUT/$d/acked-target"
@@ -352,9 +352,9 @@ _uc_u7_wait_acked() {
     sleep 0.05
   done
   echo "$got" >"$OUT/$d/acked-at-signal"
-  if ((got >= n)); then echo ok >"$OUT/$d/ack.status"; return 0; fi
-  echo "load point not reached: $got of $n acknowledged writes in $secs s" >"$OUT/$d/ack.status"
-  log "${CUR:-}: $d: $(<"$OUT/$d/ack.status")"
+  if ((got >= n)); then echo ok >"$OUT/$d/acked.status"; return 0; fi
+  echo "load point not reached: $got of $n acknowledged writes in $secs s" >"$OUT/$d/acked.status"
+  log "${CUR:-}: $d: $(<"$OUT/$d/acked.status")"
 }
 
 # _uc_u7_writer_start DIR NAME PREFIX: the ack-writer on the server, detached.
