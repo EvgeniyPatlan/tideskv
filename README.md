@@ -41,7 +41,7 @@ The aim is a production alternative to Kvrocks: a dataset larger than RAM, durab
 - `CLUSTER` views, and topology pushed through Kvrocks's `CLUSTERX` protocol, so [kvrocks-controller](https://github.com/apache/kvrocks-controller) 1.3.0 can manage a TidesKV cluster.
 - Online slot migration (`CLUSTERX MIGRATE`), with a per-slot write fence and no lost acknowledged writes.
 
-**Not supported yet** (planned for v1.x): Streams, Bitmaps, HyperLogLog, Geo, Pub/Sub, JSON, Search, TLS and ACLs. `MOVE`, `COPY` and `SWAPDB` are also missing. On-disk compatibility with Redis RDB or Kvrocks is a non-goal.
+**Not supported yet** (planned for v1.x): Streams, Bitmaps, HyperLogLog, Geo, Pub/Sub, JSON, Search, TLS and ACLs. `MOVE`, `COPY` and `SWAPDB` are also missing. On-disk compatibility with Redis RDB or Kvrocks is a non-goal. See the [roadmap](ROADMAP.md) for what comes next.
 
 Run `COMMAND LIST` against a server for the exact command set.
 
