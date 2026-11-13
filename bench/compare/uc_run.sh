@@ -241,10 +241,10 @@ uc_identity() {
   local k
   echo "mode=$UC_MODE"
   echo "tideskv_image_id=$(uc_tideskv_image_id)"
-  meta_common_fields | while IFS= read -r k; do
-    [[ " $UC_RESUME_KEYS " == *" ${k%%=*} "* ]] && echo "$k"
-  done
-  return 0
+  # an if, not `[[ ]] && echo`: a last non-matching line would fail the loop and, under errexit, the caller's subshell
+  while IFS= read -r k; do
+    if [[ " $UC_RESUME_KEYS " == *" ${k%%=*} "* ]]; then echo "$k"; fi
+  done < <(meta_common_fields)
 }
 
 # The images this run uses, stamped into each rep dir by _uc_run.

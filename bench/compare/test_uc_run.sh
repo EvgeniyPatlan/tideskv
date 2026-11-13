@@ -153,6 +153,17 @@ print(m['mode'], m['reps'], m['cases'], m['cache_accounting'], m['fio_fsync_stat
 check usecases-runs-report "$(grep -c '^python3 "$HERE/uc_report.py" "$OUT" || rc=$?$' "$HERE/usecases.sh")" 1
 
 
+# the real uc_identity under errexit (as usecases.sh runs it): every field, and the stamp's memtier line after them
+# shellcheck disable=SC2317
+meta_common_fields() { printf '%s\n' "tideskv_image=t:1" "kvrocks_image=k@sha256:bb" "server_cpus=0-3" "host=h" "started_utc=x"; }
+# shellcheck disable=SC2317
+uc_tideskv_image_id() { echo sha256:aa; }
+UC_MODE=quick
+uc_image_stamp
+check image-stamp-lines "${UC_IMAGE_STAMP[*]}" "tideskv_image_id=sha256:aa tideskv_image=t:1 kvrocks_image=k@sha256:bb memtier_image=$MEMTIER_IMAGE"
+check identity-fields "$(uc_identity | tr '\n' ' ')" "mode=quick tideskv_image_id=sha256:aa tideskv_image=t:1 kvrocks_image=k@sha256:bb server_cpus=0-3 "
+unset -f meta_common_fields uc_tideskv_image_id
+
 # ---- F4: resume refuses a run directory written with other images or resources ----
 OUT=$TMP/resume; mkdir -p "$OUT"
 # shellcheck disable=SC2317
