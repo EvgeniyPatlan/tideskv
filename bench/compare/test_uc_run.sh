@@ -187,6 +187,18 @@ write_meta_kv "$OUT/meta.json" "${ID2[@]}"
 rc=0; uc_check_resume >/dev/null 2>&1 || rc=$?
 check resume-mode-mismatch "$rc" 2
 unset -f uc_identity
+# the real uc_identity strips meta_common_fields' integer # mark, so the U8 cap and memtier image are compared too
+IDREAL=$(
+  # shellcheck source=uc_run.sh
+  source "$HERE/uc_run.sh"
+  # shellcheck disable=SC2317
+  meta_common_fields() { printf '%s\n' "memtier_image=m:1" "#quiesce_max_s=60" "#other=1"; }
+  # shellcheck disable=SC2317
+  uc_tideskv_image_id() { echo sha256:aa; }
+  UC_MODE=quick uc_identity
+)
+check resume-keys-cap "$(grep -c -e '^quiesce_max_s=60$' -e '^memtier_image=m:1$' <<<"$IDREAL")" 2
+check resume-keys-skip-other "$(grep -c '^other=' <<<"$IDREAL")" 0
 
 # ---- image stamp per rep, remove_data failure, U8 invalidated by a redone U1/U3 ----
 OUT=$TMP/stamp UC_REPS=1 UC_MODE=quick UC_IMAGE_STAMP=("tideskv_image=t:1" "kvrocks_image=k@sha256:bb")

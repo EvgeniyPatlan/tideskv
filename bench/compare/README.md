@@ -207,8 +207,8 @@ is Kvrocks' WAL archive at its stock `wal_size_limit_mb 16384`; 4 GiB is slack. 
 Kvrocks term). Full-size needs: U1 50.9 GiB (the largest; 54.6 GB), U5 44.7 GiB, U2 30.2 GiB, U4 28.9 GiB, U7 26.3 GiB
 (its preload plus every point's acknowledged writes, since the data dir is kept), U3 26.3 GiB, U6 20.2 GiB, U8 and F1
 20 GiB. The
-fio files (8 GiB for the random-read baseline before U1 in full mode, 1 GiB for each U6 job) are deleted before any
-server loads. A case that does not fit is skipped, and its repetitions say why.
+random-read baseline's 8 GiB fio file (full mode) is deleted before U1 loads; each U6 fio job's 1 GiB file exists only
+beside U6's small preload and is deleted after the job. A case that does not fit is skipped, and its repetitions say why.
 
 ### Time
 
@@ -259,9 +259,9 @@ pinned to cores and the cases measure latency.
 |---|---|---|---|---|
 | U1 Cache bigger than RAM | 20M keys x 1 KB (about 20 GB, 2.5x `SERVER_MEM`), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. Kvrocks gets a full COMPACT after the closed-loop phases (for U8). fio's random-read curve is measured before U1 | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
 | U2 TTL churn and space reclaim | SET with random TTLs 120-1200 s, 1:1 GET (negative lookups over a 1e9-key space) at a fixed rate for 60 min, then 30 min idle; `du` every 60 s | TidesKV, Kvrocks, Kvrocks+cron (`compaction-checker-cron * * * * *`) | relaxed | disk bytes over time and at the end; p99.9 at the fixed rate; end-of-run key count |
-| U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk write bytes per op (cgroup write bytes / requests of the closed run) |
+| U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk write bytes per op (cgroup write bytes / requests of the closed run; information) |
 | U4 Hashes as records | 5M hashes x 20 fields x 50 B; HGET/HSET/HGETALL/HDEL mix 10:6:3:1 | TidesKV, Kvrocks | relaxed | ops/s; p99 |
-| U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk write bytes per op; on-disk size |
+| U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk write bytes per op (information); on-disk size |
 | U6 Durable writes | SET 100 B at 1, 8, 64 and 256 connections, pipeline 1; before each server's sweep fio measures the durable-append floor (4 KiB sequential write + fdatasync) and a reference (4 KiB random write + fsync) | TidesKV, Kvrocks | strict | writes/s; p99; ops/s over the durable-append floor (information) |
 | U7 Restart and crash recovery | writer with an acknowledgement log (2 KiB values); SIGTERM and SIGKILL once 12710, 63550 and 114390 writes are acknowledged (about 10, 50 and 90% of the 256 MiB memtable), the same counts on both servers, 5 times each; restart, then verify every acknowledged key | TidesKV, Kvrocks | strict | acknowledged writes lost, corrupt, restart misses; time to PONG; time to recovered p99 (with each server's absolute threshold and the acked count at the signal) |
 | U8 Bulk load and footprint | no server of its own: reads U1's load and U3's aging | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet (censored at `QUIESCE_MAX`: "≥ cap"); disk after load, after aging, after COMPACT (Kvrocks only) |

@@ -118,7 +118,9 @@ def methodology(summary):
         "apparent size is shown beside them. Runs recorded before the allocated column existed fall back to apparent "
         "size, and the tables label it as such." % (
             ("The observed on-disk / logical ratio (allocated bytes excluding the WAL archive after the load, over "
-             "keys x value size; U2: disk at end over the live-bytes estimate) was: %s." % _observed_text(summary))
+             "keys x value size; U2: disk at end over the live-bytes estimate) was: %s. It is not a pure compression "
+             "ratio: data still in the memtable or the live WAL distorts it, notably when the data set is near the "
+             "memtable size (as in quick mode)." % _observed_text(summary))
             if _observed_text(summary) else "No observed on-disk / logical ratio is available in this run."),
         "7. **Correctness.** Checked per cell from memtier's per-command byte and hit counts: every SET reply must be "
         "the 5-byte `+OK` (U1, U2, U3, U5, U6), every HSET and HDEL reply a 4-byte integer (U4), and GETs must hit at "

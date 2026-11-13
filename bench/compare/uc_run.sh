@@ -236,13 +236,14 @@ uc_write_meta() {
 }
 
 # Fields a resumed run must share with the run directory's meta.json (ruling F4), as key=value lines for this run.
-UC_RESUME_KEYS="mode tideskv_image tideskv_image_id kvrocks_image server_cpus server_mem client_cpus"
+UC_RESUME_KEYS="mode tideskv_image tideskv_image_id kvrocks_image memtier_image server_cpus server_mem client_cpus quiesce_max_s"
 uc_identity() {
   local k
   echo "mode=$UC_MODE"
   echo "tideskv_image_id=$(uc_tideskv_image_id)"
   # an if, not `[[ ]] && echo`: a last non-matching line would fail the loop and, under errexit, the caller's subshell
   while IFS= read -r k; do
+    k=${k#\#}  # meta_common_fields marks integer fields with a leading #
     if [[ " $UC_RESUME_KEYS " == *" ${k%%=*} "* ]]; then echo "$k"; fi
   done < <(meta_common_fields)
 }
