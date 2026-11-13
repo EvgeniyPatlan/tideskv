@@ -157,21 +157,27 @@ _uc_logical() {
   esac
 }
 
-# Bytes free a case needs (ruling F1-crit, replacing R6's "LZ4 compresses ~3x", which the quick run contradicts):
-#   logical x 1.4             the data on disk after the load. memtier's --random-data does not compress (U1 load is 1 KiB
+# Bytes free a case needs (ruling F1-crit, replacing R6's "LZ4 compresses ~3x", which the quick run contradicts). Only
+# one server's data is on disk at a time (each pass starts from an emptied data dir), so the need is the larger of the
+# two servers' needs, not their sum:
+#   TidesKV: logical x 1.4 + UC_SLACK
+#   Kvrocks: logical x 1.6 + UC_WAL_ALLOWANCE + UC_SLACK
+#   logical x 1.4/1.1         the data on disk after the load. memtier's --random-data does not compress (U1 load is 1 KiB
 #                             values of random bytes): in the quick run build/bench/uc-quick (du-after-load: allocated bytes
 #                             excluding the WAL archive, over keys x (value + 12)) U1 TidesKV was 1.33x and Kvrocks 1.05x;
 #                             U5 1/4/16 KiB TidesKV 1.48/1.25/1.00x, Kvrocks 1.41/1.43/1.56x at 0.5 GiB per size, where
-#                             fixed per-file overheads weigh more than at full size. 1.4 covers U1, the largest case;
-#                             the COMPACT term and the slack absorb U5's excess (about 2 GiB at full size).
-#   + UC_WAL_ALLOWANCE        Kvrocks' WAL archive (stock wal_size_limit_mb 16384 caps it at 16 GiB)
-#   + logical / 2             the transient extra space of Kvrocks' full COMPACT (U1) while old and new SSTs coexist
-#   + UC_SLACK                4 GiB for logs, the fio files and the filesystem
-# One formula for every case and server, so U8 and F1 (logical 0) still ask for 20 GiB.
+#                             fixed per-file overheads weigh more than at full size.
+#   Kvrocks + logical / 2     the transient extra space of its full COMPACT (U1) while old and new SSTs coexist
+#                             (1.1 + 0.5 = 1.6)
+#   UC_WAL_ALLOWANCE          Kvrocks' WAL archive (stock wal_size_limit_mb 16384 caps it at 16 GiB)
+#   UC_SLACK                  4 GiB for logs, the fio files and the filesystem
+# U8 and F1 (logical 0) still ask for 20 GiB (the Kvrocks term).
 uc_disk_need() {
-  local logical
+  local logical t k
   logical=$(_uc_logical "$1") || return
-  echo $((logical * 14 / 10 + UC_WAL_ALLOWANCE + logical / 2 + UC_SLACK))
+  t=$((logical * 14 / 10 + UC_SLACK))
+  k=$((logical * 16 / 10 + UC_WAL_ALLOWANCE + UC_SLACK))
+  echo $((t > k ? t : k))
 }
 
 uc_phases() {

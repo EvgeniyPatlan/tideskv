@@ -198,13 +198,15 @@ also gets the images it ran with (`images.done`, and `images.closed` for pass A)
 pass A makes U8 recompute that server's repetition. A repetition whose data directory cannot be emptied first is
 recorded as failed, not run on top of old data (U5 checks the same between value sizes).
 
-Before each case loads, the suite checks the free disk against that case's need: `logical x 1.4 + 16 GiB + logical / 2
-+ 4 GiB`. memtier's random values do not compress: after U1's load in the quick run TidesKV held 1.33x and Kvrocks 1.05x
-of the logical bytes (keys x (value + 12)), so 1.4 covers the data; 16 GiB is Kvrocks' WAL archive at its stock
-`wal_size_limit_mb 16384`; `logical / 2` is the transient space of Kvrocks' full COMPACT in U1; 4 GiB is slack. The
-formula applies to every case whatever the server, so even U8 and F1 need 20 GiB. Full-size needs: U1 56.7 GiB (the
-largest; 60.8 GB), U5 49.3 GiB, U2 32.1 GiB, U4 30.6 GiB, U7 27.5 GiB (its preload plus every point's acknowledged writes, since the
-data dir is kept), U3 27.5 GiB, U6 20.2 GiB, U8 and F1 20 GiB. The
+Before each case loads, the suite checks the free disk against that case's need. Only one server's data is on disk at a
+time (each pass starts from an emptied data dir), so the need is the larger of two per-server needs: TidesKV
+`logical x 1.4 + 4 GiB`, Kvrocks `logical x 1.6 + 16 GiB + 4 GiB`. memtier's random values do not compress: after U1's
+load in the quick run TidesKV held 1.33x and Kvrocks 1.05x of the logical bytes (keys x (value + 12)), so 1.4 covers
+TidesKV's data; Kvrocks' 1.6 is about 1.1 for its data plus 0.5 for the transient space of its full COMPACT in U1; 16 GiB
+is Kvrocks' WAL archive at its stock `wal_size_limit_mb 16384`; 4 GiB is slack. Even U8 and F1 ask for 20 GiB (the
+Kvrocks term). Full-size needs: U1 50.9 GiB (the largest; 54.6 GB), U5 44.7 GiB, U2 30.2 GiB, U4 28.9 GiB, U7 26.3 GiB
+(its preload plus every point's acknowledged writes, since the data dir is kept), U3 26.3 GiB, U6 20.2 GiB, U8 and F1
+20 GiB. The
 fio files (8 GiB for the random-read baseline before U1 in full mode, 1 GiB for each U6 job) are deleted before any
 server loads. A case that does not fit is skipped, and its repetitions say why.
 

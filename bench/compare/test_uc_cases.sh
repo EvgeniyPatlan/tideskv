@@ -31,15 +31,15 @@ check level-u7 "$(uc_level U7)" strict
 check level-u1 "$(uc_level U1)" relaxed
 # lib.sh writes and checks TidesKV's relaxed sync-mode from RELAXED: the suite's relaxed level is sync-mode none
 check relaxed-sync-mode "$(BLOCK_CACHE_MB=2048 SERVER_WORKERS=4 _parity_expect tideskv relaxed | grep '^sync-mode')" "sync-mode none"
-# F1-crit: logical x 1.4 (measured on-disk ratio) + 16 GiB WAL archive + logical / 2 (Kvrocks COMPACT) + 4 GiB slack
+# F1-crit: max(TidesKV logical x 1.4 + 4 GiB, Kvrocks logical x 1.6 + 16 GiB WAL archive + 4 GiB); Kvrocks is the larger
 G=$((1024 * 1024 * 1024))
-check disk-u1 "$(uc_disk_need U1)" $((20000000 * 1036 * 14 / 10 + 16 * G + 20000000 * 1036 / 2 + 4 * G))
+check disk-u1 "$(uc_disk_need U1)" $((20000000 * 1036 * 16 / 10 + 16 * G + 4 * G))
 check disk-u7-writer "$(_uc_logical U7)" $((2000000 * 112 + 5 * 2 * (12710 + 63550 + 114390) * 2112))
 check disk-u8-none "$(uc_disk_need U8)" $((20 * G))
-check disk-u5 "$(uc_disk_need U5)" $((16000000 * 1036 * 14 / 10 + 16 * G + 16000000 * 1036 / 2 + 4 * G))
-# spec section 3: every case's full-size need fits in 60 GiB (U1, the largest, is about 56.7 GiB)
+check disk-u5 "$(uc_disk_need U5)" $((16000000 * 1036 * 16 / 10 + 16 * G + 4 * G))
+# spec section 3: every case's full-size need fits in 60 GB (decimal; U1, the largest, is about 54.6 GB)
 for c in $(uc_cases); do
-  check "disk-$c-under-60gib" "$(( $(uc_disk_need "$c") <= 60 * G ))" 1
+  check "disk-$c-under-60gb" "$(( $(uc_disk_need "$c") <= 60000000000 ))" 1
 done
 check debt-fields "$([[ -n ${UC_DEBT_FIELDS_tideskv[*]} && -n ${UC_DEBT_FIELDS_kvrocks[*]} ]] && echo yes)" yes
 check debt-kvrocks-pending "$(has "${UC_DEBT_FIELDS_kvrocks[*]}" estimate_pending_compaction_bytes)" yes
