@@ -11,8 +11,8 @@ import statistics
 from dataclasses import dataclass, replace
 from typing import Callable
 
-from uc_cells import (CellError, NotRun, _json, _num, _reads, cache_hit_rate, du_peak, du_rows, hit_rate, ops, over_10x,
-                      pct)
+from uc_cells import (CellError, NotRun, _json, _num, _reads, cache_hit_rate, cell, du_peak, du_rows, fio_job, hit_rate, ops,
+                      over_10x, pct)
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class Metric:
     disk_src: str | None = None   # du file or summary.json:<field> read; {basis} in the title says allocated or apparent
     twin_of: str | None = None    # apparent-size twin of a disk metric (dropped when that metric is apparent already)
     floor_key: str | None = None  # meta.json key of a measurement floor: values at or under it get no verdict
+    cap_key: str | None = None    # meta.json key of a cap the value is censored at (shown as "≥ cap", verdict rule in uc_report)
 
 
 
@@ -72,10 +73,39 @@ def _u8_growth(rep):
 
 
 def _u8_settle(rep):
-    d = _json(rep, "summary.json")
-    if d.get("settle_load_capped"):
-        raise CellError("settle hit the cap (%s s) before the server went quiet" % d["settle_load_s"])
-    return _num(d["settle_load_s"])
+    """Seconds to quiet after U1's load; a capped wait gives the cap (settle_load_s holds it): a lower bound, which the
+    report shows as "≥ cap" (cap_key) rather than as an error."""
+    return _num(_json(rep, "summary.json")["settle_load_s"])
+
+
+# ---- disk writes per op, ratio to the fio floor ----
+
+def bytes_per_op(phase):
+    """The server cgroup's bytes written during the timed run (PHASE.io) over the run's requests."""
+    def f(rep):
+        n = _num(cell(rep, phase)["ALL STATS"]["Totals"]["Count"])
+        try:
+            io = float(_reads(rep, phase + ".io"))
+        except ValueError:
+            raise CellError("%s.io is not a number" % phase)
+        return io / n
+    return f
+
+
+def floor_ratio(phase):
+    """PHASE ops/s over the durable-append floor (fio/append.json) measured right before this server's sweep."""
+    def f(rep):
+        path = os.path.join(rep, "fio", "append.json")
+        if not os.path.exists(path):
+            raise NotRun("fio/append.json")
+        try:
+            floor = fio_job(path, "write")["iops"]
+        except (OSError, ValueError, KeyError, TypeError):
+            raise CellError("unreadable fio/append.json")
+        if not floor:
+            raise CellError("durable-append floor of 0 writes/s")
+        return ops(phase)(rep) / floor
+    return f
 
 
 # ---- U7 ----
@@ -178,9 +208,13 @@ def _m(key, title, hib, headline, fn, unit, phase=None, **kw):
 def _open():
     out = []
     for ph in ("open25", "open50", "open75"):
-        out += [_m(ph + "_p99", "%s p99" % ph, False, False, pct(ph, "p99.00"), "ms", ph),
+        out += [_m(ph + "_p50", "%s p50" % ph, False, False, pct(ph, "p50.00"), "ms", ph),
+                _m(ph + "_p99", "%s p99" % ph, False, False, pct(ph, "p99.00"), "ms", ph),
                 _m(ph + "_p999", "%s p99.9" % ph, False, False, pct(ph, "p99.90"), "ms", ph)]
     return out
+
+
+BOP_TITLE = "%s disk writes per op (server cgroup write bytes / requests)"
 
 
 def _build_metrics():
@@ -188,7 +222,7 @@ def _build_metrics():
     m["U1"] = [_m("closed-gauss_ops", "closed-gauss ops/s", True, True, ops("closed-gauss"), "ops/s", "closed-gauss"),
                _m("closed-uniform_ops", "closed-uniform ops/s", True, False, ops("closed-uniform"), "ops/s", "closed-uniform")] \
         + _open() + [_m("cache_hit", "block cache hit rate (closed-gauss)", True, False, cache_hit_rate("closed-gauss"), "%",
-                        info=True, only="kvrocks", note="Kvrocks only: TidesKV's INFO has no hit/miss counters")]
+                        "closed-gauss", info=True, only="kvrocks", note="Kvrocks only: TidesKV's INFO has no hit/miss counters")]
     basis = "{basis}, excl. WAL archive"
     m["U2"] = [_m("du_end", "disk at end (%s)" % basis, False, True, _du_last("du-end"), "bytes", disk_src="du-end"),
                _m("du_end_apparent", "disk at end (apparent size, excl. WAL archive)", False, False, _du_last("du-end", 3),
@@ -203,7 +237,8 @@ def _build_metrics():
     m["U3"] = [_m("closed_p999", "closed p99.9 (not compared: servers run at different loads)", False, False,
                   pct("closed", "p99.90"), "ms", "closed", info=True),
                _m("closed_ops", "closed ops/s", True, False, ops("closed"), "ops/s", "closed"),
-               _m("windows_over_10x", "windows over 10x median p99.9", False, False, over_10x("closed"), "count", "closed")] \
+               _m("windows_over_10x", "windows over 10x median p99.9", False, False, over_10x("closed"), "count", "closed"),
+               _m("closed_bop", BOP_TITLE % "closed", False, False, bytes_per_op("closed"), "B/op", "closed")] \
         + [replace(x, headline=x.key == "open50_p999") for x in _open() if x.key.endswith("_p999")]
     m["U4"] = [_m("mix_ops", "mix ops/s", True, True, ops("mix"), "ops/s", "mix"),
                _m("mix_p99", "mix p99 (not compared: closed loop)", False, False, pct("mix", "p99.00"), "ms", "mix", info=True)] \
@@ -216,13 +251,16 @@ def _build_metrics():
         m["U5"] += [_m(sz + "_ops", "%s ops/s" % sz, True, sz == "v4k", ops(sz), "ops/s", sz),
                     _m(sz + "_p99", "%s p99 (not compared: closed loop)" % sz, False, False, pct(sz, "p99.00"), "ms", sz,
                        info=True),
+                    _m(sz + "_bop", BOP_TITLE % sz, False, False, bytes_per_op(sz), "B/op", sz),
                     _m(sz + "_du", "%s disk after load (%s)" % (sz, basis), False, False, _du_last(src), "bytes", disk_src=src),
                     _m(sz + "_du_apparent", "%s disk after load (apparent size, excl. WAL archive)" % sz, False, False,
                        _du_last(src, 3), "bytes", info=True, twin_of=sz + "_du")]
     m["U6"] = []
     for c in ("c1", "c8", "c64", "c256"):
         m["U6"] += [_m(c + "_ops", "%s ops/s" % c, True, c == "c64", ops(c), "ops/s", c),
-                    _m(c + "_p99", "%s p99 (not compared: closed loop)" % c, False, False, pct(c, "p99.00"), "ms", c, info=True)]
+                    _m(c + "_p99", "%s p99 (not compared: closed loop)" % c, False, False, pct(c, "p99.00"), "ms", c, info=True),
+                    _m(c + "_floor", "%s ops/s over the durable-append floor" % c, True, False, floor_ratio(c), "x", c,
+                       info=True)]
     m["U7"] = _u7_headline()
     src = "summary.json:"
     m["U8"] = [_m("du_after_load", "disk after load (%s)" % basis, False, True, _u8("du_after_load"), "bytes",
@@ -230,7 +268,8 @@ def _build_metrics():
                _m("du_after_load_apparent", "disk after load (apparent size, excl. WAL archive)", False, False,
                   _u8("du_after_load", True), "bytes", info=True, twin_of="du_after_load"),
                _m("load_ops", "bulk load ops/s", True, False, _u8_plain("load_ops_per_s"), "ops/s"),
-               _m("settle_s", "time to quiet after load", False, False, _u8_settle, "s", floor_key="quiesce_window_s"),
+               _m("settle_s", "time to quiet after load", False, False, _u8_settle, "s", floor_key="quiesce_window_s",
+                  cap_key="quiesce_max_s"),
                _m("u3_load", "U3 disk after its load (%s)" % basis, False, False, _u8("u3_du_after_load"), "bytes", info=True,
                   disk_src=src + "u3_du_after_load"),
                _m("age_growth", "U3 disk growth during aging (%s)" % basis, False, False, _u8_growth, "bytes", info=True,

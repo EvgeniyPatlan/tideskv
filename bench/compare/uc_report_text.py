@@ -26,7 +26,8 @@ INFO = {
     "U5": ("Mid-size values", "values of 1, 4 and 16 KB (user records, small documents)", "How do throughput, tail "
            "latency and disk footprint change with value size? Kvrocks runs with and without BlobDB."),
     "U6": ("Durable writes, connection sweep", "a store that must not lose acknowledged writes",
-           "What does an fsync per acknowledged write cost at 1, 8, 64 and 256 connections, against the disk's own fsync floor?"),
+           "What does an fsync per acknowledged write cost at 1, 8, 64 and 256 connections, against the disk's own "
+           "durable-append floor?"),
     "U7": ("Restart and crash recovery", "a server that is restarted or killed under write load",
            "After SIGTERM or SIGKILL under write load at strict durability, is any acknowledged write lost, and how long "
            "until the server answers and is fast again?"),
@@ -45,6 +46,9 @@ OTHER_NOTES = {
     "U3": ["Both servers had the same aging. Background debt is shown as information, not as a verdict."],
     "U4": ["HGET/HGETALL replies are not hit-counted by memtier, so the reply check covers the integer replies of "
            "HSET and HDEL only.",
+           "memtier picks each command by its weight on its own, so HDEL runs without a paired HSET (the spec's "
+           "\"HDEL+HSET 5%\" is HDEL alone at weight 1); a deleted field is set again by a later HSET. The same "
+           "command stream runs on both servers.",
            "Per-command ops/s follow the mix ops/s (the command ratio is fixed) and are not counted separately."],
     "U5": ["Both Kvrocks configurations are shown so that neither blob threshold is cherry-picked."],
     "U6": ["Strict durability on both sides.",
@@ -65,6 +69,9 @@ OTHER_NOTES = {
            "both closed-loop phases, so it is not a fresh-load figure.",
            "Time to quiet cannot be shorter than the settle check's window; a value at that floor is shown as \"≤ floor\" "
            "and gets no verdict.",
+           "A settle wait that reached QUIESCE_MAX is censored: shown as \"≥ cap\", not an error. It gets a verdict only "
+           "when the other side went quiet below the cap by more than the band; when both reached it there is none "
+           "(\"both capped\").",
            "U8 reads U1's load and U3's aging; it runs no server of its own."],
 }
 
@@ -77,16 +84,21 @@ def fmt(v, unit):
             if v >= size:
                 return "%.2f GiB" % (v / size) if name == "GiB" else "%.1f %s" % (v / size, name)
         return "%d B" % v
-    return {"ops/s": "{:,.0f}", "ms": "{:.3f} ms", "count": "{:,.0f}", "s": "{:.1f} s", "%": "{:.1f}%"}.get(unit, "{:g}").format(v)
+    return {"ops/s": "{:,.0f}", "ms": "{:.3f} ms", "count": "{:,.0f}", "s": "{:.1f} s", "%": "{:.1f}%",
+            "B/op": "{:,.0f} B/op", "x": "{:.2f}x"}.get(unit, "{:g}").format(v)
 
 
-def fmt_cell(c, unit, floor=None):
+def fmt_cell(c, unit, floor=None, cap=None):
     if c is None:
         return "n/a"
     if c["errors"]:
         return "ERR: " + "; ".join(c["errors"])[:110]
     if floor and c["median"] <= floor:
         return "≤ %g s (floor)" % floor
+    if cap and c["median"] >= cap:
+        return "≥ %g s (cap)" % cap
+    if cap and c["hi"] >= cap:
+        return "%s [%s–≥ %g s]" % (fmt(c["median"], unit), fmt(c["lo"], unit), cap)
     if c["n"] > 1 and c["lo"] != c["hi"]:
         return "%s [%s–%s]" % (fmt(c["median"], unit), fmt(c["lo"], unit), fmt(c["hi"], unit))
     return fmt(c["median"], unit)
@@ -138,7 +150,15 @@ def _reason(head):
     vs = next(((s, c) for s, c in ks if s == head["vs"]), ks[0] if ks else None)
     if not t or not vs:
         return head["title"]
-    return "%s: TidesKV %s vs %s %s" % (head["title"], fmt_cell(t, head["unit"]), NAMES[vs[0]], fmt_cell(vs[1], head["unit"]))
+    return "%s: TidesKV %s vs %s %s" % (head["title"], fmt_cell(t, head["unit"], cap=head.get("cap")), NAMES[vs[0]],
+                                        fmt_cell(vs[1], head["unit"], cap=head.get("cap")))
+
+
+def _non_tie(cs):
+    """'title (label)' for every counted metric with a TidesKV- or Kvrocks-better verdict (spec 5a: a row lists each)."""
+    wins = ("TidesKV better", "Kvrocks better")
+    return ["%s (%s)" % (e["title"], e["verdict"]["label"]) for e in cs["metrics"]
+            if e["verdict"] and (e["headline"] or e["pros_cons"]) and e["verdict"]["label"] in wins]
 
 
 def _matrix(summary):
@@ -152,8 +172,11 @@ def _matrix(summary):
             if head["ratio_range"]:
                 rng += " [%.2f–%.2f]" % tuple(head["ratio_range"])
         label = cs["label"] + (" (quick)" if summary["quick"] else "")
-        out.append("| %s | %s | %s | %s | %s | %s |" % (case, INFO[case][1], label, rng, _vs_text(cs, head),
-                                                         _reason(head) if head else "no data"))
+        reason = _reason(head) if head else "no data"
+        wins = _non_tie(cs)
+        if wins:
+            reason += ". Non-tie verdicts: " + "; ".join(wins)
+        out.append("| %s | %s | %s | %s | %s | %s |" % (case, INFO[case][1], label, rng, _vs_text(cs, head), reason))
     return out
 
 
@@ -196,8 +219,9 @@ def _setup(case, cs, summary):
     out = ["**Setup.** Durability level: %s. Repetitions: %s." % (st["level"], len(cs["reps"]))]
     w = st.get("workload")
     if w:
-        out.append("Headline cell: ratio %s, %s B values, key pattern %s, keys up to %s, %s threads x %s clients, "
-                   "pipeline %s, %s s%s." % (w["ratio"], w["data_size"], w["key_pattern"], w["key_maximum"], w["threads"],
+        mix = ("commands %s (weights)" % w["commands"]) if w.get("commands") else "ratio %s" % w["ratio"]
+        out.append("Headline cell: %s, %s B values, key pattern %s, keys up to %s, %s threads x %s clients, "
+                   "pipeline %s, %s s%s." % (mix, w["data_size"], w["key_pattern"], w["key_maximum"], w["threads"],
                                              w["clients"], w["pipeline"], w["test_time"],
                                              ", rate limit %s/connection" % w["rate_limit"] if w["rate_limit"] else ""))
     mem = _mem_bytes(summary["meta"].get("server_mem"))
@@ -233,7 +257,7 @@ def _results(cs):
             verdict += " (%s)" % v["note"] if v["note"] else ""
             if any(_kvrocks_has_errors(x) for x in (e,)) and e["vs"]:
                 verdict += " [vs best valid Kvrocks config]"
-        cells = [fmt_cell(e["configs"].get(s), e["unit"], e.get("floor")) for s in servers]
+        cells = [fmt_cell(e["configs"].get(s), e["unit"], e.get("floor"), e.get("cap")) for s in servers]
         out.append("| %s | %s | %s | %s |" % (e["title"] + (" †" if e["note"] else ""), " | ".join(cells),
                                               fmt_ratio(v) if v else "–", verdict))
     return out
@@ -261,6 +285,9 @@ def _notes(cs):
         for s, c in e["configs"].items():
             for err in (c["errors"] if c else ()):
                 out.append("- %s, %s: %s" % (NAMES[s], e["title"], err))
+    for s, r, where, line in cs.get("evict") or ():
+        out.append("- %s rep%d%s: %s; its reads may have been served from the host page cache beyond SERVER_MEM, "
+                   "so treat its read numbers with care." % (NAMES[s], r, " " + where if where else "", line))
     return out + [""] if out else out
 
 
@@ -307,24 +334,33 @@ def _extras(case, cs, summary):
                 "the ones counted in the case label and the pros and cons. A server that never recovered shows ERR with "
                 "the cause.", ""]
     if case == "U6":
-        out += _u6_floor(ex.get("fio") or {}, (summary.get("fio") or {}).get("fsync"))
+        fio = summary.get("fio") or {}
+        out += _u6_floor(ex.get("fio") or {}, ex.get("fio_append") or {}, fio.get("fsync"), fio.get("append"))
     return out
 
 
-def _u6_floor(fio, start):
-    """Lines for each server's fsync floor measured before its sweep (or why it was not), plus the run-start one."""
+FIO_REF = "fio reference (4 KiB random write + fsync)"
+FIO_FLOOR = "durable-append floor (4 KiB sequential write + fdatasync)"
+
+
+def _u6_floor(fio, append, start, start_append):
+    """Lines for each server's fio reference and durable-append floor measured before its sweep (or why not), plus the
+    run-start ones."""
     out = []
-    if start:
-        out.append("- start of run: %.0f writes/s%s" % (start["iops"], _fsync_lat(start)))
-    for s, reps in fio.items():
-        for r, fs in reps.items():
-            if "missing" in fs:
-                out.append("- fsync floor before %s's sweep: not measured (%s)" % (NAMES[s], fs["missing"]))
-            else:
-                out.append("- %s rep%d: %.0f writes/s%s" % (NAMES[s], r, fs["iops"], _fsync_lat(fs)))
+    for name, first, per in ((FIO_FLOOR, start_append, append), (FIO_REF, start, fio)):
+        if first:
+            out.append("- %s, start of run: %.0f writes/s%s" % (name, first["iops"], _fsync_lat(first)))
+        for s, reps in per.items():
+            for r, fs in reps.items():
+                if "missing" in fs:
+                    out.append("- %s before %s's sweep: not measured (%s)" % (name, NAMES[s], fs["missing"]))
+                else:
+                    out.append("- %s, %s rep%d: %.0f writes/s%s" % (name, NAMES[s], r, fs["iops"], _fsync_lat(fs)))
     if not out:
         return []
-    return ["**Disk floor** (fio, 4 KiB writes with an fsync each, queue depth 1), right before each server's sweep:", ""] + out + [""]
+    return ["**Disk floors** (fio, queue depth 1, right before each server's sweep). The durable-append floor is the "
+            "write pattern of a write-ahead log and the reference for the \"ops/s over the durable-append floor\" rows; "
+            "the random-write job is kept as a reference:", ""] + out + [""]
 
 
 def _fsync_lat(fs):
@@ -346,10 +382,14 @@ def _case_section(case, cs, summary):
     out += _extras(case, cs, summary) + _timelines(case, cs)
     notes = list(OTHER_NOTES.get(case, []))
     if case == "U6":
-        measured = any("missing" not in fs for reps in cs["extras"].get("fio", {}).values() for fs in reps.values())
-        notes.insert(1 if notes else 0, "The disk's fsync floor drifts, so it was measured right before each server's sweep "
-                     "(above)." if measured else "The disk's fsync floor was not measured before the sweeps (see above), so "
-                     "the disk's drift cannot be read from this run.")
+        measured = any("missing" not in fs for key in ("fio", "fio_append")
+                       for reps in cs["extras"].get(key, {}).values() for fs in reps.values())
+        notes.insert(1 if notes else 0, "The disk's flush rate drifts, so both fio jobs were measured right before each "
+                     "server's sweep (above)." if measured else "The disk's floors were not measured before the sweeps (see "
+                     "above), so the disk's drift cannot be read from this run.")
+        notes.insert(2, "Strict mode is configured and read back on both servers, but per-ack fsync is not observed by "
+                     "the suite: a server faster than the durable-append floor batches flushes (group commit) or does "
+                     "not flush per write; the suite cannot tell which.")
     out += ["**Caveats.**", ""] + ["- " + n for n in notes]
     if case in ("U1", "U2", "U5", "U8"):
         out.append("- Disk numbers exclude Kvrocks' WAL archive.")

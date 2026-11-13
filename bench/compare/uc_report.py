@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 
 import uc_cells
@@ -99,14 +100,31 @@ def _withhold(metric, flags):
     return None
 
 
-def _decide(metric, sums, flags, quick, floor=None):
+def _censored(v, t, k, cap, best):
+    """Verdict of a lower-is-better value censored at CAP (a capped wait records the cap, a lower bound): none when
+    both sides reached the cap, and otherwise only the uncapped side can win, by more than the band."""
+    if not cap or v.label == uc_verdict.LABEL_NO_VERDICT:
+        return v
+    t_cap, k_cap = t.hi >= cap, k.hi >= cap
+    if t_cap and k_cap:
+        return uc_verdict.Verdict(uc_verdict.LABEL_NO_VERDICT, v.ratio, v.band, "both capped")
+    if t_cap or k_cap:
+        win = uc_verdict.LABEL_KVROCKS if t_cap else uc_verdict.LABEL_TIDESKV
+        if v.label != win:
+            who = "TidesKV" if t_cap else NAMES.get(best, best)
+            return uc_verdict.Verdict(uc_verdict.LABEL_NO_VERDICT, v.ratio, v.band,
+                                      "%s capped at %g s and the other side not below it by more than the band" % (who, cap))
+    return v
+
+
+def _decide(metric, sums, flags, quick, floor=None, cap=None):
     t = sums.get("tideskv")
     ks = {n: s for n, s in sums.items() if n.startswith("kvrocks") and s is not None}
     if metric.info or t is None or not ks:
         return None, None, None
     best = _pick_k(ks, metric.higher_is_better)
     k = ks[best or next(iter(ks))]
-    v = uc_verdict.verdict(t, k, metric.higher_is_better, quick)
+    v = _censored(uc_verdict.verdict(t, k, metric.higher_is_better, quick), t, k, cap, best or next(iter(ks)))
     why = _withhold(metric, flags) or ("time to quiet is at the measurement floor of %g s" % floor if floor else None)
     if why and v.label != uc_verdict.LABEL_NO_VERDICT:
         v = uc_verdict.Verdict(uc_verdict.LABEL_NO_VERDICT, v.ratio, v.band, why)
@@ -148,9 +166,9 @@ def _basis(metric, servers, reps, case_dir):
     return "apparent size" if len(old) == len(got) else "mixed: apparent size for " + ", ".join(old)
 
 
-def _metric_entry(metric, sums, verdict, best, rng, flags, title, floor):
+def _metric_entry(metric, sums, verdict, best, rng, flags, title, floor, cap=None):
     why = _withhold(metric, flags)
-    return {"key": metric.key, "title": title, "floor": floor, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
+    return {"key": metric.key, "title": title, "floor": floor, "cap": cap, "unit": metric.unit, "higher_is_better": metric.higher_is_better,
             "headline": metric.headline, "info": metric.info, "pros_cons": metric.pros_cons, "note": metric.note,
             "phase": metric.phase, "withheld": why,
             "configs": {s: None if x is None else {"median": x.median, "lo": x.lo, "hi": x.hi, "n": x.n,
@@ -211,8 +229,81 @@ def _setup(case, run_dir, case_dir, servers, rep1, headline_phase):
             out["workload"] = {k: cfg["configuration"].get(k) for k in (
                 "ratio", "data_size", "key_pattern", "key_maximum", "threads", "clients", "pipeline", "test_time",
                 "rate_limit", "expiry_range")}
+            if case == "U4":  # memtier's --ratio is not used by --command runs: show the command weights instead
+                out["workload"]["ratio"], out["workload"]["commands"] = None, u4_command_weights()
         except (OSError, ValueError, KeyError):
             pass
+    return out
+
+
+def u4_command_weights():
+    """'HGET 10, HSET 6, ...' from uc_cases.sh's U4 --command / --command-ratio pairs (the runner's own list)."""
+    try:
+        text = uc_cells.read_text(os.path.join(HERE, "uc_cases.sh"))
+    except OSError:
+        return None
+    pairs = re.findall(r'"--command=(\w+) [^"]*" "--command-ratio=(\d+)"', text)
+    return ", ".join("%s %s" % p for p in pairs) or None
+
+
+def _load_logical(rep_dir, name):
+    """Keys x value size of a load from its first memtier result (NAME/1.json), or None."""
+    try:
+        cfg = json.loads(uc_cells.read_text(os.path.join(rep_dir, name, "1.json")))["configuration"]
+        return (int(cfg["key_maximum"]) - int(cfg["key_minimum"]) + 1) * int(cfg["data_size"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _observed_one(case, rep_dir):
+    """{label: on-disk / logical} for one repetition: allocated bytes excluding the WAL archive after the load over
+    keys x value size (U1, U3, U5 per size), or U2's disk at end over its live-bytes estimate."""
+    out = {}
+    if case == "U2":
+        try:
+            live = uc_cells.u2_end_state(rep_dir)["live_estimate"]
+            if live:
+                out["at end"] = uc_cells.du_rows(os.path.join(rep_dir, "du-end"))[-1][1] / float(live)
+        except (CellError, NotRun):
+            pass
+        return out
+    loads = {"U1": [("after load", "load", "du-after-load")], "U3": [("after load", "load", "du-after-load")],
+             "U5": [(sz, "load-" + sz, "du-after-load-" + sz) for sz in ("v1k", "v4k", "v16k")]}.get(case, [])
+    for label, load, du in loads:
+        logical = _load_logical(rep_dir, load)
+        try:
+            if logical:
+                out[label] = uc_cells.du_rows(os.path.join(rep_dir, du))[-1][1] / float(logical)
+        except CellError:
+            continue
+    return out
+
+
+def _observed(case, case_dir, servers, reps):
+    """{server: {label: median ratio over the repetitions, 2 decimals}} for the cases that measure disk (spec 5.5)."""
+    out = {}
+    for s in servers:
+        vals = {}
+        for r in reps:
+            for label, v in _observed_one(case, os.path.join(case_dir, s, "rep%d" % r)).items():
+                vals.setdefault(label, []).append(v)
+        if vals:
+            out[s] = {label: round(statistics.median(v), 2) for label, v in vals.items()}
+    return out
+
+
+def _evict(case_dir, servers, reps):
+    """[(server, rep, where, line)] for every evict-failed note (start_server could not drop the data dir from the page
+    cache) in the repetition dirs, U7 point dirs included."""
+    out = []
+    for s in servers:
+        for r in reps:
+            rep_dir = os.path.join(case_dir, s, "rep%d" % r)
+            for root, _dirs, files in sorted(os.walk(rep_dir)):
+                if "evict-failed" in files:
+                    where = os.path.relpath(root, rep_dir)
+                    for line in uc_cells.read_text(os.path.join(root, "evict-failed")).splitlines():
+                        out.append((s, r, "" if where == "." else where, line))
     return out
 
 
@@ -247,11 +338,12 @@ def _extras(case, case_dir, servers, reps):
                     state["du_end"], state["basis"] = last[1], last[5]
                     out.setdefault("end_state", {}).setdefault(s, {})[r] = state
                 elif case == "U6":
-                    try:
-                        res = uc_cells.fio_job(os.path.join(rep_dir, "fio", "fsync.json"), "write")
-                    except (OSError, ValueError, KeyError, IndexError, TypeError):
-                        res = {"missing": uc_cells.fio_status(os.path.join(rep_dir, "fio"))}
-                    out.setdefault("fio", {}).setdefault(s, {})[r] = res
+                    for name in ("fsync", "append"):
+                        try:
+                            res = uc_cells.fio_job(os.path.join(rep_dir, "fio", name + ".json"), "write")
+                        except (OSError, ValueError, KeyError, IndexError, TypeError):
+                            res = {"missing": uc_cells.fio_status(os.path.join(rep_dir, "fio"), name)}
+                        out.setdefault("fio" if name == "fsync" else "fio_append", {}).setdefault(s, {})[r] = res
                 elif case == "U3":
                     kind = "tideskv" if s == "tideskv" else "kvrocks"
                     out.setdefault("debt", {}).setdefault(s, {})[r] = uc_cells.debt_values(rep_dir, "closed", kind)
@@ -280,18 +372,20 @@ def _build_case(case, run_dir, meta, quick):
         if not ran:
             continue
         title, floor = m.title, _at_floor(m, sums, meta)
+        cap = meta.get(m.cap_key) if m.cap_key else None
         if m.disk_src:
             bases[m.key] = _basis(m, servers, reps, case_dir)
             title = title.replace("{basis}", bases[m.key])
         elif m.twin_of and bases.get(m.twin_of) == "apparent size":
             continue  # the main figure is apparent size already
-        v, best, rng = _decide(m, sums, flags, quick, floor)
-        entries.append(_metric_entry(m, sums, v, best, rng, flags, title, floor))
+        v, best, rng = _decide(m, sums, flags, quick, floor, cap)
+        entries.append(_metric_entry(m, sums, v, best, rng, flags, title, floor, cap))
     head = headline(entries)
     return {"servers": servers, "reps": reps, "metrics": entries, "flags": flags, "failed": sorted(set(failed)),
             "label": _case_label(entries) if entries else uc_verdict.LABEL_NO_VERDICT,
             "setup": _setup(case, run_dir, case_dir, servers, reps[0] if reps else 1, head["phase"] if head else None),
-            "timelines": _timelines(case, case_dir, servers, reps), "extras": _extras(case, case_dir, servers, reps)}
+            "timelines": _timelines(case, case_dir, servers, reps), "extras": _extras(case, case_dir, servers, reps),
+            "observed": _observed(case, case_dir, servers, reps), "evict": _evict(case_dir, servers, reps)}
 
 
 def _read_meta(run_dir):

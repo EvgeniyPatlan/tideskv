@@ -332,8 +332,9 @@ def fio_job(path, direction):
 
 
 def fio_baselines(run_dir):
-    """{'read': {qd: result}, 'fsync': result or None} from <run>/fio (warnings before the JSON are skipped)."""
-    d, out = os.path.join(run_dir, "fio"), {"read": {}, "fsync": None}
+    """{'read': {qd: result}, 'fsync': result or None, 'append': result or None} from <run>/fio (warnings before the
+    JSON are skipped): the random-read curve, the fio reference (random write + fsync) and the durable-append floor."""
+    d, out = os.path.join(run_dir, "fio"), {"read": {}, "fsync": None, "append": None}
     try:
         names = os.listdir(d)
     except OSError:
@@ -343,17 +344,18 @@ def fio_baselines(run_dir):
         try:
             if m:
                 out["read"][int(m.group(1))] = fio_job(os.path.join(d, n), "read")
-            elif n == "fsync.json":
-                out["fsync"] = fio_job(os.path.join(d, n), "write")
+            elif n in ("fsync.json", "append.json"):
+                out[n[:-5]] = fio_job(os.path.join(d, n), "write")
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return out
 
 
-def fio_status(fio_dir):
-    """Why a per-server fio fsync result is missing: the last line of its log, else that nothing was written."""
+def fio_status(fio_dir, name="fsync"):
+    """Why a per-server fio result (NAME: fsync or append) is missing: the last line of its log, else that nothing was
+    written."""
     try:
-        lines = read_text(os.path.join(fio_dir, "fsync.log")).splitlines()
+        lines = read_text(os.path.join(fio_dir, name + ".log")).splitlines()
         return lines[-1] if lines else "empty fio log"
     except OSError:
-        return "no fio/fsync.json and no log"
+        return "no fio/%s.json and no log" % name

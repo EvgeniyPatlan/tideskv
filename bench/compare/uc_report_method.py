@@ -1,5 +1,7 @@
 """Methodology section of the use-case suite report, generated from the run's own values (stdlib only)."""
 
+NAMES = {"tideskv": "TidesKV", "kvrocks": "Kvrocks", "kvrocks-blob": "Kvrocks+BlobDB", "kvrocks-cron": "Kvrocks+cron"}
+
 NOT_COVERED = (
     "Replication, failover and slot migration under load (needs a multi-node harness).",
     "Memory sweeps from 1x to 10x RAM, relaxed-mode pipeline and connection sweeps, scans after deletes.",
@@ -44,26 +46,41 @@ def _shared(summary):
     return "Same workers, block cache, memtable and compression on both sides."
 
 
+def _flush_lat(fs):
+    if not fs.get("sync_mean_ms"):
+        return ""
+    lat = ", flush latency mean %.3f ms" % fs["sync_mean_ms"]
+    return lat + (", p99 %.3f ms" % fs["sync_p99_ms"] if fs.get("sync_p99_ms") else "")
+
+
 def _fio_lines(fio):
     out = []
     reads = fio.get("read") or {}
     if reads:
         out.append("- fio 256 KiB random reads (O_DIRECT) on the benchmark filesystem: " + "; ".join(
             "QD%d %.0f MB/s, %.0f IOPS" % (qd, r["mbs"], r["iops"]) for qd, r in sorted(reads.items())) + ".")
-    fs = fio.get("fsync")
-    if not reads:
+    else:
         out.append("- fio random-read baseline: not run in this run.")
-    if fs:
-        lat = ""
-        if fs.get("sync_mean_ms"):
-            lat = ", fsync latency mean %.3f ms" % fs["sync_mean_ms"]
-            if fs.get("sync_p99_ms"):
-                lat += ", p99 %.3f ms" % fs["sync_p99_ms"]
-        out.append("- fio 4 KiB random writes with an fsync after each, queue depth 1 (the durable-commit floor of U6): "
-                   "%.0f writes/s%s." % (fs["iops"], lat))
-    if not fs:
-        out.append("- fio fsync baseline: measured per server before each U6 sweep (see U6), not at the start of the run.")
+    for key, name in (("append", "durable-append floor (4 KiB sequential write + fdatasync, queue depth 1; the U6 floor)"),
+                      ("fsync", "fio reference (4 KiB random write + fsync, queue depth 1)")):
+        fs = fio.get(key)
+        if fs:
+            out.append("- %s at the start of the run: %.0f writes/s%s." % (name, fs["iops"], _flush_lat(fs)))
+    if not fio.get("append") and not fio.get("fsync"):
+        out.append("- fio flush baselines: measured per server before each U6 sweep (see U6), not at the start of the run.")
     return out
+
+
+def _observed_text(summary):
+    """'U1 TidesKV 1.33, Kvrocks 1.05; U5 v1k TidesKV ...' from every case's observed on-disk / logical ratios."""
+    parts = []
+    for case, cs in summary["cases"].items():
+        obs = cs.get("observed") or {}
+        labels = sorted({label for v in obs.values() for label in v}, key=lambda x: (len(x), x))
+        for label in labels:
+            vals = ["%s %.2f" % (NAMES.get(s, s), v[label]) for s, v in obs.items() if label in v]
+            parts.append("%s%s %s" % (case, "" if label in ("after load", "at end") else " " + label, ", ".join(vals)))
+    return "; ".join(parts)
 
 
 def methodology(summary):
@@ -92,15 +109,22 @@ def methodology(summary):
             meta.get("server_nofile", "?"), meta.get("client_cpus", "?"), _shared(summary)),
         "5. **Durability.** U1-U5 and U8 run relaxed (TidesKV `sync-mode none`, Kvrocks `write_options.sync no`); "
         "relaxed is not power-loss safe on either side. U6 and U7 run strict (fsync before every acknowledged write on "
-        "both sides). TidesKV's interval mode is not compared with Kvrocks `sync yes`.",
-        "6. **Data.** memtier's random data compresses about 3x under LZ4, which is on for both servers; disk and cache "
-        "numbers (U1, U2, U5, U8) depend on that. Disk figures are allocated bytes (`du --block-size=1`) after the server went "
+        "both sides). TidesKV's interval mode is not compared with Kvrocks `sync yes`. Strict mode is configured and read "
+        "back, but per-ack fsync is not observed by the suite (neither server reports an fsync count).",
+        "6. **Data.** LZ4 is on for both servers; memtier writes random values, and how well they compress is not assumed "
+        "but measured. %s Disk figures are allocated bytes (`du --block-size=1`) after the server went "
         "quiet, excluding Kvrocks' WAL archive (default `wal_ttl_seconds 10800`), which is reported on its own line; "
         "apparent size is shown beside them. Runs recorded before the allocated column existed fall back to apparent "
-        "size, and the tables label it as such.",
-        "7. **Correctness.** Every cell's replies are checked: any error reply, or a GET hit rate under 99% after a "
-        "load (U1, U3, U5), makes the cell ERR and it is shown as such, not as a number. U2 expects misses (keys expire) "
-        "and reports the hit rate without a check. U4's check covers the integer replies of HSET and HDEL only.",
+        "size, and the tables label it as such." % (
+            ("The observed on-disk / logical ratio (allocated bytes excluding the WAL archive after the load, over "
+             "keys x value size; U2: disk at end over the live-bytes estimate) was: %s." % _observed_text(summary))
+            if _observed_text(summary) else "No observed on-disk / logical ratio is available in this run."),
+        "7. **Correctness.** Checked per cell from memtier's per-command byte and hit counts: every SET reply must be "
+        "the 5-byte `+OK` (U1, U2, U3, U5, U6), every HSET and HDEL reply a 4-byte integer (U4), and GETs must hit at "
+        "least 99% after a load (U1, U3, U5). A failed check makes the cell ERR, shown as such and not as a number. Not "
+        "checked: U2's GET replies (nearly all are negative lookups by design; the hit rate is reported) and U4's HGET "
+        "and HGETALL replies (memtier counts no hits for them and their lengths vary). U7's writer stops on an error "
+        "reply, and its verify step reads back every acknowledged value.",
         "8. **Client not the bottleneck.** A cell whose memtier used over 85% of the client CPUs is flagged "
         "client-bound and gets no verdict.",
         "9. **Baselines and host.** Host: %s. Loopback networking inside one Docker network." % meta.get("host", "?")]

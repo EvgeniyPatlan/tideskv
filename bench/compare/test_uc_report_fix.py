@@ -238,7 +238,7 @@ class FixTest(unittest.TestCase):
             run.done("U6", srv, 1)
         _, text = run.report()
         u6 = text.split("### U6")[1].split("## F1")[0]
-        self.assertIn("fsync floor before Kvrocks's sweep: not measured (", u6)
+        self.assertIn("fio reference (4 KiB random write + fsync) before Kvrocks's sweep: not measured (", u6)
         self.assertIn("fio: pid=1 failed", u6)
         self.assertIn("1500 writes/s", u6)
         run2 = Run(self)
@@ -247,7 +247,7 @@ class FixTest(unittest.TestCase):
             run2.done("U6", srv, 1)
         _, text2 = run2.report()
         self.assertNotIn("was measured right before", text2)
-        self.assertIn("fsync floor before TidesKV's sweep: not measured", text2)
+        self.assertIn("fio reference (4 KiB random write + fsync) before TidesKV's sweep: not measured", text2)
 
     def test_mixed_disk_basis_is_named(self):
         run = Run(self)
