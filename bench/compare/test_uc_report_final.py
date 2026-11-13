@@ -220,6 +220,13 @@ class ReportWordingTest(unittest.TestCase):
             self.assertIn(needle, item)
         self.assertNotIn("any error reply", item)
 
+    def test_flush_baselines_not_claimed_without_u6(self):
+        run = Run(self)
+        from test_uc_report import u4
+        u4(run, 1000, 500)
+        _, text = run.report()
+        self.assertIn("fio flush baselines: not run in this run (U6 did not run)", text)
+
 
 if __name__ == "__main__":
     unittest.main()

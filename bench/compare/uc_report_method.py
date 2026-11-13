@@ -53,7 +53,7 @@ def _flush_lat(fs):
     return lat + (", p99 %.3f ms" % fs["sync_p99_ms"] if fs.get("sync_p99_ms") else "")
 
 
-def _fio_lines(fio):
+def _fio_lines(fio, has_u6=True):
     out = []
     reads = fio.get("read") or {}
     if reads:
@@ -67,7 +67,8 @@ def _fio_lines(fio):
         if fs:
             out.append("- %s at the start of the run: %.0f writes/s%s." % (name, fs["iops"], _flush_lat(fs)))
     if not fio.get("append") and not fio.get("fsync"):
-        out.append("- fio flush baselines: measured per server before each U6 sweep (see U6), not at the start of the run.")
+        out.append("- fio flush baselines: measured per server before each U6 sweep (see U6), not at the start of the run."
+                   if has_u6 else "- fio flush baselines: not run in this run (U6 did not run).")
     return out
 
 
@@ -128,7 +129,7 @@ def methodology(summary):
         "8. **Client not the bottleneck.** A cell whose memtier used over 85% of the client CPUs is flagged "
         "client-bound and gets no verdict.",
         "9. **Baselines and host.** Host: %s. Loopback networking inside one Docker network." % meta.get("host", "?")]
-    lines += ["   " + x for x in _fio_lines(summary.get("fio") or {})]
+    lines += ["   " + x for x in _fio_lines(summary.get("fio") or {}, "U6" in summary["cases"])]
     lines += ["10. **Raw data.** memtier JSON, INFO before and after each cell, configs as read back, the du series and "
               "the commit and image digests are in the run directory (TidesKV %s; %s; %s)." % (
                   meta.get("tideskv_sha", "?"), meta.get("kvrocks_image", "?"), meta.get("memtier_image", "?")), ""]
