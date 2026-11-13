@@ -12,15 +12,20 @@
 #   <load>.pipeline: the load's memtier --pipeline (the load is unmeasured, pipelined alike on every server)
 #   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end (or `unverified`) value-size idle.status
 #   U6: load/ load.seconds settle-load du-after-load c1|c8|c64|c256.*
-#   U7: load/ load.seconds settle-load du-after-load, then per kill point <sig>-<t>/ (sig term|kill, t = seconds of writes
-#       before the signal), or <sig>-<t>/run<i>/ for i = 1..UC_U7_TIMES when that is above 1, holding: baseline.json
-#       (probe of the preload keys in 100 ms windows, 10 s before the writer: p99_ms, requests, hits), until-p99-ms (2 x its
-#       p99), ack.<thread> (the writer's acked-key logs; keys are ack-r<rep>-<sig>-<t>-<run>-<thread>:<seq>, unique per
-#       point because the data dir is kept), writer.out, writer.status (exit code; probe.status likewise), signal.epoch_ms, term.seconds (TERM
-#       only: signal to exit), restart.epoch_ms (t0: written by start_server right after the restart's docker run returned) and restart.docker_run_ms (that docker run's duration),
-#       probe.json / probe.out (pong_ms, restart_misses = requests - hits (not a failure), recovered_ms = start of the first 3 consecutive passing 100 ms windows, hits;
-#       the probe container is started before the kill and waits for restart.epoch_ms) and verify.json (acked, lost,
-#       lost_sample, corrupt, corrupt_sample)
+#   U7: load/ load.seconds settle-load du-after-load, then per point <sig>-<n>/ (sig term|kill, n = acknowledged writes
+#       before the signal, the same on both servers: uc_cases.sh's UC_U7_ACKS), or <sig>-<n>/run<i>/ for i = 1..UC_U7_TIMES
+#       when that is above 1, holding: baseline.json (probe of the preload keys in 100 ms windows, 10 s before the writer:
+#       p99_ms, requests, hits), until-p99-ms (2 x its p99), ack.<thread> (the writer's acked-key logs; keys are
+#       ack-r<rep>-<sig>-<n>-<run>-<thread>:<seq>, unique per point because the data dir is kept; values UC_U7_VALUE
+#       bytes), acked-target (n), acked-at-signal (acked writes counted right before the signal), ack.status (ok, or why
+#       n was not reached within UC_U7_ACK_TIMEOUT: the point is ERR in the report, but still signalled and verified),
+#       writer.out, writer.status (exit code; probe.status likewise), signal.epoch_ms, term.seconds (TERM only: signal to
+#       exit), restart.epoch_ms (t0: written by start_server right after the restart's docker run returned),
+#       restart.docker_run_ms (that docker run's duration), evict-failed (only when the restart could not drop the data
+#       dir from the page cache), probe.json / probe.out (pong_ms, restart_misses = requests - hits (not a failure),
+#       recovered_ms = start of the first 3 consecutive passing 100 ms windows, hits; the probe container is started
+#       before the signal and waits for restart.epoch_ms) and verify.json (acked, lost, lost_sample, corrupt,
+#       corrupt_sample)
 #   U8: summary.json (no server)
 #   F1: matrix.json per server (this server against Redis 7.2, run.log) and, merged over the servers done so far, F1/matrix.json
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes,allocated_bytes,
@@ -33,10 +38,20 @@ _uc_fail() { UC_FAIL_REASON=$1; log "${CUR:-}: $1"; return 1; }
 # Seconds since START_MS (date +%s%3N) with millisecond precision.
 _uc_since() { local ms=$(($(date +%s%3N) - $1)); printf '%d.%03d\n' $((ms / 1000)) $((ms % 1000)); }
 
+# _uc_note_evict DIR WHAT: start_server sets EVICT_FAILED when it could not drop the data dir from the page cache (its
+# reads could then be served past SERVER_MEM); DIR/evict-failed gets a line naming the start, for the report's caveat.
+_uc_note_evict() {
+  if ((${EVICT_FAILED:-0})); then echo "$2: could not drop the data dir from the page cache" >>"$OUT/$1/evict-failed"; fi
+  return 0
+}
+
+# _uc_up SERVER CASE [WHAT]: start SERVER at CASE's level, note a failed page-cache eviction in the rep dir (UC_REP_DIR,
+# set by _uc_run) and check parity.
 _uc_up() {
   local level
   level=$(uc_level "$2") || return 1
   start_server "$1" "$level" "$OUT/data/$1" || { _uc_fail "server did not start"; return 1; }
+  if [[ -n ${UC_REP_DIR:-} ]]; then _uc_note_evict "$UC_REP_DIR" "${3:-start}"; fi
   parity_check "$1" "$level" || { _uc_fail "parity check failed; see $1/config.txt"; return 1; }
 }
 
@@ -178,7 +193,7 @@ case_U5() {
   for p in $(uc_phases U5); do
     kv=$(uc_u5_keys "$p") || { _uc_fail "no key count for U5 $p"; return 1; }
     read -r k v <<<"$kv"
-    _uc_up "$s" U5 || return 1
+    _uc_up "$s" U5 "start before $p" || return 1
     _uc_load U5 "$rep" "load-$p" "$k" "$p" || return 1
     _uc_settle_du "$rep" "load-$p" || return 1
     _uc_cell U5 "$rep" "$p" || return 1
@@ -310,7 +325,7 @@ _uc_u7_wait_exit() {
   return 1
 }
 
-# The writer's first acknowledged write is logged: the kill timer starts then, not at container start.
+# The writer's first acknowledged write is logged: it is writing.
 _uc_u7_wait_writing() {
   local i
   for ((i = 0; i < 300; i++)); do
@@ -320,12 +335,33 @@ _uc_u7_wait_writing() {
   return 1
 }
 
+# Acknowledged writes logged so far under DIR: complete lines of every ack.<thread> (a line is written after the +OK).
+_uc_u7_acked() { cat "$OUT/$1"/ack.* 2>/dev/null | wc -l; }
+
+# _uc_u7_wait_acked DIR N SECS: polls the writer's ack logs every 50 ms until N writes are acknowledged or SECS pass.
+# Writes acked-target, acked-at-signal (the count of the last poll, right before the signal) and ack.status.
+_uc_u7_wait_acked() {
+  local d=$1 n=$2 secs=$3 got=0 start
+  echo "$n" >"$OUT/$d/acked-target"
+  start=$(date +%s%3N)
+  while :; do
+    got=$(_uc_u7_acked "$d")
+    ((got >= n)) && break
+    (($(date +%s%3N) - start >= secs * 1000)) && break
+    sleep 0.05
+  done
+  echo "$got" >"$OUT/$d/acked-at-signal"
+  if ((got >= n)); then echo ok >"$OUT/$d/ack.status"; return 0; fi
+  echo "load point not reached: $got of $n acknowledged writes in $secs s" >"$OUT/$d/ack.status"
+  log "${CUR:-}: $d: $(<"$OUT/$d/ack.status")"
+}
+
 # _uc_u7_writer_start DIR NAME PREFIX: the ack-writer on the server, detached.
 _uc_u7_writer_start() {
   _track "$2"
   docker run -d --name "$2" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" \
     -v "$OUT/$1:/out" -v "$HERE_RUN/uc_ackwriter.py:/uc_ackwriter.py:ro" "$PY_IMAGE" python -I /uc_ackwriter.py write \
-    --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --conns "${UC_U7_CONNS:-16}" --prefix "$3" --log /out/ack >/dev/null
+    --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --conns "${UC_U7_CONNS:-16}" --prefix "$3" --log /out/ack --value-size "$UC_U7_VALUE" >/dev/null
 }
 
 # _uc_u7_probe_start DIR NAME UNTIL: the recovery probe, detached and started before the kill so that its own start-up
@@ -359,10 +395,10 @@ _uc_u7_signal() {
   if [[ $sig == TERM ]]; then _uc_since "$start" >"$OUT/$d/term.seconds"; fi
 }
 
-# One kill point, files in DIR (relative to $OUT): baseline probe, probe container, writer, signal, restart, probe, verify.
-# PREFIX is unique per point (the data dir is kept, so a repeated key name could hide a lost write).
+# One point, files in DIR (relative to $OUT): baseline probe, probe container, writer, N acked writes, signal, restart,
+# probe, verify. PREFIX is unique per point (the data dir is kept, so a repeated key name could hide a lost write).
 _uc_u7_point() {
-  local d=$1 sig=$2 t=$3 prefix=$4 w=tideskv-bench-writer-$TS-$RANDOM p=tideskv-bench-probe-$TS-$RANDOM until
+  local d=$1 sig=$2 n=$3 prefix=$4 w=tideskv-bench-writer-$TS-$RANDOM p=tideskv-bench-probe-$TS-$RANDOM until
   mkdir -p "$OUT/$d"
   _uc_py "$d" probe --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --baseline-secs 10 --prefix u7: \
     --keymax "$U7_KEYS" --out /out/baseline.json >/dev/null \
@@ -373,32 +409,33 @@ _uc_u7_point() {
   _uc_u7_probe_start "$d" "$p" "$until" || { _uc_fail "could not start the probe"; return 1; }
   _uc_u7_writer_start "$d" "$w" "$prefix" || { _uc_fail "could not start the writer"; return 1; }
   _uc_u7_wait_writing "$d" || { _uc_fail "the writer acked nothing in 30 s"; return 1; }
-  sleep "$t"
+  _uc_u7_wait_acked "$d" "$n" "$UC_U7_ACK_TIMEOUT"
   _uc_u7_signal "$d" "$sig" || return 1
   _uc_u7_tool_collect "$d" "$w" writer.out "the writer" 60 || return 1
   stop_server || true  # keeps the server's log, removes the dead container
   START_NOWAIT=1 START_T0_FILE=$OUT/$d/restart.epoch_ms START_RUN_MS_FILE=$OUT/$d/restart.docker_run_ms \
     start_server "$SERVER_NAME" strict "$OUT/data/$SERVER_NAME" \
     || { _uc_fail "restart failed"; return 1; }
+  _uc_note_evict "$d" "restart"
   _uc_u7_tool_collect "$d" "$p" probe.out "the recovery probe" $((${UC_U7_PROBE_TIMEOUT:-300} + 60)) || return 1
-  _uc_py "$d" verify --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --log /out/ack --out /out/verify.json >/dev/null \
+  _uc_py "$d" verify --host "$SERVER_CONTAINER" --port "$SERVER_PORT" --log /out/ack --value-size "$UC_U7_VALUE" --out /out/verify.json >/dev/null \
     || { _uc_fail "verify failed"; return 1; }
 }
 
-# U7: strict durability. One preload, then for every kill point (UC_U7_SECS seconds of writes before the signal) and
+# U7: strict durability. One preload, then for every point (UC_U7_ACKS acknowledged writes before the signal) and
 # signal (TERM, KILL), UC_U7_TIMES times: the point restarts the server on the same data dir, so the next one starts
 # from the recovered server.
 case_U7() {
-  local s=$1 rep=U7/$1/rep$2 ph sig t i d
+  local s=$1 rep=U7/$1/rep$2 ph sig n i d
   _uc_up "$s" U7 || return 1
   _uc_load U7 "$rep" load "$U7_KEYS" || return 1
   _uc_settle_du "$rep" load || return 1
   for ph in $(uc_phases U7); do
-    sig=${ph%-*} t=${ph#*-}
+    sig=${ph%-*} n=${ph#*-}
     for ((i = 1; i <= UC_U7_TIMES; i++)); do
       d=$rep/$ph
       if ((UC_U7_TIMES > 1)); then d=$d/run$i; fi
-      _uc_u7_point "$d" "${sig^^}" "$t" "ack-r$2-$sig-$t-$i-" || return 1
+      _uc_u7_point "$d" "${sig^^}" "$n" "ack-r$2-$sig-$n-$i-" || return 1
     done
   done
 }

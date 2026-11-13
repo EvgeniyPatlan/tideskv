@@ -109,7 +109,7 @@ _uc_disk_ok() {
 # The server is stopped afterwards only if FUNC left one running (start_server sets SERVER_CONTAINER).
 _uc_run() {
   local c=$1 r=$2 s=$3 fn=$4 mark=$5 rc=0
-  CUR=$s UC_FAIL_REASON="" SERVER_CONTAINER=""
+  CUR=$s UC_FAIL_REASON="" SERVER_CONTAINER="" UC_REP_DIR=$c/$s/rep$r
   remove_data
   mapfile -t UC_EXTRA_CONF < <(uc_conf_lines "$s")
   log "$c $s rep$r$([[ $fn == *_open ]] && echo " open phases")"

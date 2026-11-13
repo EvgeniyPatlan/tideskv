@@ -54,9 +54,13 @@ OTHER_NOTES = {
            "unstable and gets no verdict: the disk's fsync rate was not steady."],
     "U7": ["This is a process kill (SIGTERM/SIGKILL), not an OS crash or power loss.",
            "pong_ms and recovered_ms are measured from docker run returning; docker's own time is shown separately.",
-           "The recovery threshold is 2x the warm pre-kill p99 of the same server.",
-           "Acked counts are not throughput: how many writes were acknowledged before the signal depends on the "
-           "server's speed and says nothing about durability."],
+           "The recovery threshold is 2x the warm pre-kill p99 of the same server; each server's absolute threshold "
+           "is in the table, since a lower warm p99 makes the 2x rule stricter for that server.",
+           "Each point (the number in its name) signals after the same number of acknowledged writes on both servers, "
+           "about 10%, 50% and 90% of the 256 MiB memtable at 2 KiB values (a tenth of that in quick mode); the "
+           "acked-at-signal row is the count when the signal was sent (the 50 ms poll overshoots a little). The fill "
+           "counts the writer's writes only, not the preload or what a restart's WAL replay leaves in the memtable. A "
+           "point that did not reach its count in time is ERR."],
     "U8": ["TidesKV has no COMPACT, so the compaction figure exists for Kvrocks only. It was taken after U1's load and "
            "both closed-loop phases, so it is not a fresh-load figure.",
            "Time to quiet cannot be shorter than the settle check's window; a value at that floor is shown as \"≤ floor\" "
@@ -299,7 +303,7 @@ def _extras(case, cs, summary):
                 out.append("- %s rep%d: %s" % (NAMES[s], r, ", ".join("%s %s -> %s" % (k, _num(a), _num(b)) for k, (a, b) in d.items())))
         out.append("")
     if case == "U7":
-        out += ["Per-point rows (SIGTERM and SIGKILL at each write time) are information; the \"all points\" rows are "
+        out += ["Per-point rows (SIGTERM and SIGKILL at each acked-write count) are information; the \"all points\" rows are "
                 "the ones counted in the case label and the pros and cons. A server that never recovered shows ERR with "
                 "the cause.", ""]
     if case == "U6":

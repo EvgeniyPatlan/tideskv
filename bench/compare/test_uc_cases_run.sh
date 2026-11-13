@@ -239,17 +239,19 @@ DBSIZE_REPLY=999999999
 # ---- U7: per kill point = baseline probe, writer, signal, restart, probe, verify (strict, both servers) ----
 OUT=$TMP/u7 UC_MODE=quick
 uc_sizes quick
-U7_KEYS=1000 UC_U7_SECS="5 15" UC_U7_TIMES=1 SERVER_PORT=6379 NET=testnet SCAN_TRACK="" DBSIZE_REPLY=999999999
+U7_KEYS=1000 UC_U7_ACKS="20 50" UC_U7_TIMES=1 SERVER_PORT=6379 NET=testnet SCAN_TRACK="" DBSIZE_REPLY=999999999
 rm -f "$TMP/scanwait"
 # shellcheck disable=SC2317
 {
 start_server() {
   EV+=("$CUR:start${START_NOWAIT:+-nowait}${START_T0_FILE:+-t0file}${START_RUN_MS_FILE:+-runms}") START_LEVELS+=("$1:$2"); SERVER_NAME=$1 SERVER_CONTAINER=c-$1; mkdir -p "$3"
+  EVICT_FAILED=${STUB_EVICT:-0}
 }
 stop_server() { EV+=("$CUR:stop"); SERVER_CONTAINER=""; }
 sleep() { EV+=("$CUR:sleep-$1"); }
 _uc_u7_wait_writing() { EV+=("$CUR:writing"); }
-_uc_u7_writer_start() { EV+=("$CUR:writer") PREFIXES+=("$3"); }
+# the writer "acks" U7_STUB_ACKS keys at once (one line each in ack.0, as the real one logs them)
+_uc_u7_writer_start() { EV+=("$CUR:writer") PREFIXES+=("$3"); seq "${U7_STUB_ACKS:-100}" >"$OUT/$1/ack.0"; }
 _uc_u7_probe_start() { EV+=("$CUR:probe-up"); }
 _uc_u7_wait_exit() { EV+=("$CUR:exit-$1"); }
 docker() {
@@ -276,21 +278,36 @@ check u7-done "$(cat "$OUT/U7/tideskv/rep1/done") $(cat "$OUT/U7/kvrocks/rep1/do
 check u7-strict "${START_LEVELS[*]}" "tideskv:strict tideskv:strict tideskv:strict tideskv:strict tideskv:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict kvrocks:strict"
 seq_of() { printf '%s\n' "${EV[@]}" | grep "^$1:" | grep -v -e ':load' -e 'exit-tideskv-bench' | sed 's/^[^:]*://' | tr '\n' ' '; }
 check u7-sequence-tideskv "$(seq_of tideskv)" \
-  "start probe probe-up writer writing sleep-5 signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-5 signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-15 signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing sleep-15 signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify stop "
-check u7-point-files "$(count_files "$OUT/U7/kvrocks/rep1/kill-15" baseline.json until-p99-ms verify.json signal.epoch_ms writer.out writer.status probe.status)" 7
-check u7-term-seconds "$([[ -s $OUT/U7/kvrocks/rep1/term-5/term.seconds && ! -e $OUT/U7/kvrocks/rep1/kill-5/term.seconds ]] && echo y)" y
-check u7-until-is-2x-baseline "$(cat "$OUT/U7/tideskv/rep1/term-5/until-p99-ms")" "1.5"
+  "start probe probe-up writer writing signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-TERM exit-c-tideskv rm stop start-nowait-t0file-runms rm verify probe probe-up writer writing signal-KILL exit-c-tideskv rm stop start-nowait-t0file-runms rm verify stop "
+# F3: the signal goes once N writes are acked; the count and the target are recorded, the same N on both servers
+check u7-acked-files "$(cat "$OUT/U7/kvrocks/rep1/kill-50/acked-target" "$OUT/U7/kvrocks/rep1/kill-50/acked-at-signal" "$OUT/U7/kvrocks/rep1/kill-50/ack.status" | tr '\n' ' ')" "50 100 ok "
+check u7-same-n "$(cat "$OUT/U7/tideskv/rep1/term-20/acked-target") $(cat "$OUT/U7/kvrocks/rep1/term-20/acked-target")" "20 20"
+check u7-verify-value-size "$(printf '%s\n' "${PY_ARGS[@]}" | grep -m1 '^verify ' | grep -o -- '--value-size 2048')" "--value-size 2048"
+check u7-no-evict-note "$(find "$OUT/U7" -name evict-failed | wc -l)" 0
+check u7-point-files "$(count_files "$OUT/U7/kvrocks/rep1/kill-50" baseline.json until-p99-ms verify.json signal.epoch_ms writer.out writer.status probe.status)" 7
+check u7-term-seconds "$([[ -s $OUT/U7/kvrocks/rep1/term-20/term.seconds && ! -e $OUT/U7/kvrocks/rep1/kill-20/term.seconds ]] && echo y)" y
+check u7-until-is-2x-baseline "$(cat "$OUT/U7/tideskv/rep1/term-20/until-p99-ms")" "1.5"
 check u7-baseline-args "$(printf '%s\n' "${PY_ARGS[@]}" | grep -m1 '^probe ' | grep -o -e '--baseline-secs 10' -e '--prefix u7:' | tr '\n' ' ')" \
   "--baseline-secs 10 --prefix u7: "
-check u7-unique-prefixes "${PREFIXES[*]:0:4}" "ack-r1-term-5-1- ack-r1-kill-5-1- ack-r1-term-15-1- ack-r1-kill-15-1-"
+check u7-unique-prefixes "${PREFIXES[*]:0:4}" "ack-r1-term-20-1- ack-r1-kill-20-1- ack-r1-term-50-1- ack-r1-kill-50-1-"
 check u7-prefixes-distinct "$(printf '%s\n' "${PREFIXES[@]:0:4}" | sort | uniq -d | wc -l)" 0
 check u7-load-pipeline "$(cat "$OUT/U7/tideskv/rep1/load.pipeline")" 32
 # repeats get a run<i> sub-directory
-OUT=$TMP/u7t UC_U7_SECS="5" UC_U7_TIMES=2
+OUT=$TMP/u7t UC_U7_ACKS="5" UC_U7_TIMES=2
 EV=() PREFIXES=()
 uc_dispatch U7 2>/dev/null
 check u7-times-prefixes "${PREFIXES[*]:0:4}" "ack-r1-term-5-1- ack-r1-term-5-2- ack-r1-kill-5-1- ack-r1-kill-5-2-"
 check u7-times-dirs "$(cd "$OUT/U7/tideskv/rep1" && printf '%s ' term-5/run* kill-5/run*)" "term-5/run1 term-5/run2 kill-5/run1 kill-5/run2 "
+# N not reached within the timeout: the point says why (ERR in the report), is still signalled and verified, the rep goes on
+OUT=$TMP/u7slow UC_U7_ACKS="30" UC_U7_TIMES=1 U7_STUB_ACKS=7 UC_U7_ACK_TIMEOUT=0 STUB_EVICT=1
+EV=()
+uc_dispatch U7 2>/dev/null
+check u7-timeout-status "$(cat "$OUT/U7/tideskv/rep1/term-30/ack.status")" "load point not reached: 7 of 30 acknowledged writes in 0 s"
+check u7-timeout-signalled "$(cat "$OUT/U7/tideskv/rep1/term-30/acked-at-signal") $([[ -e $OUT/U7/tideskv/rep1/term-30/verify.json ]] && echo verified) $(cat "$OUT/U7/tideskv/rep1/done")" "7 verified ok"
+# R-minor 10: a failed page-cache eviction is noted in the rep dir (first start) and in the point dir (restart)
+check u7-evict-noted "$(cat "$OUT/U7/kvrocks/rep1/evict-failed") / $(cat "$OUT/U7/kvrocks/rep1/term-30/evict-failed")" \
+  "start: could not drop the data dir from the page cache / restart: could not drop the data dir from the page cache"
+U7_STUB_ACKS=100 STUB_EVICT=0 UC_U7_ACK_TIMEOUT=300
 # a failing writer fails the cell and says why
 OUT=$TMP/u7f UC_U7_TIMES=1 WRITER_RC=2
 uc_dispatch U7 2>/dev/null

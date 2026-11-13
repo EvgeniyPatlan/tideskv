@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Acknowledged-write checker for the use-case suite's U7 (stdlib only; runs in the PY_IMAGE container).
 
-  write  --host H --port P --conns N --prefix PFX --log FILE [--command SET]
-      N threads, each doing `SET PFX<thread>:<seq> <seq>` (seq from 0) in a loop at pipeline 1. After each +OK the
+  write  --host H --port P --conns N --prefix PFX --log FILE [--value-size B] [--command SET]
+      N threads, each doing `SET PFX<thread>:<seq> <value>` (seq from 0) in a loop at pipeline 1; the value is <seq>,
+      or with --value-size B, `<seq>:` padded with '.' to B bytes. After each +OK the
       thread appends `key\\n` to FILE.<thread> and flushes. A thread stops when its connection is lost (a write
       whose reply never came is not logged) or when the server answers with an error. Prints `acked <total>` and
       exits 0, or exits 2 if any thread stopped on an error reply or could not connect. --command is a test hook.
-  verify --host H --port P --log FILE --out JSON
+  verify --host H --port P --log FILE --out JSON [--value-size B]
       Reads every FILE.* (a last line without its newline is skipped), MGETs the keys in batches of 1000 and writes
       {"acked", "lost", "lost_sample", "corrupt", "corrupt_sample"} (samples: first 10). A key is lost when MGET
-      returns nil, corrupt when its value is not the key's suffix after the last ':' (the writer's seq). Retries
+      returns nil, corrupt when its value is not the one the writer sent for the key's seq (the suffix after the last
+      ':'), with the same --value-size. Retries
       while the server is not reachable or answers an error (up to 60 s).
   probe  --host H --port P --prefix PFX --keymax N --out JSON
          (--until-p99 MS --timeout S | --baseline-secs S) [--t0 EPOCH_MS | --t0-file PATH]
@@ -99,7 +101,13 @@ def connect_retry(host, port, until, poll=0.01):
 
 # ---- write ----
 
-def _writer(host, port, prefix, log_path, command, idx, result):
+def value_for(seq, size):
+    """The value written for SEQ: the seq itself, or `<seq>:` padded with '.' to SIZE bytes (SIZE > 0)."""
+    v = str(seq).encode()
+    return (v + b":").ljust(size, b".") if size > 0 else v
+
+
+def _writer(host, port, prefix, log_path, command, idx, result, size=0):
     conn = connect_retry(host, port, time.monotonic() + 10)
     if conn is None:
         result[idx] = (0, "could not connect")
@@ -109,7 +117,7 @@ def _writer(host, port, prefix, log_path, command, idx, result):
         with open("%s.%d" % (log_path, idx), "w") as log:
             while True:
                 key = "%s%d:%d" % (prefix, idx, seq)
-                reply = conn.command(command, key, seq)
+                reply = conn.command(command, key, value_for(seq, size))
                 if isinstance(reply, RuntimeError):
                     error = str(reply)
                     break
@@ -125,7 +133,7 @@ def _writer(host, port, prefix, log_path, command, idx, result):
 
 def cmd_write(a):
     result = [None] * a.conns
-    threads = [threading.Thread(target=_writer, args=(a.host, a.port, a.prefix, a.log, a.command, i, result))
+    threads = [threading.Thread(target=_writer, args=(a.host, a.port, a.prefix, a.log, a.command, i, result, a.value_size))
                for i in range(a.conns)]
     for t in threads:
         t.start()
@@ -179,7 +187,7 @@ def cmd_verify(a):
                 lost += 1
                 if len(sample) < 10:
                     sample.append(key)
-            elif val != key.rsplit(":", 1)[-1].encode():
+            elif val != value_for(key.rsplit(":", 1)[-1], a.value_size):
                 corrupt += 1
                 if len(bad) < 10:
                     bad.append(key)
@@ -347,6 +355,8 @@ def main(argv=None):
     v = sub.choices["verify"]
     v.add_argument("--log", required=True)
     v.add_argument("--out", required=True)
+    for p in (w, v):
+        p.add_argument("--value-size", type=int, default=0)
     p = sub.choices["probe"]
     p.add_argument("--out", required=True)
     p.add_argument("--until-p99", type=float)

@@ -97,8 +97,20 @@ def u7_points(rep_dir):
     return out
 
 
+def _u7_load_point(d):
+    """CellError when the point was signalled before its acked-write target (ack.status not ok; older runs have none)."""
+    path = os.path.join(d, "ack.status")
+    if os.path.exists(path):
+        status = _reads(d, "ack.status").splitlines()[0:1]
+        if status != ["ok"]:
+            raise CellError(status[0] if status else "empty ack.status")
+
+
 def _u7_value(d, field_name):
+    _u7_load_point(d)
     try:
+        if field_name in ("acked_signal", "until_p99"):
+            return _num(float(_reads(d, {"acked_signal": "acked-at-signal", "until_p99": "until-p99-ms"}[field_name])))
         if field_name in ("lost", "corrupt"):
             return _num(_json(d, "verify.json")[field_name])
         if field_name == "docker_run_ms":
@@ -146,6 +158,11 @@ def u7_point_metrics(points):
         for k, t, u, _agg, _pc in U7_FIELDS + (("docker_run_ms", "docker run (not in PONG time)", "ms", "median", False),):
             out.append(Metric("%s:%s" % (k, p), "%s, %s" % (t, p), False, False, u7_metric(k, "median" if u == "ms" else "sum", p),
                               unit=u, pros_cons=False, info=k == "docker_run_ms"))
+        n = p.split("-")[1]
+        out.append(Metric("acked_signal:%s" % p, "acked writes at the signal (target %s), %s" % (n, p), False, False,
+                          u7_metric("acked_signal", "median", p), unit="count", pros_cons=False, info=True))
+        out.append(Metric("until_p99:%s" % p, "recovery threshold (2x warm p99), %s" % p, False, False,
+                          u7_metric("until_p99", "median", p), unit="ms", pros_cons=False, info=True))
         if p.startswith("term"):
             out.append(Metric("term_s:%s" % p, "TERM shutdown, %s" % p, False, False, u7_metric("term_s", "median", p),
                               unit="s", pros_cons=False, info=True))

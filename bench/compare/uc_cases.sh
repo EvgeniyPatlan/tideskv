@@ -10,7 +10,8 @@
 #   UC_U2_WRITE_S UC_U2_IDLE_S UC_U2_DU_EVERY   U2 churn seconds, idle seconds, du sampling interval
 #   UC_U3_CLOSED_S UC_U3_OPEN_S   U3 closed-loop and per-open-phase seconds
 #   UC_U6_S                       U6 seconds per connection-count phase
-#   UC_U7_TIMES UC_U7_SECS        U7 repeats per phase, and the space-separated write seconds before the kill
+#   UC_U7_TIMES UC_U7_ACKS        U7 repeats per phase, and the space-separated acked-write counts before the signal
+#   UC_U7_ACK_TIMEOUT             longest wait in seconds for a U7 point's acked-write count (ERR when not reached)
 #   UC_COMPACT_WAIT               longest wait in seconds for U1's Kvrocks COMPACT to finish
 # UC_RATE (set by the runner) is the per-connection --rate-limiting of the open-loop phases of U1 and U3.
 # shellcheck disable=SC2034  # globals are read by uc_run.sh and the test
@@ -32,18 +33,39 @@ uc_sizes() {
       UC_REPS=3 UC_WARMUP=60 UC_DURATION=180
       U1_KEYS=20000000 U3_KEYS=20000000 U4_KEYS=5000000 U6_KEYS=1000000 U7_KEYS=2000000
       U2_RATE_PER_CONN=200 U2_EXPIRY=120-1200 UC_U2_WRITE_S=3600 UC_U2_IDLE_S=1800 UC_U2_DU_EVERY=60
-      UC_U3_CLOSED_S=3600 UC_U3_OPEN_S=600 UC_U6_S=60 UC_U7_TIMES=5 UC_U7_SECS="10 60 120"
+      UC_U3_CLOSED_S=3600 UC_U3_OPEN_S=600 UC_U6_S=60 UC_U7_TIMES=5 UC_U7_ACK_DIV=1 UC_U7_ACK_TIMEOUT=900
       U5_KEYS_1K=16000000 U5_KEYS_4K=4000000 U5_KEYS_16K=1000000 UC_COMPACT_WAIT=7200 ;;
     quick)
       UC_REPS=1 UC_WARMUP=10 UC_DURATION=30
       U1_KEYS=2000000 U3_KEYS=1000000 U4_KEYS=250000 U6_KEYS=1000000 U7_KEYS=200000
       U2_RATE_PER_CONN=50 U2_EXPIRY=30-300 UC_U2_WRITE_S=600 UC_U2_IDLE_S=300 UC_U2_DU_EVERY=15
-      UC_U3_CLOSED_S=300 UC_U3_OPEN_S=60 UC_U6_S=15 UC_U7_TIMES=1 UC_U7_SECS="5 15"
+      UC_U3_CLOSED_S=300 UC_U3_OPEN_S=60 UC_U6_S=15 UC_U7_TIMES=1
+      # U7 points at a tenth of the full counts (1271 6355 11439 acked writes)
+      UC_U7_ACK_DIV=10 UC_U7_ACK_TIMEOUT=300
       # 0.5 GiB logical per value size
       U5_KEYS_1K=524288 U5_KEYS_4K=131072 U5_KEYS_16K=32768 UC_COMPACT_WAIT=600 ;;
     *) echo "uc_sizes: unknown mode $1" >&2; return 2 ;;
   esac
   UC_U2_CLIENTS=25
+  UC_U7_ACKS=$(_uc_u7_acks)
+}
+
+# U7 load points (spec section 4: "kill at the same load point for both"): the signal goes after N acknowledged writes,
+# the same N on both servers, at about 10, 50 and 90% of the 256 MiB memtable (memtable-size 268435456 / Kvrocks
+# rocksdb.write_buffer_size 256 in lib.sh). An entry is the writer's value (UC_U7_VALUE bytes, `<seq>:` padded) plus 64 B
+# for the key (about 30 B: ack-r<rep>-<sig>-<N>-<run>-<thread>:<seq>) and the engines' per-entry memtable overhead.
+# With the 2 KiB value the overhead is about 3% of an entry, so the fill estimate does not hinge on either engine's
+# encoding, and the 90% point is about 114k writes: 40 s to 4 min at the 500-3200 strict acks/s of the quick run
+# (a value of the seq alone, about 60 B per entry, would need 3.9M writes, over 20 minutes per point).
+# The fill counts the writer's writes only; the preload before the first point, and what each restart's WAL replay
+# leaves in the memtable, are not counted (the same for both servers).
+UC_U7_VALUE=2048
+UC_U7_ENTRY=$((UC_U7_VALUE + 64))
+UC_U7_MEMTABLE=$((256 << 20))
+_uc_u7_acks() {
+  local p out=()
+  for p in 10 50 90; do out+=($((UC_U7_MEMTABLE * p / 100 / UC_U7_ENTRY / UC_U7_ACK_DIV))); done
+  echo "${out[*]}"
 }
 
 # Cache accounting (spec §4 U1, note 2026-11-12-uc-cache-accounting): TidesDB charges btree nodes (index) and
@@ -126,7 +148,10 @@ _uc_logical() {
         for p in v1k v4k v16k; do read -r k v <<<"$(uc_u5_keys "$p")"; ((k * (v + 12) > max)) && max=$((k * (v + 12))); done
         echo "$max" ;;
     U6) echo $((U6_KEYS * (100 + 12))) ;;
-    U7) echo $((U7_KEYS * (100 + 12))) ;;
+    # the preload, plus every point's acked writes: the data dir is kept from point to point
+    U7) local n w=0
+        for n in $UC_U7_ACKS; do w=$((w + n)); done
+        echo $((U7_KEYS * (100 + 12) + UC_U7_TIMES * 2 * w * UC_U7_ENTRY)) ;;
     U8|F1) echo 0 ;;
     *) echo "uc_disk_need: unknown case $1" >&2; return 2 ;;
   esac
@@ -159,7 +184,7 @@ uc_phases() {
     U5) echo "v1k v4k v16k" ;;
     U6) echo "c1 c8 c64 c256" ;;
     U7) local out=()
-        for t in $UC_U7_SECS; do out+=("term-$t" "kill-$t"); done
+        for t in $UC_U7_ACKS; do out+=("term-$t" "kill-$t"); done
         echo "${out[*]}" ;;
     U8) echo "report-only" ;;
     F1) echo "matrix" ;;

@@ -242,6 +242,35 @@ class AckWriterTest(unittest.TestCase):
         self.assertEqual(v["lost"], 3)
         self.assertEqual(v["corrupt"], 0)
 
+    def test_value_size_pads_the_value_and_verify_checks_it(self):
+        """--value-size (U7's memtable fill points): the value is the seq padded to the size, checked whole by verify."""
+        self.serve()
+        box = []
+        t = threading.Thread(target=lambda: box.append(run_tool(
+            "write", "--host", "127.0.0.1", "--port", self.fake.port, "--conns", 2, "--prefix", "k", "--log", self.log,
+            "--value-size", 2048)))
+        t.start()
+        time.sleep(0.5)
+        self.fake.kill(drop_last=0)
+        t.join(30)
+        self.assertEqual(box[0].returncode, 0, box[0].stderr)
+        self.fake.restart(0)
+        keys = self.logged()
+        val = self.fake.store[keys[1].encode()]
+        self.assertEqual(len(val), 2048)
+        self.assertTrue(val.startswith(keys[1].rsplit(":", 1)[1].encode() + b":"))
+        out = os.path.join(self.dir, "v.json")
+        r = run_tool("verify", "--host", "127.0.0.1", "--port", self.fake.port, "--log", self.log, "--out", out,
+                     "--value-size", 2048)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as f:
+            self.assertEqual(json.load(f)["corrupt"], 0)
+        self.fake.store[keys[0].encode()] = self.fake.store[keys[0].encode()][:-1] + b"?"  # one byte of the padding
+        r = run_tool("verify", "--host", "127.0.0.1", "--port", self.fake.port, "--log", self.log, "--out", out,
+                     "--value-size", 2048)
+        with open(out) as f:
+            self.assertEqual(json.load(f)["corrupt_sample"], [keys[0]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -194,7 +194,7 @@ if(Python3_FOUND)
     COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_f1_matrix.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   add_test(NAME bench_uc_report
-    COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_uc_report.py bench/compare/test_uc_report_fix.py
+    COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_uc_report.py bench/compare/test_uc_report_fix.py bench/compare/test_uc_report_final.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 endif()
 

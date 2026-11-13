@@ -17,7 +17,10 @@ has() { [[ $1 == *"$2"* ]] && echo yes || echo no; }
 uc_sizes full
 check full-reps "$UC_REPS" 3
 check u1-keys-full "$U1_KEYS" 20000000
-check u7-times-full "$UC_U7_TIMES $UC_U7_SECS" "5 10 60 120"
+# U7 points: N acked writes = 10/50/90% of the 256 MiB memtable at 2048 B values + 64 B key and entry overhead
+check u7-times-full "$UC_U7_TIMES $UC_U7_ACKS" "5 12710 63550 114390"
+check u7-entry "$UC_U7_VALUE $UC_U7_ENTRY $UC_U7_MEMTABLE" "2048 2112 268435456"
+check u7-ack-timeout-full "$UC_U7_ACK_TIMEOUT" 900
 check cases-order "$(uc_cases)" "U1 U2 U3 U4 U5 U6 U7 U8 F1"
 check servers-u2 "$(uc_servers U2)" "tideskv kvrocks kvrocks-cron"
 check servers-u5 "$(uc_servers U5)" "tideskv kvrocks kvrocks-blob"
@@ -31,6 +34,7 @@ check relaxed-sync-mode "$(BLOCK_CACHE_MB=2048 SERVER_WORKERS=4 _parity_expect t
 # F1-crit: logical x 1.4 (measured on-disk ratio) + 16 GiB WAL archive + logical / 2 (Kvrocks COMPACT) + 4 GiB slack
 G=$((1024 * 1024 * 1024))
 check disk-u1 "$(uc_disk_need U1)" $((20000000 * 1036 * 14 / 10 + 16 * G + 20000000 * 1036 / 2 + 4 * G))
+check disk-u7-writer "$(_uc_logical U7)" $((2000000 * 112 + 5 * 2 * (12710 + 63550 + 114390) * 2112))
 check disk-u8-none "$(uc_disk_need U8)" $((20 * G))
 check disk-u5 "$(uc_disk_need U5)" $((16000000 * 1036 * 14 / 10 + 16 * G + 16000000 * 1036 / 2 + 4 * G))
 # spec section 3: every case's full-size need fits in 60 GiB (U1, the largest, is about 56.7 GiB)
@@ -45,7 +49,7 @@ check phases-u3 "$(uc_phases U3)" "age closed open25 open50 open75"
 check phases-u4 "$(uc_phases U4)" "mix"
 check phases-u5 "$(uc_phases U5)" "v1k v4k v16k"
 check phases-u6 "$(uc_phases U6)" "c1 c8 c64 c256"
-check phases-u7-full "$(uc_phases U7)" "term-10 kill-10 term-60 kill-60 term-120 kill-120"
+check phases-u7-full "$(uc_phases U7)" "term-12710 kill-12710 term-63550 kill-63550 term-114390 kill-114390"
 check phases-u8 "$(uc_phases U8)" "report-only"
 check phases-f1 "$(uc_phases F1)" "matrix"
 
@@ -112,7 +116,7 @@ calls=(); uc_load U6 record
 check u6-load "$(has "${calls[0]}" "--key-maximum=1000000")" yes
 calls=(); uc_load U7 record
 check u7-load "$(has "${calls[0]}" "--key-maximum=2000000")" yes
-calls=(); uc_phase U7 term-10 record; uc_load U8 record; uc_phase U8 report-only record; uc_load F1 record; uc_phase F1 matrix record
+calls=(); uc_phase U7 term-12710 record; uc_load U8 record; uc_phase U8 report-only record; uc_load F1 record; uc_phase F1 matrix record
 check no-callback-cases "${#calls[@]}" 0
 check unknown-case "$(uc_phases ZZ 2>/dev/null || echo rc=$?)" "rc=2"
 
@@ -124,8 +128,8 @@ check u2-quick "$U2_RATE_PER_CONN $U2_EXPIRY $UC_U2_WRITE_S $UC_U2_IDLE_S $UC_U2
 check u3-quick "$U3_KEYS $UC_U3_CLOSED_S $UC_U3_OPEN_S" "1000000 300 60"
 check u4-quick "$U4_KEYS" 250000
 check u6-quick "$UC_U6_S" 15
-check u7-quick "$UC_U7_TIMES $UC_U7_SECS $U7_KEYS" "1 5 15 200000"
-check phases-u7-quick "$(uc_phases U7)" "term-5 kill-5 term-15 kill-15"
+check u7-quick "$UC_U7_TIMES $UC_U7_ACKS $U7_KEYS $UC_U7_ACK_TIMEOUT" "1 1271 6355 11439 200000 300"
+check phases-u7-quick "$(uc_phases U7)" "term-1271 kill-1271 term-6355 kill-6355 term-11439 kill-11439"
 calls=(); uc_phase U2 churn record
 check u2-quick-args "$(has "${calls[0]}" "--expiry-range=30-300") $(has "${calls[0]}" "--rate-limiting=50")" "yes yes"
 calls=(); uc_load U5 record v1k
