@@ -196,6 +196,9 @@ if(Python3_FOUND)
   add_test(NAME bench_uc_report
     COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_uc_report.py bench/compare/test_uc_report_fix.py bench/compare/test_uc_report_final.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  add_test(NAME bench_report_cases
+    COMMAND ${Python3_EXECUTABLE} -m unittest bench/compare/test_report_cases.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 endif()
 
 add_test(NAME bench_workloads
@@ -212,6 +215,14 @@ add_test(NAME bench_uc_run
 
 add_test(NAME bench_uc_cases_run
   COMMAND bash bench/compare/test_uc_cases_run.sh
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
+add_test(NAME bench_workloads_cases
+  COMMAND bash bench/compare/test_workloads_cases.sh
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
+add_test(NAME bench_cases
+  COMMAND bash bench/compare/test_cases.sh
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 option(TIDESKV_COMPAT "Run the Go compatibility suites (needs Go >= 1.22; first run downloads modules)" OFF)
