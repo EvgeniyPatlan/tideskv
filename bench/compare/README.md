@@ -298,8 +298,10 @@ keeps its 1M-key preload.
   U4's HGET and HGETALL replies are not checked. A failed check makes the cell ERR.
 - **Data.** LZ4 is on for both servers. memtier's random values are not assumed to compress: the report prints the
   observed on-disk / logical ratio per server and case (U1, U2, U3, U5).
-- **U3 and U5 disk writes per op** are the server cgroup's bytes written during the timed run over its requests (lower
-  is better, with a verdict).
+- **U3 and U5 disk writes per op** are the server cgroup's bytes written during the timed run over its requests. They
+  are information only, with no verdict: only writes inside the window count, so a server that keeps the data in its
+  memtable or defers flushes and compaction past the window looks cheaper than it is (in the quick U3 run TidesKV showed
+  7 B/op and Kvrocks 420, with the whole data set inside TidesKV's memtable).
 - **U4.** memtier picks each command by weight (HGET 10, HSET 6, HGETALL 3, HDEL 1), so HDEL runs without a paired
   HSET, the same on both servers. The report shows the weights, not memtier's unused `--ratio`.
 - **U8 time to quiet** is censored at `QUIESCE_MAX`: a wait that reached it is shown as "≥ cap", not as an error. It

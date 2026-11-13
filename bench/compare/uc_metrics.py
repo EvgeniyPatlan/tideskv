@@ -238,7 +238,8 @@ def _build_metrics():
                   pct("closed", "p99.90"), "ms", "closed", info=True),
                _m("closed_ops", "closed ops/s", True, False, ops("closed"), "ops/s", "closed"),
                _m("windows_over_10x", "windows over 10x median p99.9", False, False, over_10x("closed"), "count", "closed"),
-               _m("closed_bop", BOP_TITLE % "closed", False, False, bytes_per_op("closed"), "B/op", "closed")] \
+               _m("closed_bop", BOP_TITLE % "closed", False, False, bytes_per_op("closed"), "B/op", "closed",
+                  info=True, pros_cons=False, note="window-only: writes deferred past the timed run (memtable-resident data, later flushes and compactions) are not counted, so it is not compared")] \
         + [replace(x, headline=x.key == "open50_p999") for x in _open() if x.key.endswith("_p999")]
     m["U4"] = [_m("mix_ops", "mix ops/s", True, True, ops("mix"), "ops/s", "mix"),
                _m("mix_p99", "mix p99 (not compared: closed loop)", False, False, pct("mix", "p99.00"), "ms", "mix", info=True)] \
@@ -251,7 +252,8 @@ def _build_metrics():
         m["U5"] += [_m(sz + "_ops", "%s ops/s" % sz, True, sz == "v4k", ops(sz), "ops/s", sz),
                     _m(sz + "_p99", "%s p99 (not compared: closed loop)" % sz, False, False, pct(sz, "p99.00"), "ms", sz,
                        info=True),
-                    _m(sz + "_bop", BOP_TITLE % sz, False, False, bytes_per_op(sz), "B/op", sz),
+                    _m(sz + "_bop", BOP_TITLE % sz, False, False, bytes_per_op(sz), "B/op", sz,
+                       info=True, pros_cons=False, note="window-only: writes deferred past the timed run (memtable-resident data, later flushes and compactions) are not counted, so it is not compared"),
                     _m(sz + "_du", "%s disk after load (%s)" % (sz, basis), False, False, _du_last(src), "bytes", disk_src=src),
                     _m(sz + "_du_apparent", "%s disk after load (apparent size, excl. WAL archive)" % sz, False, False,
                        _du_last(src, 3), "bytes", info=True, twin_of=sz + "_du")]
