@@ -167,3 +167,161 @@ docker run --rm --name tideskv-bench-clean-manual -v "$PWD/build/bench/<ts>/data
 ## Scaling up (S4)
 
 For the S4 sign-off, run on a host where `wl_sizes full` in `workloads.sh` can be raised to 3× host RAM, and set `SERVER_MEM` to the host's RAM minus a margin.
+
+## Use-case suite
+
+`usecases.sh` compares TidesKV with Kvrocks 2.17.0 on eight use cases (U1-U8) and two non-performance parts (F1, F2).
+Where `run.sh` measures workloads, this suite asks questions a user would ask: does a cache bigger than RAM hold up,
+does disk usage follow expiring data, what does a durable write cost, is an acknowledged write ever lost. It reuses
+`run.sh`'s harness (`lib.sh`): the same pinned images, the same CPU, memory and file limits, the same parity read-back,
+and the same page-cache and settle rules as under "Fairness rules" above. Its output is `<out>/report.md` plus
+`summary.json`; nothing in `run.sh` or W1-W7 changes.
+
+```bash
+bench/compare/usecases.sh --quick --out build/bench/uc-quick   # every case, 1 repetition, small data: a check of the suite, not a result
+bench/compare/usecases.sh --out build/bench/uc-full            # full: 3 repetitions
+bench/compare/usecases.sh U6 U7 --out build/bench/uc-full      # only these cases (U1..U8, F1)
+bench/compare/uc_report.py build/bench/uc-full                 # rebuild report.md and summary.json from the run directory
+```
+
+Options: `--quick`, `--dirty` (build TidesKV from the working tree), `--out DIR`, and any number of case names.
+`SERVER_CPUS`, `SERVER_MEM`, `CLIENT_CPUS` and `QUIESCE_MAX` (default 600 s, quick 60 s) work as for `run.sh`.
+`uc_report.py` exits 1 when any cell failed. The host needs Docker, `fio` is run from its pinned image, and Python
+tools (U7's ack-writer and F1) run from the pinned `PY_IMAGE` in `lib.sh`.
+
+Resume: running `usecases.sh` again with the same `--out` skips every repetition that has a `done` file and redoes the
+rest from an empty data directory, so an interrupted run (Ctrl-C, a crashed host) never mixes partial files. U1 and U3
+run in two passes (see "Method"); a repetition whose pass A is missing redoes pass A and then pass B for every server.
+Before each case loads, the suite checks the free disk against that case's need (half the logical bytes, plus 16 GiB for
+Kvrocks' WAL archive and 4 GiB slack); a case that does not fit is skipped, and its repetitions say why.
+
+### Time
+
+Measured on the dev host (i9-12900HK, NVMe) in quick mode:
+
+| Case | Wall time |
+|---|---|
+| U1 | 4 min |
+| U2 | 45 min (3 servers x 15 min) |
+| U3 | 11 min |
+| U4 | 2 min |
+| U5 | 9 min |
+| U6 | 59 min (TidesKV 21 min, Kvrocks 38 min; the strict preload of 1M keys dominates) |
+| U7 | 12 min |
+| U8, F1 | under 1 min |
+| Whole run | 2 h 23 min (22:19 to 00:42 UTC, including the fio baselines and image checks) |
+
+The quick run is a check of the suite, not a measurement: its data fits in the page cache.
+
+A full run is about 2 days (about 45-55 h). That is an estimate from the quick timings and the full-mode constants in
+`uc_cases.sh`, not a measurement: U2 alone is 3 configurations x 3 repetitions x 90 min (13.5 h); U3 is about 2 h per
+server and repetition (12 h); U7's strict preload of 2M keys is fsync-bound (about 35 min for TidesKV and 80 min for
+Kvrocks per repetition) before its 30 kill runs per server (about 12 h in all); U1 takes 3-4 h, U5 about 5 h, U6 about
+3 h, U4 about 1 h. It is resumable, so it can be done in pieces (for example U6 and U7 alone, or one case
+per night). Do not start it on a host that runs anything else: server and client are pinned to cores and the cases
+measure latency.
+
+### Cases
+
+| Case | What runs | Servers | Durability | Headline metrics |
+|---|---|---|---|---|
+| U1 Cache bigger than RAM | 40M keys x 1 KB (about 40 GB), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. Kvrocks gets a full COMPACT after the load | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
+| U2 TTL churn and space reclaim | SET with random TTLs 120-1200 s, 1:1 GET (negative lookups over a 1e9-key space) at a fixed rate for 60 min, then 30 min idle; `du` every 60 s | TidesKV, Kvrocks, Kvrocks+cron (`compaction-checker-cron * * * * *`) | relaxed | disk bytes over time and at the end; p99.9 at the fixed rate; end-of-run key count |
+| U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk B/op |
+| U4 Hashes as records | 5M hashes x 20 fields x 50 B; HGET/HSET/HGETALL/HDEL mix 10:6:3:1 | TidesKV, Kvrocks | relaxed | ops/s; p99 |
+| U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk B/op; on-disk size |
+| U6 Durable writes | SET 100 B at 1, 8, 64 and 256 connections, pipeline 1; fio measures the disk's fsync floor before each server's sweep | TidesKV, Kvrocks | strict | writes/s; p99; ratio to the fsync floor |
+| U7 Restart and crash recovery | writer with an acknowledgement log; SIGTERM and SIGKILL after 10, 60 and 120 s of writes, 5 times each; restart, then verify every acknowledged key | TidesKV, Kvrocks | strict | acknowledged writes lost, corrupt, restart misses; time to PONG; time to recovered p99 |
+| U8 Bulk load and footprint | no server of its own: reads U1's load and U3's aging | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet; disk after load, after aging, after COMPACT (Kvrocks only) |
+| F1 Command coverage | a command matrix against Redis 7.2 | TidesKV, Kvrocks | relaxed | same / differs / unsupported / documented / extra per command and case |
+| F2 Operations facts | a hand-written, sourced table (`f2_operations.md`) | | | facts with links |
+
+Quick mode shrinks the data (U1 2M keys, U3 1M, U4 250k, U5 0.5 GiB per size, U7 200k) and the time (U2 10 min of
+writes and 5 idle, U3 5 min, U6 15 s per step, U7 kills after 5 and 15 s, once). U6 keeps its 1M-key preload.
+
+### Method
+
+- **Repetitions.** Full mode runs every cell 3 times, interleaved per repetition (TidesKV, then each Kvrocks
+  configuration, then again). Quick mode runs once. Tables give the median and the min-max range.
+- **Equal resources.** Same as `run.sh`: server on `SERVER_CPUS` with `SERVER_MEM` (8g) and 65536 open files, client
+  on `CLIENT_CPUS`, 4 workers, 2048 MB block cache, 256 MB memtable, LZ4. Every setting is read back from the running
+  server before any cell is measured; a mismatch fails the cell. Settings added for one case (the cron and blob
+  Kvrocks configs) are read back the same way, and Kvrocks 2.17 rejecting a
+  setting fails the cell loudly.
+- **Cache accounting (U1).** TidesDB charges its index and bloom blocks to its block cache, as Kvrocks does with
+  `cache_index_and_filter_blocks yes` (its default), so both sides have 2048 MB of total read cache.
+- **Two passes (U1, U3, full mode).** Pass A loads and runs the closed-loop phases for every server of a repetition.
+  Pass B reloads and runs open-loop phases at 25, 50 and 75% of the lower of the two servers' closed-loop ops/s from that
+  repetition, so both servers are measured at the same offered load and neither is saturated. Quick mode runs pass A only.
+- **Durability.** U1-U5 and U8 are relaxed (TidesKV `sync-mode none`, Kvrocks `write_options.sync no`), which is not
+  power-loss safe on either side. U6 and U7 are strict (`full` / `yes`: fsync before each acknowledged write). TidesKV's
+  `interval` mode is not compared with Kvrocks `sync yes`.
+- **Disk figures** are allocated bytes (`du --block-size=1`, what the filesystem holds, since TidesKV preallocates files)
+  taken after the server went quiet, excluding Kvrocks' WAL archive (`wal_ttl_seconds` default 10800), which is
+  reported on its own line. Apparent size is shown beside them. Older runs that recorded only apparent size fall back
+  to it, and the report labels that.
+- **U2.** GETs are negative lookups over a 1e9-key space, so the live set follows the SET rate times the mean TTL.
+  Neither Kvrocks config gets a manual COMPACT. Kvrocks' end-of-run key count needs `DBSIZE SCAN` and may read
+  "unverified" when the scan does not finish.
+- **U1 cache hit rate** is Kvrocks-only: TidesKV's `INFO` has no hit or miss counters.
+- **U6.** The 1M-key strict preload is fsync-bound: on the dev host about 17-21 minutes for TidesKV and 38-40 minutes for
+  Kvrocks per repetition. The host disk's fsync rate was also observed to shift between about 1.5k and 6.8k per second,
+  so a single-repetition U6 result is not trustworthy (the quick run measured 1720 writes/s at the start of the run and 216 and 237 writes/s right before the two sweeps). Before each server's sweep fio measures 4 KiB random writes with
+  an fsync after each at queue depth 1 (the disk's durable-write floor); it is shown beside the results. A cell whose
+  per-second ops have a coefficient of variation above 0.25 is flagged unstable and gets no verdict.
+- **U7.** A process kill (SIGTERM or SIGKILL), not an OS crash or power loss. Each kill point uses a unique key prefix
+  and keeps the data dir. Before the restart the page cache of the data dir is dropped. After the restart every
+  acknowledged key is read back: `lost` (missing), `corrupt` (wrong value) and `restart_misses` (preload keys not
+  found by the probe, reported, not a failure). Timings are measured from the moment `docker run` returned
+  (docker's own time is shown separately). Recovery is the start of the first 3 consecutive 100 ms windows whose p99 is
+  within 2x the same server's warm pre-kill p99.
+- **F1.** Redis 7.2.5 is the oracle. The same commands run on a flushed db against Redis and each server, and every
+  command of a case is compared. Statuses: `same`; `differs`; `unsupported` (the server refuses where Redis succeeds);
+  `extra` (a command Redis 7.2 does not have); `documented` (the difference is described by the project's own
+  documentation, with a link: used only when every difference in a case is documented). Pros and cons are listed
+  symmetrically by root cause. F1 is a single run, and at least one case (Kvrocks `EXPIRE b 0` then `GET`) was observed
+  timing-dependent, so re-running may change a row. Kvrocks ran with the default `redis-databases` of 0, which is
+  configurable.
+- **F2.** Facts about operating each server, each with its source and no scores. TidesKV is pre-1.0. A fact that
+  could not be checked from the source is marked "not verified".
+
+### Verdict rule
+
+Per metric, the ratio is oriented so that above 1 means TidesKV is better (throughput: TidesKV over Kvrocks; latency,
+bytes, recovery time: Kvrocks over TidesKV). The band is the larger of each side's relative spread, (max - min) / median,
+and 0.05. Inside the band the verdict is "tie"; outside it, "TidesKV better" or "Kvrocks better". Rules around it:
+
+- No verdict ("no verdict") for quick runs, for single repetitions, and when either side has an error in any
+  repetition (a failed repetition is not replaced by the survivors; the note says which).
+- A zero median with spread is a tie; 0 against 0 is a tie and 0 against a positive value is a win for the zero side.
+- The comparison is against the best valid Kvrocks configuration for that metric, so TidesKV is never compared with a
+  weaker Kvrocks setting. Errored configurations stay visible in the table.
+- A case row says "mixed" when its metrics disagree. There is no weighting across metrics.
+- Latency verdicts are given only at equal offered load: the open-loop cells of U1 and U3, and U2's churn, which runs at a
+  fixed rate identical for both servers. Closed-loop latency is shown as information and never compared. A cell
+  that reached under 95% of its target rate ("under target"), or whose memtier used over 85% of the client CPUs
+  ("client-bound"), gets no latency verdict.
+
+### Reading the report
+
+`report.md` opens with a summary table (one row per case: the headline metric for each server, the verdict label and
+a one-line meaning), then one section per case: what it models, the question, the setup read back from the servers,
+per-metric tables with ratio, band and verdict, notes, then the F1 matrix and the F2 table, and a methodology section
+at the end. Cells show `median [min-max]`. `ERR: ...` cells name why a cell has no number. A quick run opens with the
+banner "quick: not a disk result, no verdicts". `summary.json` holds the same numbers for other tools.
+
+### Not covered in v1
+
+- Replication, failover and slot migration under load (needs a multi-node harness).
+- Memory sweeps from 1x to 10x RAM, relaxed-mode pipeline and connection sweeps, scans after deletes.
+- Power-loss simulation: U7 kills the server process only.
+- MULTI/Lua atomicity across a crash.
+- Kvrocks features TidesKV lacks (streams, geo, JSON, search...) are listed in F1 and F2, not benchmarked.
+- Any change to either server's code, or tuning beyond the settings in the report.
+
+### For Kvrocks maintainers
+
+Please review the Kvrocks configurations (`kvrocks.conf`, the cron and blob variants in `uc_cases.sh`, and the
+settings the report lists as read back). If a setting is not what you would run in production, or a workload favours
+one side, say so: every setting, command line and raw result is in the run directory, and a corrected configuration
+can be re-run and published next to the original.
