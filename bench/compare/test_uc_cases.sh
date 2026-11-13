@@ -16,7 +16,7 @@ has() { [[ $1 == *"$2"* ]] && echo yes || echo no; }
 
 uc_sizes full
 check full-reps "$UC_REPS" 3
-check u1-keys-full "$U1_KEYS" 40000000
+check u1-keys-full "$U1_KEYS" 20000000
 check u7-times-full "$UC_U7_TIMES $UC_U7_SECS" "5 10 60 120"
 check cases-order "$(uc_cases)" "U1 U2 U3 U4 U5 U6 U7 U8 F1"
 check servers-u2 "$(uc_servers U2)" "tideskv kvrocks kvrocks-cron"
@@ -28,11 +28,15 @@ check level-u7 "$(uc_level U7)" strict
 check level-u1 "$(uc_level U1)" relaxed
 # lib.sh writes and checks TidesKV's relaxed sync-mode from RELAXED: the suite's relaxed level is sync-mode none
 check relaxed-sync-mode "$(BLOCK_CACHE_MB=2048 SERVER_WORKERS=4 _parity_expect tideskv relaxed | grep '^sync-mode')" "sync-mode none"
-# R6: memtier random data compresses ~3x under LZ4, so half the logical bytes plus 16 GiB WAL archive and 4 GiB slack
-check disk-u1 "$(uc_disk_need U1)" $((40000000 * 1036 / 2 + 20 * 1024 * 1024 * 1024))
-check disk-u1-fits-62g "$([[ $(uc_disk_need U1) -lt $((62 * 1000 * 1000 * 1000)) ]] && echo yes)" yes
-check disk-u8-none "$(uc_disk_need U8)" $((20 * 1024 * 1024 * 1024))
-check disk-u5-half "$(uc_disk_need U5)" $((16000000 * 1024 / 2 + 20 * 1024 * 1024 * 1024))
+# F1-crit: logical x 1.4 (measured on-disk ratio) + 16 GiB WAL archive + logical / 2 (Kvrocks COMPACT) + 4 GiB slack
+G=$((1024 * 1024 * 1024))
+check disk-u1 "$(uc_disk_need U1)" $((20000000 * 1036 * 14 / 10 + 16 * G + 20000000 * 1036 / 2 + 4 * G))
+check disk-u8-none "$(uc_disk_need U8)" $((20 * G))
+check disk-u5 "$(uc_disk_need U5)" $((16000000 * 1036 * 14 / 10 + 16 * G + 16000000 * 1036 / 2 + 4 * G))
+# spec section 3: every case's full-size need fits in 60 GiB (U1, the largest, is about 56.7 GiB)
+for c in $(uc_cases); do
+  check "disk-$c-under-60gib" "$(( $(uc_disk_need "$c") <= 60 * G ))" 1
+done
 check debt-fields "$([[ -n ${UC_DEBT_FIELDS_tideskv[*]} && -n ${UC_DEBT_FIELDS_kvrocks[*]} ]] && echo yes)" yes
 check debt-kvrocks-pending "$(has "${UC_DEBT_FIELDS_kvrocks[*]}" estimate_pending_compaction_bytes)" yes
 check phases-u1 "$(uc_phases U1)" "closed-gauss closed-uniform open25 open50 open75"
@@ -56,8 +60,8 @@ check conf-unknown "$(uc_conf_lines bogus 2>/dev/null || echo rc=$?)" "rc=2"
 UC_RATE=37
 calls=(); uc_phase U1 closed-gauss record
 check u1-gauss-pattern "$(has "${calls[0]}" "--key-pattern=G:G")" yes
-check u1-gauss-stddev "$(has "${calls[0]}" "--key-stddev=2000000")" yes
-check u1-gauss-median "$(has "${calls[0]}" "--key-median=20000000")" yes
+check u1-gauss-stddev "$(has "${calls[0]}" "--key-stddev=1000000")" yes
+check u1-gauss-median "$(has "${calls[0]}" "--key-median=10000000")" yes
 check u1-flags "$(has "${calls[0]}" "--distinct-client-seed")" yes
 calls=(); uc_phase U1 closed-uniform record
 check u1-uniform "$(has "${calls[0]}" "--key-pattern=R:R")" yes

@@ -30,7 +30,7 @@ uc_sizes() {
   case $1 in
     full)
       UC_REPS=3 UC_WARMUP=60 UC_DURATION=180
-      U1_KEYS=40000000 U3_KEYS=20000000 U4_KEYS=5000000 U6_KEYS=1000000 U7_KEYS=2000000
+      U1_KEYS=20000000 U3_KEYS=20000000 U4_KEYS=5000000 U6_KEYS=1000000 U7_KEYS=2000000
       U2_RATE_PER_CONN=200 U2_EXPIRY=120-1200 UC_U2_WRITE_S=3600 UC_U2_IDLE_S=1800 UC_U2_DU_EVERY=60
       UC_U3_CLOSED_S=3600 UC_U3_OPEN_S=600 UC_U6_S=60 UC_U7_TIMES=5 UC_U7_SECS="10 60 120"
       U5_KEYS_1K=16000000 U5_KEYS_4K=4000000 U5_KEYS_16K=1000000 UC_COMPACT_WAIT=7200 ;;
@@ -123,7 +123,7 @@ _uc_logical() {
     U4) echo $((U4_KEYS * 20 * (50 + 10))) ;;
     # each size is loaded and removed in turn, so the largest one counts
     U5) local p max=0
-        for p in v1k v4k v16k; do read -r k v <<<"$(uc_u5_keys "$p")"; ((k * v > max)) && max=$((k * v)); done
+        for p in v1k v4k v16k; do read -r k v <<<"$(uc_u5_keys "$p")"; ((k * (v + 12) > max)) && max=$((k * (v + 12))); done
         echo "$max" ;;
     U6) echo $((U6_KEYS * (100 + 12))) ;;
     U7) echo $((U7_KEYS * (100 + 12))) ;;
@@ -132,12 +132,21 @@ _uc_logical() {
   esac
 }
 
-# Bytes free a case needs: half its logical bytes (memtier random data compresses ~3x under LZ4, which every case uses;
-# /2 keeps a margin) plus the WAL archive allowance and slack (controller ruling R6).
+# Bytes free a case needs (ruling F1-crit, replacing R6's "LZ4 compresses ~3x", which the quick run contradicts):
+#   logical x 1.4             the data on disk after the load. memtier's --random-data does not compress (U1 load is 1 KiB
+#                             values of random bytes): in the quick run build/bench/uc-quick (du-after-load: allocated bytes
+#                             excluding the WAL archive, over keys x (value + 12)) U1 TidesKV was 1.33x and Kvrocks 1.05x;
+#                             U5 1/4/16 KiB TidesKV 1.48/1.25/1.00x, Kvrocks 1.41/1.43/1.56x at 0.5 GiB per size, where
+#                             fixed per-file overheads weigh more than at full size. 1.4 covers U1, the largest case;
+#                             the COMPACT term and the slack absorb U5's excess (about 2 GiB at full size).
+#   + UC_WAL_ALLOWANCE        Kvrocks' WAL archive (stock wal_size_limit_mb 16384 caps it at 16 GiB)
+#   + logical / 2             the transient extra space of Kvrocks' full COMPACT (U1) while old and new SSTs coexist
+#   + UC_SLACK                4 GiB for logs, the fio files and the filesystem
+# One formula for every case and server, so U8 and F1 (logical 0) still ask for 20 GiB.
 uc_disk_need() {
   local logical
   logical=$(_uc_logical "$1") || return
-  echo $((logical / 2 + UC_WAL_ALLOWANCE + UC_SLACK))
+  echo $((logical * 14 / 10 + UC_WAL_ALLOWANCE + logical / 2 + UC_SLACK))
 }
 
 uc_phases() {
