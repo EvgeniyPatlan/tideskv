@@ -100,9 +100,11 @@ class AdvertisedMetricsTest(unittest.TestCase):
         s, text = run.report()
         e = entry(s, "U3", "closed_bop")
         self.assertEqual(e["configs"]["tideskv"]["median"], 100.0)  # 100000 bytes / 1000 ops
-        self.assertEqual(e["verdict"]["label"], "TidesKV better")
+        # ruling FC3: window-only counting misses deferred writes, so it is shown but never compared
+        self.assertIsNone(e.get("verdict"))
         self.assertFalse(e["higher_is_better"])
         self.assertEqual(entry(s, "U5", "v4k_bop")["configs"]["kvrocks"]["median"], 3000.0)
+        self.assertIsNone(entry(s, "U5", "v4k_bop").get("verdict"))
         self.assertIn("disk writes per op", text)
 
     def test_u6_ratio_to_the_floor_and_both_floors(self):
@@ -177,14 +179,14 @@ class ReportWordingTest(unittest.TestCase):
     def test_reason_lists_every_non_tie_metric(self):
         run = Run(self)
         for rep in (1, 2):
-            for srv, ops, io in (("tideskv", 1000, 300000), ("kvrocks", 1000, 100000)):
+            for srv, ops, alloc in (("tideskv", 1000, 3 << 30), ("kvrocks", 1000, 1 << 30)):
                 run.cell("U5", srv, rep, "v4k", memtier(ops + rep, sets=200, gets=800))
-                run.write("U5/%s/rep%d/v4k.io" % (srv, rep), str(io))
+                du5(run, "U5", srv, rep, "du-after-load-v4k", alloc)
                 run.done("U5", srv, rep)
         s, text = run.report()
         row = next(l for l in text.splitlines() if l.startswith("| U5"))
         self.assertIn("| tie |", row)  # the tie headline and one Kvrocks win: not mixed (only one side wins)
-        self.assertIn("v4k disk writes per op", row)
+        self.assertIn("v4k disk after load", row)
         self.assertIn("Kvrocks better", row)
 
     def test_evict_failure_is_a_caveat(self):
