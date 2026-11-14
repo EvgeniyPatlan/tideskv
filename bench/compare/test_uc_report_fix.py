@@ -117,7 +117,30 @@ class FixTest(unittest.TestCase):
         self.assertEqual(entry(s, "U8", "u3_load")["configs"]["tideskv"]["median"], 200)
         self.assertEqual(entry(s, "U8", "age_growth")["configs"]["tideskv"]["median"], 300)
         self.assertIsNone(entry(s, "U8", "age_growth")["verdict"])
-        self.assertIn("after U1's load and both closed-loop phases", text)
+        self.assertIn("fresh load of U1's data on an empty server followed by a full COMPACT", text)
+
+    def test_u8_kvrocks_uncompressed_share_and_memtier_footprint(self):
+        run = Run(self, reps=1)
+        self.u8(run)
+        for srv, share in (("tideskv", None), ("kvrocks", 0.25)):
+            path = run.path("U8/%s/rep1/summary.json" % srv)
+            with open(path) as f:
+                doc = json.load(f)
+            doc["memtier_du_after_load"] = {"bytes": 400, "wal_archive_bytes": 0}
+            doc["controlled_load_ops_per_s"] = 7
+            doc["sst_after_load"] = None if share is None else {"uncompressed_share": share, "sst_bytes": 900}
+            run.write("U8/%s/rep1/summary.json" % srv, json.dumps(doc))
+        s, text = run.report()
+        unc = entry(s, "U8", "uncompressed_after_load")
+        self.assertEqual(unc["configs"]["kvrocks"]["median"], 25.0)
+        self.assertIsNone(unc["configs"].get("tideskv"))
+        self.assertIsNone(unc["verdict"])
+        mt = entry(s, "U8", "memtier_du_after_load")
+        self.assertEqual(mt["configs"]["tideskv"]["median"], 400)
+        self.assertIsNone(mt["verdict"])
+        self.assertIn("memtier's values compress unrealistically well", text)
+        ctl = entry(s, "U8", "controlled_load_ops")
+        self.assertEqual((ctl["configs"]["tideskv"]["median"], ctl["verdict"]), (7, None))
 
     def test_u8_settle_at_floor_has_no_verdict(self):
         run = Run(self, reps=2)

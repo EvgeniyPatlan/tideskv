@@ -35,7 +35,9 @@ check relaxed-sync-mode "$(BLOCK_CACHE_MB=2048 SERVER_WORKERS=4 _parity_expect t
 G=$((1024 * 1024 * 1024))
 check disk-u1 "$(uc_disk_need U1)" $((20000000 * 1036 * 16 / 10 + 16 * G + 4 * G))
 check disk-u7-writer "$(_uc_logical U7)" $((2000000 * 112 + 5 * 2 * (12710 + 63550 + 114390) * 2112))
-check disk-u8-none "$(uc_disk_need U8)" $((20 * G))
+# U8 loads U1's key set once more (its memtier speed load)
+check disk-u8-as-u1 "$(uc_disk_need U8)" "$(uc_disk_need U1)"
+check disk-f1-none "$(uc_disk_need F1)" $((20 * G))
 check disk-u5 "$(uc_disk_need U5)" $((16000000 * 1036 * 16 / 10 + 16 * G + 4 * G))
 # spec section 3: every case's full-size need fits in 60 GB (decimal; U1, the largest, is about 54.6 GB)
 for c in $(uc_cases); do
@@ -74,7 +76,9 @@ check u1-open-rate "$(has "${calls[0]}" "--rate-limiting=37")" yes
 check u1-open-ratio "$(has "${calls[0]}" "--ratio=1:10")" yes
 check u1-open-gauss "$(has "${calls[0]}" "--key-pattern=G:G")" yes
 calls=(); uc_load U1 record
-check u1-load "$(has "${calls[0]}" "--key-prefix=u1:") $(has "${calls[0]}" "--data-size=1024") $(has "${calls[0]}" "--requests=allkeys")" "yes yes yes"
+check u1-load "${calls[0]}" "--prefix=u1:"$'\x1f'"--keys=20000000"$'\x1f'"--value-size=1024"
+calls=(); uc_memtier_load record
+check u8-memtier-load "$(has "${calls[0]}" "--key-prefix=u1:") $(has "${calls[0]}" "--data-size=1024") $(has "${calls[0]}" "--random-data") $(has "${calls[0]}" "--requests=allkeys") $(has "${calls[0]}" "--pipeline=32") $(has "${calls[0]}" "--key-maximum=20000000")" "yes yes yes yes yes yes"
 
 calls=(); uc_phase U2 churn record
 check u2-expiry "$(has "${calls[0]}" "--expiry-range=120-1200")" yes
@@ -86,9 +90,10 @@ check u2-idle-none "${#calls[@]}" 0
 
 calls=(); uc_load U3 record
 check u3-load-calls "${#calls[@]}" 1
-check u3-load-size "$(has "${calls[0]}" "--data-size=200")" yes
-calls=(); uc_phase U3 age record
-check u3-age "$(has "${calls[0]}" "--ratio=1:0") $(has "${calls[0]}" "--key-pattern=R:R") $(has "${calls[0]}" "--pipeline=32") $(has "${calls[0]}" "--requests=1250000")" "yes yes yes yes"
+check u3-load-size "$(has "${calls[0]}" "--value-size=200")" yes
+calls=(); uc_age record
+check u3-age "${calls[0]}" "$(IFS=$'\x1f'; echo "--prefix=u3:${IFS}--keys=20000000${IFS}--value-size=200${IFS}--order=random${IFS}--requests=40000000${IFS}--seed=2")"
+check u3-age-not-a-phase "$(uc_phase U3 age record 2>/dev/null || echo rc=$?)" "rc=2"
 calls=(); uc_phase U3 closed record
 check u3-closed "$(has "${calls[0]}" "--ratio=4:1")" yes
 calls=(); uc_phase U3 open75 record
@@ -100,10 +105,10 @@ check u4-ratios "$(grep -o -- '--command=' <<<"${calls[0]}" | wc -l) $(has "${ca
 check u4-hgetall "$(has "${calls[0]}" "--command=HGETALL __key__")" yes
 check u4-pattern "$(has "${calls[0]}" "--command-key-pattern=R")" yes
 calls=(); uc_load U4 record
-check u4-load "$(has "${calls[0]}" "--key-prefix=u4:") $(has "${calls[0]}" "f20 __data__") $(has "${calls[0]}" "--data-size=50")" "yes yes yes"
+check u4-load "$(has "${calls[0]}" "--prefix=u4:") $(has "${calls[0]}" "--fields=20") $(has "${calls[0]}" "--value-size=50") $(has "${calls[0]}" "--keys=5000000")" "yes yes yes yes"
 
 calls=(); uc_load U5 record v16k
-check u5-v16k-load "${#calls[@]} $(has "${calls[0]}" "--key-maximum=1000000") $(has "${calls[0]}" "--data-size=16384")" "1 yes yes"
+check u5-v16k-load "${#calls[@]} $(has "${calls[0]}" "--keys=1000000") $(has "${calls[0]}" "--value-size=16384")" "1 yes yes"
 calls=(); uc_phase U5 v4k record
 check u5-v4k-run "$(has "${calls[0]}" "--ratio=1:4") $(has "${calls[0]}" "--key-maximum=4000000") $(has "${calls[0]}" "--data-size=4096")" "yes yes yes"
 
@@ -113,9 +118,9 @@ calls=(); uc_phase U6 c1 record
 check u6-c1 "$(has "${calls[0]}" "--threads=1") $(has "${calls[0]}" "--clients=1") $(has "${calls[0]}" "--ratio=1:0")" "yes yes yes"
 check u6-secs "$UC_U6_S" 60
 calls=(); uc_load U6 record
-check u6-load "$(has "${calls[0]}" "--key-maximum=1000000")" yes
+check u6-load "$(has "${calls[0]}" "--keys=1000000")" yes
 calls=(); uc_load U7 record
-check u7-load "$(has "${calls[0]}" "--key-maximum=2000000")" yes
+check u7-load "$(has "${calls[0]}" "--keys=2000000")" yes
 calls=(); uc_phase U7 term-12710 record; uc_load U8 record; uc_phase U8 report-only record; uc_load F1 record; uc_phase F1 matrix record
 check no-callback-cases "${#calls[@]}" 0
 check unknown-case "$(uc_phases ZZ 2>/dev/null || echo rc=$?)" "rc=2"
@@ -133,7 +138,7 @@ check phases-u7-quick "$(uc_phases U7)" "term-1271 kill-1271 term-6355 kill-6355
 calls=(); uc_phase U2 churn record
 check u2-quick-args "$(has "${calls[0]}" "--expiry-range=30-300") $(has "${calls[0]}" "--rate-limiting=50")" "yes yes"
 calls=(); uc_load U5 record v1k
-check u5-quick-keys "$(has "${calls[0]}" "--key-maximum=524288")" yes
+check u5-quick-keys "$(has "${calls[0]}" "--keys=524288")" yes
 calls=(); uc_load U5 record
 check u5-load-all "${#calls[@]}" 3
 check unknown-mode "$(uc_sizes bogus 2>/dev/null || echo rc=$?)" "rc=2"
@@ -143,5 +148,20 @@ if command -v shellcheck >/dev/null; then
 else
   echo "skip shellcheck (not installed)"
 fi
+# Removing a server container also removes its anonymous volumes (the Kvrocks image declares VOLUME /var/lib/kvrocks, and
+# every start used to leave one behind); bind mounts and named volumes are never touched by -v.
+DOCKER_CALLS=()
+# shellcheck disable=SC2317  # stands in for docker inside stop_server and bench_cleanup
+docker() { DOCKER_CALLS+=("$*"); }
+sync() { :; }
+OUT=$(mktemp -d) SERVER_CONTAINER=tideskv-bench-kvrocks-t SERVER_NAME=kvrocks TS=t CONTAINERS=(c1) NET_CREATED=0
+mkdir -p "$OUT/kvrocks"
+stop_server
+check stop-removes-volumes "$(printf '%s\n' "${DOCKER_CALLS[@]}" | grep -c '^rm -v tideskv-bench-kvrocks-t$')" 1
+DOCKER_CALLS=()
+bench_cleanup
+check cleanup-removes-volumes "$(printf '%s\n' "${DOCKER_CALLS[@]}" | grep -c '^rm -f -v c1$')" 1
+rm -rf "$OUT"
+unset -f docker sync
 bash -n "$HERE/uc_cases.sh" || fail=1
 exit $fail

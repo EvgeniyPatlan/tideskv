@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Use-case suite case definitions U1-U8 and F1 (spec 2026-11-12 §4). Sourced by uc_run.sh; pure functions, no Docker.
-# Callbacks receive memtier arguments as separate words. The runner appends --test-time (UC_WARMUP / UC_DURATION, or
+# uc_phase and uc_memtier_load callbacks receive memtier arguments as separate words (uc_load and uc_age callbacks get
+# uc_loader.py's). The runner appends --test-time (UC_WARMUP / UC_DURATION, or
 # the phase-specific globals below), so phase arguments carry traffic shape only.
 # Globals set by uc_sizes (read by the runner):
 #   UC_REPS                       repetitions per phase (3 full, 1 quick)
@@ -12,7 +13,7 @@
 #   UC_U6_S                       U6 seconds per connection-count phase
 #   UC_U7_TIMES UC_U7_ACKS        U7 repeats per phase, and the space-separated acked-write counts before the signal
 #   UC_U7_ACK_TIMEOUT             longest wait in seconds for a U7 point's acked-write count (ERR when not reached)
-#   UC_COMPACT_WAIT               longest wait in seconds for U1's Kvrocks COMPACT to finish
+#   UC_COMPACT_WAIT               longest wait in seconds for U8's Kvrocks COMPACT to finish
 # UC_RATE (set by the runner) is the per-connection --rate-limiting of the open-loop phases of U1 and U3.
 # shellcheck disable=SC2034  # globals are read by uc_run.sh and the test
 HERE_UC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -131,8 +132,7 @@ uc_u5_keys() {
   esac
 }
 
-# Logical bytes a case keeps on disk (key + per-entry overhead as in wl_logical_bytes). U8 starts no server: it reads
-# U1's and U3's files.
+# Logical bytes a case keeps on disk (key + per-entry overhead as in wl_logical_bytes).
 _uc_logical() {
   local k v
   case $1 in
@@ -152,7 +152,9 @@ _uc_logical() {
     U7) local n w=0
         for n in $UC_U7_ACKS; do w=$((w + n)); done
         echo $((U7_KEYS * (100 + 12) + UC_U7_TIMES * 2 * w * UC_U7_ENTRY)) ;;
-    U8|F1) echo 0 ;;
+    # U8 loads U1's key set once more (memtier, for the load speed)
+    U8) _uc_logical U1 ;;
+    F1) echo 0 ;;
     *) echo "uc_disk_need: unknown case $1" >&2; return 2 ;;
   esac
 }
@@ -162,16 +164,20 @@ _uc_logical() {
 # two servers' needs, not their sum:
 #   TidesKV: logical x 1.4 + UC_SLACK
 #   Kvrocks: logical x 1.6 + UC_WAL_ALLOWANCE + UC_SLACK
-#   logical x 1.4/1.1         the data on disk after the load. memtier's --random-data does not compress (U1 load is 1 KiB
-#                             values of random bytes): in the quick run build/bench/uc-quick (du-after-load: allocated bytes
-#                             excluding the WAL archive, over keys x (value + 12)) U1 TidesKV was 1.33x and Kvrocks 1.05x;
-#                             U5 1/4/16 KiB TidesKV 1.48/1.25/1.00x, Kvrocks 1.41/1.43/1.56x at 0.5 GiB per size, where
-#                             fixed per-file overheads weigh more than at full size.
-#   Kvrocks + logical / 2     the transient extra space of its full COMPACT (U1) while old and new SSTs coexist
+#   logical x 1.4/1.1         the data on disk after the load, taken as if nothing compressed: TidesKV does not
+#                             compress values of 1 KiB and up, and Kvrocks leaves the levels above the bottom one
+#                             uncompressed, so a load can end mostly uncompressed (uc_loader.py's values compress to
+#                             about half only where a server compresses them). The quick run build/bench/uc-quick
+#                             (memtier payload; du-after-load: allocated bytes excluding the WAL archive, over keys x
+#                             (value + 12)) had U1 TidesKV at 1.33x and Kvrocks at 1.05x; U5 1/4/16 KiB TidesKV
+#                             1.48/1.25/1.00x, Kvrocks 1.41/1.43/1.56x at 0.5 GiB per size, where fixed per-file
+#                             overheads weigh more than at full size.
+#   Kvrocks + logical / 2     the transient extra space of its full COMPACT (U8; U1 keeps
+#                             the term, which only makes it conservative) while old and new SSTs coexist
 #                             (1.1 + 0.5 = 1.6)
 #   UC_WAL_ALLOWANCE          Kvrocks' WAL archive (stock wal_size_limit_mb 16384 caps it at 16 GiB)
 #   UC_SLACK                  4 GiB for logs, the fio files and the filesystem
-# U8 and F1 (logical 0) still ask for 20 GiB (the Kvrocks term).
+# F1 (logical 0) still asks for 20 GiB (the Kvrocks term).
 uc_disk_need() {
   local logical t k
   logical=$(_uc_logical "$1") || return
@@ -201,24 +207,22 @@ uc_phases() {
 # Closed-loop shape: 4 threads x 50 clients, pipeline 1, distinct seeds.
 _uc_conns() { echo "--threads=$UC_THREADS" "--clients=$UC_CLIENTS" "--pipeline=1" "${MEMTIER_RUN_FLAGS[@]}"; }
 
-# String load of N keys of SIZE bytes under PREFIX (same _seq pattern as wl_load).
-_uc_str_load() {
-  local cb=$1 prefix=$2 keys=$3 size=$4
-  # shellcheck disable=SC2046
-  "$cb" "--ratio=1:0" "--data-size=$size" "--random-data" "--key-prefix=$prefix" $(_seq "$keys")
-}
+# Loads go through uc_loader.py, not memtier (memtier's --random-data payload compresses unrealistically well in blocks
+# and not at all per value: see uc_loader.py's header). CB gets the loader's arguments; keys are PREFIX1..PREFIXN, the
+# names memtier's P:P / --key-maximum=N phases read. Every value compresses to about half, the same bytes on every
+# server (--seed 1 for loads), at pipeline 32 over 32 connections as memtier's loads were.
+UC_LOADER_CONNS=32  # memtier's loads ran 4 x 8 connections; strict preloads (U6, U7) are bound by them
+UC_LOADER_PIPELINE=32
+_uc_str_load() { "$1" "--prefix=$2" "--keys=$3" "--value-size=$4"; }
 
 # Load CASE through CB. U5 takes an optional PHASE (v1k|v4k|v16k) and loads all three sizes in turn without one.
 uc_load() {
-  local c=$1 cb=$2 p k v args=() f
+  local c=$1 cb=$2 p k v
   case $c in
     U1) _uc_str_load "$cb" "u1:" "$U1_KEYS" 1024 ;;
     U3) _uc_str_load "$cb" "u3:" "$U3_KEYS" 200 ;;
-    U4)
-      for ((f = 1; f <= 20; f++)); do args+=("f$f" "__data__"); done
-      # shellcheck disable=SC2046
-      "$cb" "--command=HSET __key__ ${args[*]}" "--data-size=50" "--random-data" "--key-prefix=u4:" \
-        $(_cseq "$U4_KEYS") ;;
+    # HSET u4:<i> f1 v .. f20 v, the fields U4's memtier commands read and write
+    U4) "$cb" "--prefix=u4:" "--keys=$U4_KEYS" "--value-size=50" "--fields=20" ;;
     U5)
       for p in ${3:-v1k v4k v16k}; do
         read -r k v <<<"$(uc_u5_keys "$p")" || return
@@ -229,6 +233,20 @@ uc_load() {
     U2|U8|F1) ;;
     *) echo "uc_load: unknown case $c" >&2; return 2 ;;
   esac
+}
+
+# U3's aging through CB (loader arguments): two overwrites of the loaded set, 2 x U3_KEYS SETs of uniform random keys,
+# with new values (--seed 2; pass B ages with the same seed, so both passes reach the same state).
+uc_age() {
+  "$1" "--prefix=u3:" "--keys=$U3_KEYS" "--value-size=200" "--order=random" "--requests=$((2 * U3_KEYS))" "--seed=2"
+}
+
+# U8's bulk-load speed through CB (memtier arguments): U1's key set with memtier's own payload, pipelined 32 over
+# 4 x 8 connections, so the ops/s does not depend on uc_loader.py's speed. Its footprint is recorded but the reported
+# footprint comes from U1's controlled load.
+uc_memtier_load() {
+  # shellcheck disable=SC2046
+  "$1" "--ratio=1:0" "--data-size=1024" "--random-data" "--key-prefix=u1:" $(_seq "$U1_KEYS")
 }
 
 # Gaussian over [1, keys]: median keys/2, stddev keys/20.
@@ -255,11 +273,6 @@ _uc_u3() {
   local ph=$1 cb=$2
   # shellcheck disable=SC2046
   case $ph in
-    # two overwrites of the loaded set: 2 x U3_KEYS random pipelined SETs split over 4 x 8 clients
-    age)
-      "$cb" "--ratio=1:0" "--data-size=200" "--random-data" "--key-prefix=u3:" "--key-pattern=R:R" \
-        $(_random "$U3_KEYS") "--requests=$((2 * U3_KEYS / 32))" "--pipeline=32" "--threads=4" "--clients=8" \
-        "${MEMTIER_RUN_FLAGS[@]}" ;;
     closed)
       "$cb" "--ratio=4:1" "--data-size=200" "--random-data" "--key-prefix=u3:" "--key-pattern=R:R" \
         $(_random "$U3_KEYS") $(_uc_conns) ;;

@@ -44,7 +44,7 @@ _diff_start() {
 _diff_stop() {
   local c; c=$(_diff_name "$1")
   docker logs "$c" >>"$OUT/$1/diff-server.log" 2>&1 || true
-  docker rm -f "$c" >/dev/null 2>&1 || true
+  docker rm -f -v "$c" >/dev/null 2>&1 || true
 }
 
 # Runs TestKvrocksCases from a Go container on $NET; prints go test's -json stream (and any error text).
