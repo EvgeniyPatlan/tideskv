@@ -1,0 +1,531 @@
+diff --git a/src/compaction/compaction_commit.c b/src/compaction/compaction_commit.c
+index 1247c74..e0e1c94 100644
+--- a/src/compaction/compaction_commit.c
++++ b/src/compaction/compaction_commit.c
+@@ -132,12 +132,17 @@ int ce_commit(const compaction_ctx_t *cx, const compaction_job_t *job, sstable_t
+         return TDB_ERR_MEMORY;
+     }
+     for (int i = 0; i < sink->n_outputs; i++) out_levels[i] = job->target_level;
++    /* a reader that pinned an input resolves its values until it lets go, after the swap below has
++     * left them named by no installed table; see sstable_hold_vlog_floor */
++    for (int i = 0; i < n_inputs; i++) sstable_hold_vlog_floor(inputs[i], cx->cf->vlog);
+     const int rc = level_set_swap(cx->cf->levels, inputs, n_inputs, sink->outputs, out_levels,
+                                   sink->sizes, sink->n_outputs);
+     if (out_levels != levels) free(out_levels);
+ 
+     if (rc != 0)
+     {
++        /* the inputs stay installed, so their segments are counted live again */
++        for (int i = 0; i < n_inputs; i++) sstable_drop_vlog_floor(inputs[i]);
+         (void)ce_rollback_commit(cx, job, inputs, in_levels, in_sizes, n_inputs, sink, catalogued);
+         if (in_levels != in_stack) free(in_levels);
+         return TDB_ERR_MEMORY;
+diff --git a/src/engine/engine_l0.c b/src/engine/engine_l0.c
+index b4b75de..24d3737 100644
+--- a/src/engine/engine_l0.c
++++ b/src/engine/engine_l0.c
+@@ -180,11 +180,6 @@ static void engine_flush_one(tidesdb_t *db, tidesdb_memtable_t *imm, uint64_t ti
+     }
+     engine_cf_index_array_release(db, cfs, view);
+ 
+-    /* read before the install, which retires the immutable and frees it on the way through. the
+-     * value is settled by then -- a reference is only ever added to the active memtable, and this
+-     * one was sealed and its writers drained before the build started */
+-    const int held = atomic_load_explicit(&imm->vlog_token, memory_order_acquire);
+-
+     /* a flush that did not install leaves the immutable queued and unflushed, so drop the claim
+      * that won it -- otherwise no worker can ever take it again and its data reaches L1 only via a
+      * WAL replay on the next open. the next rotation's wake retries it */
+@@ -194,11 +189,10 @@ static void engine_flush_one(tidesdb_t *db, tidesdb_memtable_t *imm, uint64_t ti
+      * exist and a reclaim scanning now would find them referenced by nothing */
+     vlog_build_leave(db->vlog, build_token);
+ 
+-    /* and the immutable's own floor, which covered the values a commit separated into it while it
+-     * was the active memtable. only an install ends that -- until one lands, this memtable is still
+-     * the only thing naming them, and a failed build leaves it queued to be flushed again */
+-    if (install_rc == TDB_SUCCESS && held != VLOG_BUILD_TOKEN_NONE)
+-        vlog_build_leave(db->vlog, held);
++    /* the immutable's own floor is not given back here but by the L0 reclaim the install runs,
++     * once no reader pins the memtable (tidesdb_memtable_drop_vlog_floor): a reader that pinned it
++     * before this install still resolves its values through it, while the table installed here may
++     * be compacted away, its values rewritten into new segments, before that reader lets go */
+ 
+     if (install_rc != TDB_SUCCESS) tidesdb_l0_release_immutable(db->l0, imm);
+ }
+diff --git a/src/internal/types.h b/src/internal/types.h
+index 2112a98..106325c 100644
+--- a/src/internal/types.h
++++ b/src/internal/types.h
+@@ -52,7 +52,16 @@
+  * then, so without a floor covering that segment a reclaim would drain it. taken when the memtable
+  * becomes the active one and lowered onto the segment of every reference it goes on to receive --
+  * not at the first of them, because a commit writes its value to the value log before it reaches
+- * any memtable, and a floor taken only once a reference landed would leave that gap uncovered
++ * any memtable, and a floor taken only once a reference landed would leave that gap uncovered.
++ * held past its flush install for as long as an iterator or a point read still pins the memtable,
++ * since that reader resolves its references through it while the installed table naming the same
++ * values may be compacted away -- its values rewritten into new segments -- before the reader lets
++ * go. given back by tidesdb_memtable_drop_vlog_floor once the retired memtable is unpinned, which
++ * the L0 reclaim checks at the flush and on every deferred sweep, not only when it is freed: the
++ * free also waits for the db-global reader epoch to be quiet, which steady point reads may rarely
++ * allow
++ * @param vlog_floor_of the value log vlog_token was taken from, set once after the token is
++ * published and read only by tidesdb_memtable_drop_vlog_floor; NULL while it holds no token
+  * @param range_tombstones the prefix and range deletes committed into this memtable, over prefixed
+  * keys so one set serves every column family, or NULL while none have been. guarded by
+  * range_tombstone_lock
+@@ -89,6 +98,7 @@ typedef struct tidesdb_memtable_t
+     _Atomic(int) flushed;
+     _Atomic(int) claimed;
+     _Atomic(int) vlog_token;
++    struct vlog *vlog_floor_of;
+     range_tombstone_set_t *range_tombstones;
+     _Atomic(size_t) range_tombstone_frags;
+     tdb_wprwlock_t range_tombstone_lock;
+diff --git a/src/memtable/l0_immutable.c b/src/memtable/l0_immutable.c
+index b01e2e4..b481f97 100644
+--- a/src/memtable/l0_immutable.c
++++ b/src/memtable/l0_immutable.c
+@@ -273,6 +273,19 @@ static int l0_reclaim_ready(const tidesdb_l0_t *l0, const tidesdb_memtable_t *mt
+     return atomic_load_explicit(&mt->refcount, memory_order_acquire) <= TDB_L0_MEMTABLE_BASELINE;
+ }
+ 
++/* a retired memtable no reader holds a reference to needs no floor any more: its values are named
++ * by the installed table its flush produced. checked here rather than left to the free, which also
++ * waits for the db-global reader epoch to be quiet -- under steady point reads that can hold a
++ * whole queue of flushed memtables, and with them reclamation, for far longer than any reader
++ * needs.
++ * a reader still inside the pin window without a reference resolves through the table installed
++ * moments before, as it did when the floor was given back at the install */
++static void l0_drop_floor_if_unpinned(tidesdb_memtable_t *mt)
++{
++    if (atomic_load_explicit(&mt->refcount, memory_order_acquire) <= TDB_L0_MEMTABLE_BASELINE)
++        tidesdb_memtable_drop_vlog_floor(mt);
++}
++
+ void tidesdb_l0_reclaim_pending(tidesdb_l0_t *l0)
+ {
+     if (!l0) return;
+@@ -288,6 +301,7 @@ void tidesdb_l0_reclaim_pending(tidesdb_l0_t *l0)
+         }
+         else
+         {
++            l0_drop_floor_if_unpinned(cur->mt);
+             l0_pending_push(l0, cur);
+         }
+         cur = next;
+@@ -297,6 +311,7 @@ void tidesdb_l0_reclaim_pending(tidesdb_l0_t *l0)
+ void tidesdb_l0_reclaim(tidesdb_l0_t *l0, tidesdb_memtable_t *mt)
+ {
+     if (!mt) return;
++    l0_drop_floor_if_unpinned(mt);
+ 
+     /* the caller dequeued mt, so no new reader can reach it and the only question is when the
+      * readers already holding it leave. this runs inside a flush install, under locks a create or
+diff --git a/src/memtable/memtable.c b/src/memtable/memtable.c
+index 82bbca4..04f4da2 100644
+--- a/src/memtable/memtable.c
++++ b/src/memtable/memtable.c
+@@ -15,6 +15,7 @@
+ #include "base/log.h"                    /* TDB_DEBUG_LOG for the admission trace */
+ #include "base/waitstat.h"               /* tdb_wait_deadline and the condvar clock it pairs with */
+ #include "l0_internal.h"
++#include "sstable/vlog.h"   /* vlog_build_leave for the floor a memtable holds */
+ #include "memtable_bloom.h" /* the whole-key filter every put sets before its skip list insert */
+ 
+ /* a writer the policy blocks re-reads L0 pressure on this cadence, for at most this many reads. the
+@@ -104,6 +105,7 @@ tidesdb_memtable_t *tidesdb_memtable_create_with_bloom(block_manager_t *wal, uin
+     atomic_init(&mt->flushed, 0);
+     atomic_init(&mt->claimed, 0);
+     atomic_init(&mt->vlog_token, VLOG_BUILD_TOKEN_NONE);
++    mt->vlog_floor_of = NULL;
+     atomic_init(&mt->high_seq, 0);
+     atomic_init(&mt->seq_floor, 0);
+     mt->queued_bytes = 0; /* weighed by the rotation that seals it */
+@@ -122,9 +124,19 @@ tidesdb_memtable_t *tidesdb_memtable_create_with_bloom(block_manager_t *wal, uin
+     return mt;
+ }
+ 
++void tidesdb_memtable_drop_vlog_floor(tidesdb_memtable_t *mt)
++{
++    if (!mt) return;
++    const int token =
++        atomic_exchange_explicit(&mt->vlog_token, VLOG_BUILD_TOKEN_NONE, memory_order_acq_rel);
++    if (token != VLOG_BUILD_TOKEN_NONE && mt->vlog_floor_of)
++        vlog_build_leave(mt->vlog_floor_of, token);
++}
++
+ void tidesdb_memtable_free(tidesdb_memtable_t *mt)
+ {
+     if (!mt) return;
++    tidesdb_memtable_drop_vlog_floor(mt); /* a no-op when the L0 reclaim already gave it back */
+     if (mt->skip_list) skip_list_free(mt->skip_list);
+     range_tombstone_set_free(mt->range_tombstones);
+     tdb_wprwlock_destroy(&mt->range_tombstone_lock);
+@@ -482,6 +494,8 @@ static void l0_hold_vlog_floor(tidesdb_l0_t *l0, tidesdb_memtable_t *mt)
+     if (!atomic_compare_exchange_strong_explicit(&mt->vlog_token, &expected, fresh,
+                                                  memory_order_acq_rel, memory_order_acquire))
+         vlog_build_leave(l0->vlog, fresh); /* already holds one, so give the extra back */
++    else
++        mt->vlog_floor_of = l0->vlog;
+ }
+ 
+ /* reach this memtable's floor back to the segment a reference's bytes actually live in. its own
+diff --git a/src/memtable/memtable.h b/src/memtable/memtable.h
+index a7a2966..da43cf8 100644
+--- a/src/memtable/memtable.h
++++ b/src/memtable/memtable.h
+@@ -85,6 +85,14 @@ size_t tidesdb_memtable_bloom_bytes(size_t write_buffer_size);
+  */
+ void tidesdb_memtable_free(tidesdb_memtable_t *mt);
+ 
++/**
++ * tidesdb_memtable_drop_vlog_floor
++ * give back the value-log floor the memtable holds (see vlog_token), at most once however many
++ * callers race to it
++ * @param mt the memtable, may be NULL
++ */
++void tidesdb_memtable_drop_vlog_floor(tidesdb_memtable_t *mt);
++
+ /* digits in a WAL file name, zero-padded; a WAL is named by its generation alone, and the width
+  * matches the sstable id so a listing of a database directory lines up whatever kind of file is
+  * being looked at */
+diff --git a/src/sstable/sstable.c b/src/sstable/sstable.c
+index 04d497b..932195b 100644
+--- a/src/sstable/sstable.c
++++ b/src/sstable/sstable.c
+@@ -72,6 +72,8 @@ sstable_t *sstable_alloc_owning_path(uint64_t id, int partition, char *klog_path
+     sst->cache_key_prefix = XXH64(klog_path, strlen(klog_path), 0);
+     snprintf(sst->cf_name, sizeof(sst->cf_name), "%s", cf_name);
+     sst->sync_mode = sync_mode;
++    sst->floor_vlog = NULL;
++    sst->floor_token = VLOG_BUILD_TOKEN_NONE;
+ 
+     atomic_init(&sst->klog_bm, NULL);
+     atomic_init(&sst->bloom, NULL);
+@@ -329,6 +331,9 @@ void sstable_close(sstable_t *sst)
+     pr_filter_reader_free(atomic_load_explicit(&sst->bloom, memory_order_acquire));
+     cache_release(sst->root_pin);
+ 
++    /* the last reference has gone, so nothing resolves this table's values through it any more */
++    sstable_drop_vlog_floor(sst);
++
+     /* a superseded sstable's bytes stay charged to the filesystem until the file is unlinked, and
+      * this is the first moment it is safe -- the last reference has gone, so no reader is inside
+      * it. without this the merged-away inputs accumulate for as long as the database stays open,
+@@ -354,6 +359,28 @@ int sstable_klog_resident(const sstable_t *sst)
+     return atomic_load_explicit(&sst->klog_bm, memory_order_acquire) != NULL;
+ }
+ 
++void sstable_hold_vlog_floor(sstable_t *sst, vlog_t *vlog)
++{
++    if (!sst || !vlog || sst->floor_vlog || sst->vlog_ref_count == 0) return;
++    uint64_t lowest = sst->vlog_refs[0].segment;
++    for (uint32_t r = 1; r < sst->vlog_ref_count; r++)
++        if (sst->vlog_refs[r].segment < lowest) lowest = sst->vlog_refs[r].segment;
++    /* entered at the active segment and lowered at once: the table is still installed, so its
++     * segments are counted live until the swap that this floor now outlives */
++    const int token = vlog_build_enter(vlog);
++    vlog_build_lower(vlog, token, lowest);
++    sst->floor_token = token;
++    sst->floor_vlog = vlog;
++}
++
++void sstable_drop_vlog_floor(sstable_t *sst)
++{
++    if (!sst || !sst->floor_vlog) return;
++    vlog_build_leave(sst->floor_vlog, sst->floor_token);
++    sst->floor_vlog = NULL;
++    sst->floor_token = VLOG_BUILD_TOKEN_NONE;
++}
++
+ void sstable_mark_for_deletion(sstable_t *sst)
+ {
+     if (!sst) return;
+diff --git a/src/sstable/sstable.h b/src/sstable/sstable.h
+index 56eddb8..bfac01c 100644
+--- a/src/sstable/sstable.h
++++ b/src/sstable/sstable.h
+@@ -190,6 +190,9 @@ typedef struct
+  * @param last_access_time lru key for reaper victim selection, in seconds from the same clock
+  * @param marked_for_deletion set once a compaction has committed the merge that supersedes this
+  * sstable, so whoever drops its last reference unlinks the key log rather than only closing it
++ * @param floor_vlog the value log this table holds a build floor in once a compaction retired it,
++ * NULL while it holds none (sstable_hold_vlog_floor)
++ * @param floor_token the token of that floor
+  */
+ typedef struct
+ {
+@@ -247,6 +250,8 @@ typedef struct
+     tdb_refcount_t refcount;
+     _Atomic(int64_t) last_access_time;
+     _Atomic(int) marked_for_deletion;
++    vlog_t *floor_vlog;
++    int floor_token;
+ } sstable_t;
+ 
+ /**
+@@ -713,6 +718,28 @@ int sstable_klog_resident(const sstable_t *sst);
+  */
+ void sstable_mark_for_deletion(sstable_t *sst);
+ 
++/**
++ * sstable_hold_vlog_floor
++ * keep every value-log segment this table names from being reclaimed until its last reference
++ * drops. a reclaim restates liveness from the installed tables only, so once a compaction retires
++ * a table its segments read as unnamed -- and when that compaction rewrote the table's values into
++ * new segments, the old ones read as empty and are unlinked -- while an iterator or a point read
++ * that pinned the table still resolves its references through them. taken before the table leaves
++ * the level set, so no reclaim pass can fall between the two. a table naming no segment, or one
++ * already holding a floor, takes nothing
++ * @param sst the table about to be retired
++ * @param vlog the value log its references resolve in, or NULL for none
++ */
++void sstable_hold_vlog_floor(sstable_t *sst, vlog_t *vlog);
++
++/**
++ * sstable_drop_vlog_floor
++ * give back the floor sstable_hold_vlog_floor took, for a table that stays installed after all
++ * (a failed swap) and for the close of a retired one
++ * @param sst the table
++ */
++void sstable_drop_vlog_floor(sstable_t *sst);
++
+ /**
+  * sstable_unref
+  * drop a reference
+diff --git a/test/engine__tests.c b/test/engine__tests.c
+index 23831b0..7c83a26 100644
+--- a/test/engine__tests.c
++++ b/test/engine__tests.c
+@@ -5932,6 +5932,221 @@ void test_engine_vlog_gc(void)
+     (void)remove_directory(ENGINE_TEST_DB_DIR);
+ }
+ 
++/* one commit putting a value of vlen bytes filled with c under prefix%05d */
++static void engine_test_put_one(tidesdb_t *db, tidesdb_column_family_t *cf, const char *prefix,
++                                int i, char *buf, size_t vlen, char c)
++{
++    char key[24];
++    snprintf(key, sizeof(key), "%s%05d", prefix, i);
++    memset(buf, c, vlen);
++    tidesdb_txn_t *t = NULL;
++    ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_txn_put(t, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)buf, vlen,
++                              -1),
++              TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
++    tidesdb_txn_free(t);
++}
++
++/* an open iterator keeps the value-log segments its sources name. a compaction that rewrites the
++ * values of a mostly-dead segment gives them new ids and retires the table the iterator is reading;
++ * the next reclaim restates liveness from the installed tables only, finds the old segment named by
++ * nothing and unlinks it. without the iterator's own floor its next value read failed with
++ * TDB_ERR_IO */
++void test_engine_vlog_gc_keeps_segments_an_iterator_reads(void)
++{
++    (void)remove_directory(ENGINE_TEST_DB_DIR);
++    char db_path[] = ENGINE_TEST_DB_DIR;
++    tidesdb_config_t cfg = engine_test_config(db_path);
++    cfg.vlog_segment_size = 64 * 1024; /* as in test_engine_vlog_gc: the passes seal segments */
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    cc.l1_file_count_trigger = 1000000; /* no background compaction races the manual ones */
++    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
++    ASSERT_TRUE(cf != NULL);
++
++    const int n = 24;
++    const size_t alen = 2048, xlen = 4096; /* both above the 1024 spill threshold */
++    char *buf = malloc(xlen);
++    ASSERT_TRUE(buf != NULL);
++
++    /* each A value shares its segments with an X value twice its size, then filler seals them */
++    for (int i = 0; i < n; i++)
++    {
++        engine_test_put_one(db, cf, "x", i, buf, xlen, 'X');
++        engine_test_put_one(db, cf, "a", i, buf, alen, 'A');
++    }
++    for (int i = 0; i < 20; i++) engine_test_put_one(db, cf, "y", i, buf, xlen, 'Y');
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++
++    /* the X keys go, so a third of each shared segment stays live and the pass marks it
++     * drainable */
++    for (int i = 0; i < n; i++)
++    {
++        char key[24];
++        snprintf(key, sizeof(key), "x%05d", i);
++        tidesdb_txn_t *t = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_delete(t, cf, (const uint8_t *)key, strlen(key)), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
++        tidesdb_txn_free(t);
++    }
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++    ASSERT_EQ(engine_test_compact(db, cf), TDB_SUCCESS);
++    engine_vlog_gc(db);
++
++    /* the scan starts on the table naming the A values in the drainable segments */
++    tidesdb_txn_t *rt = NULL;
++    ASSERT_EQ(tidesdb_txn_begin(db, &rt), TDB_SUCCESS);
++    tidesdb_iter_t *it = NULL;
++    ASSERT_EQ(tidesdb_iter_new(rt, cf, &it), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
++
++    /* a compaction carrying the A values rewrites them into a fresh segment, retiring the table the
++     * scan holds, and the reclaim after it finds the old segments named by no installed table */
++    engine_test_put_one(db, cf, "z", 0, buf, alen, 'Z');
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++    ASSERT_EQ(engine_test_compact(db, cf), TDB_SUCCESS);
++    tidesdb_db_stats_t st;
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    const uint64_t retired_before = st.vlog_segments_retired;
++    engine_vlog_gc(db);
++
++    /* every value still reads back through the open scan */
++    int seen_a = 0;
++    while (tidesdb_iter_valid(it))
++    {
++        uint8_t *k = NULL, *v = NULL;
++        size_t ks = 0, vs = 0;
++        ASSERT_EQ(tidesdb_iter_key(it, &k, &ks), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_iter_value(it, &v, &vs), TDB_SUCCESS);
++        ASSERT_TRUE(ks > 0 && v != NULL);
++        if (k[0] == 'a')
++        {
++            memset(buf, 'A', alen);
++            ASSERT_EQ((int)vs, (int)alen);
++            ASSERT_TRUE(memcmp(v, buf, alen) == 0);
++            seen_a++;
++        }
++        free(k);
++        free(v);
++        if (tidesdb_iter_next(it) != TDB_SUCCESS) break;
++    }
++    ASSERT_EQ(seen_a, n);
++    tidesdb_iter_free(it);
++    ASSERT_EQ(tidesdb_txn_commit(rt), TDB_SUCCESS);
++    tidesdb_txn_free(rt);
++
++    /* the scan's floor goes with it, so the next pass drops the old segments */
++    engine_vlog_gc(db);
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    ASSERT_TRUE(st.vlog_segments_retired > retired_before);
++
++    free(buf);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(ENGINE_TEST_DB_DIR);
++}
++
++/* the same for a memtable an iterator pinned before its flush installed. the iterator resolves the
++ * memtable's references, while the table the flush installed names the same values and can be
++ * compacted away with them rewritten elsewhere -- so the memtable's floor has to outlast its flush
++ * for as long as the iterator holds it, and no longer once the iterator lets go */
++void test_engine_vlog_gc_keeps_segments_a_pinned_memtable_names(void)
++{
++    (void)remove_directory(ENGINE_TEST_DB_DIR);
++    char db_path[] = ENGINE_TEST_DB_DIR;
++    tidesdb_config_t cfg = engine_test_config(db_path);
++    cfg.vlog_segment_size = 64 * 1024;
++    tidesdb_t *db = NULL;
++    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
++    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
++    cc.l1_file_count_trigger = 1000000;
++    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
++    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
++    ASSERT_TRUE(cf != NULL);
++
++    const int n = 24;
++    const size_t alen = 2048, xlen = 4096;
++    char *buf = malloc(xlen);
++    ASSERT_TRUE(buf != NULL);
++
++    /* all of it still in the memtable: A values sharing segments with larger X values, filler to
++     * seal them, and the X keys deleted again */
++    for (int i = 0; i < n; i++)
++    {
++        engine_test_put_one(db, cf, "x", i, buf, xlen, 'X');
++        engine_test_put_one(db, cf, "a", i, buf, alen, 'A');
++    }
++    for (int i = 0; i < 20; i++) engine_test_put_one(db, cf, "y", i, buf, xlen, 'Y');
++    for (int i = 0; i < n; i++)
++    {
++        char key[24];
++        snprintf(key, sizeof(key), "x%05d", i);
++        tidesdb_txn_t *t = NULL;
++        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_delete(t, cf, (const uint8_t *)key, strlen(key)), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
++        tidesdb_txn_free(t);
++    }
++
++    /* the scan pins the memtable, which the flush then retires behind it */
++    tidesdb_txn_t *rt = NULL;
++    ASSERT_EQ(tidesdb_txn_begin(db, &rt), TDB_SUCCESS);
++    tidesdb_iter_t *it = NULL;
++    ASSERT_EQ(tidesdb_iter_new(rt, cf, &it), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++    tidesdb_l0_reclaim_pending(db->l0); /* a sweep while the scan holds the memtable */
++
++    /* the pass marks the shared segments drainable, a compaction rewrites the A values out of them
++     * and retires the flushed table, which no reader holds, and the next pass finds them unnamed */
++    engine_vlog_gc(db);
++    engine_test_put_one(db, cf, "z", 0, buf, alen, 'Z');
++    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
++    ASSERT_EQ(engine_test_compact(db, cf), TDB_SUCCESS);
++    tidesdb_db_stats_t st;
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    const uint64_t retired_before = st.vlog_segments_retired;
++    engine_vlog_gc(db);
++
++    int seen_a = 0;
++    while (tidesdb_iter_valid(it))
++    {
++        uint8_t *k = NULL, *v = NULL;
++        size_t ks = 0, vs = 0;
++        ASSERT_EQ(tidesdb_iter_key(it, &k, &ks), TDB_SUCCESS);
++        ASSERT_EQ(tidesdb_iter_value(it, &v, &vs), TDB_SUCCESS);
++        ASSERT_TRUE(ks > 0 && v != NULL);
++        if (k[0] == 'a')
++        {
++            memset(buf, 'A', alen);
++            ASSERT_EQ((int)vs, (int)alen);
++            ASSERT_TRUE(memcmp(v, buf, alen) == 0);
++            seen_a++;
++        }
++        free(k);
++        free(v);
++        if (tidesdb_iter_next(it) != TDB_SUCCESS) break;
++    }
++    ASSERT_EQ(seen_a, n);
++    tidesdb_iter_free(it);
++    ASSERT_EQ(tidesdb_txn_commit(rt), TDB_SUCCESS);
++    tidesdb_txn_free(rt);
++
++    /* unpinned, the memtable's floor goes on the next sweep, and the pass after it drops the
++     * segments the rewrite emptied */
++    tidesdb_l0_reclaim_pending(db->l0);
++    engine_vlog_gc(db);
++    ASSERT_EQ(tidesdb_get_db_stats(db, &st), TDB_SUCCESS);
++    ASSERT_TRUE(st.vlog_segments_retired > retired_before);
++
++    free(buf);
++    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
++    (void)remove_directory(ENGINE_TEST_DB_DIR);
++}
++
+ /* what a codec achieved is attributed to the pipeline each table was written with, read from its
+  * own footer, so a table older than a configuration change still reports what encoded it */
+ void test_engine_klog_encoding_stats_are_per_pipeline(void)
+@@ -7626,6 +7841,8 @@ int main(int argc, char **argv)
+     RUN_TEST(test_engine_oldest_readable_seq_resets_on_open, tests_passed);
+     RUN_TEST(test_engine_drop_removes_only_that_familys_files, tests_passed);
+     RUN_TEST(test_engine_vlog_gc, tests_passed);
++    RUN_TEST(test_engine_vlog_gc_keeps_segments_an_iterator_reads, tests_passed);
++    RUN_TEST(test_engine_vlog_gc_keeps_segments_a_pinned_memtable_names, tests_passed);
+     RUN_TEST(test_engine_deleting_everything_reclaims_the_space, tests_passed);
+     RUN_TEST(test_engine_klog_encoding_stats_are_per_pipeline, tests_passed);
+     RUN_TEST(test_engine_wal_descriptor_accounting_balances, tests_passed);

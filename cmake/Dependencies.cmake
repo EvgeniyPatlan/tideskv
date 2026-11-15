@@ -59,7 +59,13 @@ set(TIDESDB_PATCHES
   # tidesdb_iter_new_opts with bypass_cache: a one-pass bulk scan reads its sstable blocks straight from
   # disk, as compaction does, so it neither replaces the cache's hot set nor leaves a cache's worth of node
   # memory owned by the thread that ran it
-  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-iter-no-cache-fill.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-iter-no-cache-fill.patch"
+  # a value-log reclaim keeps the segments a reader can still reach: a table a compaction retires
+  # holds a floor at its lowest segment until its last reference drops, and a flushed memtable keeps
+  # its floor until no reader pins it rather than only until its flush installs. a reclaim counted
+  # only installed tables, so a scan holding a table whose values a compaction had just rewritten
+  # elsewhere read unlinked segments and failed with TDB_ERR_IO
+  "${CMAKE_CURRENT_LIST_DIR}/patches/tidesdb-vlog-reader-floor.patch")
 # The patch step reruns only when its command changes, so the command carries a hash of the patches'
 # contents, which the script ignores. Editing a patch then reconfigures (CMAKE_CONFIGURE_DEPENDS) and
 # reruns the step, and on a tree patched with the old version the step fails, asking for a fresh fetch.
