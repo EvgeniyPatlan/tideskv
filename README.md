@@ -173,7 +173,9 @@ CI runs debug, release, ASan/UBSan, TSan, coverage, clang-format, clang-tidy, fu
 
 ## Benchmarks
 
-The comparison benchmark against Kvrocks is in progress under `bench/compare/`. Published numbers will follow it.
+The comparison benchmark against Kvrocks lives under `bench/compare/`. The first results are from a quick run on small
+data, a check of behaviour rather than a performance claim: see
+[docs/benchmarks/2026-11-16-quick](docs/benchmarks/2026-11-16-quick/README.md). Full-size results will follow.
 
 ## License
 
