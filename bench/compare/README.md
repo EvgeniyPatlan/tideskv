@@ -249,7 +249,7 @@ bench/compare/uc_report.py build/bench/uc-full                 # rebuild report.
 Options: `--quick`, `--dirty` (build TidesKV from the working tree), `--out DIR`, and any number of case names.
 `SERVER_CPUS`, `SERVER_MEM`, `CLIENT_CPUS` and `QUIESCE_MAX` (default 600 s, quick 60 s) work as for `run.sh`.
 `usecases.sh` runs `uc_report.py` at the end and exits with its status; `uc_report.py` exits 1 when any cell failed. The host needs Docker, `fio` is run from its pinned image, and Python
-tools (U7's ack-writer and F1) run from the pinned `PY_IMAGE` in `lib.sh`.
+tools (the loader, U7's ack-writer and F1) run from the pinned `PY_IMAGE` in `lib.sh`.
 
 Resume: running `usecases.sh` again with the same `--out` skips every repetition that has a `done` file and redoes the
 rest from an empty data directory, so an interrupted run (Ctrl-C, a crashed host) never mixes partial files. It refuses
@@ -262,13 +262,14 @@ recorded as failed, not run on top of old data (U5 checks the same between value
 
 Before each case loads, the suite checks the free disk against that case's need. Only one server's data is on disk at a
 time (each pass starts from an emptied data dir), so the need is the larger of two per-server needs: TidesKV
-`logical x 1.4 + 4 GiB`, Kvrocks `logical x 1.6 + 16 GiB + 4 GiB`. memtier's random values do not compress: after U1's
-load in the quick run TidesKV held 1.33x and Kvrocks 1.05x of the logical bytes (keys x (value + 12)), so 1.4 covers
-TidesKV's data; Kvrocks' 1.6 is about 1.1 for its data plus 0.5 for the transient space of its full COMPACT in U1; 16 GiB
-is Kvrocks' WAL archive at its stock `wal_size_limit_mb 16384`; 4 GiB is slack. Even U8 and F1 ask for 20 GiB (the
-Kvrocks term). Full-size needs: U1 50.9 GiB (the largest; 54.6 GB), U5 44.7 GiB, U2 30.2 GiB, U4 28.9 GiB, U7 26.3 GiB
-(its preload plus every point's acknowledged writes, since the data dir is kept), U3 26.3 GiB, U6 20.2 GiB, U8 and F1
-20 GiB. The
+`logical x 1.4 + 4 GiB`, Kvrocks `logical x 1.6 + 16 GiB + 4 GiB`. The need is sized as if nothing compressed, since a
+load can end mostly uncompressed on both servers (TidesKV does not compress values of 1 KiB and up; Kvrocks leaves the
+levels above its bottom one uncompressed): after U1's load in the quick run TidesKV held 1.33x and Kvrocks 1.05x of the
+logical bytes (keys x (value + 12)), so 1.4 covers TidesKV's data; Kvrocks' 1.6 is about 1.1 for its data plus 0.5 for
+the transient space of its full COMPACT in U8; 16 GiB is Kvrocks' WAL archive at its stock `wal_size_limit_mb 16384`;
+4 GiB is slack. F1 asks for 20 GiB (the Kvrocks term), U8 as much as U1. Full-size needs: U1 and U8 50.9 GiB (the
+largest; 54.6 GB), U5 44.7 GiB, U2 30.2 GiB, U4 28.9 GiB, U7 26.3 GiB (its preload plus every point's acknowledged
+writes, since the data dir is kept), U3 26.3 GiB, U6 20.2 GiB, F1 20 GiB. The
 random-read baseline's 8 GiB fio file (full mode) is deleted before U1 loads; each U6 fio job's 1 GiB file exists only
 beside U6's small preload and is deleted after the job. A case that does not fit is skipped, and its repetitions say why.
 
@@ -294,7 +295,7 @@ for its two fio jobs at full-mode settings.
 
 The quick run is a check of the suite, not a measurement: its data fits in the page cache.
 
-A full run is estimated at about 46 h (roughly 2 days); the first full run measures it. The estimate is rough, +-20%,
+A full run is estimated at about 47 h (roughly 2 days); the first full run measures it. The estimate is rough, +-20%,
 and built from these components. "Derived" means computed from the full-mode constants in `uc_cases.sh`;
 "extrapolated" means scaled from the quick run's timings.
 
@@ -307,11 +308,12 @@ and built from these components. "Derived" means computed from the full-mode con
 | U5 | 5 h | extrapolated: three value sizes, each loaded and run for 4 min, 9 server-repetitions |
 | U6 | 3.1 h | extrapolated: the quick run's strict preload of 1M keys took 21 min (TidesKV) and 38 min (Kvrocks), times 3 repetitions, plus 4 sweep steps of 60 s and 1 min of fio per server and repetition |
 | U7 | 9 h (5-11 h) | extrapolated: the quick U7 preload of 200k strict keys took 372 s (TidesKV) and 154 s (Kvrocks), so 2M keys take about 62 and 26 min per repetition (4.4 h in all); derived: 30 points per server and repetition need 1.9M acknowledged writes, 32 min at 1000/s (the quick run saw 430-3700/s), plus about 20 s per point for the baseline probe, restart and verify, about 4.2 h in all |
-| U8, F1 | under 5 min | measured |
-| Total | about 46 h | sum of the rows |
+| U8 | 1 h | extrapolated: one memtier load of 20M keys per server and repetition (about 2 min), plus for Kvrocks a second load and a COMPACT of up to 7200 s |
+| F1 | under 5 min | measured |
+| Total | about 47 h | sum of the rows |
 
-U1 can be longer: Kvrocks' COMPACT after the closed-loop phases may run up to the 7200 s cap per repetition (up to 6 h more over three
-repetitions); the quick run's COMPACT is not representative. The run is resumable, so it can be done in pieces (for
+U8 can be longer: Kvrocks' COMPACT may run up to the 7200 s cap per repetition (up to 6 h over three repetitions); the
+quick run's COMPACT is not representative. The run is resumable, so it can be done in pieces (for
 example U6 and U7 alone, or one case per night). Do not start it on a host that runs anything else: server and client are
 pinned to cores and the cases measure latency.
 
@@ -319,14 +321,14 @@ pinned to cores and the cases measure latency.
 
 | Case | What runs | Servers | Durability | Headline metrics |
 |---|---|---|---|---|
-| U1 Cache bigger than RAM | 20M keys x 1 KB (about 20 GB, 2.5x `SERVER_MEM`), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. Kvrocks gets a full COMPACT after the closed-loop phases (for U8). fio's random-read curve is measured before U1 | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
+| U1 Cache bigger than RAM | 20M keys x 1 KB (about 20 GB, 2.5x `SERVER_MEM`), GET:SET 10:1, Gaussian and uniform key patterns closed-loop; then open-loop at 25/50/75% of the lower server's maximum. fio's random-read curve is measured before U1 | TidesKV, Kvrocks | relaxed | ops/s; p50/p99/p99.9 at equal offered load; Kvrocks cache hit rate |
 | U2 TTL churn and space reclaim | SET with random TTLs 120-1200 s, 1:1 GET (negative lookups over a 1e9-key space) at a fixed rate for 60 min, then 30 min idle; `du` every 60 s | TidesKV, Kvrocks, Kvrocks+cron (`compaction-checker-cron * * * * *`) | relaxed | disk bytes over time and at the end; p99.9 at the fixed rate; end-of-run key count |
 | U3 Aged store, small updates | 20M x 200 B, overwritten twice at random, then 4:1 SET:GET for 60 min closed-loop, then open-loop phases; background-debt INFO fields shown beside the numbers | TidesKV, Kvrocks | relaxed | p99/p99.9 per window; windows over 10x median; ops/s; disk write bytes per op (cgroup write bytes / requests of the closed run; information) |
 | U4 Hashes as records | 5M hashes x 20 fields x 50 B; HGET/HSET/HGETALL/HDEL mix 10:6:3:1 | TidesKV, Kvrocks | relaxed | ops/s; p99 |
 | U5 Mid-size values | 1, 4 and 16 KB values, GET:SET 4:1 | TidesKV, Kvrocks, Kvrocks+BlobDB (`min_blob_size 4096`) | relaxed | ops/s; p99; disk write bytes per op (information); on-disk size |
 | U6 Durable writes | SET 100 B at 1, 8, 64 and 256 connections, pipeline 1; before each server's sweep fio measures the durable-append floor (4 KiB sequential write + fdatasync) and a reference (4 KiB random write + fsync) | TidesKV, Kvrocks | strict | writes/s; p99; ops/s over the durable-append floor (information) |
 | U7 Restart and crash recovery | writer with an acknowledgement log (2 KiB values); SIGTERM and SIGKILL once 12710, 63550 and 114390 writes are acknowledged (about 10, 50 and 90% of the 256 MiB memtable), the same counts on both servers, 5 times each; restart, then verify every acknowledged key | TidesKV, Kvrocks | strict | acknowledged writes lost, corrupt, restart misses; time to PONG; time to recovered p99 (with each server's absolute threshold and the acked count at the signal) |
-| U8 Bulk load and footprint | no server of its own: reads U1's load and U3's aging | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet (censored at `QUIESCE_MAX`: "≥ cap"); disk after load, after aging, after COMPACT (Kvrocks only) |
+| U8 Bulk load and footprint | a memtier load of U1's key set (the load speed); Kvrocks also loads U1's data again on an empty server and runs a full COMPACT; disk after load and after aging come from U1 and U3 | TidesKV, Kvrocks | relaxed | load ops/s; time to quiet (censored at `QUIESCE_MAX`: "≥ cap"); disk after load, after aging, after COMPACT (Kvrocks only) |
 | F1 Command coverage | a command matrix against Redis 7.2 | TidesKV, Kvrocks | relaxed | same / differs / unsupported / documented / extra per command and case |
 | F2 Operations facts | a hand-written, sourced table (`f2_operations.md`) | | | facts with links |
 
@@ -358,8 +360,21 @@ keeps its 1M-key preload.
 - **Correctness.** memtier's byte counts check that every SET reply is `+OK` (U1, U2, U3, U5, U6) and every HSET and
   HDEL reply an integer (U4); GETs must hit 99% after a load (U1, U3, U5). U2's GETs (negative lookups by design) and
   U4's HGET and HGETALL replies are not checked. A failed check makes the cell ERR.
-- **Data.** LZ4 is on for both servers. memtier's random values are not assumed to compress: the report prints the
-  observed on-disk / logical ratio per server and case (U1, U2, U3, U5).
+- **Data.** LZ4 is on for both servers. Every load (U1 and U3-U7) and U3's aging go through `uc_loader.py`, not
+  memtier: memtier's `--random-data` value is one buffer with one byte changed per request, the same sequence in every
+  client, so a block of loaded values compresses to about 15% while one value does not compress at all. That favours a
+  block compressor (Kvrocks) and penalises a per-value one. The loader's values are random bytes followed by a copy of
+  them (RocksDB's db_bench does the same at its default `--compression_ratio 0.5`), so each compresses to about half and
+  values share nothing; a value depends only on the seed and the key, so both servers get the same bytes. It writes
+  the key names memtier reads (`u1:1` to `u1:N`), at pipeline 32 over 32 connections (memtier's loads used 4 x 8). The timed phases still write
+  memtier values, so keys they overwrite change payload, and U8's load speed is a memtier load so that it does not
+  depend on the loader. The report prints the observed on-disk / logical ratio per server and case (U1, U2, U3, U5).
+- **Kvrocks' footprint after a load varies.** With its defaults (`compression_start_level 2`, dynamic level sizes)
+  only the bottom level is compressed, and how much data compaction has moved there when the load ends depends on
+  timing: identical 2M x 1 KiB memtier loads ended between 273 MB and 1.96 GB on one host. Next to each Kvrocks disk
+  figure the suite records how many of its SST bytes are stored uncompressed (`sst-after-*.json`, from `uc_lsm.py`
+  reading RocksDB's LOG), and U8 gives the COMPACT figure, which is stable (a 2M x 1 KiB controlled load compacted to
+  1015 MiB, all LZ4).
 - **U3 and U5 disk writes per op** are the server cgroup's bytes written during the timed run over its requests. They
   are information only, with no verdict: only writes inside the window count, so a server that keeps the data in its
   memtable or defers flushes and compaction past the window looks cheaper than it is (in the quick U3 run TidesKV showed

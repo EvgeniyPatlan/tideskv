@@ -3,13 +3,15 @@
 # for pass B of U1 and U3 (see uc_run.sh's header). Sourced after uc_run.sh by usecases.sh and the tests. The
 # dispatcher runs them with errexit off, so every step is checked and a failure sets UC_FAIL_REASON and returns 1.
 # Files per repetition, under $OUT/<CASE>/<server>/rep<N>/:
-#   load/<n>.json load.seconds settle-load du-after-load   the load; seconds = memtier wall time (the DBSIZE check after
+#   load/<n>.json load.seconds settle-load du-after-load   the load; seconds = uc_loader.py's wall time (the DBSIZE check after
 #                                                          it is not counted)
 #   <phase>.{json,status,settle,cpu,io,info0,info1,stats.jsonl,client.jsonl}   one uc_cell per timed phase
-#   U3: age.* age.seconds settle-age du-after-age;  U1 Kvrocks: compact.status settle-compact du-after-compact
-#   pass B: reload/ reload.seconds reload.settle (U3: reload-age.*) open.rates open25|open50|open75.*
+#   U3: age/ age.seconds settle-age du-after-age (the aging is a uc_loader.py run, like the loads)
+#   pass B: reload/ reload.seconds reload.settle (U3: reload-age/ reload-age.seconds) open.rates open25|open50|open75.*
 #   U5: load-<size>/ load-<size>.seconds settle-load-<size> du-after-load-<size> <size>.*
-#   <load>.pipeline: the load's memtier --pipeline (the load is unmeasured, pipelined alike on every server)
+#   <load>/<n>.json <n>.log: uc_loader.py's result and output; <load>.pipeline: its pipeline depth (the same on every
+#   server)
+#   sst-after-<what>.json (Kvrocks only, next to each du-after-<what>): its live SST bytes by compression (uc_lsm.py)
 #   U2: du.csv (sampler over churn and idle) churn.* du-end dbsize-end (or `unverified`) value-size idle.status
 #   U6: load/ load.seconds settle-load du-after-load c1|c8|c64|c256.*
 #   U7: load/ load.seconds settle-load du-after-load, then per point <sig>-<n>/ (sig term|kill, n = acknowledged writes
@@ -26,7 +28,9 @@
 #       recovered_ms = start of the first 3 consecutive passing 100 ms windows, hits; the probe container is started
 #       before the signal and waits for restart.epoch_ms) and verify.json (acked, lost, lost_sample, corrupt,
 #       corrupt_sample)
-#   U8: summary.json (no server)
+#   U8: memtier-load/ memtier-load.seconds settle-memtier-load du-after-memtier-load (the load speed, memtier payload);
+#       Kvrocks also, on an emptied data dir: compact-load/ compact-load.seconds settle-compact-load
+#       du-after-compact-load, compact.status settle-compact du-after-compact; then summary.json
 #   F1: matrix.json per server (this server against Redis 7.2, run.log) and, merged over the servers done so far, F1/matrix.json
 # du-after-* files hold the du sampler's header and one row (epoch_s,bytes,wal_archive_bytes,allocated_bytes,
 # wal_archive_allocated_bytes: columns 2-3 apparent size, 4-5 allocated bytes).
@@ -58,10 +62,9 @@ _uc_up() {
 _uc_down() { stop_server; SERVER_CONTAINER=""; }
 
 # shellcheck disable=SC2317  # callbacks are invoked indirectly by uc_load / uc_phase
-_uc_load_cb() {
-  local a
-  for a in "$@"; do [[ $a == --pipeline=* ]] && UC_LOAD_PIPELINE=${a#--pipeline=}; done
-  memtier "$UC_LOAD_DIR/$UC_LOAD_N" "$@" || return; UC_LOAD_N=$((UC_LOAD_N + 1)); }
+_uc_load_cb() { uc_loader "$UC_LOAD_DIR/$UC_LOAD_N" "$@" || return; UC_LOAD_N=$((UC_LOAD_N + 1)); }
+# shellcheck disable=SC2317
+_uc_memtier_cb() { memtier "$UC_LOAD_DIR/$UC_LOAD_N" "$@" || return; UC_LOAD_N=$((UC_LOAD_N + 1)); }
 # shellcheck disable=SC2317
 _uc_args_cb() { UC_ARGS=("$@"); }
 
@@ -78,21 +81,64 @@ _uc_dbsize_ok() {
   _uc_fail "load check failed: DBSIZE = [$got], want >= $want"
 }
 
-# _uc_load CASE REP NAME KEYS [U5 PHASE]: memtier load into REP/NAME/, NAME.seconds, then the DBSIZE check.
+# uc_loader NAME ARGS...: uc_loader.py in a PY_IMAGE container on the bench network against the running server, with
+# UC_LOADER_CONNS connections at pipeline UC_LOADER_PIPELINE; result in $OUT/NAME.json, output in $OUT/NAME.log.
+uc_loader() {
+  local name=$1 dir c=tideskv-bench-loader-$TS-$RANDOM; shift
+  dir=$(dirname "$OUT/$name")
+  mkdir -p "$dir"
+  _track "$c"
+  docker run --rm --name "$c" --network "$NET" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" -v "$dir:/out" \
+    -v "$HERE_RUN/uc_loader.py:/uc_loader.py:ro" "$PY_IMAGE" python -I /uc_loader.py --host "$SERVER_CONTAINER" \
+    --port "$SERVER_PORT" --conns "$UC_LOADER_CONNS" --pipeline "$UC_LOADER_PIPELINE" \
+    --out "/out/$(basename "$name").json" "$@" >"$OUT/$name.log" 2>&1
+}
+
+# _uc_load CASE REP NAME KEYS [U5 PHASE]: uc_loader.py load into REP/NAME/, NAME.seconds, then the DBSIZE check.
 _uc_load() {
   local c=$1 rep=$2 name=$3 keys=$4 start
-  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1 UC_LOAD_PIPELINE=""
+  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1
   start=$(date +%s%3N)
   uc_load "$c" _uc_load_cb ${5:+"$5"} || { _uc_fail "load failed; see $rep/$name/"; return 1; }
   _uc_since "$start" >"$OUT/$rep/$name.seconds"
-  echo "${UC_LOAD_PIPELINE:-1}" >"$OUT/$rep/$name.pipeline"  # the unmeasured load is pipelined (same for every server)
+  echo "$UC_LOADER_PIPELINE" >"$OUT/$rep/$name.pipeline"  # the unmeasured load is pipelined (same for every server)
   _uc_dbsize_ok "$keys"
 }
 
-# _uc_settle_du REP NAME: settle-NAME, then du-after-NAME of the server's data dir.
+# _uc_memtier_load REP NAME: U8's memtier load of U1's key set into REP/NAME/, NAME.seconds, then the DBSIZE check.
+_uc_memtier_load() {
+  local rep=$1 name=$2 start
+  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1
+  start=$(date +%s%3N)
+  uc_memtier_load _uc_memtier_cb || { _uc_fail "memtier load failed; see $rep/$name/"; return 1; }
+  _uc_since "$start" >"$OUT/$rep/$name.seconds"
+  echo 32 >"$OUT/$rep/$name.pipeline"
+  _uc_dbsize_ok "$U1_KEYS"
+}
+
+# _uc_age REP NAME: U3's aging (uc_age through uc_loader.py) into REP/NAME/, NAME.seconds, then a liveness check.
+_uc_age() {
+  local rep=$1 name=$2 start
+  UC_LOAD_DIR=$rep/$name UC_LOAD_N=1
+  start=$(date +%s%3N)
+  uc_age _uc_load_cb || { _uc_fail "aging failed; see $rep/$name/"; return 1; }
+  _uc_since "$start" >"$OUT/$rep/$name.seconds"
+  echo ok >"$OUT/$rep/$name.status"
+  _uc_check_alive "$rep/$name"
+  [[ $(head -1 "$OUT/$rep/$name.status") == ok ]] || { _uc_fail "$name failed: $(head -1 "$OUT/$rep/$name.status")"; return 1; }
+}
+
+# _uc_settle_du REP NAME: settle-NAME, then du-after-NAME of the server's data dir and, for Kvrocks, sst-after-NAME.json
+# (uc_lsm.py: how much of that is stored uncompressed). A failed uc_lsm.py leaves a note in sst-after-NAME.err only.
 _uc_settle_du() {
   settle "$OUT/$1/settle-$2" || { _uc_fail "could not read the server's cgroup to wait for it to settle"; return 1; }
-  uc_du_snapshot "$OUT/data/$SERVER_NAME" >"$OUT/$1/du-after-$2"
+  uc_du_snapshot "$OUT/data/$SERVER_NAME" >"$OUT/$1/du-after-$2" || { _uc_fail "du of the data dir failed"; return 1; }
+  if [[ $SERVER_NAME == kvrocks* ]]; then
+    python3 "$HERE_RUN/uc_lsm.py" "$OUT/data/$SERVER_NAME/db" >"$OUT/$1/sst-after-$2.json" 2>"$OUT/$1/sst-after-$2.err" \
+      || rm -f "$OUT/$1/sst-after-$2.json"
+    [[ -s $OUT/$1/sst-after-$2.err ]] || rm -f "$OUT/$1/sst-after-$2.err"
+  fi
+  return 0
 }
 
 # _uc_cell CASE REP PHASE: one timed phase through uc_cell (UC_CELL_WARMUP / UC_CELL_DURATION apply).
@@ -100,18 +146,6 @@ _uc_cell() {
   UC_ARGS=()
   uc_phase "$1" "$3" _uc_args_cb || { _uc_fail "no memtier arguments for $1 $3"; return 1; }
   uc_cell "$2/$3" "${UC_ARGS[@]}" || { _uc_fail "cell $3 failed: $(head -1 "$OUT/$2/$3.status" 2>/dev/null)"; return 1; }
-}
-
-# _uc_requests CASE REP PHASE NAME: a --requests phase (U3's aging) measured like a cell but not timed; NAME.seconds.
-_uc_requests() {
-  local start
-  UC_ARGS=()
-  uc_phase "$1" "$3" _uc_args_cb || { _uc_fail "no memtier arguments for $1 $3"; return 1; }
-  start=$(date +%s%3N)
-  MEASURE_INFO=INFO measure_memtier "$2/$4" "${UC_ARGS[@]}"
-  _uc_since "$start" >"$OUT/$2/$4.seconds"
-  _uc_check_alive "$2/$4"
-  [[ $(head -1 "$OUT/$2/$4.status") == ok ]] || { _uc_fail "$4 failed: $(head -1 "$OUT/$2/$4.status")"; return 1; }
 }
 
 # _uc_open_cells CASE REP: open25/50/75 at the per-connection rates in UC_RATES (set by the dispatcher).
@@ -146,8 +180,6 @@ case_U1() {
   _uc_load U1 "$rep" load "$U1_KEYS" || return 1
   _uc_settle_du "$rep" load || return 1
   for ph in closed-gauss closed-uniform; do _uc_cell U1 "$rep" "$ph" || return 1; done
-  # U8's "after a full compaction where the server offers one": TidesKV has no COMPACT
-  if [[ $s == kvrocks* ]]; then _uc_compact "$rep" || return 1; fi
 }
 
 case_U1_open() {
@@ -164,7 +196,7 @@ case_U3() {
   _uc_up "$1" U3 || return 1
   _uc_load U3 "$rep" load "$U3_KEYS" || return 1
   _uc_settle_du "$rep" load || return 1
-  _uc_requests U3 "$rep" age age || return 1
+  _uc_age "$rep" age || return 1
   _uc_settle_du "$rep" age || return 1
   UC_CELL_WARMUP=0 UC_CELL_DURATION=$UC_U3_CLOSED_S _uc_cell U3 "$rep" closed
 }
@@ -174,7 +206,7 @@ case_U3_open() {
   local rep=U3/$1/rep$2
   _uc_up "$1" U3 || return 1
   _uc_load U3 "$rep" reload "$U3_KEYS" || return 1
-  _uc_requests U3 "$rep" age reload-age || return 1
+  _uc_age "$rep" reload-age || return 1
   settle "$OUT/$rep/reload-age.settle" || { _uc_fail "could not read the server's cgroup"; return 1; }
   UC_CELL_WARMUP=0 UC_CELL_DURATION=$UC_U3_OPEN_S _uc_open_cells U3 "$rep"
 }
@@ -266,15 +298,33 @@ _uc_closed_status() {
   if [[ -e $d/closed.done ]]; then cat "$d/closed.done"; else cat "$d/done" 2>/dev/null; fi
 }
 
-# U8 runs no server: bulk-load and footprint numbers from U1's load (and Kvrocks' COMPACT) and U3's aging.
+# U8: bulk load and footprint. The load speed comes from a memtier load of U1's key set (memtier-load), so it does not
+# depend on uc_loader.py; its footprint is kept but not the reported one (memtier's payload compresses unrealistically).
+# Kvrocks then gets an emptied data dir, U1's controlled load once more (compact-load) and a full COMPACT, for the
+# steady-state footprint of the same data U1 measured after its load (TidesKV has no COMPACT). The footprints after load
+# and after aging come from U1's and U3's files.
+_uc_u8_kvrocks_compact() {
+  local rep=$1
+  _uc_down
+  remove_data || { _uc_fail "could not empty the data dir before the compact load"; return 1; }
+  _uc_up "$SERVER_NAME" U8 "start before the compact load" || return 1
+  _uc_load U1 "$rep" compact-load "$U1_KEYS" || return 1
+  _uc_settle_du "$rep" compact-load || return 1
+  _uc_compact "$rep"
+}
+
 case_U8() {
-  local s=$1 r=$2 c
+  local s=$1 r=$2 c rep=U8/$1/rep$2
   for c in U1 U3; do
     [[ $(_uc_closed_status "$c" "$s" "$r") == ok ]] || { _uc_fail "U8 needs $c rep$r of $s (run $c first)"; return 1; }
   done
-  python3 - "$U1_KEYS" "$OUT/U1/$s/rep$r" "$OUT/U3/$s/rep$r" "$s" "$r" >"$OUT/U8/$s/rep$r/summary.json" <<'PY' ||
+  _uc_up "$s" U8 || return 1
+  _uc_memtier_load "$rep" memtier-load || return 1
+  _uc_settle_du "$rep" memtier-load || return 1
+  if [[ $s == kvrocks* ]]; then _uc_u8_kvrocks_compact "$rep" || return 1; fi
+  python3 - "$U1_KEYS" "$OUT/U1/$s/rep$r" "$OUT/U3/$s/rep$r" "$s" "$r" "$OUT/$rep" >"$OUT/$rep/summary.json" <<'PY' ||
 import json, os, sys
-keys, u1, u3, server, rep = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+keys, u1, u3, server, rep, u8 = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6]
 
 def text(path):
     with open(path) as f:
@@ -289,18 +339,31 @@ def du(path):
         out.update(allocated_bytes=row[3], wal_archive_allocated_bytes=row[4])
     return out
 
-secs = float(text(os.path.join(u1, "load.seconds")))
+def sst(path):
+    return json.load(open(path)) if os.path.exists(path) else None
+
+def ops(d, name):
+    secs = float(text(os.path.join(d, name + ".seconds")))
+    return secs, (round(keys / secs) if secs > 0 else None)
+
+secs, speed = ops(u8, "memtier-load")
+_, controlled = ops(u1, "load")
 settle = text(os.path.join(u1, "settle-load")).split()
-compact = os.path.join(u1, "compact.status")
+compact = os.path.join(u8, "compact.status")
 print(json.dumps({
-    "server": server, "rep": rep, "load_keys": keys, "load_seconds": secs,
-    "load_ops_per_s": round(keys / secs) if secs > 0 else None,
+    "server": server, "rep": rep, "load_keys": keys, "load_seconds": secs, "load_ops_per_s": speed,
+    "controlled_load_ops_per_s": controlled,
     "settle_load_s": int(settle[0]), "settle_load_capped": len(settle) > 1,
     "du_after_load": du(os.path.join(u1, "du-after-load")),
+    "memtier_du_after_load": du(os.path.join(u8, "du-after-memtier-load")),
     "u3_du_after_load": du(os.path.join(u3, "du-after-load")),
     "du_after_age": du(os.path.join(u3, "du-after-age")),
-    "kvrocks_after_compact": du(os.path.join(u1, "du-after-compact")),
+    "kvrocks_after_compact": du(os.path.join(u8, "du-after-compact")),
     "compact_status": text(compact) if os.path.exists(compact) else None,
+    "sst_after_load": sst(os.path.join(u1, "sst-after-load.json")),
+    "sst_after_memtier_load": sst(os.path.join(u8, "sst-after-memtier-load.json")),
+    "sst_after_age": sst(os.path.join(u3, "sst-after-age.json")),
+    "sst_after_compact": sst(os.path.join(u8, "sst-after-compact.json")),
 }, indent=2))
 PY
     { _uc_fail "could not write U8 summary.json from U1/U3 files"; return 1; }
@@ -381,7 +444,7 @@ _uc_u7_tool_collect() {
   _uc_u7_wait_exit "$name" "$5" || { _uc_fail "$what did not finish in $5 s"; return 1; }
   docker logs "$name" >"$OUT/$d/$file" 2>&1 || true
   rc=$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null)
-  docker rm "$name" >/dev/null 2>&1 || true
+  docker rm -v "$name" >/dev/null 2>&1 || true
   echo "$rc" >"$OUT/$d/${file%.out}.status"
   [[ $rc == 0 ]] || { _uc_fail "$what exited $rc: $(tail -1 "$OUT/$d/$file")"; return 1; }
 }
@@ -476,7 +539,7 @@ case_F1() {
   else
     rc=2
   fi
-  docker rm -f "$ref" >/dev/null 2>&1 || true
+  docker rm -f -v "$ref" >/dev/null 2>&1 || true
   ((rc != 2)) || { _uc_fail "the Redis 7.2 reference did not answer PING"; return 1; }
   ((rc == 0)) || { _uc_fail "f1_matrix.py failed: $(tail -1 "$OUT/$rep/run.log")"; return 1; }
   for f in "$OUT"/F1/*/rep*/matrix.json; do merged+=("$f"); done

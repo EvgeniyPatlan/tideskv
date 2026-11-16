@@ -12,7 +12,7 @@ check() { if [[ $2 != "$3" ]]; then echo "FAIL $1: got [$2] want [$3]"; fail=1; 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-EV=() START_LEVELS=() MT_LOG=() MT_CNAMES=() MT_FAIL="" DBSIZE_REPLY=999999999
+EV=() START_LEVELS=() MT_LOG=() LD_LOG=() MT_CNAMES=() MT_FAIL="" DBSIZE_REPLY=999999999
 # shellcheck disable=SC2034  # read by the memtier stub through ${!var}
 STUB_OPS_tideskv=100000 STUB_OPS_kvrocks=80000
 # shellcheck disable=SC2317  # the stubs are invoked indirectly by the code under test
@@ -28,6 +28,15 @@ memtier() {
   EV+=("$CUR:$short") MT_LOG+=("$CUR:$short $*") MT_CNAMES+=("$short=${MEMTIER_CNAME:-}")
   mkdir -p "$(dirname "$OUT/$name")"
   printf '{"ALL STATS":{"Totals":{"Ops/sec":%s}}}\n' "${!var:-1}" >"$OUT/$name.json"
+  [[ " $MT_FAIL " != *" $CUR:$short "* ]]
+}
+# uc_loader.py runs (loads and U3's aging): recorded like memtier, in LD_LOG with their arguments
+uc_loader() {
+  local name=$1 short; shift
+  short=${name#*/rep*/}
+  EV+=("$CUR:$short") LD_LOG+=("$CUR:$short $*")
+  mkdir -p "$(dirname "$OUT/$name")"
+  echo '{"writes":1,"errors":0}' >"$OUT/$name.json"
   [[ " $MT_FAIL " != *" $CUR:$short "* ]]
 }
 cli() {
@@ -87,7 +96,7 @@ check u3-rates-file "$(cat "$OUT/U3/kvrocks/rep1/open.rates")" "100 200 300"
 check u3-open-rate-arg "$(printf '%s\n' "${MT_LOG[@]}" | grep -c '^tideskv:open50 .*--rate-limiting=200')" 1
 check u3-age-du "$(head -1 "$OUT/U3/tideskv/rep1/du-after-age")" "epoch_s,bytes,wal_archive_bytes,allocated_bytes,wal_archive_allocated_bytes"
 check u3-files "$(count_files "$OUT/U3/tideskv/rep1" load.seconds reload.seconds settle-load settle-age du-after-load \
-  load reload age.json reload-age.json age.seconds)" 10
+  load reload age/1.json reload-age/1.json age.seconds)" 10
 check u3-closed-seconds "$(printf '%s\n' "${MT_LOG[@]}" | grep '^kvrocks:closed ' | grep -o -- '--test-time=[0-9]*')" \
   "--test-time=$UC_U3_CLOSED_S"
 check u3-open-seconds "$(printf '%s\n' "${MT_LOG[@]}" | grep '^kvrocks:open75 ' | grep -o -- '--test-time=[0-9]*')" \
@@ -126,8 +135,7 @@ rm -f "$TMP/compacts"
 uc_dispatch U1 2>/dev/null
 check u1-full-open "$(evs | grep -o 'tideskv:open[0-9]*' | tr '\n' ' ')" "tideskv:open25 tideskv:open50 tideskv:open75 "
 check u1-reload-seconds "$([[ -s $OUT/U1/kvrocks/rep1/reload.seconds ]] && echo y)" y
-check u1-compact-kvrocks "$(cat "$TMP/compacts")" "kvrocks:compact"
-check u1-du-after-compact "$([[ -e $OUT/U1/kvrocks/rep1/du-after-compact && ! -e $OUT/U1/tideskv/rep1/du-after-compact ]] && echo y)" y
+check u1-no-compact "$([[ -e $TMP/compacts ]] && echo compacted || echo none)" none
 check u1-cell-info "$(cat "$OUT/U1/kvrocks/rep1/closed-gauss.info0") $(cat "$OUT/U1/tideskv/rep1/closed-gauss.info1")" \
   "is_compacting:no is_compacting:no"
 check u1-client-cname "$(printf '%s\n' "${MT_CNAMES[@]}" | grep '^closed-uniform=' | grep -c -- "-$TS-")" 2
@@ -136,14 +144,18 @@ check u1-client-sampler "$([[ -e $OUT/U1/tideskv/rep1/closed-gauss.client.jsonl 
 for s in tideskv kvrocks; do echo 4 >"$OUT/U1/$s/rep1/load.seconds"; done
 EV=()
 uc_dispatch U8 2>/dev/null
-check u8-no-server "$(evs)" ""
+# U8: a memtier load for the speed; Kvrocks then a controlled load on an emptied data dir and a COMPACT
+check u8-events "$(evs)" "tideskv:start tideskv:memtier-load kvrocks:start kvrocks:memtier-load kvrocks:start kvrocks:compact-load"
+check u8-compact-kvrocks "$(cat "$TMP/compacts")" "kvrocks:compact"
+check u8-du-after-compact "$([[ -e $OUT/U8/kvrocks/rep1/du-after-compact && ! -e $OUT/U8/tideskv/rep1/du-after-compact ]] && echo y)" y
+check u8-memtier-du "$(head -1 "$OUT/U8/tideskv/rep1/du-after-memtier-load")" "$DU_HEADER"
 check u8-done "$(cat "$OUT/U8/kvrocks/rep1/done")" ok
 check u8-summary "$(python3 -c "
 import json
 t = json.load(open('$OUT/U8/tideskv/rep1/summary.json'))
 k = json.load(open('$OUT/U8/kvrocks/rep1/summary.json'))
-print(t['load_ops_per_s'], t['load_keys'], t['settle_load_s'], t['kvrocks_after_compact'], k['kvrocks_after_compact'] is not None,
-      sorted(t['du_after_age']), t['du_after_load']['bytes'] >= 0)")" "250 1000 0 None True ['allocated_bytes', 'bytes', 'wal_archive_allocated_bytes', 'wal_archive_bytes'] True"
+print(t['controlled_load_ops_per_s'], t['load_ops_per_s'] > 0, t['load_keys'], t['settle_load_s'], t['kvrocks_after_compact'], k['kvrocks_after_compact'] is not None,
+      sorted(t['du_after_age']), t['du_after_load']['bytes'] >= 0)")" "250 True 1000 0 None True ['allocated_bytes', 'bytes', 'wal_archive_allocated_bytes', 'wal_archive_bytes'] True"
 rm -rf "$OUT/U8"
 mv "$OUT/U3" "$OUT/U3.away"
 uc_dispatch U8 2>/dev/null
@@ -158,7 +170,6 @@ EV=()
 rm -f "$TMP/compacts"
 uc_dispatch U1 2>/dev/null
 check quick-no-open "$(evs)" "tideskv:start tideskv:load tideskv:closed-gauss tideskv:closed-uniform kvrocks:start kvrocks:load kvrocks:closed-gauss kvrocks:closed-uniform"
-check quick-compact-kvrocks-only "$(tr '\n' ' ' <"$TMP/compacts")" "kvrocks:compact "
 check quick-done "$(cat "$OUT/U1/tideskv/rep1/done") $([[ -e $OUT/U1/tideskv/rep1/closed.done ]] && echo two-pass || echo one-pass)" "ok one-pass"
 
 # ---- U5: each size on its own data dir, removed after the size ----
@@ -358,14 +369,14 @@ F1_TOOL_RC=0
 uc_dispatch F1 2>/dev/null
 check f1-done "$(cat "$OUT/F1/tideskv/rep1/done") $(cat "$OUT/F1/kvrocks/rep1/done")" "ok ok"
 check f1-redis-no-persistence "$(grep -c 'run -d --name tideskv-bench-redis-test-.* redis-server --save  --appendonly no' "$F1_LOG")" 2
-check f1-redis-removed "$(grep -c 'rm -f tideskv-bench-redis-test-' "$F1_LOG")" 2
+check f1-redis-removed "$(grep -c 'rm -f -v tideskv-bench-redis-test-' "$F1_LOG")" 2
 check f1-tool-args "$(grep -c -e '--target tideskv=c-tideskv:6379 --ref tideskv-bench-redis-test-[0-9]*:6379 --cases /f1/f1_cases.txt' "$F1_LOG")" 1
 check f1-merged-targets "$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["targets"]))' "$OUT/F1/matrix.json")" "kvrocks tideskv"
 check f1-levels "$(printf '%s ' "${START_LEVELS[@]}" | grep -c 'tideskv:relaxed kvrocks:relaxed')" 1
 OUT=$TMP/f1f F1_TOOL_RC=1
 uc_dispatch F1 2>/dev/null
 check f1-tool-fail "$(cat "$OUT/F1/tideskv/rep1/done")" "f1_matrix.py failed: boom line"
-check f1-ref-removed-on-failure "$(grep -c 'rm -f tideskv-bench-redis-test-' "$F1_LOG")" 4
+check f1-ref-removed-on-failure "$(grep -c 'rm -f -v tideskv-bench-redis-test-' "$F1_LOG")" 4
 unset -f docker _uc_f1_tool
 
 # ---- start_server's restart timestamps: t0 after docker run, with docker run's duration recorded apart ----
@@ -384,6 +395,19 @@ unset -f docker _uc_f1_tool
   echo "$ok_t0 $ok_run" >"$OUT/result"
 )
 check start-t0-after-docker-run "$(cat "$TMP/t0/result")" "y y"
+
+# ---- the SST record next to a Kvrocks du-after-* (uc_lsm.py on the data dir's db/) ----
+OUT=$TMP/sst
+mkdir -p "$OUT/r" "$OUT/data/kvrocks/db" "$OUT/data/tideskv"
+printf 'x%.0s' {1..100} >"$OUT/data/kvrocks/db/000007.sst"
+echo '2026/11/13 1 EVENT_LOG_v1 {"event": "table_file_creation", "file_number": 7, "cf_name": "metadata", "table_properties": {"compression": "NoCompression"}}' >"$OUT/data/kvrocks/db/LOG"
+SERVER_NAME=kvrocks _uc_settle_du r load
+check sst-kvrocks "$(python3 -c "import json; d=json.load(open('$OUT/r/sst-after-load.json')); print(d['sst_bytes'], d['uncompressed_share'])")" "100 1.0"
+SERVER_NAME=tideskv _uc_settle_du r age
+check sst-tideskv-none "$(cd "$OUT/r" && printf "%s\n" * | tr '\n' ' ')" "du-after-age du-after-load settle-age settle-load sst-after-load.json "
+rm -rf "$OUT/data/kvrocks/db"
+SERVER_NAME=kvrocks _uc_settle_du r gone && check sst-failure-not-fatal ok ok
+check sst-failure-note "$([[ ! -e $OUT/r/sst-after-gone.json && -s $OUT/r/sst-after-gone.err ]] && echo y)" y
 
 # ---- shellcheck ----
 if command -v shellcheck >/dev/null; then

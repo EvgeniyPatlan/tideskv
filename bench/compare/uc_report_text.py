@@ -65,14 +65,19 @@ OTHER_NOTES = {
            "acked-at-signal row is the count when the signal was sent (the 50 ms poll overshoots a little). The fill "
            "counts the writer's writes only, not the preload or what a restart's WAL replay leaves in the memtable. A "
            "point that did not reach its count in time is ERR."],
-    "U8": ["TidesKV has no COMPACT, so the compaction figure exists for Kvrocks only. It was taken after U1's load and "
-           "both closed-loop phases, so it is not a fresh-load figure.",
+    "U8": ["TidesKV has no COMPACT, so the compaction figure exists for Kvrocks only. It comes from a fresh load of "
+           "U1's data on an empty server followed by a full COMPACT, so it is the steady state of the same data.",
+           "Kvrocks' disk after a load depends on how much data compaction has moved into its bottom level, the only "
+           "compressed one by default; the share left uncompressed is shown beside it.",
+           "The load speed is a memtier load (memtier's own values); the footprints are from loads of values that "
+           "compress to about half, the same bytes on both servers.",
            "Time to quiet cannot be shorter than the settle check's window; a value at that floor is shown as \"≤ floor\" "
            "and gets no verdict.",
            "A settle wait that reached QUIESCE_MAX is censored: shown as \"≥ cap\", not an error. It gets a verdict only "
            "when the other side went quiet below the cap by more than the band; when both reached it there is none "
            "(\"both capped\").",
-           "U8 reads U1's load and U3's aging; it runs no server of its own."],
+           "U8's footprints after load and after aging are U1's and U3's; it runs its own loads only for the speed "
+           "and the COMPACT figure."],
 }
 
 

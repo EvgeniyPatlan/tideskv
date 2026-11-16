@@ -6,7 +6,8 @@ MEMTIER_IMAGE=redislabs/memtier_benchmark:2.1.4
 CLI_IMAGE=redis:7.2.5
 # W7's disk ceiling (fio 3.13). Pinned by digest; run_fio skips and says so in meta.json when it cannot be pulled.
 FIO_IMAGE=xridge/fio@sha256:c58227616c9d2ef4c7d9c762a382d5921608ee3cf4b6aef7d99c4f964089d9c3
-# The use-case suite's Python tools (U7's ack-writer, verify and probe) run in this image, pinned by digest (python:3.12.7-slim).
+# The use-case suite's Python tools (the loader, U7's ack-writer, verify and probe, F1) run in this image, pinned by digest
+# (python:3.12.7-slim).
 PY_IMAGE=python@sha256:60d9996b6a8a3689d36db740b49f4327be3be09a21122bd02fb8895abb38b50d
 SERVER_CPUS=${SERVER_CPUS:-0-3}
 CLIENT_CPUS=${CLIENT_CPUS:-8-15}
@@ -40,9 +41,9 @@ bench_cleanup() {
   local c j
   # background jobs (the stats sampler, a settle wait, W6's DEL memtier) would outlive an interrupted run
   for j in $(jobs -p); do pkill -P "$j" 2>/dev/null; kill "$j" 2>/dev/null; done
-  for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for c in "${CONTAINERS[@]}"; do docker rm -f -v "$c" >/dev/null 2>&1 || true; done
   # containers started from background subshells (W6's DEL memtier) carry this run's $TS in their name
-  for c in $(docker ps -aq --filter "name=tideskv-bench-.*-$TS"); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for c in $(docker ps -aq --filter "name=tideskv-bench-.*-$TS"); do docker rm -f -v "$c" >/dev/null 2>&1 || true; done
   if ((NET_CREATED)); then docker network rm "$NET" >/dev/null 2>&1 || true; fi
 }
 
@@ -233,7 +234,7 @@ start_server() {
 stop_server() {
   docker logs "$SERVER_CONTAINER" >>"$OUT/$SERVER_NAME/server.log" 2>&1 || true
   docker stop -t 60 "$SERVER_CONTAINER" >/dev/null 2>&1 || true
-  docker rm "$SERVER_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -v "$SERVER_CONTAINER" >/dev/null 2>&1 || true
   # flush this server's dirty pages now, not into the next phase or the other server's run
   sync
 }

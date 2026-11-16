@@ -112,8 +112,14 @@ def methodology(summary):
         "relaxed is not power-loss safe on either side. U6 and U7 run strict (fsync before every acknowledged write on "
         "both sides). TidesKV's interval mode is not compared with Kvrocks `sync yes`. Strict mode is configured and read "
         "back, but per-ack fsync is not observed by the suite (neither server reports an fsync count).",
-        "6. **Data.** LZ4 is on for both servers; memtier writes random values, and how well they compress is not assumed "
-        "but measured. %s Disk figures are allocated bytes (`du --block-size=1`) after the server went "
+        "6. **Data.** LZ4 is on for both servers. Loads and U3's aging write values that compress to about half "
+        "(random bytes followed by a copy of them, as RocksDB's db_bench does), the same bytes on both servers "
+        "(`uc_loader.py`). memtier's own values are not used for any footprint: they are one buffer with one byte "
+        "changed per request, so a block of them compresses to ~15%% while a single value does not compress at all, "
+        "which favours a block compressor (Kvrocks) and penalises a per-value one. The timed phases still write "
+        "memtier values, so the keys they overwrite change payload; U8's load speed is a memtier load. TidesKV does "
+        "not compress values of 1 KiB and up; Kvrocks compresses only its bottom level by default, and the share of "
+        "its SST bytes left uncompressed is recorded next to each of its disk figures. %s Disk figures are allocated bytes (`du --block-size=1`) after the server went "
         "quiet, excluding Kvrocks' WAL archive (default `wal_ttl_seconds 10800`), which is reported on its own line; "
         "apparent size is shown beside them. Runs recorded before the allocated column existed fall back to apparent "
         "size, and the tables label it as such." % (

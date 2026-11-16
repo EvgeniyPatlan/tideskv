@@ -65,6 +65,26 @@ def _u8_plain(field_name):
     return lambda rep: _num(_json(rep, "summary.json")[field_name])
 
 
+def _u8_optional(field_name):
+    """A summary.json field that runs before it existed do not have: NotRun there."""
+    def f(rep):
+        v = _json(rep, "summary.json").get(field_name)
+        if v is None:
+            raise NotRun(field_name)
+        return _num(v)
+    return f
+
+
+def _u8_uncompressed(field_name):
+    """Percent of Kvrocks' live SST bytes stored uncompressed (uc_lsm.py's record next to that du)."""
+    def f(rep):
+        d = _json(rep, "summary.json").get(field_name)
+        if not d or d.get("uncompressed_share") is None:
+            raise NotRun(field_name)
+        return 100.0 * d["uncompressed_share"]
+    return f
+
+
 def _u8_growth(rep):
     d = _json(rep, "summary.json")
     if d.get("du_after_age") is None or d.get("u3_du_after_load") is None:
@@ -269,8 +289,22 @@ def _build_metrics():
                   disk_src=src + "du_after_load"),
                _m("du_after_load_apparent", "disk after load (apparent size, excl. WAL archive)", False, False,
                   _u8("du_after_load", True), "bytes", info=True, twin_of="du_after_load"),
-               _m("load_ops", "bulk load ops/s", True, False, _u8_plain("load_ops_per_s"), "ops/s"),
-               _m("settle_s", "time to quiet after load", False, False, _u8_settle, "s", floor_key="quiesce_window_s",
+               _m("load_ops", "bulk load ops/s", True, False, _u8_plain("load_ops_per_s"), "ops/s",
+                  note="memtier load of U1's key set (1 KiB values, pipeline 32, 4 x 8 connections) on an empty server; "
+                       "the footprints come from the controlled-payload loads instead"),
+               _m("controlled_load_ops", "load ops/s, controlled payload (U1's load)", True, False,
+                  _u8_optional("controlled_load_ops_per_s"), "ops/s", info=True,
+                  note="uc_loader.py at pipeline 32 over 32 connections, values that compress to about half; partly a "
+                       "measure of the loader itself, so not compared"),
+               _m("uncompressed_after_load", "Kvrocks SST bytes stored uncompressed after load", False, False,
+                  _u8_uncompressed("sst_after_load"), "%", info=True, only="kvrocks",
+                  note="Kvrocks only: its default compression_start_level 2 leaves the levels above the bottom one "
+                       "uncompressed, so this share, set by compaction timing, moves the disk-after-load figure"),
+               _m("memtier_du_after_load", "disk after the memtier load (%s)" % basis, False, False,
+                  _u8("memtier_du_after_load"), "bytes", info=True, disk_src=src + "memtier_du_after_load",
+                  note="not compared: memtier's values compress unrealistically well in blocks, which helps a block "
+                       "compressor only"),
+               _m("settle_s", "time to quiet after U1's load (controlled payload)", False, False, _u8_settle, "s", floor_key="quiesce_window_s",
                   cap_key="quiesce_max_s"),
                _m("u3_load", "U3 disk after its load (%s)" % basis, False, False, _u8("u3_du_after_load"), "bytes", info=True,
                   disk_src=src + "u3_du_after_load"),
@@ -280,8 +314,8 @@ def _build_metrics():
                   disk_src=src + "du_after_age"),
                _m("after_compact", "disk after COMPACT (%s)" % basis, False, False, _u8("kvrocks_after_compact"), "bytes",
                   info=True, only="kvrocks", disk_src=src + "kvrocks_after_compact",
-                  note="Kvrocks only: TidesKV has no COMPACT. Measured after U1's load and both closed-loop phases, "
-                       "on a store that has served traffic")]
+                  note="Kvrocks only: TidesKV has no COMPACT. A fresh load of U1's data (same values) on an empty "
+                       "server, then a full COMPACT")]
     return m
 
 
